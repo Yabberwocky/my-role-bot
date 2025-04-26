@@ -5,7 +5,7 @@ from flask import Flask
 import threading
 
 # Replace this with your actual bot token
-TOKEN = "your-token-here"
+TOKEN = "MTM2NTU3MjQzNzE4NTQwMDg5Mw.GZfG-P.G41IDr3AV8pUgFcgNEq8w2DfCc5QMfXGgbM3Vg"
 
 # Set up bot intents
 intents = discord.Intents.default()
