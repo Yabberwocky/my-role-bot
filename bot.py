@@ -129,7 +129,7 @@ async def nerdhelp(interaction: discord.Interaction):
         "**/bulkupdate** - Paste and update old member list manually.\n"
         "**/nerdhelp** - Show this help menu."
     )
-    await interaction.response.send_message(help_text, ephemeral=True)
+    await interaction.response.send_message(help_text)
 
 # Start web server
 keep_alive()
