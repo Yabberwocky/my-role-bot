@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+from discord import Modal, TextInput, TextStyle
 from flask import Flask
 import threading
 
@@ -40,6 +41,30 @@ def keep_alive():
 async def on_ready():
     await tree.sync()  # Sync commands with Discord
     print(f"Logged in as {bot.user}")
+
+class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
+    data = TextInput(
+        label="Paste entries like 'username ➔ ingamename'.",
+        style=TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lines = self.data.value.splitlines()
+        count = 0
+        for line in lines:
+            if "➔" in line:
+                try:
+                    username, ingame_name = map(str.strip, line.split("➔", 1))
+                    member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
+                    if member:
+                        hc_names[str(member.id)] = ingame_name
+                        count += 1
+                except Exception as e:
+                    print(f"Failed to process line: {line} - {e}")
+
+        await interaction.response.send_message(f"✅ Successfully updated {count} members!")
 
 @tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
@@ -90,27 +115,9 @@ async def hcmembers(interaction: discord.Interaction):
 
     await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
 
-@tree.command(name="bulkupdate", description="Paste the list of usernames ➔ in-game names to update.")
-@app_commands.describe(data="Paste entries like 'username ➔ ingame_name' one per line.")
-async def bulkupdate(interaction: discord.Interaction, data: str):
-    count = 0
-    lines = data.strip().splitlines()
-    for line in lines:
-        if "➔" in line:
-            try:
-                discord_username, ingame_name = line.split("➔")
-                discord_username = discord_username.strip()
-                ingame_name = ingame_name.strip()
-
-                # Find member by username
-                member = discord.utils.find(lambda m: m.name.lower() == discord_username.lower(), interaction.guild.members)
-                if member:
-                    hc_names[str(member.id)] = ingame_name
-                    count += 1
-            except Exception as e:
-                print(f"Failed to process line: {line} - {e}")
-
-    await interaction.response.send_message(f"✅ Successfully updated {count} members!")
+@tree.command(name="bulkupdate", description="Bulk update user in-game names.")
+async def bulkupdate(interaction: discord.Interaction):
+    await interaction.response.send_modal(BulkUpdateModal())
 
 @tree.command(name="nerdhelp", description="Show list of Catercord slash commands.")
 async def nerdhelp(interaction: discord.Interaction):
