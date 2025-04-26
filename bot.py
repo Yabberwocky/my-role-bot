@@ -3,7 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 
 # Replace this with your actual bot token later
-TOKEN = "MTM2NTU3MjQzNzE4NTQwMDg5Mw.G1jnTD.yDN0SsOUD47RnJbttgsRjN5Y8-RHtAbUTDCrX4"
+TOKEN = "MTM2NTU3MjQzNzE4NTQwMDg5Mw.GSfrrD.-aChqNHcSz6oR7j4Xv4AyCA6iiO-_xYp6l3hcc"
 
 # Set up bot intents (permissions)
 intents = discord.Intents.default()
