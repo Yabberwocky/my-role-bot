@@ -86,31 +86,31 @@ async def hcmembers(interaction: discord.Interaction):
     list_text = ""
     for idx, member in enumerate(members, 1):
         ingame_name = hc_names.get(str(member.id), "Unknown")
-        list_text += f"{idx}. {member.display_name} ➔ {ingame_name}\n"
+        list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"  # IMPORTANT: .name not .display_name
 
-    await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
+    await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}", ephemeral=True)
 
-@tree.command(name="bulkupdate", description="Paste a list to update in-game names into memory.")
-@app_commands.describe(data="Paste entries like '1. abc ➔ abc'")
+@tree.command(name="bulkupdate", description="Paste the list of usernames ➔ in-game names to update.")
+@app_commands.describe(data="Paste entries like 'username ➔ ingame_name' one per line.")
 async def bulkupdate(interaction: discord.Interaction, data: str):
     count = 0
-    lines = data.splitlines()
+    lines = data.strip().splitlines()
     for line in lines:
         if "➔" in line:
             try:
-                parts = line.split("➔")
-                discord_name = parts[0].split(".")[1].strip()
-                ingame_name = parts[1].strip()
+                discord_username, ingame_name = line.split("➔")
+                discord_username = discord_username.strip()
+                ingame_name = ingame_name.strip()
 
-                # Find member by name (loose matching)
-                member = discord.utils.find(lambda m: m.display_name.lower() == discord_name.lower(), interaction.guild.members)
+                # Find member by username
+                member = discord.utils.find(lambda m: m.name.lower() == discord_username.lower(), interaction.guild.members)
                 if member:
                     hc_names[str(member.id)] = ingame_name
                     count += 1
             except Exception as e:
                 print(f"Failed to process line: {line} - {e}")
 
-    await interaction.response.send_message(f"✅ Updated {count} members from the pasted list!")
+    await interaction.response.send_message(f"✅ Successfully updated {count} members!", ephemeral=True)
 
 @tree.command(name="nerdhelp", description="Show list of Catercord slash commands.")
 async def nerdhelp(interaction: discord.Interaction):
