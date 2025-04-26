@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+from flask import Flask
+import threading
 
 # Replace this with your actual bot token later
 TOKEN = "MTM2NTU3MjQzNzE4NTQwMDg5Mw.GSfrrD.-aChqNHcSz6oR7j4Xv4AyCA6iiO-_xYp6l3hcc"
@@ -24,3 +26,15 @@ async def addrole(interaction: discord.Interaction, user: discord.Member, role: 
     await interaction.response.send_message(f"✅ Gave **{role.name}** to **{user.display_name}**")
 
 bot.run(TOKEN)
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+t = threading.Thread(target=run)
+t.start()
