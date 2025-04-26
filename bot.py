@@ -75,12 +75,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 async def hcmembers(interaction: discord.Interaction):
     hc_role = interaction.guild.get_role(ADD_ROLE_ID_HC)
     if not hc_role:
-        await interaction.response.send_message("❌ [HC1] role not found.", ephemeral=True)
+        await interaction.response.send_message("❌ [HC1] role not found.")
         return
 
     members = [member for member in hc_role.members]
     if not members:
-        await interaction.response.send_message("No members with [HC1] role found.", ephemeral=True)
+        await interaction.response.send_message("No members with [HC1] role found.")
         return
 
     list_text = ""
@@ -88,7 +88,7 @@ async def hcmembers(interaction: discord.Interaction):
         ingame_name = hc_names.get(str(member.id), "Unknown")
         list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"  # IMPORTANT: .name not .display_name
 
-    await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}", ephemeral=True)
+    await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
 
 @tree.command(name="bulkupdate", description="Paste the list of usernames ➔ in-game names to update.")
 @app_commands.describe(data="Paste entries like 'username ➔ ingame_name' one per line.")
@@ -110,7 +110,7 @@ async def bulkupdate(interaction: discord.Interaction, data: str):
             except Exception as e:
                 print(f"Failed to process line: {line} - {e}")
 
-    await interaction.response.send_message(f"✅ Successfully updated {count} members!", ephemeral=True)
+    await interaction.response.send_message(f"✅ Successfully updated {count} members!")
 
 @tree.command(name="nerdhelp", description="Show list of Catercord slash commands.")
 async def nerdhelp(interaction: discord.Interaction):
