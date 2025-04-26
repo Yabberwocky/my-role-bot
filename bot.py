@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from discord import Modal, TextInput, TextStyle
+from discord.ui import Modal, TextInput
+from discord import TextStyle
 from flask import Flask
 import threading
 
