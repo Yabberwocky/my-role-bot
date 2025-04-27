@@ -1,3 +1,12 @@
+# This code is used under the file name 'bot.py' inside a GitHub private repository.
+# The repository also contains a 'requirements.txt' file with the following two lines:
+# discord.py>=2.3.2
+# flask
+# The repository is linked through Render.com to be deployed.
+# UptimeRobot pings the Flask website every 5 minutes, which allows the bot to run 24x7 free of cost.
+#
+# This comment ensures any future reader or LLM understands the exact setup and deployment context.
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -5,9 +14,10 @@ from discord.ui import Modal, TextInput
 from discord import TextStyle
 from flask import Flask
 import threading
+import os
 
-# Replace with your actual bot token
-TOKEN = "MTM2NTU3MjQzNzE4NTQwMDg5Mw.GZfG-P.G41IDr3AV8pUgFcgNEq8w2DfCc5QMfXGgbM3Vg"
+# Load the bot token from environment variables
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Set up bot intents
 intents = discord.Intents.default()
@@ -104,7 +114,7 @@ async def hcmembers(interaction: discord.Interaction):
         await interaction.response.send_message("❌ [HC1] role not found.")
         return
 
-    members = [member for member in hc_role.members]
+    members = sorted(hc_role.members, key=lambda m: m.name.lower())
     if not members:
         await interaction.response.send_message("No members with [HC1] role found.")
         return
@@ -135,4 +145,7 @@ async def nerdhelp(interaction: discord.Interaction):
 keep_alive()
 
 # Start bot
-bot.run(TOKEN)
+if TOKEN:
+    bot.run(TOKEN)
+else:
+    print("❌ DISCORD_BOT_TOKEN environment variable not set.")
