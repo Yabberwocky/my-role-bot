@@ -127,18 +127,29 @@ async def hcmembers(interaction: discord.Interaction):
             await interaction.response.send_message("No members with [HC1] role found.")
             return
 
-        list_text = ""
+        lines = []
         for idx, member in enumerate(members, 1):
-            response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).maybe_single().execute()
-            
-            ingame_name = "Unknown"  # Default
+            # 1) fetch
+            response = supabase\
+                .table("hc_members")\
+                .select("ingame_name")\
+                .eq("discord_id", str(member.id))\
+                .maybe_single()\
+                .execute()
 
+            # 2) debug-print what we really got
+            print(f"[hcmembers] supabase response for {member.id!r}: {response!r}")
+
+            # 3) default + safe-extract
+            ingame_name = "Unknown"
             if response is not None and getattr(response, "data", None):
                 ingame_name = response.data.get("ingame_name", "Unknown")
 
-            list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"
+            lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
 
+        list_text = "\n".join(lines)
         await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
+
     except Exception as e:
         await interaction.response.send_message(f"❌ Error during hcmembers: {e}", ephemeral=True)
         print(f"hcmembers command error: {e}")
