@@ -21,7 +21,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Set up bot intents
 intents = discord.Intents.default()
-intents.members = True  # Needed to manage roles
+intents.members = True  # Needed to manage roles and nicknames
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # For slash commands
@@ -71,6 +71,10 @@ class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
                     member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
                     if member:
                         hc_names[str(member.id)] = ingame_name
+                        try:
+                            await member.edit(nick=ingame_name)
+                        except Exception as e:
+                            print(f"Failed to change nickname for {member.name}: {e}")
                         count += 1
                 except Exception as e:
                     print(f"Failed to process line: {line} - {e}")
@@ -91,6 +95,11 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     await user.add_roles(*roles_to_add)
 
     hc_names[str(user.id)] = ingame_name
+
+    try:
+        await user.edit(nick=ingame_name)
+    except Exception as e:
+        print(f"Failed to change nickname for {user.name}: {e}")
 
     await interaction.response.send_message(f"✅ HC verified **{user.display_name}** as **{ingame_name}**!")
 
