@@ -1,14 +1,3 @@
-# This code is used under the file name 'bot.py' inside a GitHub private repository.
-# The repository also contains a 'requirements.txt' file with the following two lines:
-# discord.py>=2.3.2
-# flask
-# The repository is linked through Render.com to be deployed.
-# UptimeRobot pings the Flask website every 5 minutes, which allows the bot to run 24x7 free of cost.
-#
-# This comment ensures any future reader or LLM understands the exact setup and deployment context.
-#
-# All the comments throughout this code are intentional and meant to be kept always.
-
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -19,28 +8,22 @@ import threading
 import os
 from supabase import create_client, Client
 
-# Load the bot token and Supabase credentials from environment variables
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Set up bot intents
 intents = discord.Intents.default()
-intents.members = True  # Needed to manage roles and change nicknames
+intents.members = True
 
-# Initialize the bot
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree  # For slash commands
+tree = bot.tree
 
-# Role IDs (adjust these IDs if they change in Discord server)
 REMOVE_ROLE_ID = 1360176495947022447
 ADD_ROLE_ID_VERIFY = 1248708073019805717
 ADD_ROLE_ID_HC = 1230235110415274004
 
-# Flask App to keep the bot alive
 app = Flask('')
 
 @app.route('/')
@@ -56,10 +39,9 @@ def keep_alive():
 
 @bot.event
 async def on_ready():
-    await tree.sync()  # Sync slash commands with Discord
+    await tree.sync()
     print(f"Logged in as {bot.user}")
 
-# Modal class for bulk updating members' in-game names
 class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
     data = TextInput(
         label="Paste entries like 'username ➔ ingamename'.",
@@ -74,37 +56,20 @@ class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
         for line in lines:
             if "➔" in line:
                 try:
-                    username, ingame_name = map(str.strip, line.split(" ➔", 1))
+                    username, ingame_name = map(str.strip, line.split("➔", 1))
                     member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
                     if member:
-                        await upsert_hc_member(member, ingame_name)
+                        supabase.table("hc_members").upsert({
+                            "discord_id": str(member.id),
+                            "discord_name": member.name,
+                            "ingame_name": ingame_name
+                        }).execute()
                         count += 1
                 except Exception as e:
                     print(f"Failed to process line: {line} - {e}")
 
         await interaction.response.send_message(f"✅ Successfully updated {count} members!")
 
-# Helper function to insert or update hc_member in Supabase
-async def upsert_hc_member(member: discord.Member, ingame_name: str):
-    try:
-        supabase.table("hc_members").upsert({
-            "discord_id": str(member.id),
-            "discord_name": member.name,
-            "ingame_name": ingame_name
-        }, on_conflict=["discord_id"]).execute()
-    except Exception as e:
-        print(f"Supabase upsert failed for {member.name}: {e}")
-
-# Helper function to get ingame_name from Supabase
-def get_ingame_name(discord_id: str):
-    try:
-        result = supabase.table("hc_members").select("ingame_name").eq("discord_id", discord_id).single().execute()
-        return result.data["ingame_name"] if result.data else "Unknown"
-    except Exception as e:
-        print(f"Supabase fetch failed for {discord_id}: {e}")
-        return "Unknown"
-
-# Slash command to HC verify a user
 @tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
@@ -118,16 +83,19 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
         await user.remove_roles(role_to_remove)
     await user.add_roles(*roles_to_add)
 
-    await upsert_hc_member(user, ingame_name)
+    supabase.table("hc_members").upsert({
+        "discord_id": str(user.id),
+        "discord_name": user.name,
+        "ingame_name": ingame_name
+    }).execute()
 
     try:
-        await user.edit(nick=ingame_name)  # Change nickname to in-game name
+        await user.edit(nick=ingame_name)
     except Exception as e:
         print(f"Failed to change nickname for {user.name}: {e}")
 
     await interaction.response.send_message(f"✅ HC verified **{user.display_name}** as **{ingame_name}**!")
 
-# Slash command to normal verify a user
 @tree.command(name="verify", description="Normal verify a user into Catercord.")
 @app_commands.describe(user="The user to verify")
 async def verify(interaction: discord.Interaction, user: discord.Member):
@@ -141,7 +109,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 
     await interaction.response.send_message(f"✅ Verified **{user.display_name}**!")
 
-# Slash command to list all HC members sorted by username
 @tree.command(name="hcmembers", description="List all [HC1] members with their in-game names.")
 async def hcmembers(interaction: discord.Interaction):
     hc_role = interaction.guild.get_role(ADD_ROLE_ID_HC)
@@ -149,24 +116,23 @@ async def hcmembers(interaction: discord.Interaction):
         await interaction.response.send_message("❌ [HC1] role not found.")
         return
 
-    members = sorted(hc_role.members, key=lambda m: m.name.lower())  # Sort alphabetically by Discord username
+    members = sorted(hc_role.members, key=lambda m: m.name.lower())
     if not members:
         await interaction.response.send_message("No members with [HC1] role found.")
         return
 
     list_text = ""
     for idx, member in enumerate(members, 1):
-        ingame_name = get_ingame_name(str(member.id))
-        list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"  # Display username and ingame name
+        response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).single().execute()
+        ingame_name = response.data["ingame_name"] if response.data else "Unknown"
+        list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"
 
     await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
 
-# Slash command to open modal for bulk updating
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
 async def bulkupdate(interaction: discord.Interaction):
     await interaction.response.send_modal(BulkUpdateModal())
 
-# Slash command to show help menu
 @tree.command(name="nerdhelp", description="Show list of Catercord slash commands.")
 async def nerdhelp(interaction: discord.Interaction):
     help_text = (
@@ -178,10 +144,8 @@ async def nerdhelp(interaction: discord.Interaction):
     )
     await interaction.response.send_message(help_text)
 
-# Start Flask web server
 keep_alive()
 
-# Start Discord bot
 if TOKEN:
     bot.run(TOKEN)
 else:
