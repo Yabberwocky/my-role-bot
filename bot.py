@@ -22,6 +22,8 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 # Set up bot intents
 intents = discord.Intents.default()
 intents.members = True  # Needed to manage roles and nicknames
+intents.guilds = True
+intents.guild_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # For slash commands
@@ -62,24 +64,28 @@ class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        lines = self.data.value.splitlines()
-        count = 0
-        for line in lines:
-            if "➔" in line:
-                try:
-                    username, ingame_name = map(str.strip, line.split("➔", 1))
-                    member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
-                    if member:
-                        hc_names[str(member.id)] = ingame_name
-                        try:
-                            await member.edit(nick=ingame_name)
-                        except Exception as e:
-                            print(f"Failed to change nickname for {member.name}: {e}")
-                        count += 1
-                except Exception as e:
-                    print(f"Failed to process line: {line} - {e}")
+        try:
+            lines = self.data.value.splitlines()
+            count = 0
+            for line in lines:
+                if "➔" in line:
+                    try:
+                        username, ingame_name = map(str.strip, line.split("➔", 1))
+                        member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
+                        if member:
+                            hc_names[str(member.id)] = ingame_name
+                            try:
+                                await member.edit(nick=ingame_name)
+                            except Exception as e:
+                                print(f"Failed to change nickname for {member.name}: {e}")
+                            count += 1
+                    except Exception as e:
+                        print(f"Failed to process line: {line} - {e}")
 
-        await interaction.response.send_message(f"✅ Successfully updated {count} members!")
+            await interaction.response.send_message(f"✅ Successfully updated {count} members!")
+        except Exception as e:
+            print(f"Error in BulkUpdateModal submit: {e}")
+            await interaction.response.send_message("❌ Something went wrong. Please try again.", ephemeral=True)
 
 @tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
@@ -131,13 +137,17 @@ async def hcmembers(interaction: discord.Interaction):
     list_text = ""
     for idx, member in enumerate(members, 1):
         ingame_name = hc_names.get(str(member.id), "Unknown")
-        list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"  # IMPORTANT: .name not .display_name
+        list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"  # .name, not .display_name
 
     await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
 
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
 async def bulkupdate(interaction: discord.Interaction):
-    await interaction.response.send_modal(BulkUpdateModal())
+    try:
+        await interaction.response.send_modal(BulkUpdateModal())
+    except Exception as e:
+        print(f"Error presenting BulkUpdateModal: {e}")
+        await interaction.response.send_message("❌ Could not open bulk update modal.", ephemeral=True)
 
 @tree.command(name="nerdhelp", description="Show list of Catercord slash commands.")
 async def nerdhelp(interaction: discord.Interaction):
