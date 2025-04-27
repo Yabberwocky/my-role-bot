@@ -75,10 +75,6 @@ class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
                     member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
                     if member:
                         hc_names[str(member.id)] = ingame_name
-                        try:
-                            await member.edit(nick=ingame_name)  # Update nickname to in-game name
-                        except Exception as e:
-                            print(f"Failed to change nickname for {member.name}: {e}")
                         count += 1
                 except Exception as e:
                     print(f"Failed to process line: {line} - {e}")
@@ -130,7 +126,7 @@ async def hcmembers(interaction: discord.Interaction):
         await interaction.response.send_message("❌ [HC1] role not found.")
         return
 
-    members = sorted(hc_role.members, key=lambda m: m.name.lower())  # Sort alphabetically by username
+    members = sorted(hc_role.members, key=lambda m: m.name.lower())  # Sort alphabetically by Discord username
     if not members:
         await interaction.response.send_message("No members with [HC1] role found.")
         return
