@@ -117,19 +117,21 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 @tree.command(name="hcmembers", description="List all [HC1] members with their in-game names.")
 async def hcmembers(interaction: discord.Interaction):
     try:
+        # Defer immediately
+        await interaction.response.defer()
+
         hc_role = interaction.guild.get_role(ADD_ROLE_ID_HC)
         if not hc_role:
-            await interaction.response.send_message("❌ [HC1] role not found.")
+            await interaction.followup.send("❌ [HC1] role not found.")
             return
 
         members = sorted(hc_role.members, key=lambda m: m.name.lower())
         if not members:
-            await interaction.response.send_message("No members with [HC1] role found.")
+            await interaction.followup.send("No members with [HC1] role found.")
             return
 
         lines = []
         for idx, member in enumerate(members, 1):
-            # 1) fetch
             response = supabase\
                 .table("hc_members")\
                 .select("ingame_name")\
@@ -137,10 +139,8 @@ async def hcmembers(interaction: discord.Interaction):
                 .maybe_single()\
                 .execute()
 
-            # 2) debug-print what we really got
             print(f"[hcmembers] supabase response for {member.id!r}: {response!r}")
 
-            # 3) default + safe-extract
             ingame_name = "Unknown"
             if response is not None and getattr(response, "data", None):
                 ingame_name = response.data.get("ingame_name", "Unknown")
@@ -148,10 +148,10 @@ async def hcmembers(interaction: discord.Interaction):
             lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
 
         list_text = "\n".join(lines)
-        await interaction.response.send_message(f"**[HC1] Guild Members:**\n{list_text}")
+        await interaction.followup.send(f"**[HC1] Guild Members:**\n{list_text}")
 
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error during hcmembers: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error during hcmembers: {e}", ephemeral=True)
         print(f"hcmembers command error: {e}")
 
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
