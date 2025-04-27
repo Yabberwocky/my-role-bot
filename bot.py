@@ -42,35 +42,30 @@ async def on_ready():
     await tree.sync()
     print(f"Logged in as {bot.user}")
 
-class BulkUpdateModal(Modal, title="Bulk Update In-Game Names"):
-    data = TextInput(
-        label="Paste entries like 'username ➔ ingamename'.",
-        style=TextStyle.paragraph,
-        required=True,
-        max_length=2000,
-    )
+class BulkUpdateModal(discord.ui.Modal, title="Bulk Update"):
+    data = discord.ui.TextInput(label="Paste the list below", style=discord.TextStyle.paragraph)
 
     async def on_submit(self, interaction: discord.Interaction):
-    await interaction.response.defer()  # <-- Add this at the start
+        await interaction.response.defer()
 
-    try:
-        lines = self.data.value.splitlines()
-        count = 0
-        for line in lines:
-            if "➔" in line:
-                username, ingame_name = map(str.strip, line.split("➔", 1))
-                member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
-                if member:
-                    supabase.table("hc_members").upsert({
-                        "discord_id": str(member.id),
-                        "discord_name": member.name,
-                        "ingame_name": ingame_name
-                    }).execute()
-                    count += 1
-        await interaction.followup.send(f"✅ Successfully updated {count} members!")  # Use followup because defer was used
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error during bulk update: {e}", ephemeral=True)
-        print(f"BulkUpdateModal error: {e}")
+        try:
+            lines = self.data.value.splitlines()
+            count = 0
+            for line in lines:
+                if "➔" in line:
+                    username, ingame_name = map(str.strip, line.split("➔", 1))
+                    member = discord.utils.find(lambda m: m.name.lower() == username.lower(), interaction.guild.members)
+                    if member:
+                        supabase.table("hc_members").upsert({
+                            "discord_id": str(member.id),
+                            "discord_name": member.name,
+                            "ingame_name": ingame_name
+                        }).execute()
+                        count += 1
+            await interaction.followup.send(f"✅ Successfully updated {count} members!")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error during bulk update: {e}", ephemeral=True)
+            print(f"BulkUpdateModal error: {e}")
 
 @tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
