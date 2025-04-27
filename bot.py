@@ -132,7 +132,7 @@ async def hcmembers(interaction: discord.Interaction):
 
         list_text = ""
         for idx, member in enumerate(members, 1):
-            response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).single().execute()
+            response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).maybe_single().execute()
             ingame_name = response.data["ingame_name"] if response.data else "Unknown"
             list_text += f"{idx}. {member.name} ➔ {ingame_name}\n"
 
