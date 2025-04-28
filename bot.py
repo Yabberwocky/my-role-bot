@@ -332,7 +332,7 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.set_footer(text="Use commands responsibly, nerd.")
     embed.set_thumbnail(url=interaction.client.user.display_avatar.url)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 # Start
 keep_alive()
