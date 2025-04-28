@@ -113,15 +113,16 @@ async def build_hc_member_list(guild: discord.Guild) -> str:
 
     lines = []
     for idx, member in enumerate(members, 1):
-        response = supabase.table("hc_members")\
-            .select("ingame_name")\
-            .eq("discord_id", str(member.id))\
-            .maybe_single()\
-            .execute()
-        ingame_name = response.data.get("ingame_name", "Unknown") if response and response.data else "Unknown"
+        try:
+            response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).maybe_single().execute()
+            ingame_name = response.data.get("ingame_name", "Unknown") if response and response.data else "Unknown"
+        except Exception as e:
+            print(f"[build_hc_member_list] Error fetching ingame_name for {member.name}: {e}")
+            ingame_name = "Unknown"
         lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
 
     return "**[HC1] Guild Members:**\n" + "\n".join(lines)
+
 
 async def update_hc_member_list(guild: discord.Guild):
     """Updates the member list in the dedicated channel."""
@@ -132,74 +133,67 @@ async def update_hc_member_list(guild: discord.Guild):
 
     list_text = await build_hc_member_list(guild)
 
-    # Try to find the bot's own latest message in that channel
     async for message in channel.history(limit=50):
         if message.author == guild.me and message.content.startswith("**[HC1] Guild Members:**"):
             try:
                 await message.edit(content=list_text)
-                print("[update_hc_member_list] Successfully edited existing member list.")
-                return
+                print("[update_hc_member_list] Edited existing list.")
             except Exception as e:
                 print(f"[update_hc_member_list] Error editing message: {e}")
-                return
+            return
 
-    # If no message found, send a new one
     try:
         await channel.send(list_text)
-        print("[update_hc_member_list] Sent new member list.")
+        print("[update_hc_member_list] Sent new list.")
     except Exception as e:
-        print(f"[update_hc_member_list] Error sending new message: {e}")
+        print(f"[update_hc_member_list] Error sending message: {e}")
 
-# Bot Ready
+
 @bot.event
 async def on_ready():
     await tree.sync()
     print(f"✅ Logged in as {bot.user}")
 
-# Global Error Handler for Slash Commands
+
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
     else:
-        print(f"Unhandled application command error: {error}")
+        print(f"Unhandled app command error: {error}")
         if not interaction.response.is_done():
             await interaction.response.send_message("❌ An unexpected error occurred.", ephemeral=True)
 
-# Slash Commands
 
 @tree.command(name="verify", description="Verify a user into Catercord.")
 @app_commands.describe(user="The user to verify")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     try:
-        role_to_remove = interaction.guild.get_role(REMOVE_ROLE_ID)
-        role_to_add = interaction.guild.get_role(ADD_ROLE_ID_VERIFY)
-
-        if role_to_remove:
-            await user.remove_roles(role_to_remove)
-        if role_to_add:
-            await user.add_roles(role_to_add)
+        if role := interaction.guild.get_role(REMOVE_ROLE_ID):
+            await user.remove_roles(role)
+        if role := interaction.guild.get_role(ADD_ROLE_ID_VERIFY):
+            await user.add_roles(role)
 
         await interaction.response.send_message(f"✅ Verified **{user.display_name}**!")
     except Exception as e:
         await interaction.response.send_message(f"❌ Error during verify: {e}", ephemeral=True)
         print(f"[verify] Error: {e}")
 
-@tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
+
+@tree.command(name="hcverify", description="Verify a user into [HC1] and store their in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
     try:
-        role_to_remove = user.guild.get_role(REMOVE_ROLE_ID)
-        roles_to_add = [
+        if role := user.guild.get_role(REMOVE_ROLE_ID):
+            await user.remove_roles(role)
+        roles_to_add = [r for r in (
             user.guild.get_role(ADD_ROLE_ID_VERIFY),
             user.guild.get_role(ADD_ROLE_ID_HC)
-        ]
-
-        if role_to_remove:
-            await user.remove_roles(role_to_remove)
-        await user.add_roles(*roles_to_add)
+        ) if r]
+        if roles_to_add:
+            await user.add_roles(*roles_to_add)
 
         try:
             supabase.table("hc_members").insert({
@@ -208,28 +202,23 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
                 "ingame_name": ingame_name
             }).execute()
         except Exception as e:
-            error_str = str(e)
-            if "duplicate key value" in error_str or '"hc_members_discord_id_key"' in error_str:
-                # Duplicate: Update instead
-                supabase.table("hc_members")\
-                    .update({"ingame_name": ingame_name})\
-                    .eq("discord_id", str(user.id))\
-                    .execute()
+            if any(key in str(e) for key in ["duplicate key value", "hc_members_discord_id_key"]):
+                supabase.table("hc_members").update({"ingame_name": ingame_name}).eq("discord_id", str(user.id)).execute()
             else:
-                raise e
+                raise
 
         try:
             await user.edit(nick=ingame_name)
         except Exception as e:
-            print(f"[hcverify] Failed to change nickname for {user.name}: {e}")
+            print(f"[hcverify] Failed nickname change: {e}")
 
         await interaction.response.send_message(f"✅ HC verified **{user.display_name}** as **{ingame_name}**!")
         await update_hc_member_list(interaction.guild)
 
-
     except Exception as e:
         await interaction.response.send_message(f"❌ Error during hcverify: {e}", ephemeral=True)
         print(f"[hcverify] Error: {e}")
+
 
 @tree.command(name="hcmembers", description="List all [HC1] members with their in-game names.")
 async def hcmembers(interaction: discord.Interaction):
@@ -238,13 +227,13 @@ async def hcmembers(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(thinking=True)
-
     try:
         list_text = await build_hc_member_list(interaction.guild)
         await interaction.followup.send(list_text)
     except Exception as e:
         await interaction.followup.send(f"❌ Error during hcmembers: {e}", ephemeral=True)
         print(f"[hcmembers] Error: {e}")
+
 
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
 @app_commands.checks.has_permissions(manage_roles=True)
@@ -254,6 +243,18 @@ async def bulkupdate(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error opening bulk update modal: {e}", ephemeral=True)
         print(f"[bulkupdate] Error: {e}")
+
+
+@tree.command(name="refresh", description="Refresh the [HC1] member list manually.")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def refresh(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        await update_hc_member_list(interaction.guild)
+        await interaction.followup.send("✅ Refreshed the HC member list!")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error refreshing member list: {e}", ephemeral=True)
+        print(f"[refresh] Error: {e}")
 
 ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
 SELF_PROTECTED_ID = 1230848174218940416
@@ -367,6 +368,7 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.add_field(name="/hcverify", value="HC verify a [HC1] member and save their Florr.io name.", inline=False)
     embed.add_field(name="/hcmembers", value="List all [HC1] members with in-game names.", inline=False)
     embed.add_field(name="/bulkupdate", value="Paste and update an old list of members manually.", inline=False)
+    embed.add_field(name="/refresh", value="Refreshes the [HC1] Members list.", inline=False)
     embed.add_field(name="/wither", value="Temporarily remove all roles from a user for fun punishment.", inline=False)
     embed.add_field(name="/nerdhelp", value="Show this help menu.", inline=False)
 
