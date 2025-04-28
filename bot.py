@@ -70,6 +70,9 @@ class BulkUpdateModal(discord.ui.Modal, title="Bulk Update"):
 @tree.command(name="hcverify", description="Verify a user into [HC1] (Catercord) and store their Florr.io in-game name.")
 @app_commands.describe(user="The user to HC verify", ingame_name="Their Florr.io in-game name")
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
     try:
         role_to_remove = user.guild.get_role(REMOVE_ROLE_ID)
         roles_to_add = [
@@ -100,6 +103,9 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 @tree.command(name="verify", description="Normal verify a user into Catercord.")
 @app_commands.describe(user="The user to verify")
 async def verify(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
     try:
         role_to_remove = user.guild.get_role(REMOVE_ROLE_ID)
         role_to_add = user.guild.get_role(ADD_ROLE_ID_VERIFY)
@@ -156,6 +162,9 @@ async def hcmembers(interaction: discord.Interaction):
 
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
 async def bulkupdate(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
     try:
         await interaction.response.send_modal(BulkUpdateModal())
     except Exception as e:
