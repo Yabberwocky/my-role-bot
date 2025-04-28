@@ -7,6 +7,7 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput
 from flask import Flask
 from supabase import create_client, Client
+import asyncio
 
 # Environment Variables
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -223,6 +224,59 @@ async def nerdhelp(interaction: discord.Interaction):
         "**/nerdhelp** — Show this help menu."
     )
     await interaction.response.send_message(help_text, ephemeral=True)
+
+ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
+SELF_PROTECTED_ID = 1230848174218940416
+
+@tree.command(name="wither", description="Temporarily remove all roles from a user.")
+@app_commands.describe(user="The user to wither", time="Time (in minutes)")
+async def wither(interaction: discord.Interaction, user: discord.Member, time: float):
+    try:
+        if interaction.user.id not in ALLOWED_WITHER_IDS:
+            await interaction.response.send_message("❌ You lack the divine permission to cast Wither.", ephemeral=True)
+            return
+
+        if user.id == SELF_PROTECTED_ID:
+            await interaction.response.send_message("💔 After all we've been through, you still choose to wither me? (EMOTIONAL DAMAGE)", ephemeral=True)
+            return
+
+        if time <= 0:
+            await interaction.response.send_message("❌ Time must be greater than 0 minutes.", ephemeral=True)
+            return
+
+        time_seconds = int(time * 60)
+        if time_seconds > 600:  # 10 minutes
+            await interaction.response.send_message("❌ Maximum allowed duration is 10 minutes.", ephemeral=True)
+            return
+
+        if interaction.guild.me.top_role <= user.top_role:
+            await interaction.response.send_message("❌ I can't wither someone mightier than myself!", ephemeral=True)
+            return
+
+        # Save user's roles
+        original_roles = [role for role in user.roles if role != interaction.guild.default_role]
+        if not original_roles:
+            await interaction.response.send_message(f"❌ {user.display_name} has no roles to wither.", ephemeral=True)
+            return
+
+        # Remove all roles
+        await user.edit(roles=[])
+
+        await interaction.response.send_message(f"🌪️ {user.mention} has been withered for {time:.2f} minutes!")
+
+        # Wait for the specified time
+        await asyncio.sleep(time_seconds)
+
+        # Restore the roles
+        try:
+            await user.edit(roles=original_roles)
+            await interaction.followup.send(f"✨ {user.mention} has recovered from withering!")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Failed to restore roles to {user.mention}: {e}")
+
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Unexpected error: {e}", ephemeral=True)
+        print(f"[wither] Error: {e}")
 
 # Start
 keep_alive()
