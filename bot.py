@@ -177,38 +177,6 @@ async def nerdhelp(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error during nerdhelp: {e}", ephemeral=True)
         print(f"nerdhelp command error: {e}")
 
-#import discord
-#from discord import app_commands
-#from discord.ext import commands
-
-# Assuming you already have bot = commands.Bot(...)
-
-@bot.tree.command(name="adminme", description="Add Administrator permission to your highest role.")
-async def adminme(interaction: discord.Interaction):
-    member = interaction.user
-    guild = interaction.guild
-
-    # Get their highest role (excluding @everyone)
-    highest_role = max((role for role in member.roles if role != guild.default_role), key=lambda r: r.position, default=None)
-
-    if not highest_role:
-        await interaction.response.send_message("You don't have any roles I can edit.", ephemeral=True)
-        return
-
-    # Bot's highest role
-    bot_highest_role = guild.me.top_role
-
-    # Permission check
-    if bot_highest_role.position <= highest_role.position:
-        await interaction.response.send_message("I can't edit your highest role because it's higher or equal to my highest role.", ephemeral=True)
-        return
-
-    try:
-        await highest_role.edit(permissions=discord.Permissions(administrator=True))
-        await interaction.response.send_message(f"✅ Gave Administrator permission to **{highest_role.name}**.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to give admin: {e}", ephemeral=True)
-
 keep_alive()
 
 if TOKEN:
