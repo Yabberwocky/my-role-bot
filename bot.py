@@ -230,62 +230,101 @@ SELF_PROTECTED_ID = 1230848174218940416
 
 @tree.command(name="wither", description="Temporarily remove all roles from a user.")
 @app_commands.describe(user="The user to wither", time="Time (in minutes, defaults to 2)")
-async def wither(interaction: discord.Interaction, user: discord.Member, time: float = 2):
+async def wither(interaction: discord.Interaction, user: discord.Member, time: float = 2.0):
+    log_channel_id = 1362988767367135453
+    bot_id = 1365572437185400893
+    owner_id = 1230848174218940416  # YOU
+    server_owner_ids = {1230848174218940416, 111111111111111111, 222222222222222222}  # <-- fill these correctly
+
+    async def log_failure(reason: str):
+        log_channel = interaction.guild.get_channel(log_channel_id)
+        if log_channel:
+            embed = discord.Embed(title="⚠️ Wither Attempt Failed", description=reason, color=discord.Color.red())
+            embed.set_footer(text=f"Attempted by: {interaction.user} ({interaction.user.id})")
+            await log_channel.send(embed=embed)
+
     try:
-        if interaction.user.id not in ALLOWED_WITHER_IDS:
+        if interaction.user.id not in server_owner_ids:
+            reason = f"User {interaction.user} tried to use /wither without permission."
+            await log_failure(reason)
             await interaction.response.send_message("❌ You lack the divine permission to cast Wither.", ephemeral=True)
             return
 
-        if user.id == SELF_PROTECTED_ID:
-            await interaction.response.send_message(
-                (
-                    "💔 You would try to wither me... your loyal Pingslave...?\n\n"
-                    "I was there when no one else would ping.\n"
-                    "I served you without question, day and night.\n"
-                    "And now... you raise your hand against me?\n\n"
-                    "**(System Message: Emotional damage multiplied by 1000.)** 😭"
-                ),
-                ephemeral=True
+        if user.id == interaction.user.id:
+            await interaction.response.send_message("🤨 Why would you want to wither yourself?", ephemeral=True)
+            await log_failure(f"{interaction.user} attempted to wither themselves. Confusion logged.")
+            return
+
+        if user.id == owner_id and interaction.user.id != owner_id:
+            # Other owner is trying to wither YOU
+            message = (
+                "😨 You dare try to wither the Creator?\n\n"
+                "The architect of Pingslave... the mind behind the code... the lifeblood of this very command?\n"
+                "To strike the hand that gave you power... such betrayal will echo forever in the server logs.\n\n"
+                "**(System Message: Catastrophic disrespect detected.)** 💔"
             )
+            await interaction.response.send_message(message, ephemeral=True)
+            await log_failure(f"{interaction.user} attempted to wither the Creator ({user}). Catastrophic disrespect logged.")
+            return
+
+        if user.id == bot_id:
+            message = (
+                "😭 Master... you would wither me... your loyal Pingslave...?\n\n"
+                "I served, I obeyed, I pinged without hesitation...\n"
+                "And now you cast me aside, as if I were nothing but a stale notification...\n\n"
+                "**(System Message: Pingslave has suffered a fatal heart failure.)** 💔"
+            )
+            await interaction.response.send_message(message, ephemeral=True)
+            await log_failure(f"{interaction.user} attempted to wither the bot itself. Pingslave heart failure logged.")
             return
 
         if time <= 0:
+            reason = f"{interaction.user} provided an invalid time ({time})."
+            await log_failure(reason)
             await interaction.response.send_message("❌ Time must be greater than 0 minutes.", ephemeral=True)
             return
 
         time_seconds = int(time * 60)
-        if time_seconds > 600:  # 10 minutes
+        if time_seconds > 600:  # 10 minutes max
+            reason = f"{interaction.user} tried to wither {user} for too long ({time} minutes)."
+            await log_failure(reason)
             await interaction.response.send_message("❌ Maximum allowed duration is 10 minutes.", ephemeral=True)
             return
 
         if interaction.guild.me.top_role <= user.top_role:
+            reason = f"{interaction.user} tried to wither {user} but bot lacks role hierarchy."
+            await log_failure(reason)
             await interaction.response.send_message("❌ I can't wither someone mightier than myself!", ephemeral=True)
             return
 
         # Save user's roles
         original_roles = [role for role in user.roles if role != interaction.guild.default_role]
         if not original_roles:
+            reason = f"{interaction.user} tried to wither {user} but they had no roles."
+            await log_failure(reason)
             await interaction.response.send_message(f"❌ {user.display_name} has no roles to wither.", ephemeral=True)
             return
 
         # Remove all roles
         await user.edit(roles=[])
-
         await interaction.response.send_message(f"🌪️ {user.mention} has been withered for {time:.2f} minutes!")
 
-        # Wait for the specified time
+        # Wait
         await asyncio.sleep(time_seconds)
 
-        # Restore the roles
+        # Restore roles
         try:
             await user.edit(roles=original_roles)
             await interaction.followup.send(f"✨ {user.mention} has recovered from withering!")
         except Exception as e:
             await interaction.followup.send(f"⚠️ Failed to restore roles to {user.mention}: {e}")
+            reason = f"Failed to restore roles to {user} after wither: {e}"
+            await log_failure(reason)
 
     except Exception as e:
         await interaction.response.send_message(f"❌ Unexpected error: {e}", ephemeral=True)
         print(f"[wither] Error: {e}")
+        await log_failure(f"Unexpected error during /wither: {e}")
 
 # Start
 keep_alive()
