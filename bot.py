@@ -8,12 +8,12 @@ from discord.ui import Modal, TextInput
 from flask import Flask
 from supabase import create_client, Client
 
-# Environment variables
+# Environment Variables
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Supabase client
+# Supabase Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Role IDs
@@ -21,13 +21,13 @@ REMOVE_ROLE_ID = 1360176495947022447
 ADD_ROLE_ID_VERIFY = 1248708073019805717
 ADD_ROLE_ID_HC = 1230235110415274004
 
-# Discord intents and bot setup
+# Discord Setup
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# Flask app for keep_alive
+# Flask App for Keep Alive
 app = Flask('')
 
 @app.route('/')
@@ -40,16 +40,17 @@ def run():
 def keep_alive():
     threading.Thread(target=run).start()
 
-# Permission check function
+# Permission Check
 def has_manage_roles(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.manage_roles
 
-# Modal for bulk update
+# Modal for Bulk Update
 class BulkUpdateModal(Modal, title="Bulk Update"):
     data = TextInput(label="Paste the list below", style=discord.TextStyle.paragraph)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
+
         success_count = 0
         fail_count = 0
         errors = []
@@ -92,12 +93,21 @@ class BulkUpdateModal(Modal, title="Bulk Update"):
 
         await interaction.followup.send(result_message)
 
-
-# Bot ready event
+# Bot Ready
 @bot.event
 async def on_ready():
     await tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
+# Global Error Handler for Slash Commands
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    else:
+        print(f"Unhandled application command error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ An unexpected error occurred.", ephemeral=True)
 
 # Slash Commands
 
@@ -143,24 +153,24 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
         except Exception as e:
             error_str = str(e)
             if "duplicate key value" in error_str or '"hc_members_discord_id_key"' in error_str:
-                # Duplicate found: Update ingame_name instead
+                # Duplicate: Update instead
                 supabase.table("hc_members")\
                     .update({"ingame_name": ingame_name})\
                     .eq("discord_id", str(user.id))\
                     .execute()
             else:
-                raise e  # Unknown error, re-raise
+                raise e
 
         try:
             await user.edit(nick=ingame_name)
         except Exception as e:
-            print(f"Failed to change nickname for {user.name}: {e}")
+            print(f"[hcverify] Failed to change nickname for {user.name}: {e}")
 
         await interaction.response.send_message(f"✅ HC verified **{user.display_name}** as **{ingame_name}**!")
 
     except Exception as e:
         await interaction.response.send_message(f"❌ Error during hcverify: {e}", ephemeral=True)
-        print(f"hcverify command error: {e}")
+        print(f"[hcverify] Error: {e}")
 
 @tree.command(name="hcmembers", description="List all [HC1] members with their in-game names.")
 async def hcmembers(interaction: discord.Interaction):
@@ -179,22 +189,24 @@ async def hcmembers(interaction: discord.Interaction):
 
         lines = []
         for idx, member in enumerate(members, 1):
-            response = supabase.table("hc_members").select("ingame_name").eq("discord_id", str(member.id)).maybe_single().execute()
+            response = supabase.table("hc_members")\
+                .select("ingame_name")\
+                .eq("discord_id", str(member.id))\
+                .maybe_single()\
+                .execute()
             ingame_name = response.data.get("ingame_name", "Unknown") if response and response.data else "Unknown"
             lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
 
         list_text = "\n".join(lines)
         await interaction.followup.send(f"**[HC1] Guild Members:**\n{list_text}")
+
     except Exception as e:
         await interaction.followup.send(f"❌ Error during hcmembers: {e}", ephemeral=True)
         print(f"[hcmembers] Error: {e}")
 
 @tree.command(name="bulkupdate", description="Bulk update user in-game names.")
+@app_commands.checks.has_permissions(manage_roles=True)
 async def bulkupdate(interaction: discord.Interaction):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-        return
-
     try:
         await interaction.response.send_modal(BulkUpdateModal())
     except Exception as e:
@@ -212,7 +224,7 @@ async def nerdhelp(interaction: discord.Interaction):
     )
     await interaction.response.send_message(help_text, ephemeral=True)
 
-# Start everything
+# Start
 keep_alive()
 
 if TOKEN:
