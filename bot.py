@@ -22,6 +22,12 @@ REMOVE_ROLE_ID = 1360176495947022447
 ADD_ROLE_ID_VERIFY = 1248708073019805717
 ADD_ROLE_ID_HC = 1230235110415274004
 
+# Allowed Channel IDs for /hcmembers
+ALLOWED_CHANNEL_IDS = {1354431395140731165, 1330664430148780102, 1248710731407560835}
+
+# Channel ID to auto-post/update member list
+HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165
+
 # Discord Setup
 intents = discord.Intents.default()
 intents.members = True
@@ -93,6 +99,56 @@ class BulkUpdateModal(Modal, title="Bulk Update"):
         )
 
         await interaction.followup.send(result_message)
+        await update_hc_member_list(interaction.guild)
+
+async def build_hc_member_list(guild: discord.Guild) -> str:
+    """Builds the [HC1] Guild Members list text."""
+    hc_role = guild.get_role(ADD_ROLE_ID_HC)
+    if not hc_role:
+        return "**Error:** [HC1] role not found."
+
+    members = sorted(hc_role.members, key=lambda m: m.name.lower())
+    if not members:
+        return "No members with [HC1] role found."
+
+    lines = []
+    for idx, member in enumerate(members, 1):
+        response = supabase.table("hc_members")\
+            .select("ingame_name")\
+            .eq("discord_id", str(member.id))\
+            .maybe_single()\
+            .execute()
+        ingame_name = response.data.get("ingame_name", "Unknown") if response and response.data else "Unknown"
+        lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
+
+    return "**[HC1] Guild Members:**\n" + "\n".join(lines)
+
+async def update_hc_member_list(guild: discord.Guild):
+    """Updates the member list in the dedicated channel."""
+    channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
+    if not channel:
+        print("[update_hc_member_list] Error: Channel not found.")
+        return
+
+    list_text = await build_hc_member_list(guild)
+
+    # Try to find the bot's own latest message in that channel
+    async for message in channel.history(limit=50):
+        if message.author == guild.me and message.content.startswith("**[HC1] Guild Members:**"):
+            try:
+                await message.edit(content=list_text)
+                print("[update_hc_member_list] Successfully edited existing member list.")
+                return
+            except Exception as e:
+                print(f"[update_hc_member_list] Error editing message: {e}")
+                return
+
+    # If no message found, send a new one
+    try:
+        await channel.send(list_text)
+        print("[update_hc_member_list] Sent new member list.")
+    except Exception as e:
+        print(f"[update_hc_member_list] Error sending new message: {e}")
 
 # Bot Ready
 @bot.event
@@ -168,6 +224,8 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
             print(f"[hcverify] Failed to change nickname for {user.name}: {e}")
 
         await interaction.response.send_message(f"✅ HC verified **{user.display_name}** as **{ingame_name}**!")
+        await update_hc_member_list(interaction.guild)
+
 
     except Exception as e:
         await interaction.response.send_message(f"❌ Error during hcverify: {e}", ephemeral=True)
@@ -175,32 +233,15 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
 @tree.command(name="hcmembers", description="List all [HC1] members with their in-game names.")
 async def hcmembers(interaction: discord.Interaction):
+    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("❌ This command can only be used in specific channels.", ephemeral=True)
+        return
+
     await interaction.response.defer(thinking=True)
 
     try:
-        hc_role = interaction.guild.get_role(ADD_ROLE_ID_HC)
-        if not hc_role:
-            await interaction.followup.send("❌ [HC1] role not found.", ephemeral=True)
-            return
-
-        members = sorted(hc_role.members, key=lambda m: m.name.lower())
-        if not members:
-            await interaction.followup.send("No members with [HC1] role found.", ephemeral=True)
-            return
-
-        lines = []
-        for idx, member in enumerate(members, 1):
-            response = supabase.table("hc_members")\
-                .select("ingame_name")\
-                .eq("discord_id", str(member.id))\
-                .maybe_single()\
-                .execute()
-            ingame_name = response.data.get("ingame_name", "Unknown") if response and response.data else "Unknown"
-            lines.append(f"{idx}. {member.name} ➔ {ingame_name}")
-
-        list_text = "\n".join(lines)
-        await interaction.followup.send(f"**[HC1] Guild Members:**\n{list_text}")
-
+        list_text = await build_hc_member_list(interaction.guild)
+        await interaction.followup.send(list_text)
     except Exception as e:
         await interaction.followup.send(f"❌ Error during hcmembers: {e}", ephemeral=True)
         print(f"[hcmembers] Error: {e}")
