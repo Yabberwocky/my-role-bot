@@ -214,17 +214,6 @@ async def bulkupdate(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error opening bulk update modal: {e}", ephemeral=True)
         print(f"[bulkupdate] Error: {e}")
 
-@tree.command(name="nerdhelp", description="Show Catercord slash commands help menu.")
-async def nerdhelp(interaction: discord.Interaction):
-    help_text = (
-        "**/verify** — Verify a normal Catercord member.\n"
-        "**/hcverify** — HC verify a [HC1] member and save their Florr.io name.\n"
-        "**/hcmembers** — List all [HC1] members with in-game names.\n"
-        "**/bulkupdate** — Paste and update old member list manually.\n"
-        "**/nerdhelp** — Show this help menu."
-    )
-    await interaction.response.send_message(help_text, ephemeral=True)
-
 ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
 SELF_PROTECTED_ID = 1230848174218940416
 
@@ -325,6 +314,25 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: f
         await interaction.response.send_message(f"❌ Unexpected error: {e}", ephemeral=True)
         print(f"[wither] Error: {e}")
         await log_failure(f"Unexpected error during /wither: {e}")
+
+@tree.command(name="nerdhelp", description="Show Catercord slash commands help menu.")
+async def nerdhelp(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤓 Catercord Command List",
+        description="Here's what you can do with the bot:",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="/verify", value="Verify a normal Catercord member.", inline=False)
+    embed.add_field(name="/hcverify", value="HC verify a [HC1] member and save their Florr.io name.", inline=False)
+    embed.add_field(name="/hcmembers", value="List all [HC1] members with in-game names.", inline=False)
+    embed.add_field(name="/bulkupdate", value="Paste and update an old list of members manually.", inline=False)
+    embed.add_field(name="/wither", value="Temporarily remove all roles from a user for fun punishment.", inline=False)
+    embed.add_field(name="/nerdhelp", value="Show this help menu.", inline=False)
+
+    embed.set_footer(text="Use commands responsibly, nerd.")
+    embed.set_thumbnail(url=interaction.client.user.display_avatar.url)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Start
 keep_alive()
