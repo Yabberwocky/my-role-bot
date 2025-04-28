@@ -234,7 +234,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: f
     log_channel_id = 1362988767367135453
     bot_id = 1365572437185400893
     owner_id = 1230848174218940416  # YOU
-    server_owner_ids = {1230848174218940416, 111111111111111111, 222222222222222222}  # <-- fill these correctly
+    server_owner_ids = {1230848174218940416, 955448447790620692, 879320982299484240    }  # <-- fill these correctly
 
     async def log_failure(reason: str):
         log_channel = interaction.guild.get_channel(log_channel_id)
