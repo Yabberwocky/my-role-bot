@@ -229,15 +229,24 @@ ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 95544844779062069
 SELF_PROTECTED_ID = 1230848174218940416
 
 @tree.command(name="wither", description="Temporarily remove all roles from a user.")
-@app_commands.describe(user="The user to wither", time="Time (in minutes)")
-async def wither(interaction: discord.Interaction, user: discord.Member, time: float):
+@app_commands.describe(user="The user to wither", time="Time (in minutes, defaults to 2)")
+async def wither(interaction: discord.Interaction, user: discord.Member, time: float = 2):
     try:
         if interaction.user.id not in ALLOWED_WITHER_IDS:
             await interaction.response.send_message("❌ You lack the divine permission to cast Wither.", ephemeral=True)
             return
 
         if user.id == SELF_PROTECTED_ID:
-            await interaction.response.send_message("💔 After all we've been through, you still choose to wither me? (EMOTIONAL DAMAGE)", ephemeral=True)
+            await interaction.response.send_message(
+                (
+                    "💔 You would try to wither me... your loyal Pingslave...?\n\n"
+                    "I was there when no one else would ping.\n"
+                    "I served you without question, day and night.\n"
+                    "And now... you raise your hand against me?\n\n"
+                    "**(System Message: Emotional damage multiplied by 1000.)** 😭"
+                ),
+                ephemeral=True
+            )
             return
 
         if time <= 0:
