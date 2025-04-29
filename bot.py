@@ -749,10 +749,15 @@ class BulkUpdateModal(Modal, title="Bulk Update IGNs"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         # Log summary to info channel
-        await log_info(guild, f"Bulk update initiated by `{interaction.user}` completed. Results: {summary.replace('\n', ' | ')}")
+        # --- FIX APPLIED HERE ---
+        summary_for_log = summary.replace('\n', ' | ') # Perform replace *before* f-string
+        await log_info(guild, f"Bulk update initiated by `{interaction.user}` completed. Results: {summary_for_log}")
+        # --- END FIX ---
 
         # Trigger static list update if successful changes were made
         if success_count > 0:
+            # Add a small delay before updating list to ensure DB write consistency if needed
+            await asyncio.sleep(0.5)
             await update_hc_member_list(guild)
 
 
