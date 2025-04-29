@@ -987,6 +987,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.checks.has_permissions(manage_roles=True, manage_nicknames=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
+    # Your existing /hcverify command logic here...
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
@@ -999,11 +1000,11 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     # Defer publicly as the final message is usually public
     # Check defer state *before* deferring
     if not interaction.response.is_done():
-         await interaction.response.defer(thinking=True, ephemeral=False)
+        await interaction.response.defer(thinking=True, ephemeral=False)
     else:
-         # If already deferred (e.g., by a previous check), log or proceed carefully
-         print(f"Warning: Interaction {interaction.id} was already responded to before hcverify deferral.")
-         # Decide if you need to followup.send or just continue processing
+        # If already deferred (e.g., by a previous check), log or proceed carefully
+        print(f"Warning: Interaction {interaction.id} was already responded to before hcverify deferral.")
+        # Decide if you need to followup.send or just continue processing
 
     # Fetch roles
     role_unverified = guild.get_role(REMOVE_ROLE_ID)
@@ -1028,24 +1029,23 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
     # Compare position integers, not Role objects directly with integers
     if bot_member.top_role.position <= user.top_role.position \
-       or bot_member.top_role.position <= role_verified.position \
-       or bot_member.top_role.position <= role_hc.position \
-       or (role_unverified and bot_member.top_role.position <= role_unverified.position):
-         await send_func("❌ Hierarchy Error: I cannot manage roles for this user or the required roles (my top role is not high enough).", ephemeral=True)
-         await log_error(guild, f"HCVerify failed: Bot hierarchy too low for {user.mention} or roles.", interaction=interaction)
-         return
+            or bot_member.top_role.position <= role_verified.position \
+            or bot_member.top_role.position <= role_hc.position \
+            or (role_unverified and bot_member.top_role.position <= role_unverified.position):
+        await send_func("❌ Hierarchy Error: I cannot manage roles for this user or the required roles (my top role is not high enough).", ephemeral=True)
+        await log_error(guild, f"HCVerify failed: Bot hierarchy too low for {user.mention} or roles.", interaction=interaction)
+        return
 
     # Check invoker hierarchy (remains the same logic)
     if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-         await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
-         return
+        await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
+        return
 
     # Check bot hierarchy for nickname (using .position for consistency)
     if bot_member.top_role.position <= user.top_role.position:
-         await send_func("❌ Hierarchy Error: I cannot change the nickname for this user (my top role is not high enough).", ephemeral=True)
-         await log_error(guild, f"HCVerify failed: Bot hierarchy too low to change nick for {user.mention}.", interaction=interaction)
-         return
-
+        await send_func("❌ Hierarchy Error: I cannot change the nickname for this user (my top role is not high enough).", ephemeral=True)
+        await log_error(guild, f"HCVerify failed: Bot hierarchy too low to change nick for {user.mention}.", interaction=interaction)
+        return
 
     log_summary = []
     result_summary = []
@@ -1056,7 +1056,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     roles_to_add = []
     roles_to_remove = []
     needs_role_update = False
-    original_hc_status = role_hc in user.roles # Check if user already had HC role
+    original_hc_status = role_hc in user.roles  # Check if user already had HC role
 
     if role_unverified and role_unverified in user.roles:
         roles_to_remove.append(role_unverified)
@@ -1066,7 +1066,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
         roles_to_add.append(role_verified)
         log_summary.append("Will add Verified role")
         needs_role_update = True
-    if not original_hc_status: # Only add HC if they don't have it
+    if not original_hc_status:  # Only add HC if they don't have it
         roles_to_add.append(role_hc)
         log_summary.append("Will add HC role")
         needs_role_update = True
@@ -1090,10 +1090,10 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
             log_summary.append(f"Role update failed: {type(e).__name__}")
             await log_error(guild, "HCVerify role update failed", error=e, interaction=interaction)
         except Exception as e:
-             errors_occurred = True
-             result_summary.append("⚠️ Failed to update roles (Unknown Error)")
-             log_summary.append(f"Role update failed unexpectedly: {type(e).__name__}")
-             await log_error(guild, "HCVerify unexpected role update error", error=e, interaction=interaction)
+            errors_occurred = True
+            result_summary.append("⚠️ Failed to update roles (Unknown Error)")
+            log_summary.append(f"Role update failed unexpectedly: {type(e).__name__}")
+            await log_error(guild, "HCVerify unexpected role update error", error=e, interaction=interaction)
 
     elif not needs_role_update:
         result_summary.append("ℹ️ Roles already correct.")
@@ -1104,25 +1104,25 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     try:
         ign_to_store = ingame_name.strip()
         if not ign_to_store:
-             raise ValueError("In-game name cannot be empty after stripping whitespace.")
+            raise ValueError("In-game name cannot be empty after stripping whitespace.")
 
         await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                            .upsert({
-                                "discord_id": str(user.id),
-                                "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
-                                "ingame_name": ign_to_store
-                            }, on_conflict="discord_id")
-                            .execute()
+            .upsert({
+                "discord_id": str(user.id),
+                "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
+                "ingame_name": ign_to_store
+            }, on_conflict="discord_id")
+            .execute()
         )
         result_summary.append(f"💾 IGN Stored: `{discord.utils.escape_markdown(ign_to_store)}`")
         log_summary.append("Supabase upsert successful")
         db_success = True
-    except ValueError as e: # Catch empty IGN specifically
-         errors_occurred = True
-         result_summary.append(f"⚠️ DB Error: {e}")
-         log_summary.append(f"Supabase upsert failed: {e}")
-         await log_error(guild, "HCVerify DB upsert failed", error=e, interaction=interaction)
+    except ValueError as e:  # Catch empty IGN specifically
+        errors_occurred = True
+        result_summary.append(f"⚠️ DB Error: {e}")
+        log_summary.append(f"Supabase upsert failed: {e}")
+        await log_error(guild, "HCVerify DB upsert failed", error=e, interaction=interaction)
     except Exception as e:
         errors_occurred = True
         result_summary.append("⚠️ Database Error: Failed to store IGN.")
@@ -1131,17 +1131,17 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
     # --- Nickname Management ---
     nick_success = False
-    nickname_to_set = ingame_name.strip()[:32] # Max 32 chars for Discord nicknames
+    nickname_to_set = ingame_name.strip()[:32]  # Max 32 chars for Discord nicknames
     truncated = len(ingame_name.strip()) > 32
 
     if not nickname_to_set:
         result_summary.append("⚠️ Nickname Error: IGN is empty, cannot set nickname.")
         log_summary.append("Nickname skipped (empty IGN)")
-        errors_occurred = True # Consider this an error state
+        errors_occurred = True  # Consider this an error state
     elif user.nick == nickname_to_set:
         result_summary.append(f"🏷️ Nickname already set: `{discord.utils.escape_markdown(nickname_to_set)}`")
         log_summary.append("Nickname already correct")
-        nick_success = True # Still counts as success if already correct
+        nick_success = True  # Still counts as success if already correct
     else:
         try:
             await user.edit(nick=nickname_to_set, reason=reason)
@@ -1156,16 +1156,18 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
             log_summary.append("Nickname change failed: Forbidden")
             await log_error(guild, "HCVerify nickname change failed (Forbidden)", interaction=interaction)
         except discord.HTTPException as e:
-             errors_occurred = True
-             result_summary.append("⚠️ Nickname Error: Failed to set nickname (API Error).")
-             log_summary.append(f"Nickname change failed: HTTPException {e.status}")
-             await log_error(guild, "HCVerify nickname change failed (HTTPException)", error=e, interaction=interaction)
+            errors_occurred = True
+            result_summary.append("⚠️ Nickname Error: Failed to set nickname (API Error).")
+            log_summary.append(f"Nickname change failed: HTTPException {e.status}")
+            await log_error(guild, "HCVerify nickname change failed (HTTPException)", error=e, interaction=interaction)
         except Exception as e:
             errors_occurred = True
             result_summary.append("⚠️ Nickname Error: Failed to set nickname (Unknown Error).")
             log_summary.append(f"Nickname change failed unexpectedly: {type(e).__name__}")
             await log_error(guild, "HCVerify unexpected nickname change error", error=e, interaction=interaction)
 
+    # --- *ADD THIS LINE HERE* ---
+    await handle_hcverify(user, ingame_name)  # <----  Call handle_hcverify here
 
     # --- Final Response & Logging ---
     final_color = discord.Color.orange() if errors_occurred else discord.Color.green()
@@ -1177,17 +1179,17 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     try:
         await interaction.followup.send(embed=final_embed)
     except (discord.NotFound, discord.HTTPException) as e:
-         await log_error(guild, "HCVerify failed to send final followup message", error=e, interaction=interaction)
+        await log_error(guild, "HCVerify failed to send final followup message", error=e, interaction=interaction)
 
     # Log the overall operation
     await log_info(guild, f"`{interaction.user}` initiated HCVerify for {user.mention}. Summary: {'; '.join(log_summary)}.")
 
     # Update static list if HC role was newly added OR if it already existed and DB update was successful
     if (role_hc in roles_to_add) or (original_hc_status and db_success):
-         print(f"HCVerify: Triggering list update for {user.name}.") # Debug print
-         # Add a small delay before updating list to allow Discord/DB changes to potentially propagate
-         await asyncio.sleep(1.0)
-         await update_hc_member_list(guild)
+        print(f"HCVerify: Triggering list update for {user.name}.")  # Debug print
+        # Add a small delay before updating list to allow Discord/DB changes to potentially propagate
+        await asyncio.sleep(1.0)
+        await update_hc_member_list(guild)
 
 
 # --- Un-HC-Verify Command ---
@@ -1203,9 +1205,9 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
 
     # Check defer state *before* deferring
     if not interaction.response.is_done():
-         await interaction.response.defer(thinking=True, ephemeral=False)
+        await interaction.response.defer(thinking=True, ephemeral=False)
     else:
-         print(f"Warning: Interaction {interaction.id} was already responded to before unhcverify deferral.")
+        print(f"Warning: Interaction {interaction.id} was already responded to before unhcverify deferral.")
 
     # Fetch HC role
     role_hc = guild.get_role(ADD_ROLE_ID_HC)
@@ -1220,25 +1222,34 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
     send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 
     # Check bot hierarchy for managing the HC role itself
-    if bot_member.top_role.position <= user.top_role.position \
-       or bot_member.top_role.position <= role_hc.position:
-         await send_func("❌ Hierarchy Error: I cannot manage the HC role for this user (my top role is not high enough).", ephemeral=True)
-         await log_error(guild, f"UnHCVerify failed: Bot hierarchy too low for {user.mention} or HC role.", interaction=interaction)
-         return
+    if bot_member.top_role.position <= user.top_role.position or bot_member.top_role.position <= role_hc.position:
+        await send_func(
+            "❌ Hierarchy Error: I cannot manage the HC role for this user (my top role is not high enough).",
+            ephemeral=True,
+        )
+        await log_error(
+            guild,
+            f"UnHCVerify failed: Bot hierarchy too low for {user.mention} or HC role.",
+            interaction=interaction,
+        )
+        return
 
     # Check invoker hierarchy
     if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-         await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
-         return
+        await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
+        return
 
     # Separate check for nickname hierarchy (using .position) - only warn if nick needs changing
     nick_reset_needed = user.nick is not None
     if nick_reset_needed and bot_member.top_role.position <= user.top_role.position:
-         # Log the error but proceed with role removal if possible
-         await log_error(guild, f"UnHCVerify warning: Bot hierarchy too low to reset nick for {user.mention}, but attempting role removal.", interaction=interaction)
-         # Optionally inform user nickname won't be reset:
-         # await send_func("⚠️ Warning: My role is too low to reset this user's nickname, but I will attempt to remove the HC role.", ephemeral=True)
-
+        # Log the error but proceed with role removal if possible
+        await log_error(
+            guild,
+            f"UnHCVerify warning: Bot hierarchy too low to reset nick for {user.mention}, but attempting role removal.",
+            interaction=interaction,
+        )
+        # Optionally inform user nickname won't be reset:
+        # await send_func("⚠️ Warning: My role is too low to reset this user's nickname, but I will attempt to remove the HC role.", ephemeral=True)
 
     log_summary = []
     result_summary = []
@@ -1268,48 +1279,51 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
             log_summary.append(f"HC role removal failed: HTTPException {e.status}")
             await log_error(guild, "UnHCVerify role removal failed (HTTPException)", error=e, interaction=interaction)
         except Exception as e:
-             errors_occurred = True
-             result_summary.append("⚠️ Role Error: Failed to remove HC role (Unknown Error).")
-             log_summary.append(f"HC role removal failed unexpectedly: {type(e).__name__}")
-             await log_error(guild, "UnHCVerify unexpected role removal error", error=e, interaction=interaction)
-
+            errors_occurred = True
+            result_summary.append("⚠️ Role Error: Failed to remove HC role (Unknown Error).")
+            log_summary.append(f"HC role removal failed unexpectedly: {type(e).__name__}")
+            await log_error(guild, "UnHCVerify unexpected role removal error", error=e, interaction=interaction)
 
     # --- Nickname Reset ---
     # Only attempt reset if the user actually has a nickname AND bot hierarchy allows it
     if nick_reset_needed:
-        if bot_member.top_role.position > user.top_role.position: # Check hierarchy again explicitly
-             try:
-                 await user.edit(nick=None, reason=reason)
-                 result_summary.append("🏷️ Nickname Reset")
-                 log_summary.append("Nickname reset successfully")
-             except discord.Forbidden: # Should be caught by hierarchy but check again
-                 errors_occurred = True
-                 result_summary.append("⚠️ Nickname Error: Failed to reset nickname (Permissions).")
-                 log_summary.append("Nickname reset failed: Forbidden")
-                 await log_error(guild, "UnHCVerify nickname reset failed (Forbidden)", interaction=interaction)
-             except discord.HTTPException as e:
-                  errors_occurred = True
-                  result_summary.append("⚠️ Nickname Error: Failed to reset nickname (API Error).")
-                  log_summary.append(f"Nickname reset failed: HTTPException {e.status}")
-                  await log_error(guild, "UnHCVerify nickname reset failed (HTTPException)", error=e, interaction=interaction)
-             except Exception as e:
-                 errors_occurred = True
-                 result_summary.append("⚠️ Nickname Error: Failed to reset nickname (Unknown Error).")
-                 log_summary.append(f"Nickname reset failed unexpectedly: {type(e).__name__}")
-                 await log_error(guild, "UnHCVerify unexpected nickname reset error", error=e, interaction=interaction)
+        if bot_member.top_role.position > user.top_role.position:  # Check hierarchy again explicitly
+            try:
+                await user.edit(nick=None, reason=reason)
+                result_summary.append("🏷️ Nickname Reset")
+                log_summary.append("Nickname reset successfully")
+            except discord.Forbidden:  # Should be caught by hierarchy but check again
+                errors_occurred = True
+                result_summary.append("⚠️ Nickname Error: Failed to reset nickname (Permissions).")
+                log_summary.append("Nickname reset failed: Forbidden")
+                await log_error(guild, "UnHCVerify nickname reset failed (Forbidden)", interaction=interaction)
+            except discord.HTTPException as e:
+                errors_occurred = True
+                result_summary.append("⚠️ Nickname Error: Failed to reset nickname (API Error).")
+                log_summary.append(f"Nickname reset failed: HTTPException {e.status}")
+                await log_error(guild, "UnHCVerify nickname reset failed (HTTPException)", error=e, interaction=interaction)
+            except Exception as e:
+                errors_occurred = True
+                result_summary.append("⚠️ Nickname Error: Failed to reset nickname (Unknown Error).")
+                log_summary.append(f"Nickname reset failed unexpectedly: {type(e).__name__}")
+                await log_error(guild, "UnHCVerify unexpected nickname reset error", error=e, interaction=interaction)
         else:
             # Hierarchy check already failed, report it if not already done implicitly
             result_summary.append("⚠️ Nickname Error: Skipped reset (Bot hierarchy too low).")
             log_summary.append("Nickname reset skipped (Hierarchy)")
-            errors_occurred = True # Indicate an issue occurred
+            errors_occurred = True  # Indicate an issue occurred
     else:
         result_summary.append("🏷️ No nickname to reset.")
         log_summary.append("No nickname to reset")
 
+    # --- Activity Tracking ---
+    await handle_hcunverify(user)  # <--- ADD THIS LINE
+
     # --- Final Response & Logging ---
     final_color = discord.Color.orange() if errors_occurred else discord.Color.green()
     final_title = f"{'✅' if not errors_occurred else '⚠️'} Un-HC-Verified: {user.display_name}"
-    if errors_occurred: final_title += " (with issues)"
+    if errors_occurred:
+        final_title += " (with issues)"
 
     final_embed = create_embed(title=final_title, description="\n".join(result_summary), color=final_color)
     try:
@@ -1322,14 +1336,11 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
 
     # Update static list if the role was successfully removed
     if role_was_removed:
-        print(f"UnHCVerify: Triggering list update for {user.name}.") # Debug print
+        print(f"UnHCVerify: Triggering list update for {user.name}.")  # Debug print
         # Add a small delay
         await asyncio.sleep(1.0)
         await update_hc_member_list(guild)
 
-
-# --- HC Members Interactive List ---
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN).")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
@@ -1887,6 +1898,243 @@ async def nerdhelp(interaction: discord.Interaction):
     # Send the help message publicly in the channel it was invoked
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# --- Activity Tracking System (Add this block before bot startup) ---
+import discord
+from discord.ext import commands
+from datetime import datetime, timedelta
+import asyncio
+import os
+from supabase import create_client, Client
+
+# Assuming your Supabase URL and Key are in environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+async def run_supabase_sync(func):
+    return await asyncio.to_thread(func)
+
+# In-memory cache to track daily activity to prevent duplicates
+daily_activity = {}  # {username: date}
+inactive_warning_interval = timedelta(days=7)
+
+async def check_inactive_users(ctx):
+    """Checks for users not active in the past week and sends a warning."""
+    week_ago = datetime.utcnow() - inactive_warning_interval
+    try:
+        response = await run_supabase_sync(lambda: supabase.table("activity_log").select("DISTINCT username").execute())
+        if response.error:
+            print(f"Error fetching all usernames for inactive check: {response.error}")
+            return
+
+        all_registered_users = {record["username"] for record in response.data}
+        inactive_users = []
+
+        for username in all_registered_users:
+            response = await run_supabase_sync(lambda: supabase.table("activity_log").select("*").eq("username", username).gt("activity_timestamp", week_ago.isoformat()).execute())
+            if not response.data:
+                inactive_users.append(username)
+
+        if inactive_users:
+            warning_message = f"**Warning:** The following usernames have not been registered as active in the past week: {', '.join(inactive_users)}"
+            await ctx.send(warning_message)
+    except Exception as e:
+        print(f"Error during inactive user check: {e}")
+
+async def is_hc_member(username):
+    """
+    Checks if a given username (or nickname) is present in the hc_members table
+    as either the Discord username (without the #tag) or the in-game name.
+    """
+    try:
+        discord_username = username.split("#")[0] if "#" in username else username
+        response_by_username = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("discord_username", discord_username).execute())
+        if not response_by_username.error and response_by_username.data:
+            return True
+
+        response_by_ingame_name = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("ingame_name", username).execute())
+        if not response_by_ingame_name.error and response_by_ingame_name.data:
+            return True
+
+        return False
+    except Exception as e:
+        print(f"Error checking HC membership for {username}: {e}")
+        return False
+
+@bot.hybrid_command(name="active", description="Register a player as active for the day.")
+async def active(ctx, nickname: str = None):
+    username_to_register = ctx.author.name # Default to the command user
+
+    if nickname:
+        username_to_register = nickname
+
+    today = datetime.utcnow().date()
+
+    if username_to_register in daily_activity and daily_activity[username_to_register] == today:
+        await ctx.send(f"{username_to_register} has already been registered as active today.")
+        return
+
+    # Check if the username is on the /hcmembers list (we'll need a way to access this)
+    is_hc_member_result = await is_hc_member(username_to_register)
+    hc_marker = " [HC]" if is_hc_member_result else ""
+
+    try:
+        data = {"username": username_to_register, "activity_timestamp": datetime.utcnow().isoformat(), "activity_type": "active"}
+        response = await run_supabase_sync(lambda: supabase.table("activity_log").insert(data).execute())
+        if response.error:
+            await ctx.send(f"Error registering activity for {username_to_register}: {response.error}")
+        else:
+            await ctx.send(f"Registered {username_to_register}{hc_marker} as active for today.")
+            daily_activity[username_to_register] = today
+    except Exception as e:
+        await ctx.send(f"An unexpected error occurred while registering activity: {e}")
+    finally:
+        await check_inactive_users(ctx)
+
+@bot.hybrid_command(name="activity", description="Show activity for a given time period.")
+async def activity(ctx, time_period: str):
+    """
+    Displays a list of active users for the specified time period.
+
+    Args:
+        ctx: The command context.
+        time_period: The time period to filter by ('day', 'week', 'month', 'all').
+    """
+    now = datetime.utcnow()
+    time_filters = {
+        "day": now - timedelta(days=1),
+        "week": now - timedelta(days=7),
+        "month": now - timedelta(days=30),  # Simplified - consider variable month lengths
+    }
+
+    if time_period not in ["day", "week", "month", "all"]:
+        await ctx.send("Invalid time period. Please choose 'day', 'week', 'month', or 'all'.")
+        return
+
+    await check_inactive_users(ctx) #show warnings
+
+    try:
+        if time_period == "all":
+            response = await run_supabase_sync(lambda: supabase.table("activity_log").select("username, count(*)").group_by("username").order("count", desc=True).execute())
+        else:
+            filter_time = time_filters[time_period]
+            response = await run_supabase_sync(lambda: supabase.table("activity_log").select("username, count(*)").gt("activity_timestamp", filter_time.isoformat()).group_by("username").order("count", desc=True).execute())
+
+        if response.error:
+            await ctx.send(f"Error fetching activity data: {response.error}")
+            return
+
+        activity_data = response.data
+        if not activity_data:
+            await ctx.send(f"No activity found for the specified time period ({time_period}).")
+            return
+
+        message = f"**Activity for {time_period.capitalize()}**:\n"
+        for i, entry in enumerate(activity_data):
+            username = entry['username']
+            count = entry['count']
+            is_hc_member_result = await is_hc_member(username)
+            hc_marker = " [HC]" if is_hc_member_result else ""
+            message += f"{i+1}. {username}{hc_marker}: {count}\n"
+
+        await ctx.send(message)
+    except Exception as e:
+        await ctx.send(f"An error occurred while processing the activity command: {e}")
+
+@bot.hybrid_command(name="deactivate", description="Remove a user from the activity list.")
+async def deactivate(ctx, username: str):
+    try:
+        response = await run_supabase_sync(lambda: supabase.table("activity_log").delete().eq("username", username).execute())
+        if response.error:
+            await ctx.send(f"Error deactivating user {username}: {response.error}")
+        else:
+            await ctx.send(f"User {username} has been deactivated and removed from the activity list.")
+            if username in daily_activity:
+                del daily_activity[username]
+    except Exception as e:
+        await ctx.send(f"An error occurred while deactivating user: {e}")
+
+@bot.hybrid_command(name="bulkactive", description="Register multiple users as active at once.")
+async def bulkactive(ctx, usernames: str):
+    """
+    Registers multiple users as active at once.
+
+    Args:
+        ctx: The command context.
+        usernames: A string containing usernames separated by '//'.
+    """
+    usernames_list = usernames.split("//")
+    today = datetime.utcnow().date()
+    registered_users = []
+    failed_users = []
+
+    for username in usernames_list:
+        if username in daily_activity and daily_activity[username] == today:
+            failed_users.append(username)
+            continue  # Skip if already registered today
+
+        is_hc_member_result = await is_hc_member(username)
+        hc_marker = " [HC]" if is_hc_member_result else ""
+        try:
+            data = {"username": username, "activity_timestamp": datetime.utcnow().isoformat(), "activity_type": "active"}
+            response = await run_supabase_sync(lambda: supabase.table("activity_log").insert(data).execute())
+            if not response.error:
+                registered_users.append(username + hc_marker)
+                daily_activity[username] = today
+            else:
+                failed_users.append(username)
+        except Exception as e:
+            failed_users.append(f"{username} (Error: {e})")
+
+    message = ""
+    if registered_users:
+        message += f"Registered the following users as active: {', '.join(registered_users)}\n"
+    if failed_users:
+        message += f"Failed to register the following users: {', '.join(failed_users)}"
+
+    await ctx.send(message)
+    await check_inactive_users(ctx)
+
+# --- Integration with existing commands ---
+async def handle_hcverify(user: discord.Member, ingame_name: str):
+    """
+    Handles the /hcverify logic and silently adds the in-game name to the activity list.
+    This function should be called from your existing /hcverify command.
+
+    Args:
+        user: The Discord user being verified.
+        ingame_name: The in-game name provided (which will be used as the activity username).
+    """
+    try:
+        data = {"username": ingame_name, "activity_timestamp": datetime.utcnow().isoformat(), "activity_type": "active"}
+        response = await run_supabase_sync(lambda: supabase.table("activity_log").insert(data).execute())
+        if not response.error:
+            print(f"Silently registered {ingame_name} as active due to /hcverify.")
+            today = datetime.utcnow().date()  # Get the current date
+            daily_activity[ingame_name] = today
+        else:
+            print(f"Error silently registering {ingame_name} as active during /hcverify: {response.error}")
+    except Exception as e:
+        print(f"Error silently registering {ingame_name} as active during /hcverify: {e}")
+
+async def handle_unhcverify(username: str):
+    """
+    Handles the /unhcverify logic and removes the user from the activity list.
+    This function should be called from your existing /unhcverify command.
+
+    Args:
+        username:  The username to deactivate
+    """
+    try:
+        response = await run_supabase_sync(lambda: supabase.table("activity_log").delete().eq("username", username).execute())
+        if response.error:
+            print(f"Error deactivating user {username} during /unhcverify: {response.error}")
+        else:
+            print(f"User {username} has been deactivated due to /unhcverify.")
+            if username in daily_activity:
+                del daily_activity[username]
+    except Exception as e:
+        print(f"Error deactivating user {username} during /unhcverify: {e}")
 
 # --- Bot Startup ---
 if __name__ == "__main__":
