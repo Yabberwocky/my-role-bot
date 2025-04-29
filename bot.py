@@ -36,7 +36,7 @@ from typing import Optional, Tuple, List
 # --- END CONTEXT ---
 
 # --- Configuration ---
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+TOKEN = os.getenv("MTM2MDE4MjMwMjczNDU0OTA1Mw.GXFQEV.T8C7rxK0-3pn1_ob4REpzi9C8GT5dk5Vvxy2m8")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 REMOVE_ROLE_ID = 1360176495947022447 # "Unverified" role
