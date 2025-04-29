@@ -5,7 +5,6 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
-# Re-add View, Button, button for interactive pagination
 from discord.ui import Modal, TextInput, View, Button, button
 from flask import Flask
 from supabase import create_client, Client
@@ -64,11 +63,25 @@ intents = discord.Intents.default(); intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents); tree = bot.tree
 
 # --- Flask App ---
-app = Flask(''); @app.route('/'); def home(): return "Bot is alive!"
+# *** Corrected Flask Setup ***
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
 def run_flask():
-    try: app.run(host='0.0.0.0', port=8080)
-    except Exception as e: print(f"Flask server failed: {e}")
-def keep_alive(): t = threading.Thread(target=run_flask); t.start(); print("Keep alive thread started.")
+    try:
+        # Use a larger port if 8080 causes issues in your environment
+        app.run(host='0.0.0.0', port=8080)
+    except Exception as e:
+        print(f"Flask server failed to start: {e}")
+
+def keep_alive():
+    t = threading.Thread(target=run_flask)
+    t.start()
+    print("Keep alive thread started.")
+# *** End Corrected Flask Setup ***
 
 # --- Utility Functions ---
 async def run_supabase_sync(func):
@@ -136,8 +149,7 @@ class HCPagesView(View):
         return embed
 
     def update_buttons(self):
-        # Safely access children by index if they exist
-        if len(self.children) > 1:
+        if hasattr(self, 'children') and len(self.children) > 1: # Ensure buttons exist
             self.children[0].disabled = self.current_page == 0 # Previous
             self.children[1].disabled = self.current_page >= self.total_pages - 1 # Next
 
@@ -164,11 +176,11 @@ class HCPagesView(View):
         else: await interaction.response.defer()
 
     async def on_timeout(self):
-        if self.message: # Check if message reference exists
+        if self.message:
             try:
                 for item in self.children: item.disabled = True
                 await self.message.edit(view=self)
-            except (discord.NotFound, discord.HTTPException, AttributeError): # Catch errors if message deleted or inaccessible
+            except (discord.NotFound, discord.HTTPException, AttributeError):
                  print(f"Pagination View: Failed to disable buttons on timeout (message ID: {self.message.id if self.message else 'Unknown'}).")
             except Exception as e:
                  print(f"Pagination View: Unexpected error disabling buttons on timeout - {e}")
@@ -227,7 +239,8 @@ async def update_hc_member_list(guild: discord.Guild): # Static list update
 
         existing_messages = []
         try:
-            async for message in list_channel.history(limit=10):
+            # Increase limit slightly to ensure we catch both pages if they exist
+            async for message in list_channel.history(limit=15):
                 if message.author == guild.me and message.embeds and message.embeds[0].title == HC_LIST_EMBED_TITLE:
                     existing_messages.append(message)
             existing_messages.sort(key=lambda m: m.created_at) # Sort oldest first
@@ -236,6 +249,7 @@ async def update_hc_member_list(guild: discord.Guild): # Static list update
 
         num_existing = len(existing_messages)
 
+        # Update/Send Messages
         for i in range(num_new_pages):
             embed_to_use = new_embeds[i]
             if i < num_existing:
@@ -245,6 +259,7 @@ async def update_hc_member_list(guild: discord.Guild): # Static list update
                 try: await list_channel.send(embed=embed_to_use); await asyncio.sleep(0.5)
                 except Exception as e: await log_error(guild, f"Failed send static list page {i+1}.", error=e)
 
+        # Delete Extra Old Messages
         if num_existing > num_new_pages:
             for msg_to_delete in existing_messages[num_new_pages:]:
                 try: await msg_to_delete.delete(); await log_info(guild, f"Deleted surplus static list msg (ID: {msg_to_delete.id})."); await asyncio.sleep(0.5)
@@ -266,7 +281,7 @@ class BulkUpdateModal(Modal, title="Bulk Update"): data = TextInput(label="Paste
 # --- Slash Commands ---
 def create_embed(description: str, color: discord.Color = NERDY_YELLOW, title: str = None) -> discord.Embed: return discord.Embed(title=title, description=description, color=color)
 
-# (verify, unverify, hcverify, unhcverify definitions - condensed but same logic)
+# Condensed command definitions remain the same
 @tree.command(name="verify", description="Verify a user.") @app_commands.describe(user="User") @app_commands.checks.has_permissions(manage_roles=True)
 async def verify(i: discord.Interaction, user: discord.Member): g=i.guild; rr,ar=g.get_role(REMOVE_ROLE_ID),g.get_role(ADD_ROLE_ID_VERIFY); act,log=[],[]; if not rr:log.append(f"Role {REMOVE_ROLE_ID} NF"); if not ar:log.append(f"Role {ADD_ROLE_ID_VERIFY} NF"); if log: await log_error(g,f"/verify setup: {';'.join(log)}",i); try: if rr and rr in user.roles: await user.remove_roles(rr);act.append(f"➖ `{rr.name}`"); if ar and ar not in user.roles: await user.add_roles(ar);act.append(f"➕ `{ar.name}`"); if not act: embed=create_embed("❌ Roles missing." if not rr and not ar else f"ℹ️ No changes for {user.display_name}.", discord.Color.red() if not rr and not ar else discord.Color.orange()); await i.response.send_message(embed=embed,ephemeral=True); else: log_msg=f"Verified `{user.display_name}`. {' '.join(act)}."; await log_info(g,f"`{i.user}`: {log_msg}"); embed=create_embed(f"✅ Verified **{user.display_name}**!\n"+"\n".join(act), discord.Color.green()); await i.response.send_message(embed=embed); except discord.Forbidden: await log_error(g,"/verify Forbidden.",i); await i.response.send_message(embed=create_embed("❌ Role Perms Missing.", discord.Color.red()),ephemeral=True); except Exception as e: await log_error(g,f"/verify error {user.display_name}",e,i); await i.response.send_message(embed=create_embed("❌ Verify error.", discord.Color.red()),ephemeral=True)
 @tree.command(name="unverify", description="Unverify a user.") @app_commands.describe(user="User") @app_commands.checks.has_permissions(manage_roles=True)
@@ -276,7 +291,7 @@ async def hcverify(i: discord.Interaction, user: discord.Member, ingame_name: st
 @tree.command(name="unhcverify", description="Remove HC role and reset nickname.") @app_commands.describe(user="User") @app_commands.checks.has_permissions(manage_roles=True)
 async def unhcverify(i: discord.Interaction, user: discord.Member): g=i.guild; arh=g.get_role(ADD_ROLE_ID_HC); log,resp=[],[]; if not arh: await log_error(g,f"/unhcverify Role {ADD_ROLE_ID_HC} NF",i); await i.response.send_message(embed=create_embed("❌ HC Role missing.", discord.Color.red()),ephemeral=True); return; try: if arh in user.roles: await user.remove_roles(arh); log.append("Rm HC role"); resp.append(f"➖ Role: `{arh.name}`"); else: await i.response.send_message(embed=create_embed(f"ℹ️ {user.display_name} lacks `{arh.name}`.",discord.Color.orange()),ephemeral=True); return; nick_msg=""; if user.nick is not None: try: await user.edit(nick=None); log.append("Reset nick"); resp.append("🏷️ Reset Nick"); except discord.Forbidden: log.append("Nick reset FAIL (Perms)"); resp.append("⚠️ Nick Reset Fail (Perms)"); nick_msg=" (nick fail)"; except Exception as e: await log_error(g,f"Nick reset fail {user.display_name}",e,i); log.append(f"Nick reset FAIL ({type(e).__name__})"); resp.append("⚠️ Nick Reset Fail (Err)"); nick_msg=" (nick fail)"; else: log.append("No nick"); resp.append("🏷️ No Nick"); log_m=f"`{i.user}` un-HC-verified `{user.display_name}`. {'; '.join(log)}."; await log_info(g,log_m); embed=create_embed(title=f"✅ Un-HC-Verified: {user.display_name}{nick_msg}",description="\n".join(resp),color=discord.Color.green()); await i.response.send_message(embed=embed); except discord.Forbidden as fe: await log_error(g,"/unhcverify Role Perms",fe,i); await i.response.send_message(embed=create_embed("❌ Role Perms Missing.",discord.Color.red()),ephemeral=True); except Exception as e: await log_error(g,f"/unhcverify Err {user.display_name}",e,i); if not i.response.is_done(): await i.response.send_message(embed=create_embed("❌ UnHCVerify Err.",discord.Color.red()),ephemeral=True); else: await i.followup.send(embed=create_embed("❌ UnHCVerify Err.",discord.Color.red()),ephemeral=True)
 
-# /hcmembers now sends interactive list
+# /hcmembers updated
 @tree.command(name="hcmembers", description="Show an interactive list of [HC1] members.")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
@@ -300,16 +315,15 @@ async def hcmembers(interaction: discord.Interaction):
         else:
             view = HCPagesView(member_data, total_count)
             embed = view.create_page_embed()
-            # Store message reference in view for timeout handling
             message = await interaction.followup.send(embed=embed, view=view)
-            view.message = message # Assign after sending
+            view.message = message # Assign message to view for timeout handling
             await log_info(guild, f"/hcmembers interactive list generated by `{interaction.user}`.")
 
     except Exception as e:
         await log_error(guild, "[hcmembers] Error generating interactive list.", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ Error fetching list.", discord.Color.red()))
 
-# /refresh updates the static list
+# /refresh updates static list
 @tree.command(name="refresh", description="Refresh the static [HC1] member list.")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def refresh(interaction: discord.Interaction):
@@ -329,11 +343,9 @@ async def refresh(interaction: discord.Interaction):
         await log_error(guild, "Error during manual /refresh.", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ Error refreshing list.", discord.Color.red()), ephemeral=True)
 
-# /bulkupdate definition (condensed but same logic)
+# Condensed command definitions remain the same
 @tree.command(name="bulkupdate", description="Bulk update IGNs via modal.") @app_commands.checks.has_permissions(manage_roles=True)
 async def bulkupdate(i: discord.Interaction): try: await i.response.send_modal(BulkUpdateModal()); await log_info(i.guild, f"Opened bulk modal for `{i.user}`."); except Exception as e: await log_error(i.guild, "Err opening bulk modal.",e,i); if not i.response.is_done(): await i.response.send_message(embed=create_embed("❌ Err opening modal.",discord.Color.red()),ephemeral=True)
-
-# /syncnicknames definition (condensed but same logic)
 @tree.command(name="syncnicknames", description="Sync all HC nicks with stored IGNs.") @app_commands.checks.has_permissions(manage_roles=True)
 async def syncnicknames(i: discord.Interaction): await i.response.defer(thinking=True,ephemeral=True); g=i.guild; if not supabase: await i.followup.send(embed=create_embed("❌ Supabase missing.", discord.Color.red()),ephemeral=True); return; arh=g.get_role(ADD_ROLE_ID_HC); if not arh: await i.followup.send(embed=create_embed("❌ HC Role missing.", discord.Color.red()),ephemeral=True); return; await log_info(g,f"SyncNick started by `{i.user}`."); await i.edit_original_response(content="🔄 Fetching..."); ign_data={}; try: resp=await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id, ingame_name").execute()); if resp and resp.data: ign_data={item['discord_id']: item['ingame_name'] for item in resp.data if item.get('ingame_name')}; except Exception as e: await log_error(g,"SyncNick DB Fetch Fail",e,i); await i.edit_original_response(content="❌ DB Fail."); return; counts={'s':0,'k':0,'ni':0,'p':0,'o':0,'pr':0}; members=[m for m in g.members if arh in m.roles]; total=len(members); await i.edit_original_response(content=f"🔄 Syncing {total}..."); for idx, m in enumerate(members): counts['pr']+=1; if idx%25==0 and idx>0: await i.edit_original_response(content=f"🔄 Syncing... ({idx}/{total})"); mid=str(m.id); if mid not in ign_data: counts['ni']+=1; continue; ign=ign_data[mid]; target=ign[:32]; if m.nick==target: counts['k']+=1; continue; try: await m.edit(nick=target); counts['s']+=1; except discord.Forbidden: counts['p']+=1; except Exception as e: counts['o']+=1; await log_error(g,f"SyncNick Err: {m.name}",e,i); embed=discord.Embed(title="Nickname Sync Complete!",color=NERDY_YELLOW); summary=f"Processed:{counts['pr']}|✅Upd:{counts['s']}|ℹ️Skip:{counts['k']}|⚠️NoIGN:{counts['ni']}|❌Perm:{counts['p']}|❌Other:{counts['o']}"; embed.description=summary; await i.edit_original_response(content=None,embed=embed); log_embed=discord.Embed(title="Nickname Sync Finished",description=summary,color=NERDY_YELLOW).set_footer(text=f"By {i.user}"); await log_info(g,"",embed=log_embed)
 
