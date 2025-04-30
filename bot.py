@@ -11,7 +11,7 @@ from supabase import create_client, Client
 from postgrest import APIError
 import traceback
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -65,6 +65,7 @@ else: print("CRITICAL: Supabase credentials missing."); supabase = None
 intents = discord.Intents.default(); intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+command_ids: Dict[str, int] = {} # Dictionary to store command IDs after sync
 
 # --- Flask App (Keep Alive) ---
 app = Flask('')
@@ -453,7 +454,7 @@ async def update_hc_member_list(guild: discord.Guild):
 # --- Discord Events ---
 @bot.event
 async def on_ready():
-    global BOT_ID
+    global BOT_ID, command_ids
     if bot.user:
         BOT_ID = bot.user.id
         print(f"Logged in as {bot.user} (ID: {BOT_ID})")
@@ -462,35 +463,46 @@ async def on_ready():
         print("CRITICAL ERROR: Bot user object not found on ready.")
         return # Cannot proceed without bot user
 
-    synced_count = 0
+    # --- Sync Commands and Store IDs ---
+    print("Syncing application commands...")
+    synced_commands = []
     try:
-        synced = await tree.sync()
-        synced_count = len(synced)
-        print(f"Synced {synced_count} application commands globally.")
+        # Sync globally. If you have guild-specific commands, sync them separately.
+        synced_commands = await tree.sync()
+        print(f"Synced {len(synced_commands)} application commands globally.")
+        # Populate the command_ids dictionary
+        command_ids.clear() # Clear old IDs if any
+        for cmd in synced_commands:
+            # Store top-level commands
+            if isinstance(cmd, app_commands.Command):
+                command_ids[cmd.name] = cmd.id
+                print(f"  Stored ID for /{cmd.name}: {cmd.id}")
+            # If you use command groups, you might need to iterate recursively
+            # elif isinstance(cmd, app_commands.Group):
+            #     # Handle group commands if needed
+            #     pass
+        print(f"Stored command IDs: {command_ids}")
     except Exception as e:
         print(f"Command Sync failed: {e}")
         # Try to log error to the first available guild's error channel
         first_guild = bot.guilds[0] if bot.guilds else None
         if first_guild:
             await log_error(first_guild, "Application Command Sync failed on startup.", error=e)
+    # --- End Command Sync ---
 
     if not bot.guilds:
         print("Bot is not currently in any guilds.")
         return
 
     print(f"Performing initial setup for {len(bot.guilds)} guild(s)...")
-    # Create a list of guilds to iterate over to avoid issues if guild list changes during iteration
     guilds_to_process = list(bot.guilds)
     for guild in guilds_to_process:
         print(f"  Processing guild: {guild.name} (ID: {guild.id})")
         try:
-            # Log ready status first
-            await log_info(guild, f"Bot ready and online. Synced {synced_count} commands.")
-            # Then update the static list for this guild
+            await log_info(guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
             await update_hc_member_list(guild)
-            await asyncio.sleep(1) # Small delay between guilds
+            await asyncio.sleep(1)
         except Exception as e:
-            # Log error specific to this guild's setup
             await log_error(guild, f"Error during on_ready setup for this guild", error=e)
     print("Initial setup loop complete.")
 
@@ -749,10 +761,8 @@ class BulkUpdateModal(Modal, title="Bulk Update IGNs"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         # Log summary to info channel
-        # --- FIX APPLIED HERE ---
         summary_for_log = summary.replace('\n', ' | ') # Perform replace *before* f-string
         await log_info(guild, f"Bulk update initiated by `{interaction.user}` completed. Results: {summary_for_log}")
-        # --- END FIX ---
 
         # Trigger static list update if successful changes were made
         if success_count > 0:
@@ -763,7 +773,7 @@ class BulkUpdateModal(Modal, title="Bulk Update IGNs"):
 
 # --- Slash Commands ---
 
-# --- MODIFIED /verify Command ---
+# --- Verify Command (Hierarchy logic remains simpler here as it's less complex) ---
 @tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified).")
 @app_commands.describe(user="The user to verify.")
 @app_commands.checks.has_permissions(manage_roles=True) # Invoker only needs manage_roles
@@ -793,10 +803,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
     bot_member = guild.me
     hierarchy_fail = False
     hierarchy_reason = ""
-    if bot_member.top_role.position <= user.top_role.position:
-        hierarchy_fail = True
-        hierarchy_reason = "I cannot manage roles for this user (my top role is not high enough)."
-    elif bot_member.top_role.position <= role_to_add.position:
+    # Check if bot can manage the user first - this isn't strictly necessary for add/remove_roles usually
+    # but can indicate potential issues. The primary check is against the roles themselves.
+    # if bot_member.top_role.position <= user.top_role.position:
+    #    hierarchy_fail = True
+    #    hierarchy_reason = "I cannot manage roles for this user (my top role is not high enough)."
+    if bot_member.top_role.position <= role_to_add.position:
         hierarchy_fail = True
         hierarchy_reason = f"I cannot assign the '{role_to_add.name}' role (my top role is not high enough)."
     elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
@@ -809,9 +821,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         return
 
     # --- REMOVED Invoker Hierarchy Check ---
-    # if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-    #      await interaction.response.send_message("❌ Hierarchy Error: You cannot manage roles for this user.", ephemeral=True)
-    #      return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -870,7 +879,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 
-# --- MODIFIED Unverify Command ---
+# --- Unverify Command (Hierarchy logic remains simpler here) ---
 @tree.command(name="unverify", description="Revert a user to Unverified status (adds Unverified, removes Verified).")
 @app_commands.describe(user="The user to unverify.")
 @app_commands.checks.has_permissions(manage_roles=True) # Invoker only needs manage_roles
@@ -896,14 +905,11 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
          await interaction.response.send_message(f"❌ Setup Error: Unverified Role (ID: {REMOVE_ROLE_ID}) not found. Cannot unverify.", ephemeral=True)
          return
 
-    # --- Hierarchy Checks (Bot vs Target/Roles) ---
+    # --- Hierarchy Checks (Bot vs Roles) ---
     bot_member = guild.me
     hierarchy_fail = False
     hierarchy_reason = ""
-    if bot_member.top_role.position <= user.top_role.position:
-        hierarchy_fail = True
-        hierarchy_reason = "I cannot manage roles for this user (my top role is not high enough)."
-    elif bot_member.top_role.position <= role_to_add.position:
+    if bot_member.top_role.position <= role_to_add.position:
         hierarchy_fail = True
         hierarchy_reason = f"I cannot assign the '{role_to_add.name}' role (my top role is not high enough)."
     elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
@@ -916,9 +922,6 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
          return
 
     # --- REMOVED Invoker Hierarchy Check ---
-    # if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-    #      await interaction.response.send_message("❌ Hierarchy Error: You cannot manage roles for this user.", ephemeral=True)
-    #      return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -977,7 +980,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 
-# --- MODIFIED HC Verify Command ---
+# --- REFINED HC Verify Command ---
 @tree.command(name="hcverify", description="Verify user into HC, store IGN, set nickname.")
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will be used as nickname).")
 @app_commands.checks.has_permissions(manage_roles=True) # Invoker only needs manage_roles
@@ -997,133 +1000,135 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     else:
          print(f"Warning: Interaction {interaction.id} was already responded to before hcverify deferral.")
 
+    # --- Role Fetching and Setup ---
     role_unverified = guild.get_role(REMOVE_ROLE_ID)
     role_verified = guild.get_role(ADD_ROLE_ID_VERIFY)
     role_hc = guild.get_role(ADD_ROLE_ID_HC)
+    bot_member = guild.me
+    send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 
+    # Check critical roles exist
     missing_roles = []
-    # Check only if the ID is configured
-    if REMOVE_ROLE_ID and not role_unverified: missing_roles.append(f"Unverified (ID: {REMOVE_ROLE_ID})")
     if ADD_ROLE_ID_VERIFY and not role_verified: missing_roles.append(f"Verified (ID: {ADD_ROLE_ID_VERIFY})")
     if ADD_ROLE_ID_HC and not role_hc: missing_roles.append(f"HC (ID: {ADD_ROLE_ID_HC})")
+    # Unverified role is optional for removal, don't fail if missing unless ID is set AND not found
+    if REMOVE_ROLE_ID and not role_unverified: missing_roles.append(f"Unverified (ID: {REMOVE_ROLE_ID})")
+
     if missing_roles:
-        send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        await send_func(f"❌ Setup Error: Missing roles: {', '.join(missing_roles)}. Contact admin.", ephemeral=True)
+        await send_func(f"❌ Setup Error: Missing critical roles: {', '.join(missing_roles)}. Contact admin.", ephemeral=True)
         await log_error(guild, f"HCVerify failed: Missing roles - {', '.join(missing_roles)}", interaction=interaction)
         return
 
-    # --- Hierarchy Checks (Bot vs Target/Roles) ---
-    bot_member = guild.me
-    send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-    role_hierarchy_fail = False
-    role_hierarchy_reason = ""
-    if bot_member.top_role.position <= user.top_role.position:
-        # If bot is lower than user, it can't manage *any* roles for them.
-        role_hierarchy_fail = True
-        role_hierarchy_reason = "I cannot manage roles for this user (my top role is not high enough)."
-    # Check specific roles only if bot > user
-    elif role_verified and bot_member.top_role.position <= role_verified.position:
-         role_hierarchy_fail = True
-         role_hierarchy_reason = f"I cannot assign the '{role_verified.name}' role (my top role is not high enough)."
-    elif role_hc and bot_member.top_role.position <= role_hc.position:
-         role_hierarchy_fail = True
-         role_hierarchy_reason = f"I cannot assign the '{role_hc.name}' role (my top role is not high enough)."
-    elif role_unverified and bot_member.top_role.position <= role_unverified.position:
-         role_hierarchy_fail = True
-         role_hierarchy_reason = f"I cannot remove the '{role_unverified.name}' role (my top role is not high enough)."
-
-    if role_hierarchy_fail:
-        await send_func(f"❌ Hierarchy Error: {role_hierarchy_reason}", ephemeral=True)
-        await log_error(guild, f"HCVerify role management failed: Bot hierarchy issue. Reason: {role_hierarchy_reason}", interaction=interaction)
-        return # Stop if roles cannot be managed
-
-    # --- REMOVED Invoker Hierarchy Check ---
-    # if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-    #      await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
-    #      return
-
-    # Check bot hierarchy for nickname separately - Proceed even if this fails
-    can_change_nick = bot_member.top_role.position > user.top_role.position
-
-
     log_summary = []
     result_summary = []
-    errors_occurred = False # Tracks if any part failed
+    errors_occurred = False # Tracks if any part failed or was skipped due to hierarchy/perms
+    db_success = False
+    role_changes_attempted = False
+    role_changes_succeeded = False # Track if at least one role change was successful
     reason = f"HC Verified by {interaction.user} (ID: {interaction.user.id})"
 
+    # --- Hierarchy Flags ---
+    # Can bot manage the user object itself (needed for nick changes)?
+    can_manage_user = bot_member.top_role.position > user.top_role.position
+
     # --- Role Management ---
-    roles_to_add = []
-    roles_to_remove = []
-    needs_role_update = False
+    roles_to_add_final = []
+    roles_to_remove_final = []
     original_hc_status = role_hc and role_hc in user.roles # Check only if HC role exists
 
-    # Only add/remove roles if they exist
-    if role_unverified and role_unverified in user.roles:
-        roles_to_remove.append(role_unverified)
-        log_summary.append("Will remove Unverified role")
-        needs_role_update = True
-    if role_verified and role_verified not in user.roles:
-        roles_to_add.append(role_verified)
-        log_summary.append("Will add Verified role")
-        needs_role_update = True
-    if role_hc and not original_hc_status: # Only add HC if role exists and user doesn't have it
-        roles_to_add.append(role_hc)
-        log_summary.append("Will add HC role")
-        needs_role_update = True
+    # Determine desired changes
+    desired_adds = []
+    desired_removes = []
+    if role_verified and role_verified not in user.roles: desired_adds.append(role_verified)
+    if role_hc and not original_hc_status: desired_adds.append(role_hc)
+    if role_unverified and role_unverified in user.roles: desired_removes.append(role_unverified)
 
-    if needs_role_update:
+    # Filter changes based on hierarchy for specific roles
+    for role in desired_adds:
+        if bot_member.top_role.position > role.position:
+            roles_to_add_final.append(role)
+        else:
+            errors_occurred = True
+            reason_skip = f"Bot hierarchy too low to add role '{role.name}'"
+            result_summary.append(f"⚠️ Skipped adding role `{role.name}` (Hierarchy).")
+            log_summary.append(f"Role add skipped: {reason_skip}")
+            await log_info(guild, f"HCVerify: {reason_skip}") # Log as info, error log might be too noisy
+
+    for role in desired_removes:
+        if bot_member.top_role.position > role.position:
+            roles_to_remove_final.append(role)
+        else:
+            errors_occurred = True
+            reason_skip = f"Bot hierarchy too low to remove role '{role.name}'"
+            result_summary.append(f"⚠️ Skipped removing role `{role.name}` (Hierarchy).")
+            log_summary.append(f"Role remove skipped: {reason_skip}")
+            await log_info(guild, f"HCVerify: {reason_skip}") # Log as info
+
+    # Attempt actual role changes if any are valid
+    if roles_to_add_final or roles_to_remove_final:
+        role_changes_attempted = True
         try:
-            if roles_to_add: await user.add_roles(*roles_to_add, reason=reason)
-            if roles_to_remove: await user.remove_roles(*roles_to_remove, reason=reason)
-            added_names = ', '.join(f"`{r.name}`" for r in roles_to_add)
-            removed_names = ', '.join(f"`{r.name}`" for r in roles_to_remove)
+            # Combine operations for efficiency if possible, though separate calls are fine
+            if roles_to_add_final:
+                 await user.add_roles(*roles_to_add_final, reason=reason)
+            if roles_to_remove_final:
+                 await user.remove_roles(*roles_to_remove_final, reason=reason)
+
+            added_names = ', '.join(f"`{r.name}`" for r in roles_to_add_final)
+            removed_names = ', '.join(f"`{r.name}`" for r in roles_to_remove_final)
             if added_names: result_summary.append(f"➕ Roles Added: {added_names}")
             if removed_names: result_summary.append(f"➖ Roles Removed: {removed_names}")
-            log_summary.append("Role update successful")
-        except (discord.Forbidden, discord.HTTPException) as e:
+            log_summary.append("Role update successful for applicable roles")
+            role_changes_succeeded = True # Mark success if API call didn't raise Forbidden/HTTP
+        except discord.Forbidden:
             errors_occurred = True
-            err_msg = "Failed to update roles (Permissions)" if isinstance(e, discord.Forbidden) else "Failed to update roles (API Error)"
-            result_summary.append(f"⚠️ {err_msg}")
-            log_summary.append(f"Role update failed: {type(e).__name__}")
-            await log_error(guild, "HCVerify role update failed", error=e, interaction=interaction)
+            result_summary.append("⚠️ Role Error: Failed to update roles (Permissions error during API call).")
+            log_summary.append("Role update failed: Forbidden on API call")
+            await log_error(guild, "HCVerify role update failed (Forbidden)", interaction=interaction)
+        except discord.HTTPException as e:
+             errors_occurred = True
+             result_summary.append("⚠️ Role Error: Failed to update roles (Discord API Error).")
+             log_summary.append(f"Role update failed: HTTPException {e.status}")
+             await log_error(guild, "HCVerify role update failed (HTTPException)", error=e, interaction=interaction)
         except Exception as e:
              errors_occurred = True
-             result_summary.append("⚠️ Failed to update roles (Unknown Error)")
+             result_summary.append("⚠️ Role Error: Failed to update roles (Unknown Error).")
              log_summary.append(f"Role update failed unexpectedly: {type(e).__name__}")
              await log_error(guild, "HCVerify unexpected role update error", error=e, interaction=interaction)
-    else:
+    elif not desired_adds and not desired_removes:
         result_summary.append("ℹ️ Roles already correct.")
         log_summary.append("No role changes needed")
+    # else: roles were skipped due to hierarchy, already logged above
 
-    # --- Database Update ---
-    db_success = False
+    # --- Database Update (Proceed regardless of role/nick hierarchy) ---
     try:
         ign_to_store = ingame_name.strip()
         if not ign_to_store:
              raise ValueError("In-game name cannot be empty after stripping whitespace.")
 
-        # Ensure Supabase table exists and columns match
         await run_supabase_sync(
             lambda: supabase.table("hc_members")
                             .upsert({
                                 "discord_id": str(user.id),
                                 "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
                                 "ingame_name": ign_to_store
-                            }, on_conflict="discord_id") # Assumes discord_id is the primary key or has a unique constraint
+                            }, on_conflict="discord_id")
                             .execute()
         )
         result_summary.append(f"💾 IGN Stored: `{discord.utils.escape_markdown(ign_to_store)}`")
         log_summary.append("Supabase upsert successful")
         db_success = True
-    except ValueError as e: # Catch empty IGN specifically
+    except ValueError as e:
          errors_occurred = True
          result_summary.append(f"⚠️ DB Error: {e}")
          log_summary.append(f"Supabase upsert failed: {e}")
          await log_error(guild, "HCVerify DB upsert failed (ValueError)", error=e, interaction=interaction)
-    except APIError as e: # Catch Supabase specific errors
+    except APIError as e:
         errors_occurred = True
-        result_summary.append(f"⚠️ Database Error: Failed to store IGN (API Error: {e.code or e.status_code or 'Unknown'})")
-        log_summary.append(f"Supabase upsert failed: APIError {e}")
+        # Provide more specific Supabase error if possible
+        err_detail = f"API Error: {e.message}" if hasattr(e, 'message') and e.message else f"API Error code: {e.code or e.status_code or 'Unknown'}"
+        result_summary.append(f"⚠️ Database Error: Failed to store IGN ({err_detail})")
+        log_summary.append(f"Supabase upsert failed: {e}")
         await log_error(guild, "HCVerify DB upsert failed (APIError)", error=e, interaction=interaction)
     except Exception as e:
         errors_occurred = True
@@ -1134,22 +1139,22 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
     # --- Nickname Management ---
     nick_success = False
-    nickname_to_set = ingame_name.strip()[:32] # Max 32 chars
+    nickname_to_set = ingame_name.strip()[:32]
     truncated = len(ingame_name.strip()) > 32
 
     if not nickname_to_set:
         result_summary.append("⚠️ Nickname Error: IGN is empty, cannot set nickname.")
         log_summary.append("Nickname skipped (empty IGN)")
-        errors_occurred = True # Treat empty IGN as an issue preventing nickname set
+        errors_occurred = True
     elif user.nick == nickname_to_set:
         result_summary.append(f"🏷️ Nickname already set: `{discord.utils.escape_markdown(nickname_to_set)}`")
         log_summary.append("Nickname already correct")
         nick_success = True
-    elif not can_change_nick: # Explicit check if bot hierarchy prevents nick change
-        result_summary.append(f"⚠️ Nickname Error: Cannot set nickname for {user.mention} (Bot hierarchy too low).")
-        log_summary.append("Nickname skipped (Bot Hierarchy)")
-        errors_occurred = True # This is an issue, flag it
-    else: # Bot has hierarchy, attempt the change
+    elif not can_manage_user: # Check if bot can manage the target user object
+        result_summary.append(f"⚠️ Nickname Skipped: Cannot set nickname for {user.mention} (Bot hierarchy too low).")
+        log_summary.append("Nickname skipped (Bot Hierarchy vs User)")
+        errors_occurred = True # Flag as an issue
+    else: # Bot has hierarchy over user, attempt the change
         try:
             await user.edit(nick=nickname_to_set, reason=reason)
             nick_msg = f"🏷️ Nickname Set: `{discord.utils.escape_markdown(nickname_to_set)}`"
@@ -1157,7 +1162,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
             result_summary.append(nick_msg)
             log_summary.append(f"Nickname set{' (truncated)' if truncated else ''}")
             nick_success = True
-        except discord.Forbidden:
+        except discord.Forbidden: # Should be caught by can_manage_user, but check anyway
             errors_occurred = True
             result_summary.append("⚠️ Nickname Error: Failed to set nickname (Permissions).")
             log_summary.append("Nickname change failed: Forbidden")
@@ -1176,8 +1181,8 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
     # --- Final Response & Logging ---
     final_color = discord.Color.orange() if errors_occurred else discord.Color.green()
-    final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Verified: {user.display_name}"
-    if errors_occurred: final_title += " (with issues)"
+    final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Verify Processed: {user.display_name}"
+    if errors_occurred: final_title += " (with issues/skips)"
 
     final_embed = create_embed(title=final_title, description="\n".join(result_summary), color=final_color)
     try:
@@ -1187,15 +1192,14 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 
     await log_info(guild, f"`{interaction.user}` initiated HCVerify for {user.mention}. Summary: {'; '.join(log_summary)}.")
 
-    # Update static list if role changes occurred OR if DB was updated successfully
-    # This ensures list updates even if only IGN changed for an existing HC member
-    if needs_role_update or db_success:
-         print(f"HCVerify: Triggering list update for {user.name} (Needs role update: {needs_role_update}, DB success: {db_success}).")
+    # Update static list if roles were successfully changed OR if DB was updated successfully
+    if role_changes_succeeded or db_success:
+         print(f"HCVerify: Triggering list update for {user.name} (Role change success: {role_changes_succeeded}, DB success: {db_success}).")
          await asyncio.sleep(1.0)
          await update_hc_member_list(guild)
 
 
-# --- MODIFIED Un-HC-Verify Command ---
+# --- REFINED Un-HC-Verify Command ---
 @tree.command(name="unhcverify", description="Remove HC role and reset nickname for a user.")
 @app_commands.describe(user="The user to remove from HC.")
 @app_commands.checks.has_permissions(manage_roles=True) # Invoker only needs manage_roles
@@ -1211,7 +1215,9 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
     else:
          print(f"Warning: Interaction {interaction.id} was already responded to before unhcverify deferral.")
 
+    # --- Role Fetching and Setup ---
     role_hc = guild.get_role(ADD_ROLE_ID_HC)
+    bot_member = guild.me
     send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 
     if not role_hc:
@@ -1219,44 +1225,33 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
         await log_error(guild, f"UnHCVerify failed: HC role not found.", interaction=interaction)
         return
 
-    # --- Hierarchy Checks (Bot vs Target/Roles) ---
-    bot_member = guild.me
-    role_hierarchy_fail = False
-    role_hierarchy_reason = ""
-    if bot_member.top_role.position <= user.top_role.position:
-        # If bot is lower than user, it can't manage *any* roles for them.
-        role_hierarchy_fail = True
-        role_hierarchy_reason = "I cannot manage roles for this user (my top role is not high enough)."
-    elif bot_member.top_role.position <= role_hc.position:
-         role_hierarchy_fail = True
-         role_hierarchy_reason = f"I cannot remove the '{role_hc.name}' role (my top role is not high enough)."
-
-    if role_hierarchy_fail:
-         await send_func(f"❌ Hierarchy Error: {role_hierarchy_reason}", ephemeral=True)
-         await log_error(guild, f"UnHCVerify role management failed: Bot hierarchy issue. Reason: {role_hierarchy_reason}", interaction=interaction)
-         return # Stop if role cannot be managed
-
-    # --- REMOVED Invoker Hierarchy Check ---
-    # if interaction.user.top_role <= user.top_role and interaction.user.id != guild.owner_id:
-    #      await send_func("❌ Hierarchy Error: You cannot manage roles/nicknames for this user.", ephemeral=True)
-    #      return
-
-    # Check bot hierarchy for nickname separately - Proceed even if this fails
-    can_reset_nick = bot_member.top_role.position > user.top_role.position
-    nick_reset_needed = user.nick is not None
-
-
     log_summary = []
     result_summary = []
     errors_occurred = False
-    reason = f"Un-HC-Verified by {interaction.user} (ID: {interaction.user.id})"
     role_was_removed = False
+    reason = f"Un-HC-Verified by {interaction.user} (ID: {interaction.user.id})"
+
+    # --- Hierarchy Flags ---
+    can_manage_user = bot_member.top_role.position > user.top_role.position
+    can_manage_hc_role = bot_member.top_role.position > role_hc.position
+    nick_reset_needed = user.nick is not None
 
     # --- Role Removal ---
     if role_hc not in user.roles:
-        await send_func(f"ℹ️ {user.mention} does not have the `{role_hc.name}` role.", ephemeral=True)
-        return # Nothing more to do regarding roles or nickname if they aren't HC
-    else:
+        # Send ephemeral response if possible, otherwise public is fine too
+        try:
+            await send_func(f"ℹ️ {user.mention} does not have the `{role_hc.name}` role.", ephemeral=True)
+        except Exception: # Catch error if sending ephemeral fails after deferring publicly
+            await send_func(f"ℹ️ {user.mention} does not have the `{role_hc.name}` role.")
+        return # Nothing more to do
+    elif not can_manage_hc_role:
+        errors_occurred = True
+        reason_skip = f"Bot hierarchy too low to remove role '{role_hc.name}'"
+        result_summary.append(f"⚠️ Skipped removing role `{role_hc.name}` (Hierarchy).")
+        log_summary.append(f"Role remove skipped: {reason_skip}")
+        await log_info(guild, f"UnHCVerify: {reason_skip}") # Log as info
+        # Continue to nickname reset attempt if needed
+    else: # Bot has hierarchy over the role, attempt removal
         try:
             await user.remove_roles(role_hc, reason=reason)
             result_summary.append(f"➖ Role Removed: `{role_hc.name}`")
@@ -1279,18 +1274,17 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
              await log_error(guild, "UnHCVerify unexpected role removal error", error=e, interaction=interaction)
 
     # --- Nickname Reset ---
-    # Only attempt reset if the user actually had a nickname
     if nick_reset_needed:
-        if not can_reset_nick: # Check if bot has hierarchy
-            result_summary.append(f"⚠️ Nickname Error: Cannot reset nickname for {user.mention} (Bot hierarchy too low).")
-            log_summary.append("Nickname reset skipped (Bot Hierarchy)")
-            errors_occurred = True # This is an issue
+        if not can_manage_user: # Check if bot can manage the target user object
+            result_summary.append(f"⚠️ Nickname Skipped: Cannot reset nickname for {user.mention} (Bot hierarchy too low).")
+            log_summary.append("Nickname reset skipped (Bot Hierarchy vs User)")
+            errors_occurred = True # Flag as an issue
         else: # Bot has hierarchy, attempt reset
              try:
                  await user.edit(nick=None, reason=reason)
                  result_summary.append("🏷️ Nickname Reset")
                  log_summary.append("Nickname reset successfully")
-             except discord.Forbidden: # Should be caught by hierarchy check, but belt-and-suspenders
+             except discord.Forbidden: # Should be caught by can_manage_user, but check anyway
                  errors_occurred = True
                  result_summary.append("⚠️ Nickname Error: Failed to reset nickname (Permissions).")
                  log_summary.append("Nickname reset failed: Forbidden")
@@ -1311,11 +1305,12 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
 
     # --- Final Response & Logging ---
     final_color = discord.Color.orange() if errors_occurred else discord.Color.green()
-    final_title = f"{'✅' if not errors_occurred else '⚠️'} Un-HC-Verified: {user.display_name}"
-    if errors_occurred: final_title += " (with issues)"
+    final_title = f"{'✅' if not errors_occurred else '⚠️'} Un-HC Verify Processed: {user.display_name}"
+    if errors_occurred: final_title += " (with issues/skips)"
 
     final_embed = create_embed(title=final_title, description="\n".join(result_summary), color=final_color)
     try:
+        # Make sure to use followup as we deferred
         await interaction.followup.send(embed=final_embed)
     except (discord.NotFound, discord.HTTPException) as e:
         await log_error(guild, "UnHCVerify failed to send final followup message", error=e, interaction=interaction)
@@ -1327,6 +1322,7 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
         print(f"UnHCVerify: Triggering list update for {user.name}.")
         await asyncio.sleep(1.0)
         await update_hc_member_list(guild)
+
 
 # --- HC Members Interactive List ---
 @tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN).")
@@ -1519,17 +1515,17 @@ async def syncnicknames(interaction: discord.Interaction):
 
     # --- Syncing Logic ---
     counts = {'processed': 0, 'updated': 0, 'skipped_match': 0, 'skipped_no_ign': 0, 'skipped_empty_ign': 0, 'fail_hierarchy': 0, 'fail_forbidden': 0, 'fail_other': 0}
-    bot_top_role = guild.me.top_role
+    bot_top_role_position = guild.me.top_role.position # Get position once
     last_progress_update_time = asyncio.get_event_loop().time()
 
     for idx, member in enumerate(hc_members):
         counts['processed'] += 1
         member_id_str = str(member.id)
 
-        # Hierarchy Check (Bot vs Member)
-        if bot_top_role <= member.top_role and member.id != guild.owner_id:
+        # Hierarchy Check (Bot vs Member for nickname change)
+        if bot_top_role_position <= member.top_role.position:
             counts['fail_hierarchy'] += 1
-            continue # Skip this member
+            continue # Skip this member for nickname change
 
         # Get Stored IGN
         stored_ign = ign_data.get(member_id_str)
@@ -1559,17 +1555,17 @@ async def syncnicknames(interaction: discord.Interaction):
             counts['fail_forbidden'] += 1
             # Log first few forbidden errors for diagnosis
             if counts['fail_forbidden'] <= 3:
-                 await log_error(guild, f"SyncNick: Forbidden error updating nick for {member.mention} (`{member.id}`)", interaction=interaction, embed=None) # Don't need full embed usually
+                 await log_error(guild, f"SyncNick: Forbidden error updating nick for {member.mention} (`{member.id}`)", embed=None) # No need for full context/embed
         except discord.HTTPException as e:
              counts['fail_other'] += 1
              # Log first few other HTTP errors
              if counts['fail_other'] <= 3:
-                  await log_error(guild, f"SyncNick: HTTP error updating nick for {member.mention} (`{member.id}`)", error=e, interaction=interaction, embed=None)
+                  await log_error(guild, f"SyncNick: HTTP error updating nick for {member.mention} (`{member.id}`)", error=e, embed=None)
         except Exception as e:
             counts['fail_other'] += 1
             # Log first few unexpected errors
             if counts['fail_other'] <= 3:
-                 await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention} (`{member.id}`)", error=e, interaction=interaction, embed=None)
+                 await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention} (`{member.id}`)", error=e, embed=None)
 
 
         # Progress Update (every 5 seconds or every 50 members)
@@ -1596,7 +1592,7 @@ async def syncnicknames(interaction: discord.Interaction):
         f"ℹ️ **Skipped (Already Match):** {counts['skipped_match']}",
         f"❓ **Skipped (No IGN in DB):** {counts['skipped_no_ign']}",
         f"❓ **Skipped (Empty IGN in DB):** {counts['skipped_empty_ign']}",
-        f"❌ **Failed (Hierarchy):** {counts['fail_hierarchy']}",
+        f"❌ **Failed/Skipped (Hierarchy):** {counts['fail_hierarchy']}", # Renamed for clarity
         f"❌ **Failed (Permissions):** {counts['fail_forbidden']}",
         f"❌ **Failed (Other Errors):** {counts['fail_other']}"
     ]
@@ -1638,6 +1634,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         # Ensure interaction hasn't already been responded to before sending error
         send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         try:
+            # Always send fail checks ephemerally
             await send_func(embed=create_embed(user_message, discord.Color.red()), ephemeral=True)
         except Exception as e:
             print(f"Wither Check Fail: Could not send message '{user_message}'. Error: {e}")
@@ -1674,12 +1671,12 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         await fail_check("Target is guild owner.", "👑 The server owner cannot be withered (except by themselves).")
         return
 
-    # 3. Hierarchy Checks (Corrected - using .position)
+    # 3. Hierarchy Checks (Bot vs Target) - Crucial for role removal/addition
     if bot_member.top_role.position <= user.top_role.position:
         await fail_check("Bot hierarchy too low.", "❌ My role is not high enough to manage this user's roles.")
         return
-    # Check if invoker can manage the target (unless invoker is owner)
-    if invoker.id != guild.owner_id and invoker.top_role.position <= user.top_role.position: # Use .position for consistency
+    # Check if invoker can manage the target (unless invoker is owner) - This remains a valid check for wither
+    if invoker.id != guild.owner_id and invoker.top_role.position <= user.top_role.position:
         await fail_check("Invoker hierarchy too low.", "❌ Your role is not high enough to wither this user.")
         return
 
@@ -1690,12 +1687,11 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
     if not original_roles:
         # Use followup as we should have deferred
-        await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles (besides @everyone) to remove.", discord.Color.orange()), ephemeral=False) # Maybe make this public?
+        await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles (besides @everyone) to remove.", discord.Color.orange()), ephemeral=False) # Public info message
         return
 
     try:
         # Phase 1: Remove Roles
-        # Validate duration is within reasonable bounds (Range check helps, but good practice)
         wither_duration_seconds = max(1, int(time * 60)) # Ensure at least 1 second
         max_seconds = int(MAX_WITHER_SECONDS) if MAX_WITHER_SECONDS else 600 # Use configured max or default
         wither_duration_seconds = min(wither_duration_seconds, max_seconds) # Cap duration
@@ -1706,38 +1702,54 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         # Ensure bot still has perms right before editing
         current_bot_perms = bot_member.guild_permissions
         if not current_bot_perms.manage_roles:
-             await fail_check("Bot lost manage_roles perm.", "❌ I seem to have lost permission to manage roles just now. Aborting.")
+             # Use fail_check which handles deferral state and logging
+             await fail_check("Bot lost manage_roles perm before removal.", "❌ I seem to have lost permission to manage roles just now. Aborting.")
              return
 
-        await user.edit(roles=[], reason=reason_wither) # Empty list removes all roles except @everyone
+        # Filter original roles to only those the bot CAN manage (lower than bot's top role)
+        # Although user.edit(roles=[]) should work if bot > user, this adds safety
+        roles_to_remove_actually = [r for r in original_roles if bot_member.top_role.position > r.position]
+        skipped_roles_remove = [r for r in original_roles if r not in roles_to_remove_actually]
 
-        roles_removed_str = (', '.join(f"`{r.name}`" for r in original_roles))
-        if len(roles_removed_str) > 1000: # Avoid exceeding embed limits
-             roles_removed_str = roles_removed_str[:997] + "..."
+        await user.edit(roles=[], reason=reason_wither) # Empty list removes all roles bot can manage
+
+        roles_removed_str = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually))
+        if len(roles_removed_str) > 900: # Avoid exceeding embed limits
+             roles_removed_str = roles_removed_str[:897] + "..."
+
+        wither_desc = f"{user.mention} has been withered by {invoker.mention} for **{actual_minutes:.1f} minutes**!\n\n**Roles Removed:** {roles_removed_str or 'None Manageable'}"
+        if skipped_roles_remove:
+             skipped_str = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))
+             if len(skipped_str) > 100: skipped_str = skipped_str[:97] + "..."
+             wither_desc += f"\n\n*(Note: Could not remove roles due to hierarchy: {skipped_str})*"
 
         await interaction.followup.send(embed=create_embed(
             title="🌪️ Wither Cast! 🌪️",
-            description=f"{user.mention} has been withered by {invoker.mention} for **{actual_minutes:.1f} minutes**!\n\n**Roles Removed:** {roles_removed_str}",
+            description=wither_desc,
             color=discord.Color.dark_purple()
         ), ephemeral=False) # Send public message
-        await log_info(guild, f"`{user.name}` (`{user.id}`) withered by `{invoker.name}` (`{invoker.id}`) for {actual_minutes:.1f}m. Roles removed: {', '.join(r.name for r in original_roles)}")
+
+        log_msg = f"`{user.name}` (`{user.id}`) withered by `{invoker.name}` (`{invoker.id}`) for {actual_minutes:.1f}m. "
+        log_msg += f"Roles removed: {', '.join(r.name for r in roles_to_remove_actually) or 'None Manageable'}."
+        if skipped_roles_remove: log_msg += f" Skipped (hierarchy): {', '.join(r.name for r in skipped_roles_remove)}."
+        await log_info(guild, log_msg)
+
 
         # Phase 2: Wait
         await asyncio.sleep(wither_duration_seconds)
 
         # Phase 3: Restore Roles
-        # Re-fetch member and bot objects in case state changed (e.g., permissions, user left)
+        # Re-fetch member and bot objects in case state changed
         try:
             member_after = await guild.fetch_member(user.id)
-            # Re-fetch bot member too, in case its roles changed
-            bot_member_after = await guild.fetch_member(BOT_ID) if BOT_ID else guild.me
+            # Re-fetch bot member too, its roles/perms might have changed
+            bot_member_after = await guild.fetch_member(BOT_ID) if BOT_ID else await guild.fetch_me()
 
             reason_restore = f"Wither ended after {actual_minutes:.1f} minutes (invoked by {invoker.id})."
 
-            # Check hierarchy again before restoring (using .position)
+            # Check hierarchy again before restoring
             if bot_member_after.top_role.position <= member_after.top_role.position:
                  await log_error(guild, f"Wither restore failed: Bot hierarchy too low for {member_after.mention}.", interaction=interaction)
-                 # Try to notify in channel if possible
                  try: await interaction.channel.send(f"⚠️ Failed to restore roles for {member_after.mention} - bot hierarchy is now too low.")
                  except Exception: pass
                  return # Cannot restore
@@ -1749,72 +1761,73 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
                  except Exception: pass
                  return # Cannot restore
 
-            # Validate original roles still exist before adding them back
-            valid_original_roles = []
-            for r in original_roles:
+            # Validate original roles still exist and bot can manage them
+            valid_original_roles_to_restore = []
+            skipped_roles_restore_deleted = []
+            skipped_roles_restore_hierarchy = []
+
+            for r in original_roles: # Iterate through originally intended roles
                 fetched_role = guild.get_role(r.id)
-                if fetched_role:
-                    valid_original_roles.append(fetched_role)
+                if not fetched_role:
+                    skipped_roles_restore_deleted.append(r.name) # Store name if deleted
+                elif bot_member_after.top_role.position > fetched_role.position:
+                    valid_original_roles_to_restore.append(fetched_role) # Add if exists and bot > role
+                else:
+                    skipped_roles_restore_hierarchy.append(fetched_role.name) # Store name if skipped due to hierarchy
 
-            if len(valid_original_roles) != len(original_roles):
-                 deleted_count = len(original_roles) - len(valid_original_roles)
-                 await log_info(guild, f"Wither restore notice: {deleted_count} original role(s) for {member_after.name} no longer exist. Restoring valid ones.")
+            # Log warnings about skipped roles during restore
+            if skipped_roles_restore_deleted:
+                 await log_info(guild, f"Wither restore notice: {len(skipped_roles_restore_deleted)} original role(s) for {member_after.name} no longer exist: {', '.join(skipped_roles_restore_deleted)}. Restoring valid ones.")
+            if skipped_roles_restore_hierarchy:
+                 await log_info(guild, f"Wither restore notice: Cannot restore roles for {member_after.name} due to hierarchy: {', '.join(skipped_roles_restore_hierarchy)}. Restoring others.")
 
-            if not valid_original_roles:
+
+            if not valid_original_roles_to_restore:
                  await log_info(guild, f"Wither restore: No valid original roles left to restore for {member_after.name}.")
-                 # Send a message indicating nothing was restored if needed
-                 try: await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, but no original roles could be restored (they may have been deleted).")
+                 try: await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, but no original roles could be restored (deleted or hierarchy issues).")
                  except Exception: pass
                  return
 
+            # Restore only the valid roles bot can manage
+            await member_after.edit(roles=valid_original_roles_to_restore, reason=reason_restore)
 
-            await member_after.edit(roles=valid_original_roles, reason=reason_restore)
+            restore_msg = f"✨ {member_after.mention}'s roles have been restored!"
+            if skipped_roles_restore_deleted or skipped_roles_restore_hierarchy:
+                 restore_msg += "\n*(Some original roles could not be restored due to deletion or hierarchy.)*"
 
-            # Send confirmation of restore (use followup as original is done)
-            # Check if channel is still accessible before sending followup
+            # Send confirmation of restore
             if interaction.channel:
                 try:
-                    await interaction.followup.send(embed=create_embed(f"✨ {member_after.mention}'s roles have been restored!", color=NERDY_YELLOW), ephemeral=False) # Public confirmation
+                    await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False) # Public confirmation
                 except (discord.NotFound, discord.HTTPException) as e:
                      await log_error(guild, "Wither failed to send restore followup message", error=e, interaction=interaction)
             else:
                  await log_info(guild, f"Wither restore successful for {member_after.mention}, but couldn't send followup (channel unavailable).")
 
-            await log_info(guild, f"Restored roles for `{member_after.name}` (`{member_after.id}`) after wither.")
+            await log_info(guild, f"Restored roles for `{member_after.name}` (`{member_after.id}`) after wither. Roles: {', '.join(r.name for r in valid_original_roles_to_restore)}")
 
         except discord.NotFound:
             # User left the server before roles could be restored
             await log_info(guild, f"Wither restore skipped: User `{user.name}` (`{user.id}`) left the server.")
-            # Optionally notify the channel (check channel exists first)
             if interaction.channel:
-                 try:
-                     await interaction.channel.send(f"ℹ️ Wither ended, but {user.display_name} left the server before roles could be restored.")
+                 try: await interaction.channel.send(f"ℹ️ Wither ended, but {user.display_name} left the server before roles could be restored.")
                  except Exception: pass
         except discord.Forbidden:
-            phase = "restore"
-            await log_error(guild, f"Wither {phase} failed: Bot lacks permissions (Forbidden) for {user.name}.", interaction=interaction)
-            if interaction.channel:
-                 try: await interaction.channel.send(f"⚠️ Failed to {phase} roles for {user.display_name} - Permissions error.")
-                 except Exception: pass
+            await log_error(guild, f"Wither restore failed: Bot lacks permissions (Forbidden) for {user.name}.", interaction=interaction)
+            if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name} - Permissions error.")
+            except Exception: pass
         except discord.HTTPException as e:
-             phase = "restore"
-             await log_error(guild, f"Wither {phase} failed: Discord API error for {user.name}.", error=e, interaction=interaction)
-             if interaction.channel:
-                  try: await interaction.channel.send(f"⚠️ Failed to {phase} roles for {user.display_name} - Discord API error.")
-                  except Exception: pass
+             await log_error(guild, f"Wither restore failed: Discord API error for {user.name}.", error=e, interaction=interaction)
+             if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name} - Discord API error.")
+             except Exception: pass
         except Exception as e:
-            phase = "restore"
-            await log_error(guild, f"Wither {phase} failed: Unexpected error for {user.name}.", error=e, interaction=interaction)
-            if interaction.channel:
-                 try: await interaction.channel.send(f"⚠️ Failed to {phase} roles for {user.display_name} - Unexpected error.")
-                 except Exception: pass
-
+            await log_error(guild, f"Wither restore failed: Unexpected error for {user.name}.", error=e, interaction=interaction)
+            if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name} - Unexpected error.")
+            except Exception: pass
 
     except discord.Forbidden:
          phase = "remove"
-         # This implies the initial role removal failed
          await log_error(guild, f"Wither {phase} failed: Bot lacks permissions (Forbidden) for {user.name}.", interaction=interaction)
-         # Edit the deferred response if possible (it should be a followup)
          try: await interaction.edit_original_response(content=f"❌ Failed to {phase} roles for {user.display_name} - Permissions error.", embed=None, view=None)
          except Exception: pass # Ignore if editing fails
     except discord.HTTPException as e:
@@ -1843,14 +1856,15 @@ async def nerdhelp(interaction: discord.Interaction):
         color=NERDY_YELLOW
     )
 
-    # Helper to get command mention string or fallback
+    # Helper to get command mention string or fallback using stored IDs
     def get_cmd_mention(name: str) -> str:
-        command = bot.tree.get_command(name)
-        if command:
-            return f"</{name}:{command.id}>"
+        cmd_id = command_ids.get(name) # Get ID from dict populated in on_ready
+        if cmd_id:
+            return f"</{name}:{cmd_id}>"
         else:
-            # Fallback if command isn't synced/found (shouldn't normally happen)
-            return f"`/{name}` (Not found?)"
+            # Fallback if command ID wasn't stored (e.g., sync failed, command new)
+            print(f"Warning: Could not find stored ID for command '/{name}' during nerdhelp.")
+            return f"`/{name}`" # Non-clickable fallback
 
     # Get channel mentions dynamically
     list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
@@ -1863,63 +1877,65 @@ async def nerdhelp(interaction: discord.Interaction):
     allowed_channels_str = ", ".join(allowed_channel_mentions) if allowed_channel_mentions else "`None Configured`"
 
     # --- Verification & HC Management ---
-    embed.add_field(name="\u200B\n🔑 Verification & HC Management", value="\u200B", inline=False)
+    embed.add_field(name="\u200B\n🔑 **Verification & HC Management**", value="\u200B", inline=False)
     embed.add_field(
         name=f"{get_cmd_mention('verify')} `<user>`",
         value="> Grants `Verified` role, removes `Unverified`.\n> *Requires:* `Manage Roles`",
-        inline=False
+        inline=True # Use inline for tighter spacing where appropriate
     )
     embed.add_field(
         name=f"{get_cmd_mention('unverify')} `<user>`",
         value="> Removes `Verified` role, adds `Unverified`.\n> *Requires:* `Manage Roles`",
-        inline=False
+        inline=True
     )
+    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
     embed.add_field(
         name=f"{get_cmd_mention('hcverify')} `<user> <IGN>`",
-        value="> Adds `HC` & `Verified` roles, removes `Unverified`, stores IGN, sets nickname, updates HC list.\n> *Requires:* `Manage Roles`",
-        inline=False
+        value="> Adds `HC` & `Verified` roles, stores IGN, sets nickname, updates list.\n> *Requires:* `Manage Roles`",
+        inline=False # Keep more complex commands non-inline
     )
     embed.add_field(
         name=f"{get_cmd_mention('unhcverify')} `<user>`",
-        value="> Removes `HC` role, resets nickname, updates HC list.\n> *Requires:* `Manage Roles`",
+        value="> Removes `HC` role, resets nickname, updates list.\n> *Requires:* `Manage Roles`",
         inline=False
     )
 
     # --- [HC1] Member List ---
-    embed.add_field(name="\u200B\n<:hc_icon:12345> [HC1] Member List", # Replace with actual emoji if you have one
+    embed.add_field(name="\u200B\n📊 **[HC1] Member List**",
                       value="*Lists show `Username#Tag ➔ IGN`*", inline=False)
     embed.add_field(
         name=f"{get_cmd_mention('hcmembers')}",
         value=f"> Shows interactive HC member list.\n> *Requires:* `Everyone` (in {allowed_channels_str})",
-        inline=False
+        inline=True
     )
     embed.add_field(
         name=f"{get_cmd_mention('refresh')}",
         value=f"> Manually updates the static HC list in {list_channel_mention}.\n> *Requires:* `Manage Roles`",
-        inline=False
+        inline=True
     )
 
     # --- Utilities ---
-    embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False)
+    embed.add_field(name="\u200B\n\n⚙️ **Utilities**", value="\u200B", inline=False)
     embed.add_field(
         name=f"{get_cmd_mention('bulkupdate')}",
-        value="> Opens form to bulk update IGNs (`Username#Tag ➔ IGN`). Updates HC list.\n> *Requires:* `Manage Roles`",
-        inline=False
+        value="> Opens form to bulk update IGNs.\n> *Requires:* `Manage Roles`",
+        inline=True
     )
     embed.add_field(
         name=f"{get_cmd_mention('syncnicknames')}",
-        value="> Syncs all HC members' nicknames to stored IGNs.\n> *Requires:* `Manage Nicknames`",
-        inline=False
+        value="> Syncs HC nicknames to stored IGNs.\n> *Requires:* `Manage Nicknames`",
+        inline=True
     )
+    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
     embed.add_field(
         name=f"{get_cmd_mention('wither')} `<user> [time]`",
-        value=f"> Temporarily removes roles (0.1-{MAX_WITHER_SECONDS / 60:.0f} min, default 2).\n> *Requires:* `Special Permission`",
-        inline=False
+        value=f"> Temporarily removes roles (0.1-{MAX_WITHER_SECONDS / 60:.0f} min).\n> *Requires:* `Special Permission`",
+        inline=True
     )
     embed.add_field(
         name=f"{get_cmd_mention('nerdhelp')}",
         value="> Shows this help message.\n> *Requires:* `Everyone`",
-        inline=False
+        inline=True
     )
 
     # Footer and Thumbnail
@@ -1929,6 +1945,7 @@ async def nerdhelp(interaction: discord.Interaction):
 
     # Send the help message publicly
     await interaction.response.send_message(embed=embed, ephemeral=False)
+
 
 # --- Bot Startup ---
 if __name__ == "__main__":
@@ -1956,4 +1973,21 @@ if __name__ == "__main__":
             print(traceback.format_exc())
 
     print("--- Bot process has ended ---")
-    
+```
+
+**Explanation of Key Changes:**
+
+1.  **`on_ready`:** Added logic to store synced command names and IDs into the global `command_ids` dictionary.
+2.  **`nerdhelp`:**
+    *   The `get_cmd_mention` helper function now retrieves the ID from the `command_ids` dictionary.
+    *   The embed fields now use `get_cmd_mention` to create clickable links like `</verify:1234...>`
+    *   Formatting adjusted with bold titles and some fields made `inline=True` for a more compact look.
+3.  **`/hcverify` & `/unhcverify`:**
+    *   Hierarchy checks are now more granular.
+    *   `can_manage_user`: Checks if bot's top role > user's top role (primarily affects nick changes).
+    *   Role changes (`add_roles`/`remove_roles`): The code now checks if `bot.top_role.position > role.position` for *each specific role* being added or removed. If this fails for a specific role, that role change is skipped, logged, and reported, but other valid role changes and DB operations proceed.
+    *   Nickname change/reset: Explicitly checks `can_manage_user`. If false, the action is skipped, logged, and reported.
+    *   Database operations proceed regardless of hierarchy.
+    *   The final response embed summarizes successes, failures, and skips due to hierarchy or errors.
+4.  **`/verify` & `/unverify`:** The hierarchy logic here remains simpler because the operations are less complex. It primarily checks if the bot can manage the *roles* involved, which is sufficient for these commands. The check against the user's hierarchy isn't strictly needed for `add_roles`/`remove_roles` if the roles themselves are manageable, so it's kept streamlined.
+5.  **Invoker Hierarchy:** The check comparing the *invoker's* role to the *target's* role remains removed from `verify`, `unverify`, `hcverify`, and `unhcverify`, as requested.
