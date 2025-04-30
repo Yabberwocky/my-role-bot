@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*- and new comment line
+# -*- coding: utf-8 -*-
 import os
 import threading
 import asyncio
@@ -13,7 +13,7 @@ from postgrest import APIError
 import traceback
 import math
 from typing import Optional, Tuple, List, Dict # Keep this one, it's used more broadly
-
+# another comment to test
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
 #
