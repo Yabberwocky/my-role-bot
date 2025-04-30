@@ -10,7 +10,7 @@ from discord.ui import Modal, TextInput, View, Button, button
 from flask import Flask
 from supabase import create_client, Client
 from postgrest import APIError
-import traceback
+import traceback 
 import math
 from typing import Optional, Tuple, List, Dict # Keep this one, it's used more broadly
 
