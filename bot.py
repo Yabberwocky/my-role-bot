@@ -4,6 +4,7 @@ import threading
 import asyncio
 import discord
 from discord import app_commands
+from typing import Dict, Optional
 from discord.ext import commands
 from discord.ui import Modal, TextInput, View, Button, button
 from flask import Flask
@@ -53,6 +54,7 @@ INFO_LOG_CHANNEL_ID = 1317943895606165579 # Info log channel
 ERROR_LOG_CHANNEL_ID = 1362988767367135453 # Error log channel
 MEMBERS_PER_PAGE = 50 # Members per page in lists
 NERDY_YELLOW = discord.Color.gold() # Embed color
+bot: Optional[discord.Client] = None
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -610,7 +612,77 @@ class BulkUpdateModal(Modal, title="Bulk Update IGNs"):
         await log_info(guild, f"Bulk update by `{interaction.user}` completed. Results: {summary_for_log}")
         if success_count > 0:
             await asyncio.sleep(0.5); await update_hc_member_list(guild)
+# --- Helper Functions ---
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def get_cmd_mention(name: str) -> str:
+    """Helper to create a clickable command mention string."""
+    cmd_id = command_ids.get(name)
+    if cmd_id:
+        return f"</{name}:{cmd_id}>"
+    else:
+        # Fallback if the ID wasn't found (e.g., sync issue)
+        print(f"Warn: No ID found for cmd '/{name}' in nerdhelp generation.")
+        return f"`/{name}`"
 
 # --- Slash Commands ---
 
@@ -1246,22 +1318,25 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
-    if not guild: await interaction.response.send_message("Must be used in a server.", ephemeral=True); return
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    if not bot or not bot.user: # Added check for bot user object
+        await interaction.response.send_message("Bot not fully ready, cannot generate help.", ephemeral=True)
+        return
 
     embed = discord.Embed(title="🤓 Pingslave Bot Commands", description="Click on a command to use it!", color=NERDY_YELLOW)
 
-    def get_cmd_mention(name: str) -> str:
-        cmd_id = command_ids.get(name)
-        if cmd_id: return f"</{name}:{cmd_id}>"
-        else: print(f"Warn: No ID for cmd '/{name}' in nerdhelp."); return f"`/{name}`" # Fallback
+    list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
+    list_channel_mention = list_channel.mention if list_channel else f"ID `{HC_MEMBER_LIST_CHANNEL_ID}`"
+    allowed_ch_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS]
+    allowed_chs_str = ", ".join(allowed_ch_mentions) or "`None Configured`"
 
-    list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID); list_channel_mention = list_channel.mention if list_channel else f"ID `{HC_MEMBER_LIST_CHANNEL_ID}`"
-    allowed_ch_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS]; allowed_chs_str = ", ".join(allowed_ch_mentions) or "`None Configured`"
-
+    # Using the helper function get_cmd_mention
     embed.add_field(name="\u200B\n🔑 **Verification & HC Management**", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('verify')} `<user>`", value="> Grants `Verified`, removes `Unverified`.\n> *Requires:* `Manage Roles`", inline=True)
     embed.add_field(name=f"{get_cmd_mention('unverify')} `<user>`", value="> Removes `Verified`, adds `Unverified`.\n> *Requires:* `Manage Roles`", inline=True)
-    embed.add_field(name="\u200B", value="\u200B", inline=False)
+    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
     embed.add_field(name=f"{get_cmd_mention('hcverify')} `<user> <IGN>`", value="> Adds `HC`/`Verified`, stores IGN, sets nick, updates list.\n> *Requires:* `Manage Roles`", inline=False)
     embed.add_field(name=f"{get_cmd_mention('unhcverify')} `<user>`", value="> Removes `HC`, resets nick, updates list.\n> *Requires:* `Manage Roles`", inline=False)
 
@@ -1272,12 +1347,14 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.add_field(name="\u200B\n\n⚙️ **Utilities**", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('bulkupdate')}", value="> Bulk update IGNs form.\n> *Requires:* `Manage Roles`", inline=True)
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}", value="> Syncs HC nicks to IGNs.\n> *Requires:* `Manage Nicknames`", inline=True)
-    embed.add_field(name="\u200B", value="\u200B", inline=False)
+    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
     embed.add_field(name=f"{get_cmd_mention('wither')} `<user> [time]`", value=f"> Temporarily removes roles (0.1-{MAX_WITHER_SECONDS / 60:.0f} min).\n> *Requires:* `Special Permission`", inline=True)
     embed.add_field(name=f"{get_cmd_mention('nerdhelp')}", value="> Shows this help message.\n> *Requires:* `Everyone`", inline=True)
 
     embed.set_footer(text="Bot by TheNerd | sweet_honey")
-    if bot.user and bot.user.display_avatar: embed.set_thumbnail(url=bot.user.display_avatar.url)
+    if bot.user and bot.user.display_avatar:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
