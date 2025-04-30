@@ -1027,8 +1027,12 @@ async def syncnicknames(interaction: discord.Interaction):
                      f"❌ **Failed (Hierarchy):** {counts['fail_hier']}", f"❌ **Failed (Perms/Other):** {counts['fail_forbid'] + counts['fail_other']}"]
     summary_embed.description = "\n".join(summary_lines)
     try: await interaction.edit_original_response(content=None, embed=summary_embed)
-    except (discord.NotFound, discord.HTTPException): print(f"SyncNick ({guild.name}): Final summary failed."); try: await interaction.followup.send(embed=summary_embed, ephemeral=True)
-    except Exception as e: print(f"SyncNick ({guild.name}): Final followup failed: {e}")
+    except (discord.NotFound, discord.HTTPException):
+    print(f"SyncNick ({guild.name}): Final summary failed.")
+    try: # Moved to new line and indented
+        await interaction.followup.send(embed=summary_embed, ephemeral=True)
+    except Exception as e_inner: # Added separate handling for the inner try's exception
+        print(f"SyncNick ({guild.name}): Final followup failed: {e_inner}")
     log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW); log_embed.set_footer(text=f"By {interaction.user}")
     await log_info(guild, "", embed=log_embed)
 
@@ -1105,13 +1109,64 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
                 except (discord.NotFound, discord.HTTPException) as e: await log_error(guild, "Wither failed restore followup", error=e)
             else: await log_info(guild, f"Wither restore OK for {member_after.mention}, channel gone.")
             await log_info(guild, f"Restored roles for `{member_after.name}`. Roles: {', '.join(r.name for r in valid_restore)}")
-        except discord.NotFound: await log_info(guild, f"Wither restore skip: `{user.name}` left."); if interaction.channel: try: await interaction.channel.send(f"ℹ️ Wither ended, {user.display_name} left.") ; except Exception: pass
-        except discord.Forbidden: await log_error(guild, f"Wither restore fail: Forbidden for {user.name}."); if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Perms error.") ; except Exception: pass
-        except discord.HTTPException as e: await log_error(guild, f"Wither restore fail: API error for {user.name}.", error=e); if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - API error.") ; except Exception: pass
-        except Exception as e: await log_error(guild, f"Wither restore fail: Unexpected for {user.name}.", error=e); if interaction.channel: try: await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Error.") ; except Exception: pass
-    except discord.Forbidden: await log_error(guild, f"Wither remove fail: Forbidden for {user.name}."); try: await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Perms error.", embed=None, view=None) ; except Exception: pass
-    except discord.HTTPException as e: await log_error(guild, f"Wither remove fail: API error for {user.name}.", error=e); try: await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - API error.", embed=None, view=None) ; except Exception: pass
-    except Exception as e: await log_error(guild, f"Wither remove fail: Unexpected for {user.name}.", error=e); try: await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Error.", embed=None, view=None) ; except Exception: pass
+        # Corrected example for discord.NotFound
+except discord.NotFound:
+    await log_info(guild, f"Wither restore skip: `{user.name}` left.")
+    if interaction.channel:
+        try: # Moved to new line and indented under the 'if'
+            await interaction.channel.send(f"ℹ️ Wither ended, {user.display_name} left.")
+        except Exception: # Indented under the 'try'
+            pass # Keep original behavior
+
+# Corrected example for discord.Forbidden
+except discord.Forbidden:
+    await log_error(guild, f"Wither restore fail: Forbidden for {user.name}.")
+    if interaction.channel:
+        try: # Moved to new line and indented
+            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Perms error.")
+        except Exception: # Indented under the 'try'
+            pass # Keep original behavior
+
+# Corrected example for discord.HTTPException
+except discord.HTTPException as e:
+    await log_error(guild, f"Wither restore fail: API error for {user.name}.", error=e)
+    if interaction.channel:
+        try: # Moved to new line and indented
+            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - API error.")
+        except Exception: # Indented under the 'try'
+            pass # Keep original behavior
+
+# Corrected example for generic Exception
+except Exception as e:
+    await log_error(guild, f"Wither restore fail: Unexpected for {user.name}.", error=e)
+    if interaction.channel:
+        try: # Moved to new line and indented
+            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Error.")
+        except Exception: # Indented under the 'try'
+            pass # Keep original behavior
+    # Corrected example for discord.Forbidden
+except discord.Forbidden:
+    await log_error(guild, f"Wither remove fail: Forbidden for {user.name}.")
+    try: # Moved to new line and indented
+        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Perms error.", embed=None, view=None)
+    except Exception: # Indented under the 'try'
+        pass # Keep original behavior
+
+# Corrected example for discord.HTTPException
+except discord.HTTPException as e:
+    await log_error(guild, f"Wither remove fail: API error for {user.name}.", error=e)
+    try: # Moved to new line and indented
+        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - API error.", embed=None, view=None)
+    except Exception: # Indented under the 'try'
+        pass # Keep original behavior
+
+# Corrected example for generic Exception
+except Exception as e:
+    await log_error(guild, f"Wither remove fail: Unexpected for {user.name}.", error=e)
+    try: # Moved to new line and indented
+        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Error.", embed=None, view=None)
+    except Exception: # Indented under the 'try'
+        pass # Keep original behavior
 
 
 # --- MODIFIED Nerd Help Command ---
