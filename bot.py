@@ -1011,14 +1011,18 @@ async def syncnicknames(interaction: discord.Interaction):
         try:
             await member.edit(nick=target_nick, reason=f"Sync by {interaction.user.id}")
             counts['upd'] += 1; await asyncio.sleep(0.2)
-        except discord.Forbidden: counts['fail_forbid'] += 1; #if counts['fail_forbid'] <= 3: await log_error(guild, f"SyncNick: Forbidden for {member.mention}", embed=None)
-        except discord.HTTPException: counts['fail_other'] += 1; #if counts['fail_other'] <= 3: await log_error(guild, f"SyncNick: HTTP error for {member.mention}", embed=None)
-        except Exception as e: counts['fail_other'] += 1; #if counts['fail_other'] <= 3: await log_error(guild, f"SyncNick: Error for {member.mention}", error=e, embed=None)
+        except discord.Forbidden: counts['fail_forbid'] += 1; # Logged implicitly by overall summary now
+        except discord.HTTPException: counts['fail_other'] += 1; # Logged implicitly by overall summary now
+        except Exception as e: counts['fail_other'] += 1; # Logged implicitly by overall summary now
 
         now = asyncio.get_event_loop().time()
         if now - last_prog_time > 5.0 or counts['proc'] % 50 == 0:
-            try: await interaction.edit_original_response(content=f"<a:loading:12345> Syncing... ({counts['proc']}/{total_hc_members})"); last_prog_time = now
-            except (discord.NotFound, discord.HTTPException): print(f"SyncNick ({guild.name}): Progress update failed."); break
+            try:
+                await interaction.edit_original_response(content=f"<a:loading:12345> Syncing... ({counts['proc']}/{total_hc_members})")
+                last_prog_time = now
+            except (discord.NotFound, discord.HTTPException):
+                print(f"SyncNick ({guild.name}): Progress update failed.")
+                break # Stop trying to update progress if it fails
 
     end_time = discord.utils.utcnow(); duration = (end_time - start_time).total_seconds()
     summary_embed = discord.Embed(title="✅ Nickname Sync Complete!", color=NERDY_YELLOW, timestamp=end_time)
@@ -1026,14 +1030,32 @@ async def syncnicknames(interaction: discord.Interaction):
                      f"ℹ️ **Skipped (Match):** {counts['skip_match']}", f"❓ **Skipped (No/Empty IGN):** {counts['skip_no_ign'] + counts['skip_empty']}",
                      f"❌ **Failed (Hierarchy):** {counts['fail_hier']}", f"❌ **Failed (Perms/Other):** {counts['fail_forbid'] + counts['fail_other']}"]
     summary_embed.description = "\n".join(summary_lines)
-    try: await interaction.edit_original_response(content=None, embed=summary_embed)
+
+    # *** Start of Corrected Final Response Block ***
+    try:
+        # This is the main attempt to send the final summary
+        await interaction.edit_original_response(content=None, embed=summary_embed)
     except (discord.NotFound, discord.HTTPException):
-    print(f"SyncNick ({guild.name}): Final summary failed.")
-    try: # Moved to new line and indented
-        await interaction.followup.send(embed=summary_embed, ephemeral=True)
-    except Exception as e_inner: # Added separate handling for the inner try's exception
-        print(f"SyncNick ({guild.name}): Final followup failed: {e_inner}")
-    log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW); log_embed.set_footer(text=f"By {interaction.user}")
+        # This block executes ONLY if the edit_original_response fails
+        # It is indented one level under the 'except'
+        print(f"SyncNick ({guild.name}): Final summary edit failed.")
+        try:
+            # This is the fallback attempt to send as a followup
+            # It is indented one level under the inner 'try'
+            await interaction.followup.send(embed=summary_embed, ephemeral=True)
+        except Exception as e_inner:
+            # This handles errors ONLY from the followup.send attempt
+            # It is indented one level under the inner 'except'
+            print(f"SyncNick ({guild.name}): Final followup send failed: {e_inner}")
+    except Exception as e_outer:
+        # This handles any OTHER exceptions from the initial edit_original_response attempt
+        # It is indented at the same level as the first 'except' block
+        print(f"SyncNick ({guild.name}): Final edit response failed (Unknown Error): {e_outer}")
+    # *** End of Corrected Final Response Block ***
+
+    # Log the summary regardless of message send success
+    log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
+    log_embed.set_footer(text=f"By {interaction.user}")
     await log_info(guild, "", embed=log_embed)
 
 
@@ -1047,126 +1069,177 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
     async def fail_check(log_reason: str, user_message: str):
         send_func = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        try: await send_func(embed=create_embed(user_message, discord.Color.red()), ephemeral=True)
-        except Exception as e: print(f"Wither Check Fail Send Error: {e}")
+        try:
+            await send_func(embed=create_embed(user_message, discord.Color.red()), ephemeral=True)
+        except Exception as e:
+            print(f"Wither Check Fail Send Error: {e}")
         await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
 
+    # Initial permission and hierarchy checks
     if invoker.id not in ALLOWED_WITHER_IDS:
-        if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            try: await interaction.response.defer(ephemeral=True)
+            except discord.InteractionResponded: pass # Ignore if already deferred
         await fail_check("Invoker permission denied.", "❌ No permission."); return
-    if not interaction.response.is_done(): await interaction.response.defer(thinking=True, ephemeral=False) # Defer publicly
+
+    # Defer publicly *after* the permission check passes
+    if not interaction.response.is_done():
+        try: await interaction.response.defer(thinking=True, ephemeral=False)
+        except discord.InteractionResponded: pass # Ignore if somehow already deferred
+
+    # Other checks (self, owner, bot, hierarchy)
     if user.id == invoker.id: await fail_check("Target self.", "🤨 Cannot wither yourself."); return
     if user.id == SELF_PROTECTED_ID and invoker.id != SELF_PROTECTED_ID: await fail_check("Target protected.", "😨 Cannot wither owner."); return
     if user.id == BOT_ID: await fail_check("Target bot.", "😭 Cannot wither me."); return
     if user.bot: await fail_check("Target other bot.", "🤖 Cannot wither bots."); return
-    if user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target owner.", "👑 Cannot wither owner."); return
+    if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target owner.", "👑 Cannot wither owner."); return # Added guild.owner_id check
     if bot_member.top_role.position <= user.top_role.position: await fail_check("Bot hierarchy low.", "❌ My role isn't high enough."); return
-    if invoker.id != guild.owner_id and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", "❌ Your role isn't high enough."); return
+    if invoker.id != (guild.owner_id or 0) and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", "❌ Your role isn't high enough."); return # Added guild.owner_id check
 
     original_roles = [r for r in user.roles if r != guild.default_role]
-    if not original_roles: await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles.", discord.Color.orange()), ephemeral=False); return
+    if not original_roles:
+        await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles.", discord.Color.orange()), ephemeral=False)
+        return
 
+    # --- Start of Main Wither Logic (Outer Try Block) ---
     try:
         wither_seconds = min(max(1, int(time * 60)), int(MAX_WITHER_SECONDS or 600)); actual_minutes = wither_seconds / 60.0
         reason_wither = f"Wither by {invoker.name} for {actual_minutes:.1f}m."
-        if not bot_member.guild_permissions.manage_roles: await fail_check("Bot lost perms before remove.", "❌ Lost perms."); return
+        if not bot_member.guild_permissions.manage_roles:
+            await fail_check("Bot lost perms before remove.", "❌ Lost perms.")
+            return # Stop execution if bot perms are gone
 
+        # --- Role Removal ---
         roles_to_remove_actually = [r for r in original_roles if bot_member.top_role.position > r.position]
         skipped_roles_remove = [r for r in original_roles if r not in roles_to_remove_actually]
-        await user.edit(roles=[], reason=reason_wither) # Removes manageable roles
+
+        await user.edit(roles=[], reason=reason_wither) # Attempt to remove manageable roles
 
         roles_removed_str = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually) or 'None Manageable')[:900]
         wither_desc = f"{user.mention} withered by {invoker.mention} for **{actual_minutes:.1f}m**!\n**Removed:** {roles_removed_str}"
-        if skipped_roles_remove: skipped_str = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))[:100]; wither_desc += f"\n*(Skipped {len(skipped_roles_remove)} due to hierarchy: {skipped_str}...)*"
+        if skipped_roles_remove:
+            skipped_str = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))[:100]
+            wither_desc += f"\n*(Skipped {len(skipped_roles_remove)} due to hierarchy: {skipped_str}...)*"
+
         await interaction.followup.send(embed=create_embed(title="🌪️ Wither Cast! 🌪️", description=wither_desc, color=discord.Color.dark_purple()), ephemeral=False)
         log_msg = f"`{user.name}` withered by `{invoker.name}`. Roles removed: {', '.join(r.name for r in roles_to_remove_actually) or 'N/A'}."
-        if skipped_roles_remove: log_msg += f" Skipped: {', '.join(r.name for r in skipped_roles_remove)}."
+        if skipped_roles_remove:
+            log_msg += f" Skipped: {', '.join(r.name for r in skipped_roles_remove)}."
         await log_info(guild, log_msg)
 
+        # --- Wait Period ---
         await asyncio.sleep(wither_seconds)
 
+        # --- Role Restore (Inner Try Block) ---
         try:
+            # Refetch member and bot objects to ensure data is current
             member_after = await guild.fetch_member(user.id)
             bot_member_after = await guild.fetch_member(BOT_ID) if BOT_ID else await guild.fetch_me()
             reason_restore = f"Wither end after {actual_minutes:.1f}m."
-            if bot_member_after.top_role.position <= member_after.top_role.position: await log_error(guild, f"Wither restore fail: Bot hierarchy low for {member_after.mention}."); await interaction.channel.send(f"⚠️ Failed restore for {member_after.mention} - hierarchy low.") ; return
-            if not bot_member_after.guild_permissions.manage_roles: await log_error(guild, f"Wither restore fail: Bot lost perms for {member_after.mention}."); await interaction.channel.send(f"⚠️ Failed restore for {member_after.mention} - perms lost."); return
 
+            # Check hierarchy and perms *before* attempting restore
+            if bot_member_after.top_role.position <= member_after.top_role.position:
+                await log_error(guild, f"Wither restore fail: Bot hierarchy low for {member_after.mention}.")
+                if interaction.channel: await interaction.channel.send(f"⚠️ Failed restore for {member_after.mention} - hierarchy low.")
+                return # Stop restore attempt
+
+            if not bot_member_after.guild_permissions.manage_roles:
+                await log_error(guild, f"Wither restore fail: Bot lost perms for {member_after.mention}.")
+                if interaction.channel: await interaction.channel.send(f"⚠️ Failed restore for {member_after.mention} - perms lost.")
+                return # Stop restore attempt
+
+            # Determine roles to restore, checking existence and hierarchy again
             valid_restore = []; skipped_del = []; skipped_hier = []
             for r in original_roles:
                 fetched = guild.get_role(r.id)
-                if not fetched: skipped_del.append(r.name)
-                elif bot_member_after.top_role.position > fetched.position: valid_restore.append(fetched)
-                else: skipped_hier.append(fetched.name)
+                if not fetched:
+                    skipped_del.append(r.name)
+                elif bot_member_after.top_role.position > fetched.position:
+                    valid_restore.append(fetched)
+                else:
+                    skipped_hier.append(fetched.name)
+
             if skipped_del: await log_info(guild, f"Wither restore notice: Roles deleted for {member_after.name}: {', '.join(skipped_del)}.")
             if skipped_hier: await log_info(guild, f"Wither restore notice: Roles hierarchy issue for {member_after.name}: {', '.join(skipped_hier)}.")
-            if not valid_restore: await log_info(guild, f"Wither restore: No valid roles left for {member_after.name}."); await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, no roles restored."); return
 
+            if not valid_restore:
+                await log_info(guild, f"Wither restore: No valid roles left for {member_after.name}.")
+                if interaction.channel: await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, no roles restored.")
+                return # Stop restore attempt
+
+            # Attempt role restore
             await member_after.edit(roles=valid_restore, reason=reason_restore)
             restore_msg = f"✨ {member_after.mention}'s roles restored!" + ("\n*(Some skipped)*" if skipped_del or skipped_hier else "")
+
+            # Send confirmation message
             if interaction.channel:
-                try: await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
-                except (discord.NotFound, discord.HTTPException) as e: await log_error(guild, "Wither failed restore followup", error=e)
-            else: await log_info(guild, f"Wither restore OK for {member_after.mention}, channel gone.")
+                try:
+                    await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
+                except (discord.NotFound, discord.HTTPException) as e:
+                    # Log error if sending the confirmation fails
+                    await log_error(guild, "Wither failed restore followup send", error=e)
+            else:
+                # Log if channel is gone but restore was ok
+                await log_info(guild, f"Wither restore OK for {member_after.mention}, channel gone.")
+
             await log_info(guild, f"Restored roles for `{member_after.name}`. Roles: {', '.join(r.name for r in valid_restore)}")
-        # Corrected example for discord.NotFound
-except discord.NotFound:
-    await log_info(guild, f"Wither restore skip: `{user.name}` left.")
-    if interaction.channel:
-        try: # Moved to new line and indented under the 'if'
-            await interaction.channel.send(f"ℹ️ Wither ended, {user.display_name} left.")
-        except Exception: # Indented under the 'try'
-            pass # Keep original behavior
 
-# Corrected example for discord.Forbidden
-except discord.Forbidden:
-    await log_error(guild, f"Wither restore fail: Forbidden for {user.name}.")
-    if interaction.channel:
-        try: # Moved to new line and indented
-            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Perms error.")
-        except Exception: # Indented under the 'try'
-            pass # Keep original behavior
+        # --- Inner Except Blocks (Handling Restore Errors) ---
+        # These are indented relative to the inner 'try'
+        except discord.NotFound:
+            await log_info(guild, f"Wither restore skip: `{user.name}` left.")
+            if interaction.channel:
+                try:
+                    await interaction.channel.send(f"ℹ️ Wither ended, {user.display_name} left.")
+                except Exception:
+                    pass # Ignore failure to send notification
+        except discord.Forbidden:
+            await log_error(guild, f"Wither restore fail: Forbidden for {user.name}.")
+            if interaction.channel:
+                try:
+                    await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Perms error.")
+                except Exception:
+                    pass # Ignore failure to send notification
+        except discord.HTTPException as e:
+            await log_error(guild, f"Wither restore fail: API error for {user.name}.", error=e)
+            if interaction.channel:
+                try:
+                    await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - API error.")
+                except Exception:
+                    pass # Ignore failure to send notification
+        except Exception as e:
+            await log_error(guild, f"Wither restore fail: Unexpected for {user.name}.", error=e)
+            if interaction.channel:
+                try:
+                    await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Error.")
+                except Exception:
+                    pass # Ignore failure to send notification
 
-# Corrected example for discord.HTTPException
-except discord.HTTPException as e:
-    await log_error(guild, f"Wither restore fail: API error for {user.name}.", error=e)
-    if interaction.channel:
-        try: # Moved to new line and indented
-            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - API error.")
-        except Exception: # Indented under the 'try'
-            pass # Keep original behavior
-
-# Corrected example for generic Exception
-except Exception as e:
-    await log_error(guild, f"Wither restore fail: Unexpected for {user.name}.", error=e)
-    if interaction.channel:
-        try: # Moved to new line and indented
-            await interaction.channel.send(f"⚠️ Failed restore {user.display_name} - Error.")
-        except Exception: # Indented under the 'try'
-            pass # Keep original behavior
-    # Corrected example for discord.Forbidden
-except discord.Forbidden:
-    await log_error(guild, f"Wither remove fail: Forbidden for {user.name}.")
-    try: # Moved to new line and indented
-        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Perms error.", embed=None, view=None)
-    except Exception: # Indented under the 'try'
-        pass # Keep original behavior
-
-# Corrected example for discord.HTTPException
-except discord.HTTPException as e:
-    await log_error(guild, f"Wither remove fail: API error for {user.name}.", error=e)
-    try: # Moved to new line and indented
-        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - API error.", embed=None, view=None)
-    except Exception: # Indented under the 'try'
-        pass # Keep original behavior
-
-# Corrected example for generic Exception
-except Exception as e:
-    await log_error(guild, f"Wither remove fail: Unexpected for {user.name}.", error=e)
-    try: # Moved to new line and indented
-        await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Error.", embed=None, view=None)
-    except Exception: # Indented under the 'try'
-        pass # Keep original behavior
+    # --- Outer Except Blocks (Handling Removal Errors or other errors in the outer Try) ---
+    # These are indented relative to the outer 'try'
+    except discord.Forbidden:
+        await log_error(guild, f"Wither remove fail: Forbidden for {user.name}.")
+        try:
+            # Attempt to edit the original response to indicate failure
+            # Indented relative to this inner 'try'
+            await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Perms error.", embed=None, view=None)
+        except Exception:
+            # Indented relative to this inner 'except'
+            pass # Ignore failure to edit interaction message
+    except discord.HTTPException as e:
+        await log_error(guild, f"Wither remove fail: API error for {user.name}.", error=e)
+        try:
+            # Attempt to edit the original response to indicate failure
+            await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - API error.", embed=None, view=None)
+        except Exception:
+            pass # Ignore failure to edit interaction message
+    except Exception as e:
+        await log_error(guild, f"Wither remove fail: Unexpected for {user.name}.", error=e)
+        try:
+            # Attempt to edit the original response to indicate failure
+            await interaction.edit_original_response(content=f"❌ Failed remove roles {user.display_name} - Error.", embed=None, view=None)
+        except Exception:
+            pass # Ignore failure to edit interaction message
 
 
 # --- MODIFIED Nerd Help Command ---
