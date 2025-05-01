@@ -47,7 +47,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 REMOVE_ROLE_ID = 1360176495947022447 # "Unverified" role
 ADD_ROLE_ID_VERIFY = 1248708073019805717 # "Verified" role
 ADD_ROLE_ID_HC = 1230235110415274004 # "HC" role
-ALLOWED_CHANNEL_IDS = {1354431395140731165, 1330664430148780102, 1248710731407560835} # Channels for /hcmembers
+ALLOWED_CHANNEL_IDS = {1354431395140731165, 1330664430148780102, 1248710731407560835, 1367362849122549801} # Channels for /hcmembers
 HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165 # Channel for static list
 HC_LIST_EMBED_TITLE = "**\[HC1\] Guild Members**"
 ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692} # User IDs for /wither
@@ -171,7 +171,7 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
 
 # --- Embed Pagination View ---
 class HCPagesView(View):
-    """ Paginated view for HC members (formatted table).""" # Updated docstring
+    """ Paginated view for HC members (formatted table, mobile-friendly)."""
     def __init__(self, data: List[Tuple[Optional[discord.Member], str]], total_members: int, timeout=300.0):
         super().__init__(timeout=timeout)
         self.data = data
@@ -179,59 +179,83 @@ class HCPagesView(View):
         self.current_page = 0
         self.total_pages = math.ceil(len(self.data) / MEMBERS_PER_PAGE) if self.data else 1
         self.message: Optional[discord.Message] = None
-        self.update_buttons()
+        # Ensure buttons are updated after initialization
+        self.update_buttons() # <--- This call needs the method below to exist
 
+    # --- THIS METHOD NEEDS TO EXIST ---
+    def update_buttons(self):
+        """Disables buttons based on the current page."""
+        # Check if children exist and have at least 2 elements before accessing
+        # Assumes Previous is children[0] and Next is children[1]
+        if hasattr(self, 'children') and len(self.children) >= 2:
+            # It's safer to access by custom_id if possible, but index works if order is fixed
+            prev_button = self.children[0]
+            next_button = self.children[1]
+            if isinstance(prev_button, Button):
+                prev_button.disabled = self.current_page == 0
+            if isinstance(next_button, Button):
+                next_button.disabled = self.current_page >= self.total_pages - 1
+        else:
+            # Log or handle the case where buttons aren't found as expected
+            print(f"Warning: Could not find Previous/Next buttons in HCPagesView children to update state.")
+
+    # --- UPDATED create_page_embed ---
     def create_page_embed(self) -> discord.Embed:
-        # --- Define Column Widths ---
-        IDX_WIDTH = 4   # e.g., "999."
-        NAME_WIDTH = 30 # Discord Name (username#tag or username)
-        IGN_WIDTH = 30  # In-Game Name
-        ABC_WIDTH = 5   # New "abc" column
+        # --- Define Column Widths (Mobile Optimized) ---
+        IDX_WIDTH = 3   # "99."
+        NAME_WIDTH = 15 # Reduced for mobile
+        IGN_WIDTH = 15  # Reduced for mobile
+        ABC_WIDTH = 4   # Reduced for mobile ("abc ")
+
+        # Calculate total expected width for separator
+        TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH
 
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.data[start : start + MEMBERS_PER_PAGE]
 
         # --- Create Header ---
-        # Pad the titles to the defined widths
         header = (
             f"{'#':<{IDX_WIDTH}}"
-            f"{'Discord Name':<{NAME_WIDTH}}"
-            f"{'In-Game Name':<{IGN_WIDTH}}"
-            f"{'abc':<{ABC_WIDTH}}" # Added 'abc' header
+            f"{'Discord':<{NAME_WIDTH}}"        # Shorter title
+            f"{'In-Game':<{IGN_WIDTH}}"         # Shorter title
+            f"{'abc':<{ABC_WIDTH}}"
         )
-        separator = "-" * (IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH) # Adjust separator length
+        separator = "-" * TOTAL_WIDTH
 
         # --- Build Description within Code Block ---
-        desc_lines = [f"```md", header, separator] # Start markdown code block
+        desc_lines = [f"```", header, separator] # Use plain code block
         idx = start + 1
-        for member, ign in page_data:
-            # Prepare display strings (handle potential None member)
-            if member:
-                # Use new username format if discriminator is 0
+        for member, ign in page_data: # <--- Use the same loop structure
+            # Prepare display strings
+            if member: # Check if it's a discord.Member object
                 user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+                is_discord_member = True
             else:
-                user_display = "*User Left?*"
-            # Ensure IGN is a string, handle None/empty
+                # This is a non-Discord entry (member is None)
+                user_display = "[No Discord]" # Or "---", or ""
+                is_discord_member = False
+
             ign_display = str(ign) if ign else "Unknown"
-            abc_val = "1" # Constant value for the new column
+            abc_val = "1" # Keep your 'abc' column logic if needed
 
-            # Truncate if longer than width (subtract 1 for ellipsis if needed, or just slice)
-            user_display = user_display[:NAME_WIDTH]
-            ign_display = ign_display[:IGN_WIDTH]
-            # No need to truncate index or abc_val if widths are sufficient
+            # Truncate aggressively with ellipsis (apply to placeholder too if needed)
+            if len(user_display) > NAME_WIDTH:
+                user_display = user_display[:NAME_WIDTH-1] + "…"
+            if len(ign_display) > IGN_WIDTH:
+                ign_display = ign_display[:IGN_WIDTH-1] + "…"
 
-            # Format the line using f-string padding
+            # Format the line (ensure alignment still works)
             line = (
                 f"{str(idx)+'.':<{IDX_WIDTH}}"
                 f"{user_display:<{NAME_WIDTH}}"
                 f"{ign_display:<{IGN_WIDTH}}"
-                f"{abc_val:<{ABC_WIDTH}}" # Added 'abc' value
+                f"{abc_val:<{ABC_WIDTH}}"
             )
             desc_lines.append(line)
             idx += 1
 
         if not page_data:
-            desc_lines = ["```md\nNo members found on this page.\n```"] # Handle empty page within code block
+            desc_lines = ["```\nNo members on this page.\n```"] # Plain code block
         else:
              desc_lines.append("```") # Close the code block
 
@@ -245,62 +269,61 @@ class HCPagesView(View):
         embed.timestamp = discord.utils.utcnow()
         return embed
 
-    def update_buttons(self):
-        # Check if children exist and have at least 2 elements before accessing
-        if hasattr(self, 'children') and len(self.children) >= 2:
-            prev_button = self.children[0]
-            next_button = self.children[1]
-            if isinstance(prev_button, Button):
-                prev_button.disabled = self.current_page == 0
-            if isinstance(next_button, Button):
-                next_button.disabled = self.current_page >= self.total_pages - 1
-
+    # --- edit_message ---
     async def edit_message(self, interaction: discord.Interaction):
         embed = self.create_page_embed()
-        self.update_buttons()
+        self.update_buttons() # Update button states before editing
         try:
-            if not interaction.response.is_done():
-                 await interaction.response.edit_message(embed=embed, view=self)
-            elif self.message:
-                 await self.message.edit(embed=embed, view=self)
+            # Check if interaction is already responded to or deferred
+            if interaction.response.is_done():
+                 # If we have the message object, edit it
+                 if self.message:
+                     await self.message.edit(embed=embed, view=self)
+                 else:
+                     # If message is somehow None after response is done, log and maybe followup
+                     print(f"Warning: edit_message called but self.message is None (Interaction ID: {interaction.id})")
+                     await interaction.followup.send("Error updating view (message not found).", ephemeral=True)
             else:
-                 # Log this potential issue
-                 print(f"Warning: edit_message called but interaction was done and self.message is None (Interaction ID: {interaction.id})")
-                 await interaction.followup.send("Error updating view.", ephemeral=True)
+                 # If not responded/deferred yet, use edit_message on the response
+                 await interaction.response.edit_message(embed=embed, view=self)
+
         except discord.NotFound:
-            print(f"Paginator edit fail: Original message {self.message.id if self.message else 'Unknown'} not found.")
+            print(f"Paginator edit fail: Original message {self.message.id if self.message else 'Unknown'} not found or interaction expired.")
             # Disable buttons on the view instance if message is gone
             for item in self.children:
                 if isinstance(item, Button): item.disabled = True
             self.stop() # Stop the view as well
         except discord.HTTPException as e:
-            # Log error with guild context if possible
             guild = interaction.guild or (self.message.guild if self.message else None)
             await log_error(guild, "Paginator edit fail (HTTP)", error=e, interaction=interaction)
         except Exception as e:
             guild = interaction.guild or (self.message.guild if self.message else None)
             await log_error(guild, "Paginator edit fail (General)", error=e, interaction=interaction)
 
+    # --- previous_button ---
     @button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)
     async def previous_button(self, interaction: discord.Interaction, b: Button):
         if self.current_page > 0:
             self.current_page -= 1
             await self.edit_message(interaction)
         else:
-            # Only defer if the interaction hasn't already been responded to or deferred
+            # Acknowledge button press even if no action is taken
             try:
                 if not interaction.response.is_done():
                     await interaction.response.defer()
-            except discord.InteractionResponded: pass # Already responded, do nothing
+            except discord.InteractionResponded: pass
             except discord.NotFound: print("Previous Button: Interaction expired before defer.")
             except Exception as e: await log_error(interaction.guild, "Previous Button Defer Error", e, interaction)
 
+
+    # --- next_button ---
     @button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0)
     async def next_button(self, interaction: discord.Interaction, b: Button):
         if self.current_page < self.total_pages - 1:
             self.current_page += 1
             await self.edit_message(interaction)
         else:
+            # Acknowledge button press even if no action is taken
             try:
                 if not interaction.response.is_done():
                     await interaction.response.defer()
@@ -308,93 +331,144 @@ class HCPagesView(View):
             except discord.NotFound: print("Next Button: Interaction expired before defer.")
             except Exception as e: await log_error(interaction.guild, "Next Button Defer Error", e, interaction)
 
+    # --- on_timeout ---
     async def on_timeout(self):
         if self.message:
             try:
-                # Create a new view with disabled buttons before editing
-                view_copy = View.from_message(self.message) # Get a representation of the current view state
-                for item in view_copy.children:
-                    if isinstance(item, Button):
-                        item.disabled = True
-                await self.message.edit(view=view_copy) # Edit with the disabled copy
-                print(f"Paginator timeout: Disabled buttons on message {self.message.id}")
+                # Create a new view instance based on the message state to disable buttons
+                view_copy = View.from_message(self.message)
+                if view_copy: # Ensure view_copy was successfully created
+                    for item in view_copy.children:
+                        if isinstance(item, Button):
+                            item.disabled = True
+                    await self.message.edit(view=view_copy)
+                    print(f"Paginator timeout: Disabled buttons on message {self.message.id}")
+                else:
+                    # Fallback if from_message fails, attempt edit with None view
+                    await self.message.edit(view=None)
+                    print(f"Paginator timeout: Cleared view on message {self.message.id} (from_message failed)")
             except discord.NotFound: print(f"Paginator timeout edit fail: Message {self.message.id} not found.")
+            except discord.HTTPException as e:
+                 guild = self.message.guild
+                 # Avoid logging 404 again if it was caught above
+                 if e.status != 404:
+                     await log_error(guild, f"Paginator timeout edit HTTP fail on message {self.message.id}", error=e)
             except Exception as e:
                  guild = self.message.guild
-                 await log_error(guild, f"Paginator timeout edit fail on message {self.message.id}", error=e)
-        self.stop()
+                 await log_error(guild, f"Paginator timeout edit general fail on message {self.message.id}", error=e)
+        self.stop() # Stop the view logic regardless of message edit success
 
-
-# --- Core HC List Logic ---
+# --- REVISED fetch_hc_member_data ---
 async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Tuple[Optional[discord.Member], str]], int]:
-    """ Fetches HC members (sorted by username#discriminator) and IGNs."""
+    """
+    Fetches HC members from Discord and Supabase.
+    Returns a list combining [(discord_member, ign), ..., (None, ign_only_in_db), ...], sorted with Discord members first.
+    """
+    print(f"Fetch HC Data ({guild.name}): Starting fetch...")
     hc_role = guild.get_role(ADD_ROLE_ID_HC)
     if not hc_role:
-        await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found.")
+        await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found during fetch.")
         return [], 0
 
-    # Ensure members are cached before proceeding
-    if not guild.chunked:
-        try:
-            print(f"Attempting to chunk guild {guild.name} (ID: {guild.id}) for fetch_hc_member_data...")
+    # 1. Fetch ALL entries from Supabase
+    all_db_members_map: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'processed': False}
+    non_discord_db_members: List[Tuple[None, str]] = [] # [(None, ign)]
+    try:
+        if not supabase:
+            raise ConnectionError("Supabase client unavailable.")
+        print(f"Fetch HC Data ({guild.name}): Fetching all from Supabase hc_members table...")
+        # Fetch in chunks if table might be very large (though unlikely needed here)
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                            .select("discord_id, ingame_name")
+                            # .limit(1000) # Add limit/pagination if table is huge
+                            .execute()
+        )
+        if resp and hasattr(resp, 'data') and resp.data:
+            for entry in resp.data:
+                ign = entry.get("ingame_name") or "Unknown DB IGN"
+                d_id = entry.get("discord_id") # This can now be None
+                if d_id:
+                    # Store entries with discord_id in a map for quick lookup
+                    all_db_members_map[str(d_id)] = {"ign": ign, "processed": False}
+                else:
+                    # Store entries without discord_id directly in the non-discord list
+                    non_discord_db_members.append((None, ign))
+            print(f"Fetch HC Data ({guild.name}): Found {len(all_db_members_map)} DB entries with Discord ID, {len(non_discord_db_members)} without.")
+        else:
+             print(f"Fetch HC Data ({guild.name}): No data returned from Supabase.")
+
+    except (ConnectionError, APIError, Exception) as e:
+        await log_error(guild, "Failed to fetch all data from Supabase", error=e)
+        # Return empty or potentially partial data based on what was fetched before error?
+        # For simplicity, return empty on critical DB failure
+        return [], 0
+
+    # 2. Get Discord members with the HC role
+    discord_hc_members: List[discord.Member] = []
+    try:
+        if not guild.chunked:
+            print(f"Fetch HC Data ({guild.name}): Chunking guild...")
             await guild.chunk(cache=True)
-            print(f"Successfully chunked guild {guild.name}.")
-        except discord.ClientException as e:
-            # This can happen if members intent is disabled or bot lacks permissions
-             await log_error(guild, "Guild chunking failed (ClientException - check intents/perms)", error=e)
-             # Proceed without chunking, results might be incomplete
-             print(f"Warning: Proceeding without chunking for guild {guild.name}, member list may be incomplete.")
-        except Exception as e:
-             await log_error(guild, "Guild chunking failed unexpectedly in fetch_hc_member_data", error=e)
-             # Proceed, but log the error
-             print(f"Warning: Unexpected error during chunking for guild {guild.name}, proceeding...")
+        discord_hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
+        print(f"Fetch HC Data ({guild.name}): Found {len(discord_hc_members)} Discord members with HC role.")
+    except Exception as e:
+        await log_error(guild, "Guild chunking/member fetch failed", error=e)
+        # Continue with potentially empty list, Supabase entries might still exist
 
+    # 3. Correlate Discord members with DB data and build the final lists
+    discord_members_data: List[Tuple[discord.Member, str]] = []
 
-    members_with_role = [m for m in guild.members if hc_role in m.roles and not m.bot]
-    total = len(members_with_role)
-    # Sort members case-insensitively by name, then discriminator
-    members_sorted = sorted(members_with_role, key=lambda m: (m.name.lower(), m.discriminator))
-    ids = [str(m.id) for m in members_sorted]
-    ign_map = {}
-    if supabase and ids:
-        try:
-            chunk_size = 500 # Supabase might have limits on IN clause size
-            for i in range(0, len(ids), chunk_size):
-                chunk = ids[i:i+chunk_size]
-                print(f"Fetching IGNs for chunk {i//chunk_size + 1} (Size: {len(chunk)})")
-                resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id, ingame_name").in_("discord_id", chunk).execute())
-                if resp and hasattr(resp, 'data') and resp.data:
-                    # Ensure discord_id is treated as string for consistency
-                    ign_map.update({str(r['discord_id']): r.get("ingame_name") or "Unknown" for r in resp.data if 'discord_id' in r})
-                await asyncio.sleep(0.1) # Small delay between chunks if needed
-            print(f"Finished fetching IGNs, found {len(ign_map)} entries.")
-        except ConnectionError as e:
-             await log_error(guild, "Supabase connection unavailable during IGN fetch.", error=e)
-             ign_map = {mid: "DB Connection Err" for mid in ids} # Indicate error for all
-        except APIError as e:
-             await log_error(guild, "Supabase API Error during IGN fetch.", error=e)
-             ign_map = {mid: "DB API Err" for mid in ids}
-        except Exception as e:
-            await log_error(guild, "Unexpected error during IGN fetch.", error=e)
-            ign_map = {mid: "DB Fetch Err" for mid in ids}
+    for member in discord_hc_members:
+        member_id_str = str(member.id)
+        db_entry = all_db_members_map.get(member_id_str)
+        ign = "Unknown" # Default if not found in DB map
+        if db_entry:
+            ign = db_entry["ign"]
+            db_entry["processed"] = True # Mark as processed
+        else:
+             # This member has the HC role but isn't in our DB map (or DB failed)
+             # Log this potential inconsistency?
+             await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
+             # Decide if you want to show them with 'Unknown' IGN or skip them. Showing them seems better.
 
-    # Map sorted members to their fetched IGNs
-    result_data = [(m, ign_map.get(str(m.id), "Unknown")) for m in members_sorted]
-    return result_data, total
+        discord_members_data.append((member, ign))
+
+    # 4. Add remaining DB entries (those whose Discord members lost the role or left) to non_discord_list
+    for d_id, entry_data in all_db_members_map.items():
+        if not entry_data["processed"]:
+            # This DB entry had a discord_id, but the corresponding member doesn't have the HC role anymore (or left)
+            non_discord_db_members.append((None, entry_data["ign"]))
+            # Log this change?
+            # print(f"Fetch HC Data Note: DB entry for ID {d_id} (IGN: {entry_data['ign']}) no longer matches active HC Discord member.")
+
+    # 5. Sort the lists
+    # Sort Discord members by username#discriminator (case-insensitive)
+    discord_members_data.sort(key=lambda item: (item[0].name.lower(), item[0].discriminator))
+    # Sort non-Discord members by IGN (case-insensitive)
+    non_discord_db_members.sort(key=lambda item: item[1].lower())
+
+    # 6. Combine and return
+    final_data = discord_members_data + non_discord_db_members
+    total_members = len(final_data)
+    print(f"Fetch HC Data ({guild.name}): Finished. Total members for list: {total_members} ({len(discord_members_data)} Discord, {len(non_discord_db_members)} non-Discord).")
+    return final_data, total_members
 
 def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], total: int) -> List[discord.Embed]:
-    """ Generates static list embeds (formatted table).""" # Updated docstring
+    """ Generates static list embeds (formatted table, mobile-friendly).""" # Updated docstring
 
-    # --- Define Column Widths (Same as in HCPagesView) ---
-    IDX_WIDTH = 4
-    NAME_WIDTH = 30
-    IGN_WIDTH = 30
-    ABC_WIDTH = 5
+    # --- Define Column Widths (Mobile Optimized - MUST MATCH HCPagesView) ---
+    IDX_WIDTH = 3
+    NAME_WIDTH = 15
+    IGN_WIDTH = 15
+    ABC_WIDTH = 4
+    TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH # For separator
 
     if not data:
         embed = discord.Embed(
             title=HC_LIST_EMBED_TITLE,
-            description="```md\nNo HC members found.\n```", # Use code block for consistency
+            # Use plain code block
+            description="```\nNo HC members found.\n```", # <--- Plain code block for empty case
             color=discord.Color.orange()
         )
         embed.set_footer(text="Page 1/1 | Total: 0")
@@ -407,32 +481,40 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
     # --- Create Header and Separator (once) ---
     header = (
         f"{'#':<{IDX_WIDTH}}"
-        f"{'Discord Name':<{NAME_WIDTH}}"
-        f"{'In-Game Name':<{IGN_WIDTH}}"
-        f"{'abc':<{ABC_WIDTH}}" # Added 'abc' header
+        f"{'Discord':<{NAME_WIDTH}}"        # Shorter title
+        f"{'In-Game':<{IGN_WIDTH}}"         # Shorter title
+        f"{'abc':<{ABC_WIDTH}}"
     )
-    separator = "-" * (IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH)
+    separator = "-" * TOTAL_WIDTH
 
     for page in range(pages):
         start = page * MEMBERS_PER_PAGE
         page_data = data[start : start + MEMBERS_PER_PAGE]
 
         # --- Build Description for this page ---
-        desc_lines = [f"```md", header, separator] # Start code block, add header/separator
+         # Use plain code block ``` instead of ```md
+        desc_lines = [f"```", header, separator] # <--- Plain code block start
         idx = start + 1
-        for m, ign in page_data:
-            if m:
-                user_display = f"{m.name}#{m.discriminator}" if m.discriminator != '0' else m.name
+        for member, ign in page_data: # <--- Use the same loop structure
+            # Prepare display strings
+            if member: # Check if it's a discord.Member object
+                user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+                is_discord_member = True
             else:
-                user_display = "*User Left Guild?*" # Note: Markdown won't render inside ```
+                # This is a non-Discord entry (member is None)
+                user_display = "[No Discord]" # Or "---", or ""
+                is_discord_member = False
+        
             ign_display = str(ign) if ign else "Unknown"
-            abc_val = "1"
-
-            # Truncate
-            user_display = user_display[:NAME_WIDTH]
-            ign_display = ign_display[:IGN_WIDTH]
-
-            # Format line
+            abc_val = "1" # Keep your 'abc' column logic if needed
+        
+            # Truncate aggressively with ellipsis (apply to placeholder too if needed)
+            if len(user_display) > NAME_WIDTH:
+                user_display = user_display[:NAME_WIDTH-1] + "…"
+            if len(ign_display) > IGN_WIDTH:
+                ign_display = ign_display[:IGN_WIDTH-1] + "…"
+        
+            # Format the line (ensure alignment still works)
             line = (
                 f"{str(idx)+'.':<{IDX_WIDTH}}"
                 f"{user_display:<{NAME_WIDTH}}"
@@ -445,11 +527,10 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
         desc_lines.append("```") # Close code block
         full_desc = "\n".join(desc_lines)
 
-        # Discord embed description limit is 4096 - check *after* formatting
+        # Description limit check (same as before)
         if len(full_desc) > 4096:
-            # Basic truncation - might cut off the closing ```, needs refinement if list gets HUGE
             print(f"Warning: Embed description length ({len(full_desc)}) exceeded 4096 chars on page {page+1}. Truncating.")
-            full_desc = full_desc[:4093] + "..." # Simple truncation
+            full_desc = full_desc[:4093] + "..."
 
         # --- Create Embed for the page ---
         e = discord.Embed(
