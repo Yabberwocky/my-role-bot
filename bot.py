@@ -14,6 +14,7 @@ import traceback
 import math
 from typing import Optional, Tuple, List, Dict # Keep this one, it's used more broadly
 from dotenv import load_dotenv
+import datetime
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -34,7 +35,8 @@ from dotenv import load_dotenv
 #     service (like Uptime Robot) hitting the Flask endpoint to prevent Render's free instance from sleeping.
 #   - Environment Variables: DISCORD_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY are set directly in Render's environment settings.
 # Database: Supabase (PostgreSQL) used to store HC member IGNs linked to Discord IDs.
-# Key Features: /verify, /hcverify (stores IGN), static list updates, /hcmembers (interactive list), /syncnicknames, /wither, /bulkupdate, /nerdhelp.
+# Key Features: /verify, /hcverify (stores IGN), static list updates, /hcmembers (interactive list), /syncnicknames, /wither, /nerdhelp.
+# (Check /nerdhelp's code for latest list of features. This list might be outdated.)
 # --- END CONTEXT ---
 
 # --- Configuration ---
@@ -81,6 +83,37 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def check_supabase_available(interaction: discord.Interaction) -> bool:
+    """
+    Checks if Supabase client is initialized. If not, sends an ephemeral error
+    response/followup to the interaction and logs the error. Returns True if available, False otherwise.
+    """
+    if supabase:
+        return True
+    else:
+        # Supabase client is None (failed initialization or not configured)
+        error_message_user = "❌ Database connection unavailable. This feature cannot be used right now."
+        log_description = f"Command '/{interaction.command.name if interaction.command else 'Unknown'}' failed: Supabase client is not available."
+
+        # Log the error internally
+        await log_error(interaction.guild, log_description, interaction=interaction)
+
+        # Try to inform the user ephemerally
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(error_message_user, ephemeral=True)
+            else:
+                # If not deferred/responded yet, respond directly
+                await interaction.response.send_message(error_message_user, ephemeral=True)
+        except (discord.NotFound, discord.InteractionResponded, discord.HTTPException) as e:
+             # Log if sending the user message fails, but the function still returns False
+             print(f"Error sending Supabase check failure message to user (InteractionID: {interaction.id}): {type(e).__name__} - {e}")
+        except Exception as e_send:
+            print(f"Unexpected Error sending Supabase check failure message (InteractionID: {interaction.id}): {e_send}")
+
+        return False # Indicate Supabase is not available
+
 async def run_supabase_sync(func):
     """Runs sync Supabase func in executor."""
     if not supabase: raise ConnectionError("Supabase client unavailable.")
@@ -138,7 +171,7 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
 
 # --- Embed Pagination View ---
 class HCPagesView(View):
-    """ Paginated view for HC members (numbered, username#tag ➔ IGN)."""
+    """ Paginated view for HC members (formatted table).""" # Updated docstring
     def __init__(self, data: List[Tuple[Optional[discord.Member], str]], total_members: int, timeout=300.0):
         super().__init__(timeout=timeout)
         self.data = data
@@ -149,17 +182,65 @@ class HCPagesView(View):
         self.update_buttons()
 
     def create_page_embed(self) -> discord.Embed:
+        # --- Define Column Widths ---
+        IDX_WIDTH = 4   # e.g., "999."
+        NAME_WIDTH = 30 # Discord Name (username#tag or username)
+        IGN_WIDTH = 30  # In-Game Name
+        ABC_WIDTH = 5   # New "abc" column
+
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.data[start : start + MEMBERS_PER_PAGE]
-        embed = discord.Embed(title=HC_LIST_EMBED_TITLE, color=NERDY_YELLOW)
-        desc = []
+
+        # --- Create Header ---
+        # Pad the titles to the defined widths
+        header = (
+            f"{'#':<{IDX_WIDTH}}"
+            f"{'Discord Name':<{NAME_WIDTH}}"
+            f"{'In-Game Name':<{IGN_WIDTH}}"
+            f"{'abc':<{ABC_WIDTH}}" # Added 'abc' header
+        )
+        separator = "-" * (IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH) # Adjust separator length
+
+        # --- Build Description within Code Block ---
+        desc_lines = [f"```md", header, separator] # Start markdown code block
         idx = start + 1
         for member, ign in page_data:
-            user = discord.utils.escape_markdown(f"{member.name}#{member.discriminator}" if member and member.discriminator != '0' else member.name) if member else "*User Left?*"
-            ign_str = discord.utils.escape_markdown(ign or "Unknown")
-            desc.append(f"{idx}. {user} ➔ {ign_str}")
+            # Prepare display strings (handle potential None member)
+            if member:
+                # Use new username format if discriminator is 0
+                user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+            else:
+                user_display = "*User Left?*"
+            # Ensure IGN is a string, handle None/empty
+            ign_display = str(ign) if ign else "Unknown"
+            abc_val = "1" # Constant value for the new column
+
+            # Truncate if longer than width (subtract 1 for ellipsis if needed, or just slice)
+            user_display = user_display[:NAME_WIDTH]
+            ign_display = ign_display[:IGN_WIDTH]
+            # No need to truncate index or abc_val if widths are sufficient
+
+            # Format the line using f-string padding
+            line = (
+                f"{str(idx)+'.':<{IDX_WIDTH}}"
+                f"{user_display:<{NAME_WIDTH}}"
+                f"{ign_display:<{IGN_WIDTH}}"
+                f"{abc_val:<{ABC_WIDTH}}" # Added 'abc' value
+            )
+            desc_lines.append(line)
             idx += 1
-        embed.description = "\n".join(desc) if desc else "No members."
+
+        if not page_data:
+            desc_lines = ["```md\nNo members found on this page.\n```"] # Handle empty page within code block
+        else:
+             desc_lines.append("```") # Close the code block
+
+        # --- Create Embed ---
+        embed = discord.Embed(
+            title=HC_LIST_EMBED_TITLE,
+            description="\n".join(desc_lines),
+            color=NERDY_YELLOW
+        )
         embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members}")
         embed.timestamp = discord.utils.utcnow()
         return embed
@@ -302,185 +383,310 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Tuple[Optiona
     return result_data, total
 
 def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], total: int) -> List[discord.Embed]:
-    """ Generates static list embeds (numbered, username#tag ➔ IGN)."""
+    """ Generates static list embeds (formatted table).""" # Updated docstring
+
+    # --- Define Column Widths (Same as in HCPagesView) ---
+    IDX_WIDTH = 4
+    NAME_WIDTH = 30
+    IGN_WIDTH = 30
+    ABC_WIDTH = 5
+
     if not data:
-        e=discord.Embed(title=HC_LIST_EMBED_TITLE, description="No HC members found.", color=discord.Color.orange())
-        e.set_footer(text="Page 1/1 | Total: 0")
-        e.timestamp=discord.utils.utcnow()
-        return [e]
+        embed = discord.Embed(
+            title=HC_LIST_EMBED_TITLE,
+            description="```md\nNo HC members found.\n```", # Use code block for consistency
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="Page 1/1 | Total: 0")
+        embed.timestamp = discord.utils.utcnow()
+        return [embed]
 
     embeds = []
     pages = math.ceil(len(data) / MEMBERS_PER_PAGE)
+
+    # --- Create Header and Separator (once) ---
+    header = (
+        f"{'#':<{IDX_WIDTH}}"
+        f"{'Discord Name':<{NAME_WIDTH}}"
+        f"{'In-Game Name':<{IGN_WIDTH}}"
+        f"{'abc':<{ABC_WIDTH}}" # Added 'abc' header
+    )
+    separator = "-" * (IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH)
+
     for page in range(pages):
         start = page * MEMBERS_PER_PAGE
         page_data = data[start : start + MEMBERS_PER_PAGE]
-        e = discord.Embed(title=HC_LIST_EMBED_TITLE, color=NERDY_YELLOW)
-        desc = []
+
+        # --- Build Description for this page ---
+        desc_lines = [f"```md", header, separator] # Start code block, add header/separator
         idx = start + 1
         for m, ign in page_data:
-            # Handle potential null members gracefully
-            user=discord.utils.escape_markdown(f"{m.name}#{m.discriminator}" if m and m.discriminator != '0' else getattr(m, 'name', 'Unknown User')) if m else "*User Left Guild?*"
-            ign_s=discord.utils.escape_markdown(ign or "Unknown")
-            desc.append(f"{idx}. {user} ➔ {ign_s}")
+            if m:
+                user_display = f"{m.name}#{m.discriminator}" if m.discriminator != '0' else m.name
+            else:
+                user_display = "*User Left Guild?*" # Note: Markdown won't render inside ```
+            ign_display = str(ign) if ign else "Unknown"
+            abc_val = "1"
+
+            # Truncate
+            user_display = user_display[:NAME_WIDTH]
+            ign_display = ign_display[:IGN_WIDTH]
+
+            # Format line
+            line = (
+                f"{str(idx)+'.':<{IDX_WIDTH}}"
+                f"{user_display:<{NAME_WIDTH}}"
+                f"{ign_display:<{IGN_WIDTH}}"
+                f"{abc_val:<{ABC_WIDTH}}"
+            )
+            desc_lines.append(line)
             idx += 1
-        full_desc = "\n".join(desc)
-        # Discord embed description limit is 4096
+
+        desc_lines.append("```") # Close code block
+        full_desc = "\n".join(desc_lines)
+
+        # Discord embed description limit is 4096 - check *after* formatting
         if len(full_desc) > 4096:
-            full_desc = full_desc[:4093] + "..."
-        e.description=full_desc
+            # Basic truncation - might cut off the closing ```, needs refinement if list gets HUGE
+            print(f"Warning: Embed description length ({len(full_desc)}) exceeded 4096 chars on page {page+1}. Truncating.")
+            full_desc = full_desc[:4093] + "..." # Simple truncation
+
+        # --- Create Embed for the page ---
+        e = discord.Embed(
+            title=HC_LIST_EMBED_TITLE,
+            description=full_desc,
+            color=NERDY_YELLOW
+        )
         e.set_footer(text=f"Page {page+1}/{pages} | Total: {total}")
-        e.timestamp=discord.utils.utcnow()
+        e.timestamp = discord.utils.utcnow()
         embeds.append(e)
+
     return embeds
 
+async def _fetch_existing_list_messages(channel: discord.TextChannel, bot_user_id: int) -> List[discord.Message]:
+    """Fetches existing messages from the bot in the channel with the correct title."""
+    existing = []
+    try:
+        # Fetch a reasonable number of recent messages based on expected max pages + buffer
+        fetch_limit = max(MEMBERS_PER_PAGE // 5, 15) + 10 # Heuristic limit
+        print(f"Static List: Fetching up to {fetch_limit} messages from {channel.mention} for history.")
+        async for msg in channel.history(limit=fetch_limit):
+             # Ensure message is from the bot and has the specific embed title
+             if msg.author and msg.author.id == bot_user_id and msg.embeds:
+                  # Check embed structure carefully before accessing attributes
+                  if len(msg.embeds) > 0 and msg.embeds[0].title == HC_LIST_EMBED_TITLE:
+                       existing.append(msg)
+    except discord.Forbidden:
+        # Let the caller handle logging the Forbidden error
+        print(f"Static List: Forbidden error fetching history in {channel.mention}.")
+        raise
+    except Exception as e:
+        # Log other history fetch errors
+        print(f"Static List: Error fetching history in {channel.mention}: {e}") # Simple console log
+        raise # Re-raise to be handled by caller
+    # Sort existing messages chronologically (oldest first) for consistent editing
+    existing.sort(key=lambda m: m.created_at)
+    print(f"Static List: Found {len(existing)} relevant existing messages.")
+    return existing
+
+async def _update_or_send_list_pages(channel: discord.TextChannel, existing_messages: List[discord.Message], new_embeds: List[discord.Embed], guild_for_log: discord.Guild):
+    """Edits existing messages or sends new ones for the list pages, returning error counts."""
+    num_new = len(new_embeds)
+    num_exist = len(existing_messages)
+    tasks = []
+    edit_errors = 0
+    send_errors = 0
+    # Use a slightly longer delay for edits/sends to be safer with rate limits
+    delay = 1.5
+
+    for i in range(num_new):
+        await asyncio.sleep(delay) # Apply delay before each Discord API action
+        if i < num_exist:
+            action_desc = f"Editing message {existing_messages[i].id} (Page {i+1})"
+            print(f"  {action_desc}")
+            tasks.append(existing_messages[i].edit(embed=new_embeds[i]))
+        else:
+            action_desc = f"Sending new message (Page {i+1})"
+            print(f"  {action_desc}")
+            tasks.append(channel.send(embed=new_embeds[i]))
+
+    # Execute edits/sends concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Process results and log errors
+    for i, res in enumerate(results):
+        if isinstance(res, Exception):
+            action = "Edit" if i < num_exist else "Send"
+            msg_id = existing_messages[i].id if i < num_exist and i < len(existing_messages) else "New"
+            error_log_msg = f"Static list {action} failed for Page {i+1} (MsgID: {msg_id})"
+
+            if action == "Edit": edit_errors += 1
+            else: send_errors += 1
+
+            # Log the error using the bot's standard logging
+            await log_error(guild_for_log, error_log_msg, error=res)
+
+    return edit_errors, send_errors # Return error counts
+
+async def _delete_surplus_list_pages(channel: discord.TextChannel, messages_to_delete: List[discord.Message], guild_for_log: discord.Guild):
+    """Deletes surplus list messages, attempting bulk delete first, returning error count."""
+    delete_errors = 0
+    if not messages_to_delete:
+        return delete_errors
+
+    num_to_delete = len(messages_to_delete)
+    print(f"Static List: Attempting to delete {num_to_delete} surplus message(s).")
+    # Use a slightly longer delay for delete operations as well
+    delay = 1.5
+    # Ensure bot member object is valid before checking permissions
+    bot_member = channel.guild.me
+    if not bot_member:
+        print("Static List Error: Cannot get bot member to check permissions for deletion.")
+        # Indicate potential failure without ability to check/perform delete
+        return num_to_delete # Assume all deletions will fail if bot object isn't found
+
+    perms = channel.permissions_for(bot_member)
+    can_bulk_delete = perms.manage_messages and num_to_delete > 1
+
+    if can_bulk_delete:
+        try:
+            # Check if messages are too old for bulk delete (older than 14 days)
+            fourteen_days_ago = discord.utils.utcnow() - datetime.timedelta(days=14)
+            valid_for_bulk = [m for m in messages_to_delete if m.created_at > fourteen_days_ago]
+            invalid_for_bulk = [m for m in messages_to_delete if m not in valid_for_bulk]
+
+            if valid_for_bulk:
+                 await asyncio.sleep(delay) # Delay before bulk action
+                 await channel.delete_messages(valid_for_bulk)
+                 print(f"  Bulk deleted {len(valid_for_bulk)} recent surplus messages.")
+                 messages_to_delete = invalid_for_bulk # Update list to only contain old messages
+            else:
+                 print("  Skipping bulk delete: All surplus messages are too old.")
+                 can_bulk_delete = False # Proceed to individual deletion for old messages
+
+        except discord.HTTPException as e:
+            # Handle potential 400 Bad Request if mix of old/new messages caused issues
+            print(f"  Bulk delete failed (HTTP {e.status}): {e.text}. Falling back to individual deletion.")
+            # Fallback required, keep original messages_to_delete list
+            messages_to_delete = messages_to_delete # Ensure we process all if bulk fails
+            can_bulk_delete = False # Force fallback
+        except discord.Forbidden:
+            print(f"  Bulk delete failed: Forbidden. Falling back.")
+            await log_error(guild_for_log, "Static list bulk delete failed (Forbidden)")
+            can_bulk_delete = False
+        except Exception as e:
+            print(f"  Bulk delete failed unexpectedly: {e}. Falling back.")
+            await log_error(guild_for_log, "Static list bulk delete failed (Unknown)", error=e)
+            can_bulk_delete = False
+
+    # Fallback to individual deletion if bulk failed, wasn't possible, or messages were old
+    if messages_to_delete: # Check if there are still messages needing deletion
+         print(f"  Attempting individual deletion for {len(messages_to_delete)} remaining/old messages.")
+         for msg_del in messages_to_delete:
+            await asyncio.sleep(delay) # Delay each individual delete
+            try:
+                await msg_del.delete()
+                print(f"  Individually deleted surplus message {msg_del.id}")
+            except discord.NotFound:
+                print(f"  Skipped deleting message {msg_del.id} (already gone).")
+            except discord.Forbidden:
+                delete_errors += 1
+                await log_error(guild_for_log, f"Failed to delete surplus message {msg_del.id} (Forbidden)")
+                # Stop trying if forbidden, likely a persistent issue
+                print("  Stopping further individual deletes due to Forbidden error.")
+                break # Exit the loop for individual deletes
+            except Exception as e:
+                delete_errors += 1
+                await log_error(guild_for_log, f"Failed to delete surplus message {msg_del.id}", error=e)
+
+    return delete_errors
+
+# --- REFACTORED update_hc_member_list ---
 async def update_hc_member_list(guild: discord.Guild):
-    """ Updates static HC list (username#tag ➔ IGN format)."""
-    chan = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
+    """ Updates static HC list (username#tag ➔ IGN format using helper functions)."""
+    list_channel_id = HC_MEMBER_LIST_CHANNEL_ID
+    chan = guild.get_channel(list_channel_id)
     if not isinstance(chan, discord.TextChannel):
-        await log_error(guild, f"Static list channel {HC_MEMBER_LIST_CHANNEL_ID} invalid or not found.")
+        await log_error(guild, f"Static list channel {list_channel_id} invalid or not found.")
         return
 
+    # Ensure bot object is ready
     if not bot or not bot.user:
-        await log_error(guild, "Cannot update static list: Bot user object not available.")
+        await log_error(guild, "Cannot update static list: Bot user object not available.", guild=guild)
         return
-    bot_mem = guild.get_member(bot.user.id)
+    bot_user_id = bot.user.id
+
+    # Simplified Permission Check (as per user context - assumes bot has high roles)
+    # Basic check for sending capability is still wise.
+    bot_mem = guild.me
     if not bot_mem:
-        # Attempt to fetch if not in cache (might happen in rare cases)
         try:
-            bot_mem = await guild.fetch_member(bot.user.id)
-            print(f"Fetched bot member object for static list update in {guild.name}")
-        except discord.NotFound:
-             await log_error(guild, f"Cannot update static list: Bot not found in guild {guild.name} (even after fetch).")
+            bot_mem = await guild.fetch_member(bot_user_id) # Attempt fetch if not cached
+        except (discord.NotFound, discord.HTTPException):
+             await log_error(guild, f"Cannot update static list: Failed to get bot member object in guild {guild.name}.")
              return
-        except discord.HTTPException as e:
-            await log_error(guild, f"Cannot update static list: HTTP error fetching bot member in {guild.name}.", error=e)
-            return
-        except Exception as e:
-            await log_error(guild, f"Cannot update static list: Unexpected error fetching bot member in {guild.name}.", error=e)
-            return
-    if not bot_mem: # Double check after potential fetch
+    if not bot_mem: # Check again after fetch attempt
          await log_error(guild, f"Cannot update static list: Bot member object unavailable in {guild.name}.")
          return
 
     perms = chan.permissions_for(bot_mem)
-    # Check specific permissions needed
-    required_perms = {
-        "Send Messages": perms.send_messages,
-        "Embed Links": perms.embed_links,
-        "Read Message History": perms.read_message_history,
-        "Manage Messages": perms.manage_messages # Needed for efficient cleanup
-    }
-    missing = [p for p, has in required_perms.items() if not has]
-    if missing:
-        await log_error(guild, f"Bot missing permissions in {chan.mention} for static list update: {', '.join(missing)}")
-        return
+    if not perms.send_messages or not perms.embed_links:
+         await log_error(guild, f"Bot missing Send Messages or Embed Links in {chan.mention} for static list.")
+         # Consider returning here as these are fundamental
+         return
+    # Log warnings if other perms needed for efficiency are missing
+    if not perms.read_message_history:
+         await log_info(guild, f"Warning: Bot missing Read Message History in {chan.mention}. List update might be inefficient.")
+    if not perms.manage_messages:
+         await log_info(guild, f"Warning: Bot missing Manage Messages in {chan.mention}. Surplus message cleanup may fail or be slow.")
+
 
     try:
         await log_info(guild, f"Starting static list update in {chan.mention}...")
+
+        # 1. Fetch member data and generate new embeds
         data, total = await fetch_hc_member_data(guild)
         new_embeds = generate_hc_list_embeds(data, total)
         num_new = len(new_embeds)
 
-        existing: List[discord.Message] = []
+        # 2. Fetch existing messages using helper
         try:
-            # Fetch slightly more to be safe, limit history scan
-            async for msg in chan.history(limit=max(num_new, 15) + 5):
-                 # Ensure message is from the bot and has the specific embed title
-                 if msg.author and msg.author.id == bot.user.id and msg.embeds:
-                      if msg.embeds[0].title and msg.embeds[0].title == HC_LIST_EMBED_TITLE:
-                           existing.append(msg)
+             existing_messages = await _fetch_existing_list_messages(chan, bot_user_id)
+             num_exist = len(existing_messages)
+             print(f"Static List Update ({guild.name}): Found {num_exist} existing bot messages, Need {num_new} pages.")
         except discord.Forbidden:
-             await log_error(guild, f"History permission denied in {chan.mention} during static list update.")
-             return # Cannot proceed without history
+             # Specific logging for forbidden on history read
+             await log_error(guild, f"Static list update failed: Bot lacks Read Message History permission in {chan.mention}.")
+             return # Cannot proceed reliably without history
         except Exception as e:
-            await log_error(guild, "Error fetching history for static list update", error=e)
-            return # Stop if history fetch fails
+             # General error during history fetch
+             await log_error(guild, "Error fetching message history for static list update", error=e)
+             return # Stop if history fetch fails critically
 
-        # Sort existing messages chronologically (oldest first)
-        existing.sort(key=lambda m: m.created_at)
-        num_exist = len(existing)
-        print(f"Static List Update ({guild.name}): Found {num_exist} existing bot messages, Need to display {num_new} pages.")
+        # 3. Update/Send pages using helper
+        # Pass guild object for logging context within the helper
+        edit_errors, send_errors = await _update_or_send_list_pages(chan, existing_messages, new_embeds, guild)
 
-        tasks = []
-        messages_to_delete = []
-        # Add small delay to avoid rate limits, especially on edits/sends
-        delay = 1.2
+        # 4. Delete surplus pages using helper
+        messages_to_delete = existing_messages[num_new:] if num_exist > num_new else []
+        # Pass guild object for logging context within the helper
+        delete_errors = await _delete_surplus_list_pages(chan, messages_to_delete, guild)
 
-        # Edit existing messages or send new ones
-        for i in range(num_new):
-            await asyncio.sleep(delay) # Apply delay before each action
-            if i < num_exist:
-                print(f"  Editing message {existing[i].id} (Page {i+1})")
-                tasks.append(existing[i].edit(embed=new_embeds[i]))
-            else:
-                print(f"  Sending new message (Page {i+1})")
-                tasks.append(chan.send(embed=new_embeds[i]))
-
-        # Identify surplus messages to delete
-        if num_exist > num_new:
-            messages_to_delete = existing[num_new:]
-            print(f"  Identified {len(messages_to_delete)} surplus messages to delete.")
-
-        # Execute edits/sends concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        edit_send_errors = 0
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                edit_send_errors += 1
-                action = "Edit" if i < num_exist else "Send"
-                # Try to get message ID even for failed edits
-                msg_id = existing[i].id if i < num_exist else "New"
-                await log_error(guild, f"Static list {action} failed for Page {i+1} (MsgID: {msg_id})", error=res)
-
-        # Delete surplus messages
-        delete_errors = 0
-        if messages_to_delete:
-            # Use bulk delete if possible and needed
-            can_bulk_delete = perms.manage_messages and len(messages_to_delete) > 1
-            if can_bulk_delete:
-                try:
-                    await asyncio.sleep(delay) # Delay before bulk delete too
-                    await chan.delete_messages(messages_to_delete)
-                    print(f"  Bulk deleted {len(messages_to_delete)} surplus messages.")
-                except discord.HTTPException as e:
-                    # Handle specific HTTP errors like 400 Bad Request (e.g., message too old)
-                    print(f"  Bulk delete failed (HTTP {e.status}): {e.text}. Falling back to individual deletion.")
-                    can_bulk_delete = False # Force fallback
-                except Exception as e:
-                    await log_error(guild, f"Bulk delete failed unexpectedly", error=e)
-                    can_bulk_delete = False # Assume fallback is safer
-
-            # Fallback to individual deletion if bulk failed or wasn't possible
-            if not can_bulk_delete:
-                 print(f"  Attempting individual deletion for {len(messages_to_delete)} messages.")
-                 for msg_del in messages_to_delete:
-                    await asyncio.sleep(delay) # Delay each individual delete
-                    try:
-                        await msg_del.delete()
-                        print(f"  Individually deleted surplus message {msg_del.id}")
-                    except discord.NotFound:
-                        print(f"  Skipped deleting message {msg_del.id} (already gone).")
-                    except discord.Forbidden:
-                        delete_errors += 1
-                        await log_error(guild, f"Failed to delete surplus message {msg_del.id} (Forbidden)")
-                        # Stop trying if forbidden, likely a persistent issue
-                        print("  Stopping further individual deletes due to Forbidden error.")
-                        break
-                    except Exception as e:
-                        delete_errors += 1
-                        await log_error(guild, f"Failed to delete surplus message {msg_del.id}", error=e)
-
-        # Log final status
+        # 5. Log final status
+        total_errors = edit_errors + send_errors + delete_errors
         status_msg = f"Static list update complete ({num_new} pages displayed)."
-        if edit_send_errors > 0: status_msg += f" Encountered {edit_send_errors} edit/send errors."
-        if delete_errors > 0: status_msg += f" Encountered {delete_errors} delete errors."
-        # Use error log level if any errors occurred
-        log_level = log_error if edit_send_errors > 0 or delete_errors > 0 else log_info
+        if total_errors > 0:
+            status_msg += f" Encountered {total_errors} error(s) during update (Edit:{edit_errors}, Send:{send_errors}, Delete:{delete_errors}). Check error logs."
+        else:
+             status_msg += " No errors encountered."
+
+        # Log as error if any step had issues, otherwise info
+        log_level = log_error if total_errors > 0 else log_info
         await log_level(guild, status_msg)
 
     except Exception as e:
-        await log_error(guild, "Unhandled error during static list update process", error=e)
-
+        # Catch-all for unexpected errors in the main orchestration logic
+        await log_error(guild, "Unhandled error during the main static list update process", error=e)
 
 # --- Discord Events ---
 @bot.event
@@ -696,190 +902,6 @@ def create_embed(description: str, color: discord.Color = NERDY_YELLOW, title: O
      # Consider adding a timestamp by default
      # embed.timestamp = discord.utils.utcnow()
      return embed
-
-class BulkUpdateModal(Modal, title="Bulk Update IGNs"):
-    data = TextInput(
-        label="Paste list (username#tag ➔ IGN)",
-        style=discord.TextStyle.paragraph,
-        placeholder="ExampleUser#1234 ➔ CoolIGN\nAnotherUser ➔ AnotherIGN\n(One entry per line, format flexible)",
-        required=True,
-        min_length=5,
-        max_length=4000 # Discord's max length for text input
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Defer ephemerally while processing
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        guild = interaction.guild
-        if not guild or not supabase:
-            # Log internal error as well
-            await log_error(guild, "Bulk update failed: Guild or Supabase unavailable.", interaction=interaction)
-            await interaction.followup.send("❌ Internal error (Guild or Database unavailable). Please contact an admin.", ephemeral=True)
-            return
-
-        lines = self.data.value.strip().splitlines()
-        if not lines:
-            await interaction.followup.send("⚠️ Input was empty. No changes made.", ephemeral=True)
-            return
-
-        # --- Member Caching Strategy ---
-        # Fetch members efficiently. Chunking might be needed for very large servers,
-        # but guild.members should be sufficient if intents are enabled and cache is populated.
-        member_map_id = {} # Discord ID (str) -> Member object
-        member_map_name_disc = {} # Lowercase "name#discriminator" -> Member object
-        member_map_name_only = {} # Lowercase name/display_name -> Member object
-        try:
-            # Ensure guild members are cached if needed
-            if not guild.chunked:
-                print(f"Chunking guild {guild.name} for bulk update modal...")
-                await guild.chunk(cache=True)
-            # Build lookup dictionaries
-            for m in guild.members:
-                if m.bot: continue # Skip bots
-                member_map_id[str(m.id)] = m
-                # Handle users with new username system (discriminator '0')
-                if m.discriminator != '0':
-                    member_map_name_disc[f"{m.name}#{m.discriminator}".lower()] = m
-                # Map both username and display name (nickname) for flexibility
-                member_map_name_only[m.name.lower()] = m
-                if m.nick: # Only map nickname if it exists
-                    member_map_name_only[m.display_name.lower()] = m # display_name is nickname if set
-
-        except Exception as e:
-            await log_error(guild, "Bulk update member fetch/chunking fail", error=e, interaction=interaction)
-            await interaction.followup.send("❌ Error fetching server members. Cannot process update.", ephemeral=True)
-            return
-        # --- End Member Caching ---
-
-        success_count, fail_count, not_found_count = 0, 0, 0
-        log_details = [] # For detailed feedback in the result embed
-        payload = [] # List of dicts to upsert to Supabase
-
-        for idx, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line: continue # Skip empty lines
-
-            # Find the separator. Allow flexibility (e.g., ->, =>, :)? For now, just ➔
-            separator = "➔"
-            if separator not in line:
-                fail_count += 1
-                log_details.append(f"❌ L{idx}: Invalid format (Missing '{separator}') - Line: `{line[:60]}`")
-                continue
-
-            parts = line.split(separator, 1)
-            identifier_raw, ign_raw = map(str.strip, parts)
-            ign = ign_raw
-
-            # Clean identifier: remove leading list numbers/dots/spaces
-            identifier_clean = identifier_raw.lstrip('0123456789. ')
-            identifier_lower = identifier_clean.lower() # For case-insensitive matching
-
-            if not identifier_clean or not ign:
-                fail_count += 1
-                log_details.append(f"❌ L{idx}: Missing user identifier or IGN - User: `{identifier_raw[:30]}`, IGN: `{ign_raw[:30]}`")
-                continue
-
-            # --- Member Matching Logic ---
-            member: Optional[discord.Member] = None
-            # 1. Try matching by ID first (most reliable)
-            if identifier_clean.isdigit():
-                member = member_map_id.get(identifier_clean)
-            # 2. Try matching by "username#discriminator" (case-insensitive)
-            if not member and '#' in identifier_clean:
-                member = member_map_name_disc.get(identifier_lower)
-            # 3. Try matching by name or display name (case-insensitive)
-            if not member:
-                 member = member_map_name_only.get(identifier_lower)
-            # --- End Member Matching ---
-
-            if not member:
-                fail_count += 1
-                not_found_count += 1
-                log_details.append(f"❓ L{idx}: User not found - Identifier: `{discord.utils.escape_markdown(identifier_clean)}`")
-                continue
-
-            # Validate/Truncate IGN length (Supabase column limit?) Assume 100 for now.
-            ign_limit = 100
-            if len(ign) > ign_limit:
-                 ign_original = ign
-                 ign = ign[:ign_limit]
-                 log_details.append(f"⚠️ L{idx}: IGN for {member.mention} truncated from `{ign_original}` to `{ign}`.")
-
-            # Add to Supabase payload
-            payload.append({
-                "discord_id": str(member.id),
-                 # Store consistent name format
-                "discord_name": f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name,
-                "ingame_name": ign
-            })
-
-        # --- Database Upsert ---
-        db_error = None
-        if payload:
-            try:
-                print(f"Bulk update: Upserting {len(payload)} records to Supabase.")
-                # Use upsert with on_conflict to update existing entries or insert new ones
-                await run_supabase_sync(
-                    lambda: supabase.table("hc_members")
-                                    .upsert(payload, on_conflict="discord_id") # Assumes discord_id is unique constraint
-                                    .execute()
-                )
-                success_count = len(payload)
-                print("Bulk update: Supabase upsert successful.")
-            except Exception as e:
-                db_error = e
-                fail_count += len(payload) # Assume all in payload failed if DB error occurs
-                success_count = 0
-                await log_error(guild, "Bulk update Supabase upsert failed", error=e, interaction=interaction)
-                log_details.append(f"🔥 **Database Error:** Failed to save {len(payload)} entries. Error: `{type(e).__name__}`")
-        # --- End Database Upsert ---
-
-        # --- Final Response ---
-        result_color = discord.Color.green() if fail_count == 0 and not db_error else (discord.Color.orange() if success_count > 0 else discord.Color.red())
-        embed = discord.Embed(title="Bulk IGN Update Results", color=result_color)
-
-        format_issue_count = fail_count - not_found_count - (len(payload) if db_error else 0)
-        summary = (f"Processed Lines: {len(lines)}\n"
-                   f"✅ Successful Updates: {success_count}\n"
-                   f"❌ Failed Entries: {fail_count}\n"
-                   f"  - User Not Found: {not_found_count}\n"
-                   f"  - Format/Data Issues: {format_issue_count}\n"
-                   f"{'  - Database Save Failed: ' + str(len(payload)) if db_error else ''}")
-        embed.description = summary
-
-        if log_details:
-            # Paginate details if too long for one field? For now, just truncate.
-            log_output = "\n".join(log_details)
-            details_limit = 1024 # Discord embed field value limit
-            if len(log_output) > details_limit:
-                log_output = log_output[:details_limit - 4] + "\n..."
-            embed.add_field(name="Details", value=log_output, inline=False)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        # --- End Final Response ---
-
-        # Log summary to info channel
-        summary_for_log = summary.replace('\n', ' | ').replace('  - ', '') # Condense for logs
-        await log_info(guild, f"Bulk update by `{interaction.user}` completed. Results: {summary_for_log}")
-
-        # Trigger static list update if successful updates occurred
-        if success_count > 0:
-            print("Bulk update successful, triggering static list refresh.")
-            # Run as a separate task to avoid blocking
-            asyncio.create_task(update_hc_member_list(guild))
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        # Overload default on_error to provide better logging/feedback
-        await log_error(interaction.guild, "Error in BulkUpdateModal", error=error, interaction=interaction)
-        try:
-            # Try to respond ephemerally if the interaction is still valid
-            if not interaction.response.is_done():
-                await interaction.response.send_message("❌ An unexpected error occurred submitting the form.", ephemeral=True)
-            else:
-                await interaction.followup.send("❌ An unexpected error occurred submitting the form.", ephemeral=True)
-        except Exception as e_resp:
-             print(f"Failed to send error response for BulkUpdateModal error: {e_resp}")
-
 
 # --- Helper Function ---
 def get_cmd_mention(name: str) -> str:
@@ -1127,6 +1149,15 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
     guild = interaction.guild
+    if not await check_supabase_available(interaction):
+        # If check fails, helper sends ephemeral msg & logs.
+        try:
+             # Check if we actually deferred before trying to edit
+             if interaction.response.is_done():
+                  await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException):
+             pass # Ignore errors editing the deferred message
+        return # Stop the command here
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
@@ -1460,6 +1491,15 @@ async def unhcverify(interaction: discord.Interaction, user: discord.Member):
 @tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN).")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
+    if not await check_supabase_available(interaction):
+        # If check fails, helper sends ephemeral msg & logs.
+        try:
+             # Check if we actually deferred before trying to edit
+             if interaction.response.is_done():
+                  await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException):
+             pass # Ignore errors editing the deferred message
+        return # Stop the command here
     if not guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
@@ -1518,6 +1558,15 @@ async def hcmembers(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(manage_roles=True) # Keep permission check
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
+    if not await check_supabase_available(interaction):
+        # If check fails, helper sends ephemeral msg & logs.
+        try:
+             # Check if we actually deferred before trying to edit
+             if interaction.response.is_done():
+                  await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException):
+             pass # Ignore errors editing the deferred message
+        return # Stop the command here
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
@@ -1548,29 +1597,7 @@ async def refresh(interaction: discord.Interaction):
         await interaction.followup.send("❌ An unexpected error occurred while starting the refresh process.", ephemeral=True)
 
 
-# --- Bulk Update Command ---
-@tree.command(name="bulkupdate", description="Open form to bulk update IGNs (username#tag ➔ IGN).")
-@app_commands.checks.has_permissions(manage_roles=True) # Requires role management perms
-async def bulkupdate(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-
-    try:
-        # Send the modal to the user
-        await interaction.response.send_modal(BulkUpdateModal())
-        # Log that the modal was opened (on_submit handles the results)
-        await log_info(interaction.guild, f"`{interaction.user}` opened the bulk IGN update modal.")
-    except Exception as e:
-        await log_error(interaction.guild, "Failed to open BulkUpdateModal", error=e, interaction=interaction)
-        # Try to send an error message if the modal fails to send
-        if not interaction.response.is_done():
-            try: await interaction.response.send_message("❌ Error opening the bulk update form. Please try again.", ephemeral=True)
-            except Exception: pass # Ignore further errors
-
-
-# --- Sync Nicknames Command ---
+# --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
 @app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
@@ -1597,33 +1624,16 @@ async def syncnicknames(interaction: discord.Interaction):
     # --- Start Sync Process ---
     start_time = discord.utils.utcnow()
     await log_info(guild, f"Nickname sync initiated by `{interaction.user}`.")
-    # Placeholder message, replace ID with actual emoji ID if available
-    loading_emoji = "<a:loading:12345>" # Replace 12345 with your actual emoji ID or use text
-    await interaction.edit_original_response(content=f"{loading_emoji} Fetching data...")
+    loading_emoji = "🔄" # Simple fallback emoji
+    await interaction.edit_original_response(content=f"{loading_emoji} Fetching members...")
 
-    # 1. Fetch all IGNs from Supabase
-    ign_data = {} # discord_id (str) -> ingame_name (str)
-    try:
-        resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id, ingame_name").execute())
-        if resp and hasattr(resp, 'data') and resp.data:
-             # Ensure keys are strings and filter out entries without required fields
-            ign_data = {str(item['discord_id']): item['ingame_name']
-                        for item in resp.data
-                        if item.get('discord_id') and item.get('ingame_name')}
-        print(f"SyncNick ({guild.name}): Fetched {len(ign_data)} IGNs from database.")
-    except Exception as e:
-        await log_error(guild, "SyncNick: Database fetch failed", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Database fetch failed. Cannot proceed.")
-        return
-
-    # 2. Get all members with the HC role
+    # 1. Get all members with the HC role first
     hc_members: List[discord.Member] = []
     try:
         # Ensure members are cached
         if not guild.chunked:
             print(f"Chunking guild {guild.name} for sync nicknames...")
             await guild.chunk(cache=True)
-        # Filter members with the role, excluding bots
         hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
         total_hc_members = len(hc_members)
         print(f"SyncNick ({guild.name}): Found {total_hc_members} members with the '{hc_role.name}' role.")
@@ -1636,40 +1646,75 @@ async def syncnicknames(interaction: discord.Interaction):
         await interaction.edit_original_response(content=f"ℹ️ No members found with the `{hc_role.name}` role. Nothing to sync.")
         return
 
+    # Get IDs of members with the HC role
+    hc_member_ids = [str(m.id) for m in hc_members]
+
+    # 2. Fetch IGNs *only* for these specific members from Supabase
+    await interaction.edit_original_response(content=f"{loading_emoji} Fetching IGN data for {total_hc_members} members...")
+    ign_data = {} # discord_id (str) -> ingame_name (str)
+    try:
+        # Chunk the query if there are many members (e.g., > 500)
+        chunk_size = 500
+        for i in range(0, len(hc_member_ids), chunk_size):
+            id_chunk = hc_member_ids[i:i+chunk_size]
+            print(f"SyncNick ({guild.name}): Fetching IGNs for chunk {i//chunk_size + 1}/{math.ceil(len(hc_member_ids)/chunk_size)}")
+            resp = await run_supabase_sync(
+                lambda: supabase.table("hc_members")
+                                .select("discord_id, ingame_name")
+                                .in_("discord_id", id_chunk)
+                                .execute()
+            )
+            if resp and hasattr(resp, 'data') and resp.data:
+                ign_data.update({str(item['discord_id']): item['ingame_name']
+                                 for item in resp.data
+                                 if item.get('discord_id') and item.get('ingame_name')})
+            await asyncio.sleep(0.1) # Small delay between chunks
+
+        print(f"SyncNick ({guild.name}): Fetched {len(ign_data)} relevant IGNs from database.")
+    except ConnectionError as e:
+        await log_error(guild, "SyncNick: Database connection failed during IGN fetch.", error=e, interaction=interaction)
+        await interaction.edit_original_response(content="❌ Database connection failed. Cannot proceed.")
+        return
+    except APIError as e:
+        await log_error(guild, "SyncNick: Database API error during IGN fetch.", error=e, interaction=interaction)
+        await interaction.edit_original_response(content="❌ Database API error. Cannot proceed.")
+        return
+    except Exception as e:
+        await log_error(guild, "SyncNick: Database fetch failed (unexpected)", error=e, interaction=interaction)
+        await interaction.edit_original_response(content="❌ Database fetch failed. Cannot proceed.")
+        return
+
     # 3. Iterate and Update Nicknames
     await interaction.edit_original_response(content=f"{loading_emoji} Syncing {total_hc_members} members...")
-    # Counters for summary
     counts = {'proc': 0, 'upd': 0, 'skip_match': 0, 'skip_no_ign': 0, 'skip_empty': 0, 'skip_hier': 0, 'fail_forbid': 0, 'fail_http': 0, 'fail_other': 0}
-    bot_pos = guild.me.top_role.position
+    bot_member = guild.me # Get bot member once
+    bot_pos = bot_member.top_role.position
     last_prog_update_time = asyncio.get_event_loop().time()
     update_interval = 5.0 # Update progress every 5 seconds
-    members_per_batch = 50 # Or update every N members
 
     for idx, member in enumerate(hc_members):
         counts['proc'] += 1
         member_id_str = str(member.id)
 
         # Hierarchy check: Bot must be higher than the member to change nick
+        # Still important even if bot has admin, as owner/higher roles can exist
         if bot_pos <= member.top_role.position:
             counts['skip_hier'] += 1
-            continue # Skip this member
+            continue
 
-        # Get stored IGN
+        # Get stored IGN from the data we fetched
         stored_ign = ign_data.get(member_id_str)
         if not stored_ign:
             counts['skip_no_ign'] += 1
-            continue # Skip if no IGN stored
+            continue # Skip if no IGN stored for this specific member
 
-        # Prepare target nickname
         target_nick = stored_ign.strip()
         if not target_nick:
             counts['skip_empty'] += 1
             continue # Skip if stored IGN is empty/whitespace
 
-        # Truncate to Discord limit
-        target_nick = target_nick[:32]
+        target_nick = target_nick[:32] # Truncate
 
-        # Check if update is needed
         if member.nick == target_nick:
             counts['skip_match'] += 1
             continue # Skip if nickname already matches
@@ -1678,48 +1723,43 @@ async def syncnicknames(interaction: discord.Interaction):
         try:
             await member.edit(nick=target_nick, reason=f"Nickname Sync initiated by {interaction.user.id}")
             counts['upd'] += 1
-            # Optional small delay to avoid hitting rate limits aggressively
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2) # Keep delay to avoid rate limits
         except discord.Forbidden:
             counts['fail_forbid'] += 1
-            # Log this specific failure maybe? Or rely on summary.
         except discord.HTTPException as e_http:
             counts['fail_http'] += 1
-            # Log potentially interesting HTTP errors
-            print(f"SyncNick ({guild.name}): HTTP error {e_http.status} updating nick for {member.id}")
+            if e_http.status == 429: print(f"SyncNick ({guild.name}): Rate limit hit!") # Log rate limits
         except Exception as e_other:
             counts['fail_other'] += 1
-            await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention}", error=e_other, interaction=interaction) # Log unexpected errors
-
+            await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention}", error=e_other, interaction=interaction)
 
         # Update progress periodically
         now = asyncio.get_event_loop().time()
-        if (now - last_prog_update_time > update_interval) or (counts['proc'] % members_per_batch == 0) or (counts['proc'] == total_hc_members):
-            try:
-                # Check if interaction still exists before editing
+        if (now - last_prog_update_time > update_interval) or (counts['proc'] == total_hc_members):
+             if interaction.is_expired(): # Check if interaction expired before editing
+                  print(f"SyncNick ({guild.name}): Interaction expired, cannot update progress.")
+                  last_prog_update_time = now + 999 # Prevent further attempts
+                  continue
+             try:
                 await interaction.edit_original_response(content=f"{loading_emoji} Syncing... ({counts['proc']}/{total_hc_members})")
                 last_prog_update_time = now
-            except (discord.NotFound, discord.HTTPException):
-                # If interaction edit fails, stop trying to update it but continue sync
-                print(f"SyncNick ({guild.name}): Progress update failed (Interaction likely expired). Continuing sync...")
+             except (discord.NotFound, discord.HTTPException):
+                print(f"SyncNick ({guild.name}): Progress update failed. Continuing sync...")
                 last_prog_update_time = now + 999 # Prevent further attempts
 
-
-    # 4. Send Final Summary
+    # 4. Send Final Summary (Same as before)
     end_time = discord.utils.utcnow()
     duration = (end_time - start_time).total_seconds()
     summary_embed = discord.Embed(title="✅ Nickname Sync Complete!", color=NERDY_YELLOW, timestamp=end_time)
-
-    # Calculate total skips and fails
     total_skipped = counts['skip_match'] + counts['skip_no_ign'] + counts['skip_empty'] + counts['skip_hier']
     total_failed = counts['fail_forbid'] + counts['fail_http'] + counts['fail_other']
-
     summary_lines = [
         f"⏱️ **Duration:** {duration:.2f} seconds",
         f"👥 **Total HC Members Found:** {total_hc_members}",
+        f"📊 **Relevant IGNs Fetched:** {len(ign_data)}", # Added relevant fetch count
         f"🔄 **Members Processed:** {counts['proc']}",
         f"✅ **Nicknames Updated:** {counts['upd']}",
-        f"ℹ️ **Skipped (No Change Needed/Hierarchy):** {total_skipped}",
+        f"ℹ️ **Skipped (No Change/Hierarchy/No IGN):** {total_skipped}",
         f"   - Already Matched: {counts['skip_match']}",
         f"   - No/Empty IGN Stored: {counts['skip_no_ign'] + counts['skip_empty']}",
         f"   - Bot Hierarchy Too Low: {counts['skip_hier']}",
@@ -1730,24 +1770,23 @@ async def syncnicknames(interaction: discord.Interaction):
     ]
     summary_embed.description = "\n".join(summary_lines)
 
-    # Try to edit the original deferred response first
+    # Try edit first, then followup
     try:
-        await interaction.edit_original_response(content=None, embed=summary_embed)
+        if not interaction.is_expired():
+            await interaction.edit_original_response(content=None, embed=summary_embed)
+        else:
+            print(f"SyncNick ({guild.name}): Interaction expired before final summary edit. Attempting followup.")
+            await interaction.followup.send(embed=summary_embed, ephemeral=True)
     except (discord.NotFound, discord.HTTPException) as e_edit:
         print(f"SyncNick ({guild.name}): Final summary edit failed ({e_edit}). Attempting followup.")
-        # If edit fails (e.g., interaction expired), try sending as a new followup
-        try:
-            await interaction.followup.send(embed=summary_embed, ephemeral=True)
-        except Exception as e_followup:
-            print(f"SyncNick ({guild.name}): Final followup send also failed: {e_followup}")
-            # Log the summary internally if user notification failed
-            await log_error(guild, "SyncNick: Could not send final summary to user.", embed=summary_embed, interaction=interaction)
+        try: await interaction.followup.send(embed=summary_embed, ephemeral=True)
+        except Exception as e_followup: print(f"SyncNick ({guild.name}): Final followup send also failed: {e_followup}")
+        await log_error(guild, "SyncNick: Could not send final summary to user.", embed=summary_embed, interaction=interaction) # Log summary if user notification failed
     except Exception as e_outer:
         print(f"SyncNick ({guild.name}): Unknown error sending final summary: {e_outer}")
         await log_error(guild, "SyncNick: Unknown error sending final summary.", error=e_outer, embed=summary_embed, interaction=interaction)
 
-
-    # Log the detailed summary internally regardless of user message success
+    # Log detailed summary internally
     log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
     log_embed.set_footer(text=f"Initiated by {interaction.user}")
     await log_info(guild, "", embed=log_embed)
@@ -2034,7 +2073,6 @@ async def nerdhelp(interaction: discord.Interaction):
 
     # Section: Utilities
     embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False) # Section Title
-    embed.add_field(name=f"{get_cmd_mention('bulkupdate')}  · Update multiple IGNs via form.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
