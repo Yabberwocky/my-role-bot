@@ -13,6 +13,7 @@ from postgrest import APIError
 import traceback
 import math
 from typing import Optional, Tuple, List, Dict # Keep this one, it's used more broadly
+from dotenv import load_dotenv
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -37,6 +38,7 @@ from typing import Optional, Tuple, List, Dict # Keep this one, it's used more b
 # --- END CONTEXT ---
 
 # --- Configuration ---
+load_dotenv()  # harmless in production; only loads if a .env file exists
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
