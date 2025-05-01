@@ -512,7 +512,7 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
             if len(user_display) > NAME_WIDTH:
                 user_display = user_display[:NAME_WIDTH-1] + "…"
             if len(ign_display) > IGN_WIDTH:
-                ign_display = ign_display[:IGN_WIDTH-1] + "…" 
+                ign_display = ign_display[:IGN_WIDTH-1] + "…"
 
             # Format the line (ensure alignment still works)
             line = (
