@@ -485,66 +485,84 @@ async def update_hc_member_list(guild: discord.Guild):
 # --- Discord Events ---
 @bot.event
 async def on_ready():
-    print("--- on_ready event started ---") # DIAGNOSTIC PRINT
+    print("--- on_ready event started ---")
     global BOT_ID, command_ids
     if bot.user:
         BOT_ID = bot.user.id
-        print(f"Logged in as {bot.user} (ID: {BOT_ID})") # This should now appear
+        print(f"Logged in as {bot.user} (ID: {BOT_ID})")
         print(f"Discord.py v{discord.__version__}")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
-        # Consider attempting to exit or stop if bot.user is None
         return
 
     print("Syncing application commands...")
     synced_commands = []
     try:
         # Sync globally. Consider syncing per-guild if commands are guild-specific
-        # synced_commands = await tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)) # Example for guild sync
         synced_commands = await tree.sync() # Global sync
         print(f"Synced {len(synced_commands)} application commands globally.")
+
         command_ids.clear() # Clear old IDs before populating
+
+        # --- CORRECTED LOOP ---
+        # Iterate through the AppCommand objects returned by tree.sync()
+        # These objects directly have .name and .id attributes.
         for cmd in synced_commands:
-            # Ensure it's a base command and not a group/subcommand placeholder
-            if isinstance(cmd, app_commands.Command):
+            # Check if it's a command object with name and id (should generally be true)
+            if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
                 command_ids[cmd.name] = cmd.id
                 print(f"  Stored ID for /{cmd.name}: {cmd.id}")
-            elif isinstance(cmd, app_commands.Group):
-                 print(f"  Found command group: {cmd.name} (Subcommands might be synced)")
-                 # You might need to handle groups differently if you need their IDs
-                 # Or iterate through cmd.commands if necessary for subcommand IDs
             else:
-                 print(f"  Found unknown type during sync: {type(cmd)}")
+                # Log if we encounter something unexpected in the synced list
+                print(f"  Skipped storing ID for an item during sync (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
+        # --- END CORRECTED LOOP ---
 
-        # Check if the dictionary is populated
+        # Check if the dictionary is populated after the loop
         if command_ids:
             print(f"Stored command IDs: {command_ids}")
         else:
+             # This warning should now only appear if sync returned nothing or encountered issues
              print("Warning: command_ids dictionary is empty after sync. Help command may not show clickable links.")
 
     except discord.HTTPException as e:
         print(f"Command Sync failed (HTTPException): {e}")
-        # Log this error to your error channel if possible
         first_guild = bot.guilds[0] if bot.guilds else None
         if first_guild:
-            await log_error(first_guild, "Application Command Sync failed on startup (HTTPException).", error=e)
+            # Avoid await in except block if it causes issues, log directly
+            print(f"Error logged for Guild {first_guild.id}: Command Sync failed (HTTPException).")
+            # Consider a non-async logging mechanism here if needed
+            # await log_error(first_guild, "Application Command Sync failed on startup (HTTPException).", error=e)
     except Exception as e:
         print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
         first_guild = bot.guilds[0] if bot.guilds else None
         if first_guild:
-            await log_error(first_guild, "Application Command Sync failed on startup (Exception).", error=e)
+            print(f"Error logged for Guild {first_guild.id}: Command Sync failed (Exception).")
+            # await log_error(first_guild, "Application Command Sync failed on startup (Exception).", error=e)
 
     # Ensure the bot has guilds before proceeding with guild-specific setup
     if not bot.guilds:
         print("Bot is not currently in any guilds. Skipping guild setup.")
+        print("--- on_ready event finished (no guilds) ---")
         return
 
     print(f"Performing initial setup for {len(bot.guilds)} guild(s)...")
     # Process guilds one by one to avoid potential rate limits on setup tasks
-    guilds_to_process = list(bot.guilds) # Create a copy to avoid issues if list changes
+    guilds_to_process = list(bot.guilds) # Create a copy
     for guild in guilds_to_process:
         print(f"  Processing guild: {guild.name} (ID: {guild.id})")
         try:
+            # Ensure member cache is populated for this guild if necessary
+            if not guild.chunked and guild.member_count is not None and guild.member_count > 1000: # Optional: Only chunk larger guilds
+                 print(f"    Attempting to chunk guild {guild.name} (Members: {guild.member_count})...")
+                 try:
+                     await guild.chunk(cache=True)
+                     print(f"    Successfully chunked guild {guild.name}.")
+                 except Exception as chunk_e:
+                     print(f"    Warning: Guild chunking failed for {guild.name}: {chunk_e}")
+                     # Log this error using your logger if needed
+                     # await log_error(guild, "Guild chunking failed during on_ready setup", error=chunk_e)
+
+
             # Log bot readiness per guild
             await log_info(guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
             # Update the static list on startup for each relevant guild
@@ -1973,73 +1991,69 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         except Exception: pass
 
 
-# --- MODIFIED Nerd Help Command ---
+# --- MODIFIED Nerd Help Command (Added Spacing) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
-    # Ensure bot object and user are available before proceeding
+    # Ensure bot object and user are available
     if not bot or not bot.user:
-        print("Error: Bot object not available in nerdhelp command.") # Log issue
+        print("Error: Bot object not available in nerdhelp command.")
         await interaction.response.send_message("Bot is not fully ready, cannot generate help. Please try again shortly.", ephemeral=True)
         return
 
     # Check if command_ids dictionary is populated (important for clickable links)
     if not command_ids:
-        print("Warning: command_ids dictionary is empty during nerdhelp execution! Syncing may have failed.")
-        # Optionally inform the user, or just let the fallback work
-        # await interaction.response.send_message("Command information might be loading. If commands aren't clickable, try again later.", ephemeral=True)
+        print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
+        # Optionally inform user if needed, but fallback will still show command name
 
-    embed = discord.Embed(title="🤓 Pingslave Bot Commands", description="Click on a command name to use it!", color=NERDY_YELLOW)
+    embed = discord.Embed(
+        title="🤓 Pingslave Bot Commands",
+        color=NERDY_YELLOW
+    )
 
-    # Get channel mentions safely
-    list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
-    list_channel_mention = list_channel.mention if list_channel else f"Channel ID `{HC_MEMBER_LIST_CHANNEL_ID}`"
-    # Filter allowed channels to only those existing in the current guild
-    allowed_ch_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
-    allowed_chs_str = ", ".join(allowed_ch_mentions) or "`None Configured or Found`"
+    # --- ADDED EMPTY FIELD FOR SPACING ---
+    embed.add_field(name="\u200B", value="\u200B", inline=False)
+    # --- END ADDED FIELD ---
 
-    # --- Build Embed Fields using get_cmd_mention ---
-    embed.add_field(name="\u200B\n🔑 **Verification & HC Management**", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('verify')} `<user>`", value="> Grants `Verified`, removes `Unverified`.\n> *Requires:* `Manage Roles`", inline=True)
-    embed.add_field(name=f"{get_cmd_mention('unverify')} `<user>`", value="> Removes `Verified`, adds `Unverified`.\n> *Requires:* `Manage Roles`", inline=True)
-    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
-    embed.add_field(name=f"{get_cmd_mention('hcverify')} `<user> <IGN>`", value="> Adds `HC`/`Verified`, stores IGN, sets nick, updates list.\n> *Requires:* `Manage Roles`", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('unhcverify')} `<user>`", value="> Removes `HC`, resets nick, updates list.\n> *Requires:* `Manage Roles`", inline=False)
+    # --- Build Embed Fields (Command + Description in Name, Value is empty) ---
 
-    embed.add_field(name="\u200B\n📊 **[HC1] Member List**", value="*Lists show `Username#Tag ➔ IGN`*", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('hcmembers')}", value=f"> Interactive HC list.\n> *Requires:* `Everyone` (in {allowed_chs_str})", inline=True)
-    embed.add_field(name=f"{get_cmd_mention('refresh')}", value=f"> Updates static list in {list_channel_mention}.\n> *Requires:* `Manage Roles`", inline=True)
+    # Section: Verification & HC Management
+    embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False) # Section Title remains separate
+    embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify a standard user.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('unverify')}  · Revert a user to unverified.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify a user into HC.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('unhcverify')}  · Remove a user from HC.", value="\u200B", inline=False)
 
-    embed.add_field(name="\u200B\n\n⚙️ **Utilities**", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('bulkupdate')}", value="> Bulk update IGNs via form.\n> *Requires:* `Manage Roles`", inline=True)
-    embed.add_field(name=f"{get_cmd_mention('syncnicknames')}", value="> Syncs HC nicks to stored IGNs.\n> *Requires:* `Manage Nicknames`", inline=True)
-    embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer field
-    embed.add_field(name=f"{get_cmd_mention('wither')} `<user> [time]`", value=f"> Temporarily removes roles (0.1-{MAX_WITHER_SECONDS / 60:.0f} min).\n> *Requires:* `Special Permission` (Specific User IDs)", inline=True)
-    embed.add_field(name=f"{get_cmd_mention('nerdhelp')}", value="> Shows this help message.\n> *Requires:* `Everyone`", inline=True)
+    # Section: [HC1] Member List
+    embed.add_field(name="\u200B\n📊 [HC1] Member List", value="\u200B", inline=False) # Section Title
+    embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh the static HC member list.", value="\u200B", inline=False)
+
+    # Section: Utilities
+    embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False) # Section Title
+    embed.add_field(name=f"{get_cmd_mention('bulkupdate')}  · Update multiple IGNs via form.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
 
     # --- Footer and Thumbnail ---
     embed.set_footer(text="Bot by TheNerd | sweet_honey")
-    # Set thumbnail if bot has an avatar
     if bot.user and bot.user.display_avatar:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
 
     # --- Send Response ---
     try:
-        # Send publicly as it's a help command
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+        await interaction.response.send_message(embed=embed, ephemeral=False) # Keep it public
     except Exception as e:
-         # Log error if sending fails
         print(f"Error sending nerdhelp response: {e}")
         await log_error(guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
-        # Try a followup if initial send failed (though unlikely for send_message)
         try:
             if interaction.response.is_done():
-                 await interaction.followup.send("Failed to generate help embed.", ephemeral=True)
+                await interaction.followup.send("Failed to generate help embed.", ephemeral=True)
         except Exception: pass
-
 
 # --- Bot Startup ---
 if __name__ == "__main__":
