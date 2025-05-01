@@ -504,16 +504,16 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
                 # This is a non-Discord entry (member is None)
                 user_display = "[No Discord]" # Or "---", or ""
                 is_discord_member = False
-        
+
             ign_display = str(ign) if ign else "Unknown"
             abc_val = "1" # Keep your 'abc' column logic if needed
-        
+
             # Truncate aggressively with ellipsis (apply to placeholder too if needed)
             if len(user_display) > NAME_WIDTH:
                 user_display = user_display[:NAME_WIDTH-1] + "…"
             if len(ign_display) > IGN_WIDTH:
                 ign_display = ign_display[:IGN_WIDTH-1] + "…"
-        
+
             # Format the line (ensure alignment still works)
             line = (
                 f"{str(idx)+'.':<{IDX_WIDTH}}"
