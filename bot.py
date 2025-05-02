@@ -40,6 +40,14 @@ from dateutil.relativedelta import relativedelta # Add this import at the top
 # Database: Supabase (PostgreSQL) used to store HC member IGNs linked to Discord IDs.
 # Key Features: /verify, /hcverify (stores IGN), static list updates, /hcmembers (interactive list), /syncnicknames, /wither, /nerdhelp.
 # (Check /nerdhelp's code for latest list of features. This list might be outdated.)
+# --- LLM INSTRUCTION ---
+# (Please do not remove this comment block)
+# NOTE TO FUTURE LLMS: This `bot.py` file is quite large.
+# When providing modifications, please **DO NOT** rewrite the entire file.
+# Instead, provide **ONLY** the specific functions, classes, commands,
+# or relevant code blocks that need to be changed or added.
+# This makes merging changes much easier. Thank you!
+# --- END LLM INSTRUCTION ---
 # --- END CONTEXT ---
 
 # --- Configuration ---
@@ -70,6 +78,9 @@ VIEW_MODE_ACTIVITY_MONTHLY = "activity_monthly_view" # Using 30 days for simplic
 SORT_MODE_IGN = "sort_ign"
 SORT_MODE_ACTIVITY = "sort_activity"
 ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
+COMMAND_PREFIX = "." # Define the prefix
+AUTODELETE_CHANNEL_ID = 1354431395140731165
+AUTODELETE_DELAY_SECONDS = 5.0
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -79,9 +90,13 @@ if SUPABASE_URL and SUPABASE_KEY:
 else: print("CRITICAL: Supabase credentials missing."); supabase = None
 
 # --- Discord Setup ---
-intents = discord.Intents.default(); intents.members = True
+intents = discord.Intents.default()
+intents.members = True       # You already have this for member events/fetching
+intents.message_content = True # <<<--- ADD THIS LINE
 # Define bot instance here before using it in logging setup
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Use the defined COMMAND_PREFIX here if you want bot.process_commands for other text commands later
+# If you ONLY have slash commands + the .p handler, command_prefix doesn't strictly matter for .p
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents) # Use COMMAND_PREFIX here
 tree = bot.tree
 command_ids: Dict[str, int] = {} # Dictionary to store command IDs after sync
 
@@ -2484,12 +2499,19 @@ async def hcmembers(interaction: discord.Interaction):
     if not guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
-    # Keep channel check
-    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+
+    # --- MODIFIED CHANNEL CHECK ---
+    # Check if channel is allowed, UNLESS the user is the protected ID
+    if interaction.user.id != SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
         msg = f"❌ This command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
+        # Log attempt if not the protected user trying in wrong channel
+        if interaction.user.id != SELF_PROTECTED_ID:
+            await log_info(guild, f"User `{interaction.user}` attempted /hcmembers in disallowed channel {interaction.channel.mention if interaction.channel else interaction.channel_id}.")
+        # Send response regardless of who tried (unless they are protected user)
         await interaction.response.send_message(msg, ephemeral=False)
         return
+    # --- END MODIFIED CHECK ---
 
     await interaction.response.defer(thinking=True, ephemeral=False) # Keep public defer
 
@@ -2509,7 +2531,13 @@ async def hcmembers(interaction: discord.Interaction):
         message = await interaction.followup.send(embed=initial_embed, view=view)
         view.message = message # Link message to view
 
-        await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}.")
+        # Log success, including if the protected user bypassed channel check
+        log_detail = ""
+        if interaction.user.id == SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+            log_detail = " (Protected user bypass)"
+
+        await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}{log_detail}.")
+
 
     # Keep existing error handling for DB connection/API errors
     except ConnectionError as e:
@@ -3036,6 +3064,150 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         try: await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to wither {user.display_name}.", embed=None, view=None)
         except Exception: pass
 
+@bot.event
+async def on_message(message: discord.Message):
+    # --- Initial Checks (Ignore DMs, ensure bot user is ready) ---
+    if not message.guild or not bot.user:
+        return
+
+    # --- Auto-Delete Logic ---
+    # Check if the message is from the bot itself AND in the target channel
+    if message.author.id == bot.user.id and message.channel.id == AUTODELETE_CHANNEL_ID:
+        # Check if this message is a response to a slash command interaction
+        # This works for interaction.response.send_message and interaction.followup.send
+        if message.interaction is not None:
+            try:
+                # Schedule the deletion using the defined delay
+                await message.delete(delay=AUTODELETE_DELAY_SECONDS)
+                # Optional: Print log for debugging scheduled deletions
+                # print(f"Scheduled auto-delete for bot message {message.id} in channel {message.channel.id}")
+            except discord.Forbidden:
+                # Log an error ONCE if the bot lacks permissions in that channel
+                # You might want a flag to prevent spamming this log
+                print(f"ERROR: Cannot auto-delete in channel {message.channel.id}. Bot lacks 'Manage Messages' permission.")
+                # Consider logging this via your log_error function too, perhaps less frequently.
+            except discord.NotFound:
+                pass # Message was likely deleted manually before delay expired
+            except discord.HTTPException as e:
+                await log_error(message.guild, f"Failed to schedule auto-delete for message {message.id}: HTTP Error.", error=e)
+            except Exception as e:
+                await log_error(message.guild, f"Unexpected error during auto-delete scheduling for message {message.id}.", error=e)
+            finally:
+                # IMPORTANT: Return after handling bot's own message to prevent processing as a command
+                return
+
+    # --- Prefix Command Logic (e.g., .p) ---
+    # Now, handle messages *from users* that start with the command prefix
+    if message.author.bot: # Double check we are not processing bot messages here
+        return
+    if not message.content.startswith(COMMAND_PREFIX):
+        # If you used `await bot.process_commands(message)` before, call it here for other potential prefix commands.
+        # If ONLY .p exists, you don't need process_commands.
+        # await bot.process_commands(message) # Uncomment if using discord.ext.commands framework features
+        return
+    if not isinstance(message.channel, discord.TextChannel): # Ensure it's a text channel for .p
+         return
+
+    # --- Parse Prefix Command ---
+    content_without_prefix = message.content[len(COMMAND_PREFIX):].strip()
+    parts = content_without_prefix.split()
+    if not parts: return
+    command_name = parts[0].lower()
+    args = parts[1:]
+
+    # --- Handle the '.p' command ---
+    if command_name == "p":
+        guild = message.guild
+        channel = message.channel # Already confirmed TextChannel
+        author = message.author # Member object
+
+        # --- PASTE YOUR ENTIRE .p COMMAND LOGIC HERE ---
+        # (Starting from the argument check down to the error handling)
+        # Example structure:
+        # 1. Argument Check (Amount)
+        if not args:
+            try: await channel.send("❌ Please specify the number of messages to delete (e.g., `.p 10`).", delete_after=5.0)
+            except (discord.Forbidden, discord.HTTPException): pass
+            return
+        # ... (rest of your .p logic: amount parsing, permission checks, purge execution, logging, confirmation delete) ...
+        try:
+            amount = int(args[0])
+            if not 1 <= amount <= 100:
+                raise ValueError("Amount out of range.")
+        except ValueError:
+            try: await channel.send("❌ Invalid amount. Please provide a number between 1 and 100.", delete_after=5.0)
+            except (discord.Forbidden, discord.HTTPException): pass
+            return
+
+        bot_perms = channel.permissions_for(guild.me)
+        user_perms = channel.permissions_for(author)
+
+        if not bot_perms.manage_messages:
+            try: await channel.send(f"{author.mention}, I lack the `Manage Messages` permission here.")
+            except (discord.Forbidden, discord.HTTPException): pass
+            await log_error(guild, f".p command failed in {channel.mention}: Bot missing Manage Messages permission (invoked by {author}).")
+            return
+
+        if not user_perms.manage_messages:
+            try: await channel.send(f"{author.mention}, you need the `Manage Messages` permission to use this.", delete_after=7.0)
+            except (discord.Forbidden, discord.HTTPException): pass
+            try: await message.delete()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
+            return
+
+        confirmation_message: Optional[discord.Message] = None
+        try:
+            try:
+                await message.delete()
+            except discord.NotFound: pass # Already gone
+            except discord.Forbidden: await log_error(guild, f".p: Failed to delete trigger message {message.id} (Forbidden) in {channel.mention}.")
+            except discord.HTTPException as e_trig_del: await log_error(guild, f".p: Failed to delete trigger message {message.id} (HTTP Error)", error=e_trig_del)
+
+            deleted_messages = await channel.purge(limit=amount)
+            delete_count = len(deleted_messages)
+
+            if delete_count == 0:
+                try: confirmation_message = await channel.send("ℹ️ No messages were found to delete.", delete_after=2.0);
+                except (discord.Forbidden, discord.HTTPException): pass
+                return
+
+            author_counts: Dict[str, int] = {}
+            for msg in deleted_messages:
+                author_name = str(msg.author)
+                author_counts[author_name] = author_counts.get(author_name, 0) + 1
+            authors_log = ", ".join(f"{name}({count})" for name, count in author_counts.items())
+            if len(authors_log) > 100: authors_log = authors_log[:97]+"..."
+
+            confirm_content = f"🗑️ Deleted {delete_count} message(s). ({authors_log})"
+            confirmation_message = await channel.send(confirm_content)
+
+            await log_info(guild, f"`{author}` used .p to delete {delete_count} messages in {channel.mention}. Authors: {authors_log}")
+
+            delete_delay_seconds_p = 1.5 # Use a different variable name if needed
+            await asyncio.sleep(delete_delay_seconds_p)
+
+            try:
+                if confirmation_message: await confirmation_message.delete()
+            except discord.NotFound: pass
+            except discord.Forbidden: await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): Bot Missing Permissions in channel {channel.mention}")
+            except discord.HTTPException as e_del_conf: await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): HTTP Error", error=e_del_conf)
+
+        except discord.Forbidden:
+            await log_error(guild, f".p command failed during purge in {channel.mention}: Bot missing Manage Messages permission (Invoked by {author}).")
+            try: await channel.send(f"{author.mention}, I lack permissions to delete messages here.")
+            except Exception: pass
+        except discord.HTTPException as e:
+            await log_error(guild, f".p command failed during purge/send in {channel.mention}: HTTP Exception.", error=e)
+            try: await channel.send(f"⚠️ Discord API error during purge (HTTP {e.status}). Some messages might not be deletable.", delete_after=7.0)
+            except Exception: pass
+        except Exception as e:
+            await log_error(guild, f".p command failed unexpectedly in {channel.mention}.", error=e)
+            if confirmation_message:
+                try:
+                    await asyncio.sleep(1)
+                    await confirmation_message.delete()
+                except Exception: pass
+        # --- END OF PASTED .p LOGIC ---
 
 # --- MODIFIED Nerd Help Command (Added Spacing and Activity Commands) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
