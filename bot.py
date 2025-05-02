@@ -1385,7 +1385,7 @@ async def update_hc_member_list(guild: discord.Guild):
                 f"--- \n"
                 f"*Bot built by <@{BOT_CREATOR_ID}>.*"
             ),
-            color=discord.Color.blue() # Or NERDY_YELLOW
+            color=NERDY_YELLOW
         )
         explanatory_embed.set_footer(text=EXPLANATORY_FOOTER_TEXT)
         # Removed timestamp for a cleaner look, optional
@@ -3447,7 +3447,7 @@ async def nerdhelp(interaction: discord.Interaction):
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
-        
+
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
