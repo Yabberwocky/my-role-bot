@@ -63,10 +63,13 @@ MEMBERS_PER_PAGE = 50 # Members per page in lists
 NERDY_YELLOW = discord.Color.gold() # Embed color
 ROLE_ID_MAYBE_EXHC = 1267882075390873681 # Role to add on HC leave, remove on HC verify
 VIEW_MODE_DISCORD = "discord_view"
-VIEW_MODE_ACTIVITY = "activity_view" # Simplified: We'll show all-time activity unless specific range needed later
+VIEW_MODE_ACTIVITY_ALL = "activity_all_view" # Renamed for clarity
+VIEW_MODE_ACTIVITY_DAILY = "activity_daily_view"
+VIEW_MODE_ACTIVITY_WEEKLY = "activity_weekly_view"
+VIEW_MODE_ACTIVITY_MONTHLY = "activity_monthly_view" # Using 30 days for simplicity
 SORT_MODE_IGN = "sort_ign"
 SORT_MODE_ACTIVITY = "sort_activity"
-ACTIVITY_COLUMN_WIDTH = 6 # e.g., "Act: 99" or "Seen: "
+ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -92,6 +95,197 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+
+# --- Bulk Active Modal ---
+class BulkActiveModal(Modal, title="Bulk Mark Active"):
+    igns_input = TextInput(
+        label="In-Game Names (IGNs)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Enter one IGN per line or separate by spaces/commas...",
+        required=True,
+        max_length=2000 # Adjust as needed
+    )
+
+    def __init__(self, date_str: Optional[str]):
+        super().__init__(timeout=300.0) # 5 minute timeout for modal
+        self.target_date_str = date_str # Store the date passed from the command
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Defer the modal's interaction response ephemerally
+        await interaction.response.defer(thinking=True, ephemeral=False)
+
+        guild = interaction.guild
+        if not guild or not supabase: # Ensure guild and supabase are available
+            await interaction.followup.send("❌ Error: Command context or database unavailable.", ephemeral=False)
+            return
+
+        # --- Get Date ---
+        activity_date, date_error = get_utc_date(self.target_date_str)
+        if date_error:
+            await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+            return
+        if not activity_date:
+            await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+            return
+
+        # --- Process IGNs ---
+        raw_text = self.igns_input.value
+        # Split by newline, space, comma, and filter out empty strings
+        potential_igns = [ign.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if ign.strip()]
+
+        if not potential_igns:
+            await interaction.followup.send("❌ No IGNs were entered.", ephemeral=False)
+            return
+
+        processed_count = 0
+        success_count = 0
+        already_marked_count = 0 # Technically upsert handles this, but good for feedback
+        failed_igns = []
+        log_details = []
+
+        # Consider fetching all known IGNs first for validation if performance allows and is needed
+        # For now, we'll just try the upsert for each
+
+        progress_msg = await interaction.followup.send(f"⏳ Processing {len(potential_igns)} IGNs for {format_date_dmy(activity_date)}...", ephemeral=False)
+
+        for ign in potential_igns:
+            processed_count += 1
+            # Basic validation (e.g., length) could be added here
+            if not ign: continue
+
+            success, msg = await upsert_activity_log(guild, ign, activity_date, interaction.user.id)
+
+            if success:
+                success_count += 1
+                log_details.append(f"OK: {ign}")
+                # We can't easily tell if it was new or updated from upsert without another query
+                # For simplicity, we just count successes.
+            else:
+                failed_igns.append(f"`{ign}` ({msg.split(': ')[-1]})") # Add IGN and brief reason
+                log_details.append(f"Fail: {ign} ({msg})")
+
+            # Optional: Update progress message periodically if processing many IGNs
+            # if processed_count % 10 == 0:
+            #     try: await progress_msg.edit(content=f"⏳ Processing... ({processed_count}/{len(potential_igns)})")
+            #     except discord.HTTPException: pass # Ignore edit errors
+
+        # --- Final Feedback ---
+        summary_title = "✅ Bulk Activity Update Complete"
+        summary_desc = [f"Date Processed: **{format_date_dmy(activity_date)}**"]
+        summary_desc.append(f"Total Entries Submitted: {len(potential_igns)}")
+        summary_desc.append(f"Successfully Recorded/Updated: {success_count}")
+        # summary_desc.append(f"Already Marked: {already_marked_count}") # If we add check later
+        if failed_igns:
+            summary_title = "⚠️ Bulk Activity Update Partially Complete"
+            summary_desc.append(f"Failed Entries ({len(failed_igns)}):")
+            # Show first few failed IGNs directly in message
+            max_failed_display = 10
+            summary_desc.extend([f"- {f}" for f in failed_igns[:max_failed_display]])
+            if len(failed_igns) > max_failed_display:
+                 summary_desc.append(f"- ...and {len(failed_igns) - max_failed_display} more (check logs).")
+        else:
+             summary_desc.append("Failed Entries: 0")
+
+        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=NERDY_YELLOW if not failed_igns else discord.Color.orange())
+
+        try:
+            await progress_msg.edit(content=None, embed=summary_embed)
+        except discord.HTTPException: # Handle if original progress message gone
+             await interaction.followup.send(embed=summary_embed, ephemeral=False) # Send new message
+
+        await log_info(guild, f"`{interaction.user}` used /bulkactive. Summary: {len(potential_igns)} submitted, {success_count} success, {len(failed_igns)} failed. Details: {'; '.join(log_details)}")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await log_error(interaction.guild, "Error in BulkActiveModal", error=error, interaction=interaction)
+        # Ensure the user gets some feedback even if the modal logic fails
+        try:
+             if interaction.response.is_done():
+                 await interaction.followup.send("❌ An unexpected error occurred in the modal.", ephemeral=False)
+             else:
+                 # This case is less likely if on_submit deferred, but handle defensively
+                 await interaction.response.send_message("❌ An unexpected error occurred in the modal.", ephemeral=False)
+        except Exception:
+             pass # Ignore errors during error reporting
+
+async def ign_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes In-Game Names from the hc_members table."""
+    if not supabase:
+        print("IGN Autocomplete: Supabase unavailable.")
+        return [] # Return empty list if DB is down
+
+    # Limit the number of suggestions returned
+    limit = 25
+    choices = []
+
+    # Avoid querying if input is too short (optional, but can reduce load)
+    # if len(current) < 1:
+    #     return []
+
+    try:
+        # Use ilike for case-insensitive matching, % for wildcard
+        # Select distinct IGNs to avoid duplicates if schema allows multiple entries per IGN
+        query = supabase.table("hc_members").select("ingame_name", count='exact').ilike("ingame_name", f"%{current}%").not_.is_("ingame_name", "null").limit(limit)
+        resp = await run_supabase_sync(lambda: query.execute())
+
+        if resp and hasattr(resp, 'data') and resp.data:
+            seen_igns = set() # Prevent duplicate suggestions if DB returns them
+            for item in resp.data:
+                ign = item.get("ingame_name")
+                if ign and ign not in seen_igns:
+                     # Ensure name and value are strings
+                    ign_str = str(ign)
+                    # Truncate suggestion name if too long for Discord UI
+                    display_name = (ign_str[:97] + '...') if len(ign_str) > 100 else ign_str
+                    choices.append(app_commands.Choice(name=display_name, value=ign_str))
+                    seen_igns.add(ign)
+
+    except (ConnectionError, APIError) as e:
+        print(f"IGN Autocomplete Error: Failed to fetch IGNs matching '{current}'. Error: {e}")
+        # Optionally return a choice indicating an error
+        # choices = [app_commands.Choice(name="Error fetching suggestions...", value="ERROR")]
+    except Exception as e:
+         print(f"IGN Autocomplete Unexpected Error: {e}")
+
+    # print(f"IGN Autocomplete: Found {len(choices)} choices for '{current}'") # Debugging
+    return choices
+
+async def remove_activity_log(guild: discord.Guild, ign: str, activity_date: datetime.date, remover_id: int) -> Tuple[bool, str]:
+    """Removes an activity record. Returns (success, message). Handles case-insensitivity."""
+    if not supabase: return False, "Database unavailable."
+    if not ign: return False, "IGN cannot be empty."
+
+    # Standardize IGN to lowercase for lookup
+    ign_lower = ign.lower()
+
+    try:
+        # Execute the delete operation
+        resp = await run_supabase_sync(
+            lambda: supabase.table("activity_log")
+                           .delete()
+                           .eq("member_identifier", ign_lower) # Match lowercase IGN
+                           .eq("activity_date", activity_date.isoformat()) # Match exact date
+                           .execute()
+        )
+
+        # Check if any rows were actually deleted.
+        # The structure of 'resp.data' for delete might vary.
+        # A common pattern is that it contains the deleted records.
+        # If resp.data is non-empty, deletion occurred.
+        if resp and hasattr(resp, 'data') and resp.data:
+            return True, f"Activity record removed for `{ign}` on {format_date_dmy(activity_date)}."
+        else:
+            # No error, but nothing deleted - likely record didn't exist
+            return False, f"No activity record found for `{ign}` on {format_date_dmy(activity_date)} to remove."
+
+    except APIError as e:
+        err_msg = f"Database API error removing activity for `{ign}`: {e.message}"
+        await log_error(guild, err_msg, error=e)
+        return False, err_msg
+    except (ConnectionError, Exception) as e:
+        err_msg = f"Database connection/unexpected error removing activity for `{ign}`."
+        await log_error(guild, err_msg, error=e)
+        return False, err_msg
 
 def get_utc_date(date_str: Optional[str] = None) -> Tuple[Optional[datetime.date], Optional[str]]:
     """Parses a YYYY-MM-DD string or defaults to today's UTC date. Returns date object and error message."""
@@ -318,14 +512,16 @@ class ActivitySortButton(Button):
           if view:
                await view.toggle_sort(interaction)
 
+
+
 class ViewModeSelect(discord.ui.Select):
      def __init__(self, current_mode: str, row: int):
           options = [
                discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, description="Show Discord usernames and IGNs.", emoji="👤"),
-               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY, description="Show IGNs and total activity count.", emoji="📊"),
-               # Add options for Daily/Weekly/Monthly later if needed - requires date range fetching
-               # discord.SelectOption(label="View Activity (Today)", value="activity_daily", description="Show IGNs active today.", emoji="📅"),
-               # discord.SelectOption(label="View Activity (Last 7 Days)", value="activity_weekly", description="Show IGNs active in the last week.", emoji="🗓️"),
+               discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, description="Show IGNs active today.", emoji="📅"),
+               discord.SelectOption(label="View Activity (Last 7 Days)", value=VIEW_MODE_ACTIVITY_WEEKLY, description="Show IGNs active in the last week.", emoji="📅"),
+               discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, description="Show IGNs active in the last 30 days.", emoji="📅"), # Or use a calendar month emoji
+               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, description="Show IGNs and total activity count.", emoji="📊"),
           ]
           # Ensure the current mode is set as default
           for option in options:
@@ -337,73 +533,68 @@ class ViewModeSelect(discord.ui.Select):
           view: HCPagesView = self.view
           if view:
                selected_mode = self.values[0]
+               # Let the view handle the mode change and potential data refetching
                await view.change_view_mode(interaction, selected_mode)
 
 
 class HCPagesView(View):
-    # Data is now List[Dict[str, Any]] from fetch_hc_member_data
+    # Data is List[Dict[str, Any]] from fetch_hc_member_data (includes ALL-TIME activity)
     def __init__(self, data: List[Dict[str, Any]], total_members: int, timeout=300.0):
         super().__init__(timeout=timeout)
-        self.original_data = data # Keep original fetch order if needed
-        self.current_data = data # Data to be sorted/displayed
+        # original_data holds the base info + all-time activity counts fetched initially
+        self.original_data = data
+        # current_data is what's displayed - can be modified with date-ranged activity
+        self.current_data = list(data) # Make a copy to modify safely
         self.total_members = total_members
         self.current_page = 0
+        # Total pages depends on current_data length
         self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
         self.message: Optional[discord.Message] = None
 
-        # --- NEW STATE ---
+        # --- State ---
         self.view_mode = VIEW_MODE_DISCORD # Default view
         self.sort_mode = SORT_MODE_IGN # Default sort
+        self.is_fetching_activity = False # Lock to prevent concurrent fetches
 
         # --- Add UI Elements ---
-        # Row 0: Page Buttons (Decorators handle adding these)
-        # self.add_item(Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)) # REMOVED
-        # self.add_item(Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0))     # REMOVED
-
-        # Row 1: Sort Button
         self.add_item(ActivitySortButton(current_sort=self.sort_mode, row=1))
-        # Row 2: Dropdown
         self.add_item(ViewModeSelect(current_mode=self.view_mode, row=2))
+        # Buttons added via decorators
 
         self.update_buttons_and_ui() # Call initial update
 
     def sort_data(self):
          """Sorts self.current_data based on self.sort_mode."""
+         # Ensure activity_count exists, default to 0 if missing (e.g., during data update)
          if self.sort_mode == SORT_MODE_IGN:
-              # Sort by IGN (case-insensitive), fallback to member name if IGN is 'Unknown'
-              self.current_data.sort(key=lambda item: item['ign'].lower() if item['ign'] != "Unknown" else (item['member'].name.lower() if item.get('member') else 'zzz'))
+              self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
          elif self.sort_mode == SORT_MODE_ACTIVITY:
-              # Sort by activity_count (descending), then IGN (case-insensitive) as tie-breaker
-              self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item['ign'].lower()))
-         # Recalculate total pages after sorting (shouldn't change length, but good practice)
+              self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
          self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-         # Reset to first page after sorting to avoid confusion
          self.current_page = 0
 
 
     def update_buttons_and_ui(self):
-        """Disables page buttons based on the current page and updates other UI elements."""
+        """Updates UI elements based on state."""
         # --- Update Page Buttons ---
-        # Use find_item_by_custom_id for safety
-        # Find items added via decorators or add_item
         prev_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_prev_interactive', self.children)
         next_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_next_interactive', self.children)
-        if isinstance(prev_button, Button): prev_button.disabled = self.current_page == 0
-        if isinstance(next_button, Button): next_button.disabled = self.current_page >= self.total_pages - 1
+        if isinstance(prev_button, Button): prev_button.disabled = self.current_page == 0 or self.is_fetching_activity
+        if isinstance(next_button, Button): next_button.disabled = self.current_page >= self.total_pages - 1 or self.is_fetching_activity
 
-        # --- Update Sort Button Label ---
+        # --- Update Sort Button ---
         sort_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_toggle_sort', self.children)
         if isinstance(sort_button, Button):
              sort_button.label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
-             # Disable sort button if in discord view? Or allow sorting by name/ign? For now, enable always.
-             # sort_button.disabled = self.view_mode == VIEW_MODE_DISCORD # Example: disable in discord view
+             # Disable sort button while fetching data or if in discord view
+             sort_button.disabled = self.is_fetching_activity or self.view_mode == VIEW_MODE_DISCORD
 
-        # --- Update Select Default ---
+        # --- Update Select Default & Disable ---
         select_menu = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_view_select', self.children)
         if isinstance(select_menu, discord.ui.Select):
+             select_menu.disabled = self.is_fetching_activity # Disable dropdown during fetch
              for option in select_menu.options:
                   option.default = option.value == self.view_mode
-
 
     # --- REVISED create_page_embed ---
     def create_page_embed(self) -> discord.Embed:
@@ -411,29 +602,26 @@ class HCPagesView(View):
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
 
-        # --- Define Column Widths ---
         IDX_WIDTH = 3
-        # Adjust widths based on view mode
         if self.view_mode == VIEW_MODE_DISCORD:
-             # Similar to original, maybe reduce IGN width slightly?
              NAME_WIDTH = 15
              IGN_WIDTH = 15
+             ACT_WIDTH = 0 # No activity column
              TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
              header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
-        elif self.view_mode == VIEW_MODE_ACTIVITY:
-             IGN_WIDTH = 20 # Give IGN more space
-             ACT_WIDTH = 10 # Activity count/last seen
+        # All activity views use the same layout now
+        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+             IGN_WIDTH = 20
+             ACT_WIDTH = ACTIVITY_COLUMN_WIDTH # Use constant
              TOTAL_WIDTH = IDX_WIDTH + IGN_WIDTH + ACT_WIDTH
              header = (f"{'#':<{IDX_WIDTH}}{'In-Game':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
-        else: # Fallback/Default (shouldn't happen with current modes)
-             NAME_WIDTH = 15
-             IGN_WIDTH = 15
+        else: # Fallback
+             NAME_WIDTH = 15; IGN_WIDTH = 15; ACT_WIDTH = 0
              TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
              header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
 
         separator = "-" * TOTAL_WIDTH
 
-        # --- Build Description within Code Block ---
         desc_lines = [f"```", header, separator]
         idx = start + 1
 
@@ -443,80 +631,83 @@ class HCPagesView(View):
             for item_dict in page_data:
                 member = item_dict.get('member')
                 ign = item_dict.get('ign', 'Unknown')
-                activity_count = item_dict.get('activity_count', 0)
-                last_seen_date = item_dict.get('last_seen') # This is a date object or None
 
-                # Prepare display strings based on view mode
                 if self.view_mode == VIEW_MODE_DISCORD:
-                    if member:
-                        user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                    else:
-                        user_display = "[No Discord]"
+                    if member: user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+                    else: user_display = "[No Discord]"
                     ign_display = ign
-
-                    # Truncate aggressively
                     if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
                     if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
-
                     line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
                             f"{user_display:<{NAME_WIDTH}}"
                             f"{ign_display:<{IGN_WIDTH}}")
 
-                elif self.view_mode == VIEW_MODE_ACTIVITY:
+                elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+                    activity_count = item_dict.get('activity_count', 0)
+                    last_seen_date = item_dict.get('last_seen') # date object or None
                     ign_display = ign
-                    # Format activity string (e.g., count and maybe last seen)
-                    activity_display = f"{activity_count}d ({format_date_dmy(last_seen_date)})"
-                    # activity_display = f"Count: {activity_count}" # Simpler alternative
+                    # Format activity: Count (Last Seen DD/MM/YY)
+                    activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
 
-                    # Truncate
                     if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
                     if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
-
                     line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
                             f"{ign_display:<{IGN_WIDTH}}"
                             f"{activity_display:<{ACT_WIDTH}}")
                 else: # Fallback
                      line = f"{str(idx)+'.':<{IDX_WIDTH}} Error: Invalid View Mode"
 
-
                 desc_lines.append(line)
                 idx += 1
-            desc_lines.append("```") # Close code block
+            desc_lines.append("```")
 
-        # --- Create Embed ---
         embed = discord.Embed(
             title=HC_LIST_EMBED_TITLE,
             description="\n".join(desc_lines),
             color=NERDY_YELLOW
         )
-        # Add sort/view mode to footer
+
+        # --- Update Footer Text Based on View Mode ---
         sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
-        view_text = "Discord+IGN" if self.view_mode == VIEW_MODE_DISCORD else "Activity" # Adjust as modes expand
-        embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | View: {view_text} | Sort: {sort_text}")
+        view_text_map = {
+            VIEW_MODE_DISCORD: "Discord+IGN",
+            VIEW_MODE_ACTIVITY_ALL: "Activity (All)",
+            VIEW_MODE_ACTIVITY_DAILY: "Activity (Today)",
+            VIEW_MODE_ACTIVITY_WEEKLY: "Activity (7d)",
+            VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
+        }
+        view_text = view_text_map.get(self.view_mode, "Unknown View")
+        footer_text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | View: {view_text} | Sort: {sort_text}"
+        if self.is_fetching_activity:
+             footer_text += " | Fetching data..."
+
+        embed.set_footer(text=footer_text)
         embed.timestamp = discord.utils.utcnow()
         return embed
 
-    async def edit_message(self, interaction: discord.Interaction):
-        """Updates the message embed and view components."""
-        self.update_buttons_and_ui() # Ensure UI elements are up-to-date before creating embed
-        embed = self.create_page_embed()
+    async def edit_message(self, interaction: discord.Interaction, show_loading: bool = False):
+        """Updates the message embed and view components. Optionally shows loading state."""
+        # Update button states etc. *before* creating embed
+        self.update_buttons_and_ui()
+        embed = self.create_page_embed() # Embed reflects current state (incl. loading footer if show_loading=True)
         try:
-            # Always edit the original response for slash commands/components
             await interaction.response.edit_message(embed=embed, view=self)
         except discord.NotFound:
-            print(f"Paginator edit fail: Interaction {interaction.id} or original message not found.")
+            print(f"Paginator edit fail: Interaction {interaction.id} or message not found.")
             self.stop()
         except discord.HTTPException as e:
             guild = interaction.guild or (self.message.guild if self.message else None)
-            await log_error(guild, "Paginator edit fail (HTTP)", error=e, interaction=interaction)
+            # Avoid logging interaction cancelled errors if user was quick
+            if e.code != 10062: # Unknown Interaction
+                 await log_error(guild, "Paginator edit fail (HTTP)", error=e, interaction=interaction)
         except Exception as e:
             guild = interaction.guild or (self.message.guild if self.message else None)
             await log_error(guild, "Paginator edit fail (General)", error=e, interaction=interaction)
 
-    # --- Button Callbacks (Keep the decorators) ---
+    # --- Button Callbacks (No changes needed) ---
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)
     async def previous_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page > 0:
+        if self.current_page > 0 and not self.is_fetching_activity:
             self.current_page -= 1
             await self.edit_message(interaction)
         else:
@@ -524,50 +715,140 @@ class HCPagesView(View):
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0)
     async def next_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page < self.total_pages - 1:
+        if self.current_page < self.total_pages - 1 and not self.is_fetching_activity:
             self.current_page += 1
             await self.edit_message(interaction)
         else:
             await interaction.response.defer() # Ack
 
-    # --- New Callbacks for Sort Button and Select ---
+    # --- Sort Callback (Disable during fetch) ---
     async def toggle_sort(self, interaction: discord.Interaction):
         """Called by the ActivitySortButton."""
+        if self.is_fetching_activity:
+             await interaction.response.defer() # Ignore if fetching
+             return
+
+        if self.view_mode == VIEW_MODE_DISCORD:
+             # Maybe allow sorting by discord name/ign? For now, just ack.
+             await interaction.response.send_message("Sorting is only available in Activity views.", ephemeral=True)
+             return
+
         if self.sort_mode == SORT_MODE_IGN:
             self.sort_mode = SORT_MODE_ACTIVITY
         else:
             self.sort_mode = SORT_MODE_IGN
-        self.sort_data() # Re-sort the data
+        self.sort_data() # Re-sort the current data
         await self.edit_message(interaction) # Update the message
 
+    # --- REVISED change_view_mode ---
     async def change_view_mode(self, interaction: discord.Interaction, new_mode: str):
-        """Called by the ViewModeSelect."""
-        if self.view_mode != new_mode:
-            self.view_mode = new_mode
-            # Decide if sorting needs to reset or change based on view
-            # For now, keep the current sort mode but reset page
-            self.current_page = 0
-            # Potentially fetch new data here if view modes require different datasets (e.g., date ranges)
-            # Currently, we assume self.current_data has all needed info (all-time activity)
-            self.sort_data() # Re-apply sort just in case (might be redundant if data didn't change)
+        """Called by the ViewModeSelect. Handles data fetching for activity views."""
+        if self.view_mode == new_mode or self.is_fetching_activity:
+            await interaction.response.defer() # Ack if mode didn't change or already fetching
+            return
+
+        # --- Set Loading State ---
+        self.is_fetching_activity = True
+        self.view_mode = new_mode # Update mode immediately for UI feedback
+        await self.edit_message(interaction, show_loading=True) # Show loading state
+
+        guild = interaction.guild # Needed for logging/fetching
+
+        try:
+            start_date: Optional[datetime.date] = None
+            end_date: Optional[datetime.date] = None
+            today_utc = datetime.datetime.now(pytz.utc).date()
+
+            # Determine date range based on new mode
+            if new_mode == VIEW_MODE_ACTIVITY_DAILY:
+                start_date = end_date = today_utc
+            elif new_mode == VIEW_MODE_ACTIVITY_WEEKLY:
+                end_date = today_utc
+                start_date = today_utc - datetime.timedelta(days=6)
+            elif new_mode == VIEW_MODE_ACTIVITY_MONTHLY:
+                end_date = today_utc
+                start_date = today_utc - datetime.timedelta(days=29)
+            # VIEW_MODE_ACTIVITY_ALL and VIEW_MODE_DISCORD don't need specific range fetch here
+
+            # --- Fetch and Update Data ---
+            if new_mode in [VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+                # Fetch activity data ONLY for the required range
+                all_igns = [item['ign'] for item in self.original_data if item.get('ign')]
+                if not all_igns:
+                     print("Change View Mode: No IGNs found in original data.")
+                     self.current_data = list(self.original_data) # Reset to original
+                else:
+                    print(f"Change View Mode: Fetching activity for {len(all_igns)} IGNs between {start_date} and {end_date}")
+                    ranged_activity_data = await fetch_activity_data(guild, all_igns, start_date, end_date)
+                    print(f"Change View Mode: Fetched {len(ranged_activity_data)} activity results.")
+
+                    # Update self.current_data with the new activity counts/dates
+                    temp_data = []
+                    for item in self.original_data:
+                        ign_lower = item.get('ign', '').lower()
+                        activity_info = ranged_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
+                        # Create a new dict to avoid modifying original_data
+                        updated_item = item.copy()
+                        updated_item['activity_count'] = activity_info['count']
+                        updated_item['last_seen'] = activity_info['last_seen']
+                        temp_data.append(updated_item)
+                    self.current_data = temp_data
+                    print(f"Change View Mode: Updated current_data with ranged activity.")
+
+            elif new_mode == VIEW_MODE_ACTIVITY_ALL:
+                # Reset to the all-time activity data stored in original_data
+                self.current_data = list(self.original_data) # Make a fresh copy
+                print("Change View Mode: Reset to All-Time activity view.")
+            else: # VIEW_MODE_DISCORD
+                # Reset to original data, activity counts are irrelevant here but keep structure
+                self.current_data = list(self.original_data)
+                print("Change View Mode: Reset to Discord view.")
+
+
+            # --- Finalize Update ---
+            # Set appropriate sort mode for the new view
+            if new_mode == VIEW_MODE_DISCORD:
+                 self.sort_mode = SORT_MODE_IGN # Default sort for discord view
+            else: # All activity views default to sorting by activity
+                 self.sort_mode = SORT_MODE_ACTIVITY
+
+            self.sort_data() # Sort the newly updated data
+
+        except Exception as e:
+            # Handle errors during data fetch/processing
+            await log_error(guild, f"Error changing view mode to {new_mode}", error=e, interaction=interaction)
+            # Reset to a safe state (e.g., Discord view) and notify user
+            self.view_mode = VIEW_MODE_DISCORD
+            self.current_data = list(self.original_data)
+            self.sort_mode = SORT_MODE_IGN
+            self.sort_data()
+            self.is_fetching_activity = False # Release lock on error
+            await self.edit_message(interaction) # Update UI to reflect error state (via footer?)
+            # Send a follow-up error message
+            try:
+                await interaction.followup.send("❌ An error occurred while fetching data for the selected view.", ephemeral=True)
+            except Exception: pass # Ignore if followup fails
+            return # Stop further processing
+
+        finally:
+            # --- Release Loading State ---
+            self.is_fetching_activity = False
+            # Edit message one last time to remove loading state and show final data
             await self.edit_message(interaction)
-        else:
-             await interaction.response.defer() # Ack if mode didn't change
 
 
-    # --- on_timeout (modified slightly to handle new UI items) ---
+    # --- on_timeout (Disable lock) ---
     async def on_timeout(self):
+        self.is_fetching_activity = False # Ensure lock is released on timeout
         if self.message:
             try:
-                # Disable all components on timeout
                 for item in self.children:
                     if hasattr(item, 'disabled'):
-                         item.disabled = True # Disable buttons, select
-                await self.message.edit(view=self) # Edit with the modified view
+                         item.disabled = True
+                await self.message.edit(view=self)
                 print(f"Paginator timeout: Disabled components on message {self.message.id}")
             except discord.NotFound: print(f"Paginator timeout edit fail: Message {self.message.id} not found.")
             except discord.HTTPException as e:
-                 # Avoid logging 404 again
                  if e.status != 404: await log_error(self.message.guild, f"Paginator timeout edit HTTP fail", error=e)
             except Exception as e:
                  await log_error(self.message.guild, f"Paginator timeout edit general fail", error=e)
@@ -1739,12 +2020,13 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
          print(f"HCVerify: Triggering list update for {user.name} (HC role added: {role_hc in roles_to_add_final}, DB success: {db_success}).")
          asyncio.create_task(update_hc_member_list(guild))
 
-# --- New HCLeave Command (replaces unhcverify) ---
+# --- New HCLeave Command (MODIFIED WITH AUTOCOMPLETE) ---
 @tree.command(name="hcleave", description="Remove member from HC (Discord role/nick + DB entry).")
 @app_commands.describe(
     user="Optional: The Discord user to process.",
     ingame_name="Optional: The IGN to remove from DB (use if no Discord user)."
 )
+@app_commands.autocomplete(ingame_name=ign_autocomplete) # <--- ADD THIS LINE
 @app_commands.checks.has_permissions(manage_roles=True) # Or adjust permission
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
 async def hcleave(interaction: discord.Interaction, user: Optional[discord.Member] = None, ingame_name: Optional[str] = None):
@@ -1756,7 +2038,6 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
     if not supabase:
-        # Should be caught by helper, but double-check
         await interaction.response.send_message("❌ Database connection unavailable.", ephemeral=False)
         await log_error(guild, "hcleave failed: Supabase unavailable.", interaction=interaction)
         return
@@ -1777,11 +2058,14 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
     # --- Role Existence Checks ---
     error_msg_setup = ""
     if not role_hc: error_msg_setup += f"HC Role (ID: {ADD_ROLE_ID_HC}) not found.\n"
-    if not role_maybe_exhc: error_msg_setup += f"Maybe-ExHC Role (ID: {ROLE_ID_MAYBE_EXHC}) not found.\n"
-    if error_msg_setup:
+    # Allow Maybe-ExHC role to be optional for this command
+    if ROLE_ID_MAYBE_EXHC and not role_maybe_exhc:
+        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role (ID: {ROLE_ID_MAYBE_EXHC}) not found. Will proceed without adding it.")
+        # Don't block the command if this role is missing
+    if not role_hc: # Only block if critical HC role is missing
         msg = f"❌ Setup Error:\n{error_msg_setup}Please configure the bot."
         await interaction.followup.send(msg, ephemeral=False)
-        await log_error(guild, f"hcleave failed: Missing roles.\n{error_msg_setup}", interaction=interaction)
+        await log_error(guild, f"hcleave failed: Missing critical HC role.\n{error_msg_setup}", interaction=interaction)
         return
 
     # --- Prepare for actions ---
@@ -1792,62 +2076,62 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
     hc_role_removed = False
     exhc_role_added = False
     nick_reset = False
-    target_identifier = f"IGN: `{ingame_name}`" if ingame_name else f"User: {user.mention}" # For logging/messages
     reason = f"HC Leave processed by {interaction.user} (ID: {interaction.user.id})"
     cleaned_ign = ingame_name.strip() if ingame_name else None
+    # Determine target identifier for logging/messages early
+    target_identifier = f"IGN: `{discord.utils.escape_markdown(cleaned_ign)}`" if cleaned_ign else (f"User: {user.mention}" if user else "Unknown Target")
 
     # --- Database Deletion ---
     identifier_for_db = None
+    target_identifier_db = "Unknown"
+    # Prioritize IGN if provided
     if cleaned_ign:
         identifier_for_db = {'ingame_name': cleaned_ign}
-        target_identifier_db = f"IGN `{cleaned_ign}`"
+        target_identifier_db = f"IGN `{discord.utils.escape_markdown(cleaned_ign)}`"
     elif user:
         # If only user is provided, use their ID to find the DB entry
         identifier_for_db = {'discord_id': str(user.id)}
         target_identifier_db = f"Discord ID `{user.id}`"
+
+    if identifier_for_db:
+        try:
+            print(f"hcleave: Attempting to delete DB entry matching {identifier_for_db}")
+            delete_result = await run_supabase_sync(
+                lambda: supabase.table("hc_members")
+                               .delete()
+                               .match(identifier_for_db)
+                               .execute()
+            )
+
+            # Check if deletion occurred based on response data
+            if delete_result and hasattr(delete_result, 'data') and delete_result.data:
+                 db_removed = True
+                 result_summary.append(f"🗑️ Database entry removed for {target_identifier_db}.")
+                 log_summary.append(f"DB entry delete OK for {identifier_for_db}")
+            else:
+                 # No error, but nothing deleted - entry might not have existed
+                 result_summary.append(f"ℹ️ No database entry found matching {target_identifier_db} to remove.")
+                 log_summary.append(f"DB entry delete: No match found for {identifier_for_db}")
+
+
+        except APIError as e:
+            errors_occurred = True
+            result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: {e.message}")
+            log_summary.append(f"DB delete fail: APIError {e.code} - {e.message}")
+            await log_error(guild, f"hcleave DB delete APIError for {identifier_for_db}", error=e, interaction=interaction)
+        except ConnectionError as e:
+            errors_occurred = True
+            result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Connection failed.")
+            log_summary.append("DB delete fail: ConnectionError")
+            await log_error(guild, f"hcleave DB delete ConnectionError for {identifier_for_db}", error=e, interaction=interaction)
+        except Exception as e:
+            errors_occurred = True
+            result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Unexpected error.")
+            log_summary.append(f"DB delete fail: {type(e).__name__}")
+            await log_error(guild, f"hcleave DB delete unexpected error for {identifier_for_db}", error=e, interaction=interaction)
     else:
-        # This case is caught by the initial check, but satisfy linters
-        await interaction.followup.send("Logic error: No identifier for DB.", ephemeral=False)
-        return
-
-    try:
-        print(f"hcleave: Attempting to delete DB entry matching {identifier_for_db}")
-        delete_result = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
-                           .delete()
-                           .match(identifier_for_db)
-                           .execute()
-        )
-
-        # Check if anything was deleted. Result structure might vary.
-        # A simple check: if data exists and is not empty, assume deletion.
-        # Or if the count attribute exists and is > 0. Adjust based on actual Supabase client response.
-        # For now, we'll rely on not getting an error, and check counts later if needed.
-        # if delete_result and hasattr(delete_result, 'data') and delete_result.data:
-        #     db_removed = True
-        # else:
-        #     # Entry might not have existed
-        #     pass
-        # Simplification: Assume success if no error. Check logs if needed.
-        db_removed = True # Assume success for now unless error below
-        result_summary.append(f"🗑️ Database entry removed for {target_identifier_db}.")
-        log_summary.append(f"DB entry delete OK for {identifier_for_db}")
-
-    except APIError as e:
-        errors_occurred = True
-        result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: {e.message}")
-        log_summary.append(f"DB delete fail: APIError {e.code} - {e.message}")
-        await log_error(guild, f"hcleave DB delete APIError for {identifier_for_db}", error=e, interaction=interaction)
-    except ConnectionError as e:
-        errors_occurred = True
-        result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Connection failed.")
-        log_summary.append("DB delete fail: ConnectionError")
-        await log_error(guild, f"hcleave DB delete ConnectionError for {identifier_for_db}", error=e, interaction=interaction)
-    except Exception as e:
-        errors_occurred = True
-        result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Unexpected error.")
-        log_summary.append(f"DB delete fail: {type(e).__name__}")
-        await log_error(guild, f"hcleave DB delete unexpected error for {identifier_for_db}", error=e, interaction=interaction)
+        # Should not happen due to initial check, but log defensively
+        log_summary.append("DB delete skipped: No identifier provided.")
 
 
     # --- Discord User Actions (Only if 'user' is provided) ---
@@ -1856,7 +2140,7 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
         can_manage_user_roles = bot_member.top_role.position > user.top_role.position
         can_manage_user_nick = can_manage_user_roles # Nick management requires same hierarchy check
 
-        # 1. Remove HC Role
+        # 1. Remove HC Role (role_hc guaranteed to exist from earlier check)
         if role_hc not in user.roles:
             result_summary.append(f"ℹ️ User doesn't have the `{role_hc.name}` role.")
             log_summary.append("HC role already absent.")
@@ -1870,33 +2154,30 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
                 result_summary.append(f"➖ Role Removed: `{role_hc.name}`")
                 log_summary.append("HC role remove OK")
                 hc_role_removed = True
-            except discord.Forbidden:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: Permissions error removing HC role."); log_summary.append("HC role remove fail: Forbidden")
-            except discord.HTTPException as e:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: API Error removing HC role."); log_summary.append(f"HC role remove fail: HTTP {e.status}")
-            except Exception as e:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: Unknown error removing HC role."); log_summary.append(f"HC role remove fail: {type(e).__name__}")
+            except discord.Forbidden: errors_occurred=True; result_summary.append("⚠️ Role Error: Permissions error removing HC role."); log_summary.append("HC role remove fail: Forbidden")
+            except discord.HTTPException as e: errors_occurred=True; result_summary.append("⚠️ Role Error: API Error removing HC role."); log_summary.append(f"HC role remove fail: HTTP {e.status}")
+            except Exception as e: errors_occurred=True; result_summary.append("⚠️ Role Error: Unknown error removing HC role."); log_summary.append(f"HC role remove fail: {type(e).__name__}")
 
-        # 2. Add Maybe-ExHC Role
-        if role_maybe_exhc in user.roles:
-            result_summary.append(f"ℹ️ User already has the `{role_maybe_exhc.name}` role.")
-            log_summary.append("ExHC role already present.")
-        elif not can_manage_user_roles or bot_member.top_role.position <= role_maybe_exhc.position:
-             errors_occurred = True
-             result_summary.append(f"⚠️ Skipped adding `{role_maybe_exhc.name}` (Hierarchy).")
-             log_summary.append("ExHC role add skip: Hierarchy")
+        # 2. Add Maybe-ExHC Role (only if the role exists)
+        if role_maybe_exhc: # Check if role was found during setup
+            if role_maybe_exhc in user.roles:
+                result_summary.append(f"ℹ️ User already has the `{role_maybe_exhc.name}` role.")
+                log_summary.append("ExHC role already present.")
+            elif not can_manage_user_roles or bot_member.top_role.position <= role_maybe_exhc.position:
+                 errors_occurred = True
+                 result_summary.append(f"⚠️ Skipped adding `{role_maybe_exhc.name}` (Hierarchy).")
+                 log_summary.append("ExHC role add skip: Hierarchy")
+            else:
+                try:
+                    await user.add_roles(role_maybe_exhc, reason=reason)
+                    result_summary.append(f"➕ Role Added: `{role_maybe_exhc.name}`")
+                    log_summary.append("ExHC role add OK")
+                    exhc_role_added = True
+                except discord.Forbidden: errors_occurred=True; result_summary.append("⚠️ Role Error: Permissions error adding ExHC role."); log_summary.append("ExHC role add fail: Forbidden")
+                except discord.HTTPException as e: errors_occurred=True; result_summary.append("⚠️ Role Error: API Error adding ExHC role."); log_summary.append(f"ExHC role add fail: HTTP {e.status}")
+                except Exception as e: errors_occurred=True; result_summary.append("⚠️ Role Error: Unknown error adding ExHC role."); log_summary.append(f"ExHC role add fail: {type(e).__name__}")
         else:
-            try:
-                await user.add_roles(role_maybe_exhc, reason=reason)
-                result_summary.append(f"➕ Role Added: `{role_maybe_exhc.name}`")
-                log_summary.append("ExHC role add OK")
-                exhc_role_added = True
-            except discord.Forbidden:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: Permissions error adding ExHC role."); log_summary.append("ExHC role add fail: Forbidden")
-            except discord.HTTPException as e:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: API Error adding ExHC role."); log_summary.append(f"ExHC role add fail: HTTP {e.status}")
-            except Exception as e:
-                errors_occurred=True; result_summary.append("⚠️ Role Error: Unknown error adding ExHC role."); log_summary.append(f"ExHC role add fail: {type(e).__name__}")
+             log_summary.append("ExHC role add skipped: Role not configured/found.")
 
         # 3. Reset Nickname
         if user.nick is None:
@@ -1912,15 +2193,13 @@ async def hcleave(interaction: discord.Interaction, user: Optional[discord.Membe
                  result_summary.append("🏷️ Nickname Reset.")
                  log_summary.append("Nick reset OK")
                  nick_reset = True
-             except discord.Forbidden:
-                 errors_occurred=True; result_summary.append("⚠️ Nickname Error: Permissions error resetting nick."); log_summary.append("Nick reset fail: Forbidden")
-             except discord.HTTPException as e:
-                 errors_occurred=True; result_summary.append("⚠️ Nickname Error: API Error resetting nick."); log_summary.append(f"Nick reset fail: HTTP {e.status}")
-             except Exception as e:
-                 errors_occurred=True; result_summary.append("⚠️ Nickname Error: Unknown error resetting nick."); log_summary.append(f"Nick reset fail: {type(e).__name__}")
+             except discord.Forbidden: errors_occurred=True; result_summary.append("⚠️ Nickname Error: Permissions error resetting nick."); log_summary.append("Nick reset fail: Forbidden")
+             except discord.HTTPException as e: errors_occurred=True; result_summary.append("⚠️ Nickname Error: API Error resetting nick."); log_summary.append(f"Nick reset fail: HTTP {e.status}")
+             except Exception as e: errors_occurred=True; result_summary.append("⚠️ Nickname Error: Unknown error resetting nick."); log_summary.append(f"Nick reset fail: {type(e).__name__}")
 
     # --- Final Response & Logging ---
     final_color = discord.Color.green() if not errors_occurred else discord.Color.orange()
+    # Use the target_identifier determined earlier
     final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Leave Processed: {target_identifier}"
     if errors_occurred: final_title += " (with issues/skips)"
 
@@ -2018,16 +2297,95 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         await log_error(guild, f"Unexpected error during /hconly for IGN: {cleaned_ign}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
-
 # --- Active Command ---
-@tree.command(name="active", description="Mark a member as active for a specific date.")
+@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for a specific date.")
 @app_commands.describe(
-    user="The Discord user to mark active (fetches their IGN).",
-    ingame_name="The In-Game Name to mark active (use if no Discord user).",
+    ingame_name="The In-Game Name (IGN) to mark active.",
     date="Date of activity (YYYY-MM-DD, defaults to today UTC)."
 )
-# @app_commands.checks.has_permissions(manage_roles=True) # Or your chosen permission
-async def active(interaction: discord.Interaction, user: Optional[discord.Member] = None, ingame_name: Optional[str] = None, date: Optional[str] = None):
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+# @app_commands.checks.has_permissions(manage_roles=True) # Optional permission check
+async def active(interaction: discord.Interaction, ingame_name: str, date: Optional[str] = None):
+    # <<< NO EXTRA TEXT BETWEEN HERE...
+    guild = interaction.guild
+    # ...AND HERE >>>
+    if not await check_supabase_available(interaction): return
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    activity_date, date_error = get_utc_date(date)
+    if date_error:
+        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+        return
+    if not activity_date:
+         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+         return
+
+    target_ign = ingame_name.strip()
+    if not target_ign:
+        await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
+        return
+    display_target = f"IGN `{discord.utils.escape_markdown(target_ign)}`"
+
+    success, message = await upsert_activity_log(guild, target_ign, activity_date, interaction.user.id)
+
+    prefix = "✅" if success else "⚠️"
+    await interaction.followup.send(f"{prefix} {message}", ephemeral=False)
+
+    if success:
+        await log_info(guild, f"`{interaction.user}` used /active for {display_target} on {format_date_dmy(activity_date)}. Triggering list update.")
+        asyncio.create_task(update_hc_member_list(guild))
+
+
+# --- Inactive Command (CORRECTED DECORATOR) ---
+@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
+@app_commands.describe(
+    # user="The Discord user to mark inactive (fetches their IGN).", # <-- REMOVED THIS LINE
+    ingame_name="The In-Game Name (IGN) to mark inactive.",
+    date="Date of activity to remove (YYYY-MM-DD, defaults to today UTC)."
+)
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+async def inactive(interaction: discord.Interaction, ingame_name: str, date: Optional[str] = None):
+    guild = interaction.guild
+    if not await check_supabase_available(interaction): return
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    activity_date, date_error = get_utc_date(date)
+    if date_error:
+        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+        return
+    if not activity_date:
+         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+         return
+
+    target_ign = ingame_name.strip()
+    if not target_ign:
+        await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
+        return
+    display_target = f"IGN `{discord.utils.escape_markdown(target_ign)}`"
+
+    success, message = await remove_activity_log(guild, target_ign, activity_date, interaction.user.id)
+
+    if "removed" in message: prefix = "✅"
+    elif "No activity record found" in message: prefix = "ℹ️"
+    else: prefix = "❌"
+    await interaction.followup.send(f"{prefix} {message}", ephemeral=False)
+
+    if success:
+        await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. Record removed. Triggering list update.")
+        asyncio.create_task(update_hc_member_list(guild))
+    elif prefix == "ℹ️":
+         await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
+
+# @app_commands.checks.has_permissions(manage_roles=True) # Mirror permissions of /active if needed
+async def inactive(interaction: discord.Interaction, user: Optional[discord.Member] = None, ingame_name: Optional[str] = None, date: Optional[str] = None):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
     if not guild:
@@ -2042,7 +2400,7 @@ async def active(interaction: discord.Interaction, user: Optional[discord.Member
         await interaction.response.send_message("❌ Please provide either a Discord `@user` or an `ingame_name`, not both.", ephemeral=False)
         return
 
-    # Defer ephemerally (quick action)
+    # Defer ephemerally
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     # --- Get Date ---
@@ -2050,7 +2408,7 @@ async def active(interaction: discord.Interaction, user: Optional[discord.Member
     if date_error:
         await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
         return
-    if not activity_date: # Should be caught by date_error, but defensive check
+    if not activity_date:
          await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
          return
 
@@ -2059,139 +2417,48 @@ async def active(interaction: discord.Interaction, user: Optional[discord.Member
     if user:
         fetched_ign = await get_ign_from_user(guild, user.id)
         if not fetched_ign:
-            await interaction.followup.send(f"❌ Could not find a stored IGN for {user.mention} in the `hc_members` table. Use the `ingame_name` option instead or verify them first.", ephemeral=False)
+            await interaction.followup.send(f"❌ Could not find a stored IGN for {user.mention}. Cannot remove activity.", ephemeral=False)
             return
         target_ign = fetched_ign
-        display_target = user.mention # For user feedback
-    else: # ingame_name must be provided here due to earlier check
-        target_ign = ingame_name
-        display_target = f"IGN `{target_ign}`" # For user feedback
+        display_target = user.mention
+    else: # ingame_name must be provided
+        target_ign = ingame_name.strip() # Ensure IGN is stripped
+        if not target_ign:
+             await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
+             return
+        display_target = f"IGN `{target_ign}`"
 
-    if not target_ign: # Should not happen if logic is correct
+    if not target_ign: # Should not happen
         await interaction.followup.send("❌ Failed to determine the target IGN.", ephemeral=False)
-        await log_error(guild, "/active command failed: target_ign became None unexpectedly.", interaction=interaction)
+        await log_error(guild, "/inactive command failed: target_ign became None unexpectedly.", interaction=interaction)
         return
 
-    # --- Upsert Activity Log ---
-    success, message = await upsert_activity_log(guild, target_ign, activity_date, interaction.user.id)
+    # --- Remove Activity Log ---
+    # 'success' here means a record was actually found and deleted.
+    # 'message' contains details (deleted, not found, or error).
+    success, message = await remove_activity_log(guild, target_ign, activity_date, interaction.user.id)
 
     # --- Send Feedback ---
-    prefix = "✅" if success else "❌"
+    # Use different prefixes based on outcome
+    if "removed" in message:
+        prefix = "✅" # Record was found and removed
+    elif "No activity record found" in message:
+         prefix = "ℹ️" # Record wasn't there, not an error but info
+    else:
+         prefix = "❌" # Actual error occurred
+
     await interaction.followup.send(f"{prefix} {message}", ephemeral=False)
+
+    # --- Trigger List Refresh and Log ---
+    # Only trigger refresh if a record was actually deleted (success == True)
     if success:
-        await log_info(guild, f"`{interaction.user}` used /active for {display_target} on {format_date_dmy(activity_date)}.")
-
-
-# --- Bulk Active Modal ---
-class BulkActiveModal(Modal, title="Bulk Mark Active"):
-    igns_input = TextInput(
-        label="In-Game Names (IGNs)",
-        style=discord.TextStyle.paragraph,
-        placeholder="Enter one IGN per line or separate by spaces/commas...",
-        required=True,
-        max_length=2000 # Adjust as needed
-    )
-
-    def __init__(self, date_str: Optional[str]):
-        super().__init__(timeout=300.0) # 5 minute timeout for modal
-        self.target_date_str = date_str # Store the date passed from the command
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Defer the modal's interaction response ephemerally
-        await interaction.response.defer(thinking=True, ephemeral=False)
-
-        guild = interaction.guild
-        if not guild or not supabase: # Ensure guild and supabase are available
-            await interaction.followup.send("❌ Error: Command context or database unavailable.", ephemeral=False)
-            return
-
-        # --- Get Date ---
-        activity_date, date_error = get_utc_date(self.target_date_str)
-        if date_error:
-            await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
-            return
-        if not activity_date:
-            await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
-            return
-
-        # --- Process IGNs ---
-        raw_text = self.igns_input.value
-        # Split by newline, space, comma, and filter out empty strings
-        potential_igns = [ign.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if ign.strip()]
-
-        if not potential_igns:
-            await interaction.followup.send("❌ No IGNs were entered.", ephemeral=False)
-            return
-
-        processed_count = 0
-        success_count = 0
-        already_marked_count = 0 # Technically upsert handles this, but good for feedback
-        failed_igns = []
-        log_details = []
-
-        # Consider fetching all known IGNs first for validation if performance allows and is needed
-        # For now, we'll just try the upsert for each
-
-        progress_msg = await interaction.followup.send(f"⏳ Processing {len(potential_igns)} IGNs for {format_date_dmy(activity_date)}...", ephemeral=False)
-
-        for ign in potential_igns:
-            processed_count += 1
-            # Basic validation (e.g., length) could be added here
-            if not ign: continue
-
-            success, msg = await upsert_activity_log(guild, ign, activity_date, interaction.user.id)
-
-            if success:
-                success_count += 1
-                log_details.append(f"OK: {ign}")
-                # We can't easily tell if it was new or updated from upsert without another query
-                # For simplicity, we just count successes.
-            else:
-                failed_igns.append(f"`{ign}` ({msg.split(': ')[-1]})") # Add IGN and brief reason
-                log_details.append(f"Fail: {ign} ({msg})")
-
-            # Optional: Update progress message periodically if processing many IGNs
-            # if processed_count % 10 == 0:
-            #     try: await progress_msg.edit(content=f"⏳ Processing... ({processed_count}/{len(potential_igns)})")
-            #     except discord.HTTPException: pass # Ignore edit errors
-
-        # --- Final Feedback ---
-        summary_title = "✅ Bulk Activity Update Complete"
-        summary_desc = [f"Date Processed: **{format_date_dmy(activity_date)}**"]
-        summary_desc.append(f"Total Entries Submitted: {len(potential_igns)}")
-        summary_desc.append(f"Successfully Recorded/Updated: {success_count}")
-        # summary_desc.append(f"Already Marked: {already_marked_count}") # If we add check later
-        if failed_igns:
-            summary_title = "⚠️ Bulk Activity Update Partially Complete"
-            summary_desc.append(f"Failed Entries ({len(failed_igns)}):")
-            # Show first few failed IGNs directly in message
-            max_failed_display = 10
-            summary_desc.extend([f"- {f}" for f in failed_igns[:max_failed_display]])
-            if len(failed_igns) > max_failed_display:
-                 summary_desc.append(f"- ...and {len(failed_igns) - max_failed_display} more (check logs).")
-        else:
-             summary_desc.append("Failed Entries: 0")
-
-        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=NERDY_YELLOW if not failed_igns else discord.Color.orange())
-
-        try:
-            await progress_msg.edit(content=None, embed=summary_embed)
-        except discord.HTTPException: # Handle if original progress message gone
-             await interaction.followup.send(embed=summary_embed, ephemeral=False) # Send new message
-
-        await log_info(guild, f"`{interaction.user}` used /bulkactive. Summary: {len(potential_igns)} submitted, {success_count} success, {len(failed_igns)} failed. Details: {'; '.join(log_details)}")
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await log_error(interaction.guild, "Error in BulkActiveModal", error=error, interaction=interaction)
-        # Ensure the user gets some feedback even if the modal logic fails
-        try:
-             if interaction.response.is_done():
-                 await interaction.followup.send("❌ An unexpected error occurred in the modal.", ephemeral=False)
-             else:
-                 # This case is less likely if on_submit deferred, but handle defensively
-                 await interaction.response.send_message("❌ An unexpected error occurred in the modal.", ephemeral=False)
-        except Exception:
-             pass # Ignore errors during error reporting
+        await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. Record removed. Triggering list update.")
+        # Trigger the static list update in the background
+        asyncio.create_task(update_hc_member_list(guild))
+    elif prefix == "ℹ️":
+         # Log that the command was used but nothing changed
+         await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
+    # else: # Error case is logged by remove_activity_log
 
 
 # --- Bulk Active Command ---
@@ -2255,49 +2522,87 @@ async def hcmembers(interaction: discord.Interaction):
         await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()))
 
-# --- Refresh Static List Command ---
-@tree.command(name="refresh", description="Manually refresh static [HC1] list (username#tag ➔ IGN).")
+# --- Refresh Static List Command (MODIFIED WITH AUTO-DELETE) ---
+@tree.command(name="refresh", description="Manually refresh static [HC1] list (auto-deletes confirmation).")
 @app_commands.checks.has_permissions(manage_roles=True) # Keep permission check
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
+    # --- Initial Checks ---
     if not await check_supabase_available(interaction):
-        # If check fails, helper sends ephemeral msg & logs.
+        # Helper sends ephemeral msg & logs. We need to ensure the interaction isn't left hanging if deferred.
         try:
-             # Check if we actually deferred before trying to edit
-             if interaction.response.is_done():
+             if interaction.response.is_done(): # Check if already deferred (unlikely here, but defensive)
                   await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
-        except (discord.NotFound, discord.HTTPException):
-             pass # Ignore errors editing the deferred message
-        return # Stop the command here
+        except (discord.NotFound, discord.HTTPException): pass
+        return
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
-
-    # Defer ephemerally, the result is the list being updated, not a direct message
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    if not supabase:
-        await interaction.followup.send("❌ Database connection unavailable.", ephemeral=False)
-        await log_error(guild, "/refresh failed: Supabase unavailable.", interaction=interaction)
+    if not supabase: # Check again just in case
+        await interaction.response.send_message("❌ Database connection unavailable.", ephemeral=False)
+        await log_error(guild, "/refresh failed: Supabase unavailable post-check.", interaction=interaction)
         return
 
     list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
     if not isinstance(list_channel, discord.TextChannel):
         msg = f"❌ Configuration Error: Static list channel (ID: {HC_MEMBER_LIST_CHANNEL_ID}) is invalid or not found."
-        await interaction.followup.send(msg, ephemeral=False)
+        # Use send_message here as we haven't deferred yet for this specific error path
+        await interaction.response.send_message(msg, ephemeral=False)
         await log_error(guild, f"/refresh failed: Static list channel invalid.", interaction=interaction)
         return
 
+    # --- Defer Publicly ---
+    # Shows "Bot is thinking..." while the update runs.
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    confirmation_message: Optional[discord.Message] = None # Initialize variable
+
     try:
         await log_info(guild, f"Manual static list refresh initiated by `{interaction.user}`.")
-        # Run the update function (don't await if it's long, but for now await is fine)
-        await update_hc_member_list(guild)
-        # Confirm initiation to the user
-        await interaction.followup.send(f"✅ Refresh initiated for the static list in {list_channel.mention}. Please allow a moment for it to update.", ephemeral=False)
-    except Exception as e:
-        await log_error(guild, "Error initiating /refresh", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected error occurred while starting the refresh process.", ephemeral=False)
 
+        # --- Run the update function and wait for completion ---
+        await update_hc_member_list(guild)
+        # --- List update is now complete ---
+
+        # --- Send Confirmation (NOT ephemeral, so bot can delete it) ---
+        confirmation_message = await interaction.followup.send(
+            f"✅ Refresh complete for the static list in {list_channel.mention}. This message will self-destruct shortly.",
+            ephemeral=False # MUST be False for the bot to delete it later
+        )
+        await log_info(guild, f"Refresh command confirmed complete to user {interaction.user}.")
+
+        # --- Wait a few seconds for the user to read ---
+        delete_delay_seconds = 7 # Adjust as needed (e.g., 5, 7, 10)
+        await asyncio.sleep(delete_delay_seconds)
+
+        # --- Attempt to delete the confirmation message ---
+        try:
+            await confirmation_message.delete()
+            await log_info(guild, f"Auto-deleted refresh confirmation message (ID: {confirmation_message.id}).")
+        except discord.NotFound:
+            # Message might have been deleted manually - this is fine.
+            await log_info(guild, f"Refresh confirmation message (ID: {confirmation_message.id}) was already deleted.")
+        except discord.Forbidden:
+            # Bot lacks permissions in the interaction channel
+            await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): Missing Permissions in channel {interaction.channel.mention if interaction.channel else interaction.channel_id}", interaction=interaction)
+            # Optionally notify the user ephemerally that auto-delete failed?
+            # try: await interaction.followup.send("⚠️ Couldn't auto-delete the confirmation message (Missing Permissions).", ephemeral=True)
+            # except Exception: pass
+        except discord.HTTPException as e:
+             await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): HTTP Error", error=e, interaction=interaction)
+        except Exception as e:
+             await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): Unexpected Error", error=e, interaction=interaction)
+
+    except Exception as e:
+        # Catch errors during the main refresh process or sending the initial confirmation
+        await log_error(guild, "Error during /refresh process", error=e, interaction=interaction)
+        # Try to inform the user if the main process failed (and confirmation wasn't sent)
+        if confirmation_message is None: # Check if confirmation was successfully sent before error
+             try:
+                 # Use edit_original_response since we definitely deferred
+                 await interaction.edit_original_response(content="❌ An unexpected error occurred during the refresh process.", embed=None, view=None)
+             except Exception: pass # Ignore errors during error reporting
+             
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
@@ -2774,11 +3079,11 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh the static HC member list.", value="\u200B", inline=False)
 
-    # Section: Activity Tracking  <- NEW SECTION
+    # Section: Activity Tracking
     embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False) # Section Title
     embed.add_field(name=f"{get_cmd_mention('active')}  · Mark a member as active for a date.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False) # <-- ADDED
     embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
-    # Add /activity command here when you create it
 
     # Section: Utilities
     embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False) # Section Title
@@ -2801,7 +3106,7 @@ async def nerdhelp(interaction: discord.Interaction):
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
-        
+
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
