@@ -12,9 +12,12 @@ from supabase import create_client, Client
 from postgrest import APIError
 import traceback
 import math
-from typing import Optional, Tuple, List, Dict # Keep this one, it's used more broadly
+from typing import Optional, Tuple, List, Dict, Any # Keep this one, it's used more broadly
 from dotenv import load_dotenv
 import datetime
+import pytz # Add this import at the top
+from dateutil.parser import parse as date_parse # Add this import at the top
+from dateutil.relativedelta import relativedelta # Add this import at the top
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -59,6 +62,11 @@ ERROR_LOG_CHANNEL_ID = 1362988767367135453 # Error log channel
 MEMBERS_PER_PAGE = 50 # Members per page in lists
 NERDY_YELLOW = discord.Color.gold() # Embed color
 ROLE_ID_MAYBE_EXHC = 1267882075390873681 # Role to add on HC leave, remove on HC verify
+VIEW_MODE_DISCORD = "discord_view"
+VIEW_MODE_ACTIVITY = "activity_view" # Simplified: We'll show all-time activity unless specific range needed later
+SORT_MODE_IGN = "sort_ign"
+SORT_MODE_ACTIVITY = "sort_activity"
+ACTIVITY_COLUMN_WIDTH = 6 # e.g., "Act: 99" or "Seen: "
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -84,6 +92,130 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+def get_utc_date(date_str: Optional[str] = None) -> Tuple[Optional[datetime.date], Optional[str]]:
+    """Parses a YYYY-MM-DD string or defaults to today's UTC date. Returns date object and error message."""
+    if date_str:
+        try:
+            # Lenient parsing, but enforce basic structure checks if needed
+            if len(date_str) != 10 or date_str[4] != '-' or date_str[7] != '-':
+                 raise ValueError("Expected YYYY-MM-DD format.")
+            # Attempt to parse
+            dt_obj = date_parse(date_str)
+            # Return only the date part, assuming UTC context from input string is less relevant than just the date itself
+            return dt_obj.date(), None
+        except ValueError as e:
+            return None, f"Invalid date format or value: `{date_str}`. Please use YYYY-MM-DD. Error: {e}"
+        except Exception as e: # Catch other potential parsing errors
+             return None, f"Could not parse date `{date_str}`. Error: {e}"
+    else:
+        # Default to today's UTC date
+        return datetime.datetime.now(pytz.utc).date(), None
+
+def format_date_dmy(date_obj: Optional[datetime.date]) -> str:
+    """Formats a date object as DD/MM/YYYY or returns 'N/A'."""
+    if date_obj:
+        return date_obj.strftime("%d/%m/%Y")
+    return "N/A"
+
+async def get_ign_from_user(guild: discord.Guild, user_id: int) -> Optional[str]:
+    """Fetches the stored IGN for a given Discord user ID from hc_members."""
+    if not supabase: return None
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("ingame_name")
+                           .eq("discord_id", str(user_id))
+                           .maybe_single() # Fetch single record or None
+                           .execute()
+        )
+        if resp and hasattr(resp, 'data') and resp.data and resp.data.get("ingame_name"):
+            return resp.data["ingame_name"]
+        return None
+    except (ConnectionError, APIError, Exception) as e:
+        await log_error(guild, f"Failed to fetch IGN for user ID {user_id}", error=e)
+        return None # Return None on error
+
+async def upsert_activity_log(guild: discord.Guild, ign: str, activity_date: datetime.date, recorder_id: int) -> Tuple[bool, str]:
+    """Upserts an activity record. Returns (success, message). Handles case-insensitivity."""
+    if not supabase: return False, "Database unavailable."
+    if not ign: return False, "IGN cannot be empty."
+
+    # Standardize IGN to lowercase for storage/lookup
+    ign_lower = ign.lower()
+
+    try:
+        # Use upsert with ON CONFLICT to handle duplicates based on the unique constraint
+        await run_supabase_sync(
+            lambda: supabase.table("activity_log")
+                           .upsert({
+                               "member_identifier": ign_lower, # Store lowercase IGN
+                               "activity_date": activity_date.isoformat(), # Format date as YYYY-MM-DD string
+                               "recorded_by_id": str(recorder_id) # Optional: store who recorded it
+                               # 'created_at' should be handled by DB default
+                           }, on_conflict="member_identifier, activity_date") # Use the unique constraint columns
+                           .execute()
+        )
+        # Note: Upsert response doesn't reliably tell if insert or update happened easily.
+        # We assume success if no error. Check logs for specific errors if needed.
+        return True, f"Activity recorded for `{ign}` on {format_date_dmy(activity_date)}."
+    except APIError as e:
+        err_msg = f"Database API error recording activity for `{ign}`: {e.message}"
+        await log_error(guild, err_msg, error=e)
+        return False, err_msg
+    except (ConnectionError, Exception) as e:
+        err_msg = f"Database connection/unexpected error recording activity for `{ign}`."
+        await log_error(guild, err_msg, error=e)
+        return False, err_msg
+
+async def fetch_activity_data(guild: discord.Guild, identifiers: List[str], start_date: Optional[datetime.date] = None, end_date: Optional[datetime.date] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetches activity counts and last seen date for given IGN identifiers (case-insensitive) within a date range.
+    Returns: {'ign_lower': {'count': int, 'last_seen': date | None}}
+    """
+    if not supabase or not identifiers:
+        return {}
+
+    # Standardize identifiers to lowercase for querying
+    identifiers_lower = [ign.lower() for ign in identifiers]
+    results: Dict[str, Dict[str, Any]] = {ign_lower: {'count': 0, 'last_seen': None} for ign_lower in identifiers_lower}
+
+    try:
+        query = supabase.table("activity_log").select("member_identifier, activity_date").in_("member_identifier", identifiers_lower)
+        if start_date:
+            query = query.gte("activity_date", start_date.isoformat())
+        if end_date:
+            query = query.lte("activity_date", end_date.isoformat())
+
+        # Fetch all relevant activity logs in chunks if needed (though likely fine for typical ranges)
+        all_logs = []
+        # Simple fetch for now, add pagination if needed for very large ranges/servers
+        resp = await run_supabase_sync(lambda: query.execute())
+
+        if resp and hasattr(resp, 'data') and resp.data:
+            all_logs = resp.data
+
+        # Process logs in Python
+        for log in all_logs:
+            ign_lower = log['member_identifier'] # Already lowercase from query filter
+            activity_date_str = log['activity_date']
+            try:
+                 current_log_date = datetime.datetime.strptime(activity_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                 print(f"Warning: Skipping invalid date format '{activity_date_str}' in activity log for {ign_lower}")
+                 continue # Skip this invalid record
+
+            if ign_lower in results:
+                results[ign_lower]['count'] += 1
+                # Update last_seen date if this log is newer
+                if results[ign_lower]['last_seen'] is None or current_log_date > results[ign_lower]['last_seen']:
+                    results[ign_lower]['last_seen'] = current_log_date
+
+        return results
+
+    except (ConnectionError, APIError, Exception) as e:
+        await log_error(guild, f"Failed to fetch activity data for {len(identifiers)} identifiers", error=e)
+        return {} # Return empty dict on error
 
 async def check_supabase_available(interaction: discord.Interaction) -> bool:
     """
@@ -160,105 +292,196 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
         if error:
             etype, emsg = type(error).__name__, str(error)
             tb = "".join(traceback.format_exception(type(error), error, error.__traceback__, limit=6))
-            tb_short = (tb[:950] + "\n... (Truncated)") if len(tb) > 950 else tb
+            # Truncate traceback more aggressively
+            tb_short = (tb[:900] + "\n... (Truncated)") if len(tb) > 900 else tb # ADJUSTED TRUNCATION
             details = f"**Type:** `{etype}`\n" + (f"**Msg:** `{emsg}`\n" if emsg else "") + f"**Traceback:**\n```py\n{tb_short}\n```"
+            # Keep the final check, but reduce its limit slightly too for safety
             if len(details) > 1024:
-                 details = details[:1021] + "...```"
+                 details = details[:1000] + "...```" # ADJUSTED TRUNCATION
             embed.add_field(name="Error Details", value=details, inline=False)
             full_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
             print(f"---\nERROR LOGGED:\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---\n")
     await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed)
 
-
 # --- Embed Pagination View ---
+
+class ActivitySortButton(Button):
+     def __init__(self, current_sort: str, row: int):
+          # Determine label and style based on current sort
+          label = "Sort by IGN" if current_sort == SORT_MODE_ACTIVITY else "Sort by Activity"
+          style = discord.ButtonStyle.success # Or choose another style
+          super().__init__(label=label, style=style, custom_id="hc_toggle_sort", row=row)
+
+     async def callback(self, interaction: discord.Interaction):
+          # Tell the view to handle the sort toggle
+          view: HCPagesView = self.view # Type hint for clarity
+          if view:
+               await view.toggle_sort(interaction)
+
+class ViewModeSelect(discord.ui.Select):
+     def __init__(self, current_mode: str, row: int):
+          options = [
+               discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, description="Show Discord usernames and IGNs.", emoji="👤"),
+               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY, description="Show IGNs and total activity count.", emoji="📊"),
+               # Add options for Daily/Weekly/Monthly later if needed - requires date range fetching
+               # discord.SelectOption(label="View Activity (Today)", value="activity_daily", description="Show IGNs active today.", emoji="📅"),
+               # discord.SelectOption(label="View Activity (Last 7 Days)", value="activity_weekly", description="Show IGNs active in the last week.", emoji="🗓️"),
+          ]
+          # Ensure the current mode is set as default
+          for option in options:
+                option.default = option.value == current_mode
+
+          super().__init__(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="hc_view_select", row=row)
+
+     async def callback(self, interaction: discord.Interaction):
+          view: HCPagesView = self.view
+          if view:
+               selected_mode = self.values[0]
+               await view.change_view_mode(interaction, selected_mode)
+
+
 class HCPagesView(View):
-    """ Paginated view for HC members (formatted table, mobile-friendly)."""
-    def __init__(self, data: List[Tuple[Optional[discord.Member], str]], total_members: int, timeout=300.0):
+    # Data is now List[Dict[str, Any]] from fetch_hc_member_data
+    def __init__(self, data: List[Dict[str, Any]], total_members: int, timeout=300.0):
         super().__init__(timeout=timeout)
-        self.data = data
+        self.original_data = data # Keep original fetch order if needed
+        self.current_data = data # Data to be sorted/displayed
         self.total_members = total_members
         self.current_page = 0
-        self.total_pages = math.ceil(len(self.data) / MEMBERS_PER_PAGE) if self.data else 1
+        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
         self.message: Optional[discord.Message] = None
-        # Ensure buttons are updated after initialization
-        self.update_buttons() # <--- This call needs the method below to exist
 
-    # --- THIS METHOD NEEDS TO EXIST ---
-    def update_buttons(self):
-        """Disables buttons based on the current page."""
-        # Check if children exist and have at least 2 elements before accessing
-        # Assumes Previous is children[0] and Next is children[1]
-        if hasattr(self, 'children') and len(self.children) >= 2:
-            # It's safer to access by custom_id if possible, but index works if order is fixed
-            prev_button = self.children[0]
-            next_button = self.children[1]
-            if isinstance(prev_button, Button):
-                prev_button.disabled = self.current_page == 0
-            if isinstance(next_button, Button):
-                next_button.disabled = self.current_page >= self.total_pages - 1
-        else:
-            # Log or handle the case where buttons aren't found as expected
-            print(f"Warning: Could not find Previous/Next buttons in HCPagesView children to update state.")
+        # --- NEW STATE ---
+        self.view_mode = VIEW_MODE_DISCORD # Default view
+        self.sort_mode = SORT_MODE_IGN # Default sort
 
-    # --- UPDATED create_page_embed ---
+        # --- Add UI Elements ---
+        # Row 0: Page Buttons (Decorators handle adding these)
+        # self.add_item(Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)) # REMOVED
+        # self.add_item(Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0))     # REMOVED
+
+        # Row 1: Sort Button
+        self.add_item(ActivitySortButton(current_sort=self.sort_mode, row=1))
+        # Row 2: Dropdown
+        self.add_item(ViewModeSelect(current_mode=self.view_mode, row=2))
+
+        self.update_buttons_and_ui() # Call initial update
+
+    def sort_data(self):
+         """Sorts self.current_data based on self.sort_mode."""
+         if self.sort_mode == SORT_MODE_IGN:
+              # Sort by IGN (case-insensitive), fallback to member name if IGN is 'Unknown'
+              self.current_data.sort(key=lambda item: item['ign'].lower() if item['ign'] != "Unknown" else (item['member'].name.lower() if item.get('member') else 'zzz'))
+         elif self.sort_mode == SORT_MODE_ACTIVITY:
+              # Sort by activity_count (descending), then IGN (case-insensitive) as tie-breaker
+              self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item['ign'].lower()))
+         # Recalculate total pages after sorting (shouldn't change length, but good practice)
+         self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
+         # Reset to first page after sorting to avoid confusion
+         self.current_page = 0
+
+
+    def update_buttons_and_ui(self):
+        """Disables page buttons based on the current page and updates other UI elements."""
+        # --- Update Page Buttons ---
+        # Use find_item_by_custom_id for safety
+        # Find items added via decorators or add_item
+        prev_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_prev_interactive', self.children)
+        next_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_next_interactive', self.children)
+        if isinstance(prev_button, Button): prev_button.disabled = self.current_page == 0
+        if isinstance(next_button, Button): next_button.disabled = self.current_page >= self.total_pages - 1
+
+        # --- Update Sort Button Label ---
+        sort_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_toggle_sort', self.children)
+        if isinstance(sort_button, Button):
+             sort_button.label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
+             # Disable sort button if in discord view? Or allow sorting by name/ign? For now, enable always.
+             # sort_button.disabled = self.view_mode == VIEW_MODE_DISCORD # Example: disable in discord view
+
+        # --- Update Select Default ---
+        select_menu = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_view_select', self.children)
+        if isinstance(select_menu, discord.ui.Select):
+             for option in select_menu.options:
+                  option.default = option.value == self.view_mode
+
+
+    # --- REVISED create_page_embed ---
     def create_page_embed(self) -> discord.Embed:
-        # --- Define Column Widths (Mobile Optimized) ---
-        IDX_WIDTH = 3   # "99."
-        NAME_WIDTH = 15 # Reduced for mobile
-        IGN_WIDTH = 15  # Reduced for mobile
-        ABC_WIDTH = 4   # Reduced for mobile ("abc ")
-
-        # Calculate total expected width for separator
-        TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH
-
+        """Creates embed based on current view_mode and sort_mode."""
         start = self.current_page * MEMBERS_PER_PAGE
-        page_data = self.data[start : start + MEMBERS_PER_PAGE]
+        page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
 
-        # --- Create Header ---
-        header = (
-            f"{'#':<{IDX_WIDTH}}"
-            f"{'Discord':<{NAME_WIDTH}}"        # Shorter title
-            f"{'In-Game':<{IGN_WIDTH}}"         # Shorter title
-            f"{'abc':<{ABC_WIDTH}}"
-        )
+        # --- Define Column Widths ---
+        IDX_WIDTH = 3
+        # Adjust widths based on view mode
+        if self.view_mode == VIEW_MODE_DISCORD:
+             # Similar to original, maybe reduce IGN width slightly?
+             NAME_WIDTH = 15
+             IGN_WIDTH = 15
+             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
+             header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
+        elif self.view_mode == VIEW_MODE_ACTIVITY:
+             IGN_WIDTH = 20 # Give IGN more space
+             ACT_WIDTH = 10 # Activity count/last seen
+             TOTAL_WIDTH = IDX_WIDTH + IGN_WIDTH + ACT_WIDTH
+             header = (f"{'#':<{IDX_WIDTH}}{'In-Game':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
+        else: # Fallback/Default (shouldn't happen with current modes)
+             NAME_WIDTH = 15
+             IGN_WIDTH = 15
+             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
+             header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
+
         separator = "-" * TOTAL_WIDTH
 
         # --- Build Description within Code Block ---
-        desc_lines = [f"```", header, separator] # Use plain code block
+        desc_lines = [f"```", header, separator]
         idx = start + 1
-        for member, ign in page_data: # <--- Use the same loop structure
-            # Prepare display strings
-            if member: # Check if it's a discord.Member object
-                user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                is_discord_member = True
-            else:
-                # This is a non-Discord entry (member is None)
-                user_display = "[No Discord]" # Or "---", or ""
-                is_discord_member = False
-
-            ign_display = str(ign) if ign else "Unknown"
-            abc_val = "1" # Keep your 'abc' column logic if needed
-
-            # Truncate aggressively with ellipsis (apply to placeholder too if needed)
-            if len(user_display) > NAME_WIDTH:
-                user_display = user_display[:NAME_WIDTH-1] + "…"
-            if len(ign_display) > IGN_WIDTH:
-                ign_display = ign_display[:IGN_WIDTH-1] + "…"
-
-            # Format the line (ensure alignment still works)
-            line = (
-                f"{str(idx)+'.':<{IDX_WIDTH}}"
-                f"{user_display:<{NAME_WIDTH}}"
-                f"{ign_display:<{IGN_WIDTH}}"
-                f"{abc_val:<{ABC_WIDTH}}"
-            )
-            desc_lines.append(line)
-            idx += 1
 
         if not page_data:
-            desc_lines = ["```\nNo members on this page.\n```"] # Plain code block
+            desc_lines = ["```\nNo members found matching criteria.\n```"]
         else:
-             desc_lines.append("```") # Close the code block
+            for item_dict in page_data:
+                member = item_dict.get('member')
+                ign = item_dict.get('ign', 'Unknown')
+                activity_count = item_dict.get('activity_count', 0)
+                last_seen_date = item_dict.get('last_seen') # This is a date object or None
+
+                # Prepare display strings based on view mode
+                if self.view_mode == VIEW_MODE_DISCORD:
+                    if member:
+                        user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+                    else:
+                        user_display = "[No Discord]"
+                    ign_display = ign
+
+                    # Truncate aggressively
+                    if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
+                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
+
+                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
+                            f"{user_display:<{NAME_WIDTH}}"
+                            f"{ign_display:<{IGN_WIDTH}}")
+
+                elif self.view_mode == VIEW_MODE_ACTIVITY:
+                    ign_display = ign
+                    # Format activity string (e.g., count and maybe last seen)
+                    activity_display = f"{activity_count}d ({format_date_dmy(last_seen_date)})"
+                    # activity_display = f"Count: {activity_count}" # Simpler alternative
+
+                    # Truncate
+                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
+                    if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
+
+                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
+                            f"{ign_display:<{IGN_WIDTH}}"
+                            f"{activity_display:<{ACT_WIDTH}}")
+                else: # Fallback
+                     line = f"{str(idx)+'.':<{IDX_WIDTH}} Error: Invalid View Mode"
+
+
+                desc_lines.append(line)
+                idx += 1
+            desc_lines.append("```") # Close code block
 
         # --- Create Embed ---
         embed = discord.Embed(
@@ -266,34 +489,23 @@ class HCPagesView(View):
             description="\n".join(desc_lines),
             color=NERDY_YELLOW
         )
-        embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members}")
+        # Add sort/view mode to footer
+        sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
+        view_text = "Discord+IGN" if self.view_mode == VIEW_MODE_DISCORD else "Activity" # Adjust as modes expand
+        embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | View: {view_text} | Sort: {sort_text}")
         embed.timestamp = discord.utils.utcnow()
         return embed
 
-    # --- edit_message ---
     async def edit_message(self, interaction: discord.Interaction):
+        """Updates the message embed and view components."""
+        self.update_buttons_and_ui() # Ensure UI elements are up-to-date before creating embed
         embed = self.create_page_embed()
-        self.update_buttons() # Update button states before editing
         try:
-            # Check if interaction is already responded to or deferred
-            if interaction.response.is_done():
-                 # If we have the message object, edit it
-                 if self.message:
-                     await self.message.edit(embed=embed, view=self)
-                 else:
-                     # If message is somehow None after response is done, log and maybe followup
-                     print(f"Warning: edit_message called but self.message is None (Interaction ID: {interaction.id})")
-                     await interaction.followup.send("Error updating view (message not found).", ephemeral=False)
-            else:
-                 # If not responded/deferred yet, use edit_message on the response
-                 await interaction.response.edit_message(embed=embed, view=self)
-
+            # Always edit the original response for slash commands/components
+            await interaction.response.edit_message(embed=embed, view=self)
         except discord.NotFound:
-            print(f"Paginator edit fail: Original message {self.message.id if self.message else 'Unknown'} not found or interaction expired.")
-            # Disable buttons on the view instance if message is gone
-            for item in self.children:
-                if isinstance(item, Button): item.disabled = True
-            self.stop() # Stop the view as well
+            print(f"Paginator edit fail: Interaction {interaction.id} or original message not found.")
+            self.stop()
         except discord.HTTPException as e:
             guild = interaction.guild or (self.message.guild if self.message else None)
             await log_error(guild, "Paginator edit fail (HTTP)", error=e, interaction=interaction)
@@ -301,69 +513,73 @@ class HCPagesView(View):
             guild = interaction.guild or (self.message.guild if self.message else None)
             await log_error(guild, "Paginator edit fail (General)", error=e, interaction=interaction)
 
-    # --- previous_button ---
-    @button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)
-    async def previous_button(self, interaction: discord.Interaction, b: Button):
+    # --- Button Callbacks (Keep the decorators) ---
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)
+    async def previous_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page > 0:
             self.current_page -= 1
             await self.edit_message(interaction)
         else:
-            # Acknowledge button press even if no action is taken
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer()
-            except discord.InteractionResponded: pass
-            except discord.NotFound: print("Previous Button: Interaction expired before defer.")
-            except Exception as e: await log_error(interaction.guild, "Previous Button Defer Error", e, interaction)
+            await interaction.response.defer() # Ack the interaction
 
-
-    # --- next_button ---
-    @button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0)
-    async def next_button(self, interaction: discord.Interaction, b: Button):
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0)
+    async def next_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page < self.total_pages - 1:
             self.current_page += 1
             await self.edit_message(interaction)
         else:
-            # Acknowledge button press even if no action is taken
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer()
-            except discord.InteractionResponded: pass
-            except discord.NotFound: print("Next Button: Interaction expired before defer.")
-            except Exception as e: await log_error(interaction.guild, "Next Button Defer Error", e, interaction)
+            await interaction.response.defer() # Ack
 
-    # --- on_timeout ---
+    # --- New Callbacks for Sort Button and Select ---
+    async def toggle_sort(self, interaction: discord.Interaction):
+        """Called by the ActivitySortButton."""
+        if self.sort_mode == SORT_MODE_IGN:
+            self.sort_mode = SORT_MODE_ACTIVITY
+        else:
+            self.sort_mode = SORT_MODE_IGN
+        self.sort_data() # Re-sort the data
+        await self.edit_message(interaction) # Update the message
+
+    async def change_view_mode(self, interaction: discord.Interaction, new_mode: str):
+        """Called by the ViewModeSelect."""
+        if self.view_mode != new_mode:
+            self.view_mode = new_mode
+            # Decide if sorting needs to reset or change based on view
+            # For now, keep the current sort mode but reset page
+            self.current_page = 0
+            # Potentially fetch new data here if view modes require different datasets (e.g., date ranges)
+            # Currently, we assume self.current_data has all needed info (all-time activity)
+            self.sort_data() # Re-apply sort just in case (might be redundant if data didn't change)
+            await self.edit_message(interaction)
+        else:
+             await interaction.response.defer() # Ack if mode didn't change
+
+
+    # --- on_timeout (modified slightly to handle new UI items) ---
     async def on_timeout(self):
         if self.message:
             try:
-                # Create a new view instance based on the message state to disable buttons
-                view_copy = View.from_message(self.message)
-                if view_copy: # Ensure view_copy was successfully created
-                    for item in view_copy.children:
-                        if isinstance(item, Button):
-                            item.disabled = True
-                    await self.message.edit(view=view_copy)
-                    print(f"Paginator timeout: Disabled buttons on message {self.message.id}")
-                else:
-                    # Fallback if from_message fails, attempt edit with None view
-                    await self.message.edit(view=None)
-                    print(f"Paginator timeout: Cleared view on message {self.message.id} (from_message failed)")
+                # Disable all components on timeout
+                for item in self.children:
+                    if hasattr(item, 'disabled'):
+                         item.disabled = True # Disable buttons, select
+                await self.message.edit(view=self) # Edit with the modified view
+                print(f"Paginator timeout: Disabled components on message {self.message.id}")
             except discord.NotFound: print(f"Paginator timeout edit fail: Message {self.message.id} not found.")
             except discord.HTTPException as e:
-                 guild = self.message.guild
-                 # Avoid logging 404 again if it was caught above
-                 if e.status != 404:
-                     await log_error(guild, f"Paginator timeout edit HTTP fail on message {self.message.id}", error=e)
+                 # Avoid logging 404 again
+                 if e.status != 404: await log_error(self.message.guild, f"Paginator timeout edit HTTP fail", error=e)
             except Exception as e:
-                 guild = self.message.guild
-                 await log_error(guild, f"Paginator timeout edit general fail on message {self.message.id}", error=e)
-        self.stop() # Stop the view logic regardless of message edit success
+                 await log_error(self.message.guild, f"Paginator timeout edit general fail", error=e)
+        self.stop()
 
 # --- REVISED fetch_hc_member_data ---
-async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Tuple[Optional[discord.Member], str]], int]:
+async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Fetches HC members from Discord and Supabase.
-    Returns a list combining [(discord_member, ign), ..., (None, ign_only_in_db), ...], sorted with Discord members first.
+    Fetches HC members from Discord and Supabase, including all-time activity counts.
+    Returns a list of dicts: [{'member': discord.Member | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
+    and the total count.
+    Data is sorted by Discord name (if available), then IGN (case-insensitive).
     """
     print(f"Fetch HC Data ({guild.name}): Starting fetch...")
     hc_role = guild.get_role(ADD_ROLE_ID_HC)
@@ -371,105 +587,136 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Tuple[Optiona
         await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found during fetch.")
         return [], 0
 
-    # 1. Fetch ALL entries from Supabase
-    all_db_members_map: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'processed': False}
-    non_discord_db_members: List[Tuple[None, str]] = [] # [(None, ign)]
+    # 1. Fetch ALL entries from Supabase hc_members table
+    all_db_members: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'processed': False}
+    ign_only_members: Dict[str, Dict] = {} # ign_lower -> {'ign_original': ign, 'processed': False}
+    all_igns_in_db: List[str] = [] # List of all original-case IGNs for activity fetching
+
     try:
-        if not supabase:
-            raise ConnectionError("Supabase client unavailable.")
+        if not supabase: raise ConnectionError("Supabase client unavailable.")
         print(f"Fetch HC Data ({guild.name}): Fetching all from Supabase hc_members table...")
-        # Fetch in chunks if table might be very large (though unlikely needed here)
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
-                            .select("discord_id, ingame_name")
-                            # .limit(1000) # Add limit/pagination if table is huge
-                            .execute()
+            lambda: supabase.table("hc_members").select("discord_id, ingame_name").execute()
         )
         if resp and hasattr(resp, 'data') and resp.data:
             for entry in resp.data:
-                ign = entry.get("ingame_name") or "Unknown DB IGN"
-                d_id = entry.get("discord_id") # This can now be None
+                ign = entry.get("ingame_name")
+                if not ign: continue # Skip entries without an IGN
+                all_igns_in_db.append(ign) # Add original case IGN
+                d_id = entry.get("discord_id")
                 if d_id:
-                    # Store entries with discord_id in a map for quick lookup
-                    all_db_members_map[str(d_id)] = {"ign": ign, "processed": False}
+                    all_db_members[str(d_id)] = {"ign": ign, "processed": False}
                 else:
-                    # Store entries without discord_id directly in the non-discord list
-                    non_discord_db_members.append((None, ign))
-            print(f"Fetch HC Data ({guild.name}): Found {len(all_db_members_map)} DB entries with Discord ID, {len(non_discord_db_members)} without.")
+                    ign_only_members[ign.lower()] = {"ign_original": ign, "processed": False}
+            print(f"Fetch HC Data ({guild.name}): Found {len(all_db_members)} DB entries with Discord ID, {len(ign_only_members)} without.")
         else:
-             print(f"Fetch HC Data ({guild.name}): No data returned from Supabase.")
+            print(f"Fetch HC Data ({guild.name}): No data returned from Supabase hc_members.")
 
     except (ConnectionError, APIError, Exception) as e:
-        await log_error(guild, "Failed to fetch all data from Supabase", error=e)
-        # Return empty or potentially partial data based on what was fetched before error?
-        # For simplicity, return empty on critical DB failure
-        return [], 0
+        await log_error(guild, "Failed to fetch all data from Supabase hc_members", error=e)
+        return [], 0 # Return empty on critical DB failure
 
-    # 2. Get Discord members with the HC role
+    # 2. Fetch ALL activity data for the IGNs found
+    print(f"Fetch HC Data ({guild.name}): Fetching all-time activity for {len(all_igns_in_db)} IGNs...")
+    # Fetch activity counts using the helper function (pass original case IGNs)
+    # The helper will handle lowercase matching internally for the query
+    activity_counts = await fetch_activity_data(guild, all_igns_in_db) # Fetches count and last_seen
+    print(f"Fetch HC Data ({guild.name}): Fetched activity data for {len(activity_counts)} IGNs.")
+
+    # 3. Get Discord members with the HC role
     discord_hc_members: List[discord.Member] = []
     try:
-        if not guild.chunked:
-            print(f"Fetch HC Data ({guild.name}): Chunking guild...")
-            await guild.chunk(cache=True)
+        # Ensure guild is chunked if needed
+        if not guild.chunked and guild.member_count is not None and guild.member_count > 1000:
+             try:
+                 print(f"Fetch HC Data ({guild.name}): Chunking guild..."); await guild.chunk(cache=True)
+             except Exception as chunk_e: print(f"WARN: Chunking failed: {chunk_e}")
+
         discord_hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
         print(f"Fetch HC Data ({guild.name}): Found {len(discord_hc_members)} Discord members with HC role.")
     except Exception as e:
         await log_error(guild, "Guild chunking/member fetch failed", error=e)
-        # Continue with potentially empty list, Supabase entries might still exist
+        # Continue, Supabase entries might still exist
 
-    # 3. Correlate Discord members with DB data and build the final lists
-    discord_members_data: List[Tuple[discord.Member, str]] = []
+    # 4. Correlate and Build Final Data Structure
+    final_data: List[Dict[str, Any]] = []
 
+    # Process Discord members with HC role
     for member in discord_hc_members:
         member_id_str = str(member.id)
-        db_entry = all_db_members_map.get(member_id_str)
-        ign = "Unknown" # Default if not found in DB map
+        db_entry = all_db_members.get(member_id_str)
+        ign = "Unknown"
+        activity = {'count': 0, 'last_seen': None} # Default activity
+
         if db_entry:
             ign = db_entry["ign"]
-            db_entry["processed"] = True # Mark as processed
+            db_entry["processed"] = True
+            # Get activity for this member's IGN (use lowercase for lookup)
+            activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
         else:
-             # This member has the HC role but isn't in our DB map (or DB failed)
-             # Log this potential inconsistency?
-             await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
-             # Decide if you want to show them with 'Unknown' IGN or skip them. Showing them seems better.
+            # Member has role but no DB entry? Log it.
+            await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
 
-        discord_members_data.append((member, ign))
+        final_data.append({
+            "member": member,
+            "ign": ign,
+            "activity_count": activity['count'],
+            "last_seen": activity['last_seen'] # Store the date object or None
+        })
 
-    # 4. Add remaining DB entries (those whose Discord members lost the role or left) to non_discord_list
-    for d_id, entry_data in all_db_members_map.items():
+    # Process remaining DB entries (Discord member lost role/left or IGN-only)
+    # Add Discord-linked entries first
+    for d_id, entry_data in all_db_members.items():
         if not entry_data["processed"]:
-            # This DB entry had a discord_id, but the corresponding member doesn't have the HC role anymore (or left)
-            non_discord_db_members.append((None, entry_data["ign"]))
-            # Log this change?
-            # print(f"Fetch HC Data Note: DB entry for ID {d_id} (IGN: {entry_data['ign']}) no longer matches active HC Discord member.")
+            ign = entry_data["ign"]
+            activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
+            final_data.append({
+                "member": None,
+                "ign": ign,
+                "activity_count": activity['count'],
+                "last_seen": activity['last_seen']
+            })
 
-    # 5. Sort the lists
-    # Sort Discord members by username#discriminator (case-insensitive)
-    discord_members_data.sort(key=lambda item: (item[0].name.lower(), item[0].discriminator))
-    # Sort non-Discord members by IGN (case-insensitive)
-    non_discord_db_members.sort(key=lambda item: item[1].lower())
+    # Add IGN-only entries
+    for ign_lower, entry_data in ign_only_members.items():
+         # No need to check 'processed' here as they weren't handled by Discord member loop
+         ign = entry_data["ign_original"]
+         activity = activity_counts.get(ign_lower, {'count': 0, 'last_seen': None})
+         final_data.append({
+             "member": None,
+             "ign": ign,
+             "activity_count": activity['count'],
+             "last_seen": activity['last_seen']
+         })
 
-    # 6. Combine and return
-    final_data = discord_members_data + non_discord_db_members
+
+    # 5. Sort the final list (Default: Discord name if available, then IGN case-insensitive)
+    final_data.sort(key=lambda item: (
+        item['member'].name.lower() if item.get('member') else 'zzz', # Sort None members last initially
+        item['member'].discriminator if item.get('member') else 'zzz',
+        item['ign'].lower()
+    ))
+
     total_members = len(final_data)
-    print(f"Fetch HC Data ({guild.name}): Finished. Total members for list: {total_members} ({len(discord_members_data)} Discord, {len(non_discord_db_members)} non-Discord).")
+    print(f"Fetch HC Data ({guild.name}): Finished. Total members for list: {total_members}.")
     return final_data, total_members
 
-def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], total: int) -> List[discord.Embed]:
-    """ Generates static list embeds (formatted table, mobile-friendly).""" # Updated docstring
+# Update generate_hc_list_embeds to use the new data format and add activity column
 
-    # --- Define Column Widths (Mobile Optimized - MUST MATCH HCPagesView) ---
+def generate_hc_list_embeds(data: List[Dict[str, Any]], total: int) -> List[discord.Embed]:
+    """ Generates static list embeds (Discord Name, IGN, All-Time Activity)."""
+
+    # --- Define Column Widths (Mobile Optimized) ---
     IDX_WIDTH = 3
-    NAME_WIDTH = 15
-    IGN_WIDTH = 15
-    ABC_WIDTH = 4
-    TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ABC_WIDTH # For separator
+    NAME_WIDTH = 15 # Keep reasonable width for names
+    IGN_WIDTH = 15  # Keep reasonable width for IGNs
+    ACT_WIDTH = 5   # Width for "Act: X"
+    TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH + ACT_WIDTH
 
     if not data:
         embed = discord.Embed(
             title=HC_LIST_EMBED_TITLE,
-            # Use plain code block
-            description="```\nNo HC members found.\n```", # <--- Plain code block for empty case
+            description="```\nNo HC members found.\n```",
             color=discord.Color.orange()
         )
         embed.set_footer(text="Page 1/1 | Total: 0")
@@ -482,9 +729,9 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
     # --- Create Header and Separator (once) ---
     header = (
         f"{'#':<{IDX_WIDTH}}"
-        f"{'Discord':<{NAME_WIDTH}}"        # Shorter title
-        f"{'In-Game':<{IGN_WIDTH}}"         # Shorter title
-        f"{'abc':<{ABC_WIDTH}}"
+        f"{'Discord':<{NAME_WIDTH}}"
+        f"{'In-Game':<{IGN_WIDTH}}"
+        f"{'Act':<{ACT_WIDTH}}" # New Activity column header
     )
     separator = "-" * TOTAL_WIDTH
 
@@ -492,35 +739,33 @@ def generate_hc_list_embeds(data: List[Tuple[Optional[discord.Member], str]], to
         start = page * MEMBERS_PER_PAGE
         page_data = data[start : start + MEMBERS_PER_PAGE]
 
-        # --- Build Description for this page ---
-         # Use plain code block ``` instead of ```md
-        desc_lines = [f"```", header, separator] # <--- Plain code block start
+        desc_lines = [f"```", header, separator]
         idx = start + 1
-        for member, ign in page_data: # <--- Use the same loop structure
+        for item_dict in page_data: # Iterate through the list of dictionaries
+            member = item_dict.get('member')
+            ign = item_dict.get('ign', 'Unknown')
+            activity_count = item_dict.get('activity_count', 0) # Get activity count
+
             # Prepare display strings
-            if member: # Check if it's a discord.Member object
+            if member:
                 user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                is_discord_member = True
             else:
-                # This is a non-Discord entry (member is None)
-                user_display = "[No Discord]" # Or "---", or ""
-                is_discord_member = False
+                user_display = "[No Discord]"
 
-            ign_display = str(ign) if ign else "Unknown"
-            abc_val = "1" # Keep your 'abc' column logic if needed
+            ign_display = ign
+            activity_display = str(activity_count) # Display the count
 
-            # Truncate aggressively with ellipsis (apply to placeholder too if needed)
-            if len(user_display) > NAME_WIDTH:
-                user_display = user_display[:NAME_WIDTH-1] + "…"
-            if len(ign_display) > IGN_WIDTH:
-                ign_display = ign_display[:IGN_WIDTH-1] + "…"
+            # Truncate aggressively
+            if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
+            if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
+            if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…" # Truncate activity if needed
 
-            # Format the line (ensure alignment still works)
+            # Format the line
             line = (
                 f"{str(idx)+'.':<{IDX_WIDTH}}"
                 f"{user_display:<{NAME_WIDTH}}"
                 f"{ign_display:<{IGN_WIDTH}}"
-                f"{abc_val:<{ABC_WIDTH}}"
+                f"{activity_display:<{ACT_WIDTH}}" # Add activity column
             )
             desc_lines.append(line)
             idx += 1
@@ -1773,71 +2018,242 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         await log_error(guild, f"Unexpected error during /hconly for IGN: {cleaned_ign}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
-# --- HC Members Interactive List ---
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN).")
+
+# --- Active Command ---
+@tree.command(name="active", description="Mark a member as active for a specific date.")
+@app_commands.describe(
+    user="The Discord user to mark active (fetches their IGN).",
+    ingame_name="The In-Game Name to mark active (use if no Discord user).",
+    date="Date of activity (YYYY-MM-DD, defaults to today UTC)."
+)
+# @app_commands.checks.has_permissions(manage_roles=True) # Or your chosen permission
+async def active(interaction: discord.Interaction, user: Optional[discord.Member] = None, ingame_name: Optional[str] = None, date: Optional[str] = None):
+    guild = interaction.guild
+    if not await check_supabase_available(interaction): return
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        return
+
+    # --- Input Validation ---
+    if not user and not ingame_name:
+        await interaction.response.send_message("❌ You must provide either a Discord `@user` or an `ingame_name`.", ephemeral=False)
+        return
+    if user and ingame_name:
+        await interaction.response.send_message("❌ Please provide either a Discord `@user` or an `ingame_name`, not both.", ephemeral=False)
+        return
+
+    # Defer ephemerally (quick action)
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    # --- Get Date ---
+    activity_date, date_error = get_utc_date(date)
+    if date_error:
+        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+        return
+    if not activity_date: # Should be caught by date_error, but defensive check
+         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+         return
+
+    # --- Determine IGN ---
+    target_ign: Optional[str] = None
+    if user:
+        fetched_ign = await get_ign_from_user(guild, user.id)
+        if not fetched_ign:
+            await interaction.followup.send(f"❌ Could not find a stored IGN for {user.mention} in the `hc_members` table. Use the `ingame_name` option instead or verify them first.", ephemeral=False)
+            return
+        target_ign = fetched_ign
+        display_target = user.mention # For user feedback
+    else: # ingame_name must be provided here due to earlier check
+        target_ign = ingame_name
+        display_target = f"IGN `{target_ign}`" # For user feedback
+
+    if not target_ign: # Should not happen if logic is correct
+        await interaction.followup.send("❌ Failed to determine the target IGN.", ephemeral=False)
+        await log_error(guild, "/active command failed: target_ign became None unexpectedly.", interaction=interaction)
+        return
+
+    # --- Upsert Activity Log ---
+    success, message = await upsert_activity_log(guild, target_ign, activity_date, interaction.user.id)
+
+    # --- Send Feedback ---
+    prefix = "✅" if success else "❌"
+    await interaction.followup.send(f"{prefix} {message}", ephemeral=False)
+    if success:
+        await log_info(guild, f"`{interaction.user}` used /active for {display_target} on {format_date_dmy(activity_date)}.")
+
+
+# --- Bulk Active Modal ---
+class BulkActiveModal(Modal, title="Bulk Mark Active"):
+    igns_input = TextInput(
+        label="In-Game Names (IGNs)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Enter one IGN per line or separate by spaces/commas...",
+        required=True,
+        max_length=2000 # Adjust as needed
+    )
+
+    def __init__(self, date_str: Optional[str]):
+        super().__init__(timeout=300.0) # 5 minute timeout for modal
+        self.target_date_str = date_str # Store the date passed from the command
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Defer the modal's interaction response ephemerally
+        await interaction.response.defer(thinking=True, ephemeral=False)
+
+        guild = interaction.guild
+        if not guild or not supabase: # Ensure guild and supabase are available
+            await interaction.followup.send("❌ Error: Command context or database unavailable.", ephemeral=False)
+            return
+
+        # --- Get Date ---
+        activity_date, date_error = get_utc_date(self.target_date_str)
+        if date_error:
+            await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+            return
+        if not activity_date:
+            await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+            return
+
+        # --- Process IGNs ---
+        raw_text = self.igns_input.value
+        # Split by newline, space, comma, and filter out empty strings
+        potential_igns = [ign.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if ign.strip()]
+
+        if not potential_igns:
+            await interaction.followup.send("❌ No IGNs were entered.", ephemeral=False)
+            return
+
+        processed_count = 0
+        success_count = 0
+        already_marked_count = 0 # Technically upsert handles this, but good for feedback
+        failed_igns = []
+        log_details = []
+
+        # Consider fetching all known IGNs first for validation if performance allows and is needed
+        # For now, we'll just try the upsert for each
+
+        progress_msg = await interaction.followup.send(f"⏳ Processing {len(potential_igns)} IGNs for {format_date_dmy(activity_date)}...", ephemeral=False)
+
+        for ign in potential_igns:
+            processed_count += 1
+            # Basic validation (e.g., length) could be added here
+            if not ign: continue
+
+            success, msg = await upsert_activity_log(guild, ign, activity_date, interaction.user.id)
+
+            if success:
+                success_count += 1
+                log_details.append(f"OK: {ign}")
+                # We can't easily tell if it was new or updated from upsert without another query
+                # For simplicity, we just count successes.
+            else:
+                failed_igns.append(f"`{ign}` ({msg.split(': ')[-1]})") # Add IGN and brief reason
+                log_details.append(f"Fail: {ign} ({msg})")
+
+            # Optional: Update progress message periodically if processing many IGNs
+            # if processed_count % 10 == 0:
+            #     try: await progress_msg.edit(content=f"⏳ Processing... ({processed_count}/{len(potential_igns)})")
+            #     except discord.HTTPException: pass # Ignore edit errors
+
+        # --- Final Feedback ---
+        summary_title = "✅ Bulk Activity Update Complete"
+        summary_desc = [f"Date Processed: **{format_date_dmy(activity_date)}**"]
+        summary_desc.append(f"Total Entries Submitted: {len(potential_igns)}")
+        summary_desc.append(f"Successfully Recorded/Updated: {success_count}")
+        # summary_desc.append(f"Already Marked: {already_marked_count}") # If we add check later
+        if failed_igns:
+            summary_title = "⚠️ Bulk Activity Update Partially Complete"
+            summary_desc.append(f"Failed Entries ({len(failed_igns)}):")
+            # Show first few failed IGNs directly in message
+            max_failed_display = 10
+            summary_desc.extend([f"- {f}" for f in failed_igns[:max_failed_display]])
+            if len(failed_igns) > max_failed_display:
+                 summary_desc.append(f"- ...and {len(failed_igns) - max_failed_display} more (check logs).")
+        else:
+             summary_desc.append("Failed Entries: 0")
+
+        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=NERDY_YELLOW if not failed_igns else discord.Color.orange())
+
+        try:
+            await progress_msg.edit(content=None, embed=summary_embed)
+        except discord.HTTPException: # Handle if original progress message gone
+             await interaction.followup.send(embed=summary_embed, ephemeral=False) # Send new message
+
+        await log_info(guild, f"`{interaction.user}` used /bulkactive. Summary: {len(potential_igns)} submitted, {success_count} success, {len(failed_igns)} failed. Details: {'; '.join(log_details)}")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await log_error(interaction.guild, "Error in BulkActiveModal", error=error, interaction=interaction)
+        # Ensure the user gets some feedback even if the modal logic fails
+        try:
+             if interaction.response.is_done():
+                 await interaction.followup.send("❌ An unexpected error occurred in the modal.", ephemeral=False)
+             else:
+                 # This case is less likely if on_submit deferred, but handle defensively
+                 await interaction.response.send_message("❌ An unexpected error occurred in the modal.", ephemeral=False)
+        except Exception:
+             pass # Ignore errors during error reporting
+
+
+# --- Bulk Active Command ---
+@tree.command(name="bulkactive", description="Mark multiple members active via IGNs using a modal.")
+@app_commands.describe(
+    date="Date of activity (YYYY-MM-DD, defaults to today UTC)."
+)
+# @app_commands.checks.has_permissions(manage_roles=True) # Or your chosen permission
+async def bulkactive(interaction: discord.Interaction, date: Optional[str] = None):
+    # Pass the date string to the modal constructor
+    modal = BulkActiveModal(date_str=date)
+    await interaction.response.send_modal(modal)
+
+@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN / Activity).")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
+    # Keep Supabase check
     if not await check_supabase_available(interaction):
-        # If check fails, helper sends ephemeral msg & logs.
-        try:
-             # Check if we actually deferred before trying to edit
-             if interaction.response.is_done():
-                  await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
-        except (discord.NotFound, discord.HTTPException):
-             pass # Ignore errors editing the deferred message
-        return # Stop the command here
+        try: # Attempt cleanup if deferred
+            if interaction.response.is_done(): await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException): pass
+        return
     if not guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
-
-    # Check channel restrictions
+    # Keep channel check
     if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
-        allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)] # Mention valid channels
+        allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
         msg = f"❌ This command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
         await interaction.response.send_message(msg, ephemeral=False)
         return
 
-    # Defer publicly as the list is public
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    if not supabase:
-        await interaction.followup.send(embed=create_embed("❌ Database unavailable.", discord.Color.red()))
-        await log_error(guild, "/hcmembers failed: Supabase unavailable.", interaction=interaction)
-        return
+    await interaction.response.defer(thinking=True, ephemeral=False) # Keep public defer
 
     try:
-        data, total = await fetch_hc_member_data(guild)
+        # Fetch data using the updated function which now includes activity
+        data_list, total = await fetch_hc_member_data(guild)
 
-        if not data:
-            hc_role = guild.get_role(ADD_ROLE_ID_HC)
-            role_name = f"`{hc_role.name}`" if hc_role else f"HC role (ID: {ADD_ROLE_ID_HC})"
-            description = f"No members currently found with the {role_name} role."
-            # Add note if DB fetch might have failed partially
-            if any("DB" in ign for _, ign in data): # Quick check if any placeholder errors exist
-                 description += "\n(Note: There might have been database connection issues.)"
-            embed = create_embed(title=HC_LIST_EMBED_TITLE, description=description, color=discord.Color.orange())
+        if not data_list:
+            # Simplified no members found message
+            embed = create_embed(title=HC_LIST_EMBED_TITLE, description="No HC members found in the database or matching roles.", color=discord.Color.orange())
             await interaction.followup.send(embed=embed)
             return
 
-        # Create and send the paginated view
-        view = HCPagesView(data, total)
-        initial_embed = view.create_page_embed()
-        # Send the initial message and store it in the view for updates
+        # Create and send the updated paginated view
+        view = HCPagesView(data_list, total) # Pass the list of dicts
+        initial_embed = view.create_page_embed() # create_page_embed handles the dict format
         message = await interaction.followup.send(embed=initial_embed, view=view)
-        view.message = message # IMPORTANT: Link the message to the view
+        view.message = message # Link message to view
 
         await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}.")
 
+    # Keep existing error handling for DB connection/API errors
     except ConnectionError as e:
         await log_error(guild, "/hcmembers DB connection error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ Database Connection Error. Could not fetch member IGNs.", discord.Color.red()))
+        await interaction.followup.send(embed=create_embed("❌ Database Connection Error.", discord.Color.red()))
     except APIError as e:
         await log_error(guild, "/hcmembers Supabase API error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ Database API Error. Could not fetch member IGNs.", discord.Color.red()))
+        await interaction.followup.send(embed=create_embed("❌ Database API Error.", discord.Color.red()))
     except Exception as e:
         await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred while generating the list.", discord.Color.red()))
-
+        await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()))
 
 # --- Refresh Static List Command ---
 @tree.command(name="refresh", description="Manually refresh static [HC1] list (username#tag ➔ IGN).")
@@ -2316,7 +2732,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         except Exception: pass
 
 
-# --- MODIFIED Nerd Help Command (Added Spacing) ---
+# --- MODIFIED Nerd Help Command (Added Spacing and Activity Commands) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
@@ -2358,6 +2774,12 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh the static HC member list.", value="\u200B", inline=False)
 
+    # Section: Activity Tracking  <- NEW SECTION
+    embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False) # Section Title
+    embed.add_field(name=f"{get_cmd_mention('active')}  · Mark a member as active for a date.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
+    # Add /activity command here when you create it
+
     # Section: Utilities
     embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False) # Section Title
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
@@ -2379,7 +2801,7 @@ async def nerdhelp(interaction: discord.Interaction):
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
-
+        
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
