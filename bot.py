@@ -2753,12 +2753,13 @@ async def hcmembers(interaction: discord.Interaction):
         await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()))
 
-# --- Refresh Static List Command (MODIFIED - Removed manual delete logic) ---
-@tree.command(name="refresh", description="Manually refresh static [HC1] list.") # Removed "(auto-deletes confirmation)" from description
-@app_commands.checks.has_permissions(manage_roles=True) # Keep permission check
+# --- Refresh Static List Command (MODIFIED - Use channel.send for confirmation) ---
+@tree.command(name="refresh", description="Manually refresh static [HC1] list.")
+@app_commands.checks.has_permissions(manage_roles=True)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
+    # ... (keep initial checks for Supabase, guild, list_channel etc.) ...
     if not await check_supabase_available(interaction):
         try:
              if interaction.response.is_done():
@@ -2779,10 +2780,21 @@ async def refresh(interaction: discord.Interaction):
         await interaction.response.send_message(msg, ephemeral=False)
         await log_error(guild, f"/refresh failed: Static list channel invalid.", interaction=interaction)
         return
+    # --- END Initial Checks ---
 
     # --- Defer Publicly ---
     await interaction.response.defer(thinking=True, ephemeral=False)
 
+    # --- Optional: Send an immediate "Refresh Started" message ---
+    # This gives immediate feedback before the long task runs.
+    # Note: This uses followup *quickly* after defer, which is usually safe.
+    try:
+        await interaction.followup.send(f"⏳ Starting static list refresh in {list_channel.mention}... This may take a while.", ephemeral=False)
+    except (discord.NotFound, discord.HTTPException) as e:
+         # Log if even this initial followup fails, but proceed with the main task
+         await log_error(guild, "Failed to send initial 'refresh started' followup", error=e, interaction=interaction)
+
+    # --- Main Refresh Logic ---
     try:
         await log_info(guild, f"Manual static list refresh initiated by `{interaction.user}`.")
 
@@ -2790,27 +2802,38 @@ async def refresh(interaction: discord.Interaction):
         await update_hc_member_list(guild)
         # --- List update is now complete ---
 
-        # --- Send Confirmation (NOT ephemeral) ---
-        # REMOVED: ", This message will self-destruct shortly."
-        confirmation_message = await interaction.followup.send(
-            f"✅ Refresh complete for the static list in {list_channel.mention}.",
-            ephemeral=False # MUST be False for the bot's on_message to see and potentially delete it
-        )
-        await log_info(guild, f"Refresh command confirmed complete to user {interaction.user}.")
-
-        # --- REMOVED ASYNCIO.SLEEP AND MANUAL DELETE BLOCK ---
-        # The on_message event handler will now take care of deleting
-        # the confirmation_message if interaction.channel_id == AUTODELETE_CHANNEL_ID
+        # --- Send Confirmation Directly to Channel ---
+        confirmation_content = f"✅ Refresh complete for the static list in {list_channel.mention} (Initiated by {interaction.user.mention})."
+        # Ensure the channel object exists and is a text channel before sending
+        if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+             try:
+                 # Send directly to the interaction's channel
+                 confirmation_message = await interaction.channel.send(confirmation_content)
+                 await log_info(guild, f"Refresh command confirmed complete to user {interaction.user} via channel message.")
+                 # The on_message handler will auto-delete this if interaction.channel.id == AUTODELETE_CHANNEL_ID
+             except discord.Forbidden:
+                  await log_error(guild, f"Failed to send refresh confirmation to {interaction.channel.mention}: Bot lacks Send Messages permission.", interaction=interaction)
+             except discord.HTTPException as e:
+                  await log_error(guild, f"Failed to send refresh confirmation to {interaction.channel.mention}: HTTP Error.", error=e, interaction=interaction)
+        else:
+             # Fallback log if channel context is lost somehow
+             await log_info(guild, f"Refresh complete, but could not send confirmation to original channel (Channel type: {type(interaction.channel)}).")
 
     except Exception as e:
-        # Catch errors during the main refresh process or sending the initial confirmation
-        await log_error(guild, "Error during /refresh process", error=e, interaction=interaction)
-        # Try to inform the user if the main process failed
-        try:
-            # Use edit_original_response since we definitely deferred
-            await interaction.edit_original_response(content="❌ An unexpected error occurred during the refresh process.", embed=None, view=None)
-        except Exception: pass # Ignore errors during error reporting             
+        # Catch errors during the main refresh process
+        await log_error(guild, "Error during /refresh process execution", error=e, interaction=interaction)
+        # Try to inform the user in the channel if the main process failed
+        error_message = f"❌ An unexpected error occurred during the refresh process initiated by {interaction.user.mention}."
+        if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+             try:
+                 await interaction.channel.send(error_message)
+             except Exception: pass # Ignore errors during error reporting in channel
 
+        # Also try to edit the original deferred response if possible (might also timeout)
+        try:
+            await interaction.edit_original_response(content=error_message, embed=None, view=None)
+        except Exception: pass
+        
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
