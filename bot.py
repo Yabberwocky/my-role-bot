@@ -111,6 +111,33 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def check_activity_exists(guild: discord.Guild, ign_lower: str, activity_date: datetime.date) -> Optional[bool]:
+    """
+    Checks if an activity log entry exists for a given lowercase IGN and date.
+    Returns True if exists, False if not, None on error.
+    """
+    if not supabase:
+        await log_error(guild, f"check_activity_exists failed: Supabase unavailable for IGN {ign_lower}.")
+        return None # Indicate error
+
+    try:
+        # Select a minimal column, check if any row matches
+        resp = await run_supabase_sync(
+            lambda: supabase.table("activity_log")
+                           .select("activity_date", count='exact') # Select a small column, count needed
+                           .eq("member_identifier", ign_lower)
+                           .eq("activity_date", activity_date.isoformat())
+                           .limit(1) # Only need to know if at least one exists
+                           .execute()
+        )
+
+        # Check the count attribute in the response
+        return resp.count is not None and resp.count > 0
+
+    except (APIError, ConnectionError, Exception) as e:
+        # Log the error but return None to signal check failure
+        await log_error(guild, f"Error checking activity existence for IGN '{ign_lower}' on {activity_date}", error=e)
+        return None # Indicate error
 
 # --- Bulk Active Modal ---
 class BulkActiveModal(Modal, title="Bulk Mark Active"):
@@ -147,82 +174,145 @@ class BulkActiveModal(Modal, title="Bulk Mark Active"):
         # --- Process IGNs ---
         raw_text = self.igns_input.value
         # Split by newline, space, comma, and filter out empty strings
-        potential_igns = [ign.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if ign.strip()]
+        potential_igns = [part.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if part.strip()]
 
         if not potential_igns:
             await interaction.followup.send("❌ No IGNs were entered.", ephemeral=False)
             return
 
+        # --- NEW Counters and Lists ---
         processed_count = 0
-        success_count = 0
-        already_marked_count = 0 # Technically upsert handles this, but good for feedback
-        failed_igns = []
-        log_details = []
+        newly_added_count = 0
+        already_marked_count = 0
+        failed_count = 0
+        check_failed_count = 0 # Count how many existence checks failed
 
-        # Consider fetching all known IGNs first for validation if performance allows and is needed
-        # For now, we'll just try the upsert for each
+        newly_added_igns = []
+        already_marked_igns = []
+        failed_igns = [] # Format: "`IGN` (Reason)"
+        check_failed_igns = [] # IGNs where the existence check itself failed
+
+        log_details = []
+        # --- END NEW ---
 
         progress_msg = await interaction.followup.send(f"⏳ Processing {len(potential_igns)} IGNs for {format_date_dmy(activity_date)}...", ephemeral=False)
 
-        for ign in potential_igns:
+        for current_ign in potential_igns:
             processed_count += 1
-            # Basic validation (e.g., length) could be added here
-            if not ign: continue
+            if not current_ign: continue # Skip empty
 
-            success, msg = await upsert_activity_log(guild, ign, activity_date, interaction.user.id)
+            ign_lower = current_ign.lower() # Use lowercase for checks and upsert
 
-            if success:
-                success_count += 1
-                log_details.append(f"OK: {ign}")
-                # We can't easily tell if it was new or updated from upsert without another query
-                # For simplicity, we just count successes.
-            else:
-                failed_igns.append(f"`{ign}` ({msg.split(': ')[-1]})") # Add IGN and brief reason
-                log_details.append(f"Fail: {ign} ({msg})")
+            # --- Check if activity already exists ---
+            exists = await check_activity_exists(guild, ign_lower, activity_date)
 
-            # Optional: Update progress message periodically if processing many IGNs
+            if exists is True:
+                # Record already exists
+                already_marked_count += 1
+                already_marked_igns.append(f"`{current_ign}`")
+                log_details.append(f"Skip (Exists): {current_ign}")
+                continue # Skip the upsert call
+
+            elif exists is False:
+                # Record does not exist, proceed with upsert
+                success, msg = await upsert_activity_log(guild, current_ign, activity_date, interaction.user.id) # Pass original case to upsert if needed, though upsert likely lowercases too
+
+                if success:
+                    newly_added_count += 1
+                    newly_added_igns.append(f"`{current_ign}`")
+                    log_details.append(f"OK (Added): {current_ign}")
+                else:
+                    failed_count += 1
+                    # Extract reason more robustly if possible, fallback to full message
+                    reason = msg.split(':', 1)[-1].strip() if ':' in msg else msg
+                    failed_igns.append(f"`{current_ign}` ({reason})")
+                    log_details.append(f"Fail (Upsert): {current_ign} ({msg})")
+
+            else: # exists is None (check failed)
+                check_failed_count += 1
+                check_failed_igns.append(f"`{current_ign}`")
+                log_details.append(f"Fail (Check): {current_ign}")
+                # Treat check failure as an overall failure for this IGN
+                failed_count += 1 # Also increment failed count
+                failed_igns.append(f"`{current_ign}` (DB Check Error)")
+
+
+            # Optional: Update progress message periodically
             # if processed_count % 10 == 0:
             #     try: await progress_msg.edit(content=f"⏳ Processing... ({processed_count}/{len(potential_igns)})")
-            #     except discord.HTTPException: pass # Ignore edit errors
+            #     except discord.HTTPException: pass
 
         # --- Final Feedback ---
-        summary_title = "✅ Bulk Activity Update Complete"
-        summary_desc = [f"Date Processed: **{format_date_dmy(activity_date)}**"]
-        summary_desc.append(f"Total Entries Submitted: {len(potential_igns)}")
-        summary_desc.append(f"Successfully Recorded/Updated: {success_count}")
-        # summary_desc.append(f"Already Marked: {already_marked_count}") # If we add check later
-        if failed_igns:
-            summary_title = "⚠️ Bulk Activity Update Partially Complete"
-            summary_desc.append(f"Failed Entries ({len(failed_igns)}):")
-            # Show first few failed IGNs directly in message
-            max_failed_display = 10
-            summary_desc.extend([f"- {f}" for f in failed_igns[:max_failed_display]])
-            if len(failed_igns) > max_failed_display:
-                 summary_desc.append(f"- ...and {len(failed_igns) - max_failed_display} more (check logs).")
-        else:
-             summary_desc.append("Failed Entries: 0")
+        total_failures = failed_count # Combines upsert failures and check failures
 
-        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=NERDY_YELLOW if not failed_igns else discord.Color.orange())
+        if total_failures == 0 and newly_added_count > 0:
+             summary_title = "✅ Bulk Activity Update Successful"
+             final_color = NERDY_YELLOW # Or Green
+        elif total_failures == 0 and newly_added_count == 0:
+             summary_title = "ℹ️ Bulk Activity Update: No Changes Needed"
+             final_color = discord.Color.blue()
+        else:
+             summary_title = "⚠️ Bulk Activity Update Partially Complete"
+             final_color = discord.Color.orange()
+
+        summary_desc = [
+            f"Date Processed: **{format_date_dmy(activity_date)}**",
+            f"Total Submitted: {len(potential_igns)}",
+            f"---", # Separator
+            f"✅ **Newly Added:** {newly_added_count}",
+            f"⏭️ **Already Marked (Skipped):** {already_marked_count}",
+            f"❌ **Failed / Check Error:** {total_failures}",
+            f"---" # Separator
+        ]
+
+        # Function to format list of IGNs for embed field
+        def format_ign_list(igns: List[str], max_display: int = 15) -> str:
+            if not igns: return "None"
+            display_str = ", ".join(igns[:max_display])
+            if len(igns) > max_display:
+                display_str += f", ... *(+{len(igns) - max_display} more)*"
+            # Ensure the field value doesn't exceed Discord limits
+            return (display_str[:1021] + '...') if len(display_str) > 1024 else display_str
+
+        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=final_color)
+
+        # Add fields for details only if there are entries in that category
+        if newly_added_igns:
+            summary_embed.add_field(name="Newly Added IGNs", value=format_ign_list(newly_added_igns), inline=False)
+        if already_marked_igns:
+            summary_embed.add_field(name="Skipped IGNs (Already Marked)", value=format_ign_list(already_marked_igns), inline=False)
+        if failed_igns: # Includes check failures now
+             # Sort failed IGNs maybe? Optional.
+             summary_embed.add_field(name="Failed IGNs (Reason)", value=format_ign_list(failed_igns), inline=False)
+        # Optionally report check_failed_igns separately if needed for debugging
+        # if check_failed_igns:
+        #     summary_embed.add_field(name="DB Check Failed For", value=format_ign_list(check_failed_igns), inline=False)
 
         try:
             await progress_msg.edit(content=None, embed=summary_embed)
         except discord.HTTPException: # Handle if original progress message gone
              await interaction.followup.send(embed=summary_embed, ephemeral=False) # Send new message
 
-        await log_info(guild, f"`{interaction.user}` used /bulkactive. Summary: {len(potential_igns)} submitted, {success_count} success, {len(failed_igns)} failed. Details: {'; '.join(log_details)}")
+        # Update log message with new counts
+        log_msg = (f"`{interaction.user}` used /bulkactive for {format_date_dmy(activity_date)}. "
+                   f"Submitted: {len(potential_igns)}, Added: {newly_added_count}, "
+                   f"Skipped: {already_marked_count}, Failed: {total_failures}. "
+                   f"Details: {'; '.join(log_details)}")
+        # Truncate log message if needed before sending
+        await log_info(guild, (log_msg[:1950] + "...") if len(log_msg) > 1990 else log_msg)
+
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        # Keep this error handler as is
         await log_error(interaction.guild, "Error in BulkActiveModal", error=error, interaction=interaction)
-        # Ensure the user gets some feedback even if the modal logic fails
         try:
              if interaction.response.is_done():
-                 await interaction.followup.send("❌ An unexpected error occurred in the modal.", ephemeral=False)
+                 await interaction.followup.send("❌ An unexpected error occurred within the modal processing.", ephemeral=False)
              else:
-                 # This case is less likely if on_submit deferred, but handle defensively
-                 await interaction.response.send_message("❌ An unexpected error occurred in the modal.", ephemeral=False)
+                 await interaction.response.send_message("❌ An unexpected error occurred within the modal processing.", ephemeral=False)
         except Exception:
-             pass # Ignore errors during error reporting
-
+             pass
+                
 async def ign_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Autocompletes In-Game Names from the hc_members table."""
     if not supabase:
@@ -2833,7 +2923,7 @@ async def refresh(interaction: discord.Interaction):
         try:
             await interaction.edit_original_response(content=error_message, embed=None, view=None)
         except Exception: pass
-        
+
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
