@@ -111,6 +111,36 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def activity_date_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Provides autocomplete choices for activity dates: Today, Yesterday, Last 7 days (D/M/YYYY format)."""
+    choices = []
+    today = datetime.datetime.now(pytz.utc).date()
+    yesterday = today - datetime.timedelta(days=1)
+
+    # Helper to format date as D/M/YYYY for display name
+    def format_dmy_no_zero(date_obj: datetime.date) -> str:
+        return f"{date_obj.day}/{date_obj.month}/{date_obj.year}"
+
+    # --- Add Shortcuts ---
+    # Name uses new format, Value remains YYYY-MM-DD
+    choices.append(app_commands.Choice(name=f"Today ({format_dmy_no_zero(today)})", value=today.isoformat()))
+    choices.append(app_commands.Choice(name=f"Yesterday ({format_dmy_no_zero(yesterday)})", value=yesterday.isoformat()))
+
+    # --- Add Last 7 Days ---
+    for i in range(2, 8): # Days 2 to 7 ago
+        past_date = today - datetime.timedelta(days=i)
+        # Name uses new format, Value remains YYYY-MM-DD
+        choices.append(app_commands.Choice(name=format_dmy_no_zero(past_date), value=past_date.isoformat()))
+
+    # --- Filtering (Remains the same) ---
+    filtered_choices = [
+        choice for choice in choices
+        if current.lower() in choice.name.lower() or current in choice.value
+    ]
+
+    # Return up to 25 choices
+    return filtered_choices[:25]
+
 async def check_activity_exists(guild: discord.Guild, ign_lower: str, activity_date: datetime.date) -> Optional[bool]:
     """
     Checks if an activity log entry exists for a given lowercase IGN and date.
@@ -2576,14 +2606,12 @@ async def activatemyself(interaction: discord.Interaction):
 @tree.command(name="active", description="Mark an In-Game Name (IGN) as active for a specific date.")
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark active.",
-    date="Date of activity (YYYY-MM-DD, defaults to today UTC)."
+    date="Date of activity (Select from list)."
 )
-@app_commands.autocomplete(ingame_name=ign_autocomplete)
-# @app_commands.checks.has_permissions(manage_roles=True) # Optional permission check
-async def active(interaction: discord.Interaction, ingame_name: str, date: Optional[str] = None):
-    # <<< NO EXTRA TEXT BETWEEN HERE...
+@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
+# VV Ensure this 'async' keyword is present VV
+async def active(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
-    # ...AND HERE >>>
     if not await check_supabase_available(interaction): return
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
@@ -2593,10 +2621,10 @@ async def active(interaction: discord.Interaction, ingame_name: str, date: Optio
 
     activity_date, date_error = get_utc_date(date)
     if date_error:
-        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+        await interaction.followup.send(f"❌ Error parsing selected date: {date_error}", ephemeral=False)
         return
     if not activity_date:
-         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+         await interaction.followup.send("❌ Could not determine activity date from selection.", ephemeral=False)
          return
 
     target_ign = ingame_name.strip()
@@ -2615,15 +2643,37 @@ async def active(interaction: discord.Interaction, ingame_name: str, date: Optio
         asyncio.create_task(update_hc_member_list(guild))
 
 
-# --- Inactive Command (CORRECTED DECORATOR) ---
+# --- Alias Command /a for /active ---
+@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.") # New command name "a"
+@app_commands.describe( # Use the SAME descriptions as /active
+    ingame_name="The In-Game Name (IGN) to mark active.",
+    date="Date of activity (Select from list)."
+)
+@app_commands.autocomplete( # Use the SAME autocomplete functions as /active
+    ingame_name=ign_autocomplete,
+    date=activity_date_autocomplete
+)
+# Optional: Add permission checks if /active has them
+# @app_commands.checks.has_permissions(...)
+# Function name MUST be different from the original 'active'
+async def active_alias(interaction: discord.Interaction, ingame_name: str, date: str):
+    """Handles the /a alias by calling the /active command's logic."""
+    # Directly call the implementation of the original /active command
+    # Pass the interaction and all arguments along
+    await active(interaction, ingame_name, date)
+    
+
+# --- Inactive Command (CORRECTED DECORATOR and Date Handling) ---
 @tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
 @app_commands.describe(
-    # user="The Discord user to mark inactive (fetches their IGN).", # <-- REMOVED THIS LINE
     ingame_name="The In-Game Name (IGN) to mark inactive.",
-    date="Date of activity to remove (YYYY-MM-DD, defaults to today UTC)."
+    # MODIFIED: Changed description, date is now required via autocomplete
+    date="Date of activity to remove (Select from list)."
 )
-@app_commands.autocomplete(ingame_name=ign_autocomplete)
-async def inactive(interaction: discord.Interaction, ingame_name: str, date: Optional[str] = None):
+@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete) # ADDED date autocomplete
+# @app_commands.checks.has_permissions(manage_roles=True) # Optional permission check
+# MODIFIED: date type is now str (required), removed Optional and default
+async def inactive(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
     if not guild:
@@ -2632,12 +2682,13 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: Opt
 
     await interaction.response.defer(thinking=True, ephemeral=False)
 
+    # MODIFIED: No need to check if date is None, it's now required.
     activity_date, date_error = get_utc_date(date)
     if date_error:
-        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
+        await interaction.followup.send(f"❌ Error parsing selected date: {date_error}", ephemeral=False)
         return
     if not activity_date:
-         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
+         await interaction.followup.send("❌ Could not determine activity date from selection.", ephemeral=False)
          return
 
     target_ign = ingame_name.strip()
@@ -2659,93 +2710,21 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: Opt
     elif prefix == "ℹ️":
          await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
 
-# @app_commands.checks.has_permissions(manage_roles=True) # Mirror permissions of /active if needed
-async def inactive(interaction: discord.Interaction, user: Optional[discord.Member] = None, ingame_name: Optional[str] = None, date: Optional[str] = None):
-    guild = interaction.guild
-    if not await check_supabase_available(interaction): return
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
-        return
-
-    # --- Input Validation ---
-    if not user and not ingame_name:
-        await interaction.response.send_message("❌ You must provide either a Discord `@user` or an `ingame_name`.", ephemeral=False)
-        return
-    if user and ingame_name:
-        await interaction.response.send_message("❌ Please provide either a Discord `@user` or an `ingame_name`, not both.", ephemeral=False)
-        return
-
-    # Defer ephemerally
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    # --- Get Date ---
-    activity_date, date_error = get_utc_date(date)
-    if date_error:
-        await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
-        return
-    if not activity_date:
-         await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
-         return
-
-    # --- Determine IGN ---
-    target_ign: Optional[str] = None
-    if user:
-        fetched_ign = await get_ign_from_user(guild, user.id)
-        if not fetched_ign:
-            await interaction.followup.send(f"❌ Could not find a stored IGN for {user.mention}. Cannot remove activity.", ephemeral=False)
-            return
-        target_ign = fetched_ign
-        display_target = user.mention
-    else: # ingame_name must be provided
-        target_ign = ingame_name.strip() # Ensure IGN is stripped
-        if not target_ign:
-             await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
-             return
-        display_target = f"IGN `{target_ign}`"
-
-    if not target_ign: # Should not happen
-        await interaction.followup.send("❌ Failed to determine the target IGN.", ephemeral=False)
-        await log_error(guild, "/inactive command failed: target_ign became None unexpectedly.", interaction=interaction)
-        return
-
-    # --- Remove Activity Log ---
-    # 'success' here means a record was actually found and deleted.
-    # 'message' contains details (deleted, not found, or error).
-    success, message = await remove_activity_log(guild, target_ign, activity_date, interaction.user.id)
-
-    # --- Send Feedback ---
-    # Use different prefixes based on outcome
-    if "removed" in message:
-        prefix = "✅" # Record was found and removed
-    elif "No activity record found" in message:
-         prefix = "ℹ️" # Record wasn't there, not an error but info
-    else:
-         prefix = "❌" # Actual error occurred
-
-    await interaction.followup.send(f"{prefix} {message}", ephemeral=False)
-
-    # --- Trigger List Refresh and Log ---
-    # Only trigger refresh if a record was actually deleted (success == True)
-    if success:
-        await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. Record removed. Triggering list update.")
-        # Trigger the static list update in the background
-        asyncio.create_task(update_hc_member_list(guild))
-    elif prefix == "ℹ️":
-         # Log that the command was used but nothing changed
-         await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
-    # else: # Error case is logged by remove_activity_log
-
 
 # --- Bulk Active Command ---
 @tree.command(name="bulkactive", description="Mark multiple members active via IGNs using a modal.")
 @app_commands.describe(
-    date="Date of activity (YYYY-MM-DD, defaults to today UTC)."
+    # MODIFIED: Changed description, date is now required via autocomplete
+    date="Date of activity (Select from list)."
 )
+@app_commands.autocomplete(date=activity_date_autocomplete) # ADDED date autocomplete
 # @app_commands.checks.has_permissions(manage_roles=True) # Or your chosen permission
-async def bulkactive(interaction: discord.Interaction, date: Optional[str] = None):
-    # Pass the date string to the modal constructor
+# MODIFIED: date type is now str (required), removed Optional and default
+async def bulkactive(interaction: discord.Interaction, date: str):
+    # Pass the date string (now always YYYY-MM-DD) to the modal constructor
     modal = BulkActiveModal(date_str=date)
     await interaction.response.send_modal(modal)
+
 
 @tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN / Activity).")
 async def hcmembers(interaction: discord.Interaction):
