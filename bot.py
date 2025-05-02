@@ -554,39 +554,62 @@ class ViewModeSelect(discord.ui.Select):
 
 class HCPagesView(View):
     # Data is List[Dict[str, Any]] from fetch_hc_member_data (includes ALL-TIME activity)
-    def __init__(self, data: List[Dict[str, Any]], total_members: int, timeout=300.0):
+    def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: discord.Guild, timeout=300.0): # Added guild parameter
         super().__init__(timeout=timeout)
-        # original_data holds the base info + all-time activity counts fetched initially
-        self.original_data = data
-        # current_data is what's displayed - can be modified with date-ranged activity
-        self.current_data = list(data) # Make a copy to modify safely
+        # original_data holds the base info + all-time activity fetched initially
+        self.original_data = original_data
+        # current_data is initialized with the pre-fetched data for the default view
+        self.current_data = initial_display_data # Use the passed initial data
         self.total_members = total_members
         self.current_page = 0
-        # Total pages depends on current_data length
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
         self.message: Optional[discord.Message] = None
+        self.guild = guild # Store guild if needed later
 
         # --- State ---
-        self.view_mode = VIEW_MODE_DISCORD # Default view
-        self.sort_mode = SORT_MODE_IGN # Default sort
+        # SET DEFAULTS HERE
+        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY # <<< DEFAULT VIEW
+        self.sort_mode = SORT_MODE_ACTIVITY       # <<< DEFAULT SORT for activity views
         self.is_fetching_activity = False # Lock to prevent concurrent fetches
 
+        # --- Initial Sort ---
+        # Sort the initial data based on the default sort mode
+        self.sort_data() # This sorts self.current_data
+
+        # --- Recalculate total pages AFTER initial sort ---
+        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
+
         # --- Add UI Elements ---
+        # Pass the INITIAL sort mode to the button
         self.add_item(ActivitySortButton(current_sort=self.sort_mode, row=1))
+        # Pass the INITIAL view mode to the select menu
         self.add_item(ViewModeSelect(current_mode=self.view_mode, row=2))
         # Buttons added via decorators
 
-        self.update_buttons_and_ui() # Call initial update
+        # Update UI elements based on the initial state
+        self.update_buttons_and_ui()
 
     def sort_data(self):
-         """Sorts self.current_data based on self.sort_mode."""
-         # Ensure activity_count exists, default to 0 if missing (e.g., during data update)
-         if self.sort_mode == SORT_MODE_IGN:
-              self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
-         elif self.sort_mode == SORT_MODE_ACTIVITY:
-              self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
-         self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-         self.current_page = 0
+        """Sorts self.current_data based on self.sort_mode and retains page number if valid."""
+        # --- Store current page before sorting ---
+        stored_page = self.current_page
+
+        # Ensure activity_count exists, default to 0 if missing
+        if self.sort_mode == SORT_MODE_IGN:
+            self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
+        elif self.sort_mode == SORT_MODE_ACTIVITY:
+            # Sort descending by count, then ascending by IGN as tie-breaker
+            self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
+
+        # --- Recalculate total pages ---
+        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
+
+        # --- Restore or adjust current page ---
+        if stored_page < self.total_pages:
+            # If stored page is still valid in the new page range, keep it
+            self.current_page = stored_page
+        else:
+            # Otherwise, go to the last available page (or page 0 if no pages)
+            self.current_page = max(0, self.total_pages - 1)
 
 
     def update_buttons_and_ui(self):
@@ -755,7 +778,7 @@ class HCPagesView(View):
         self.sort_data() # Re-sort the current data
         await self.edit_message(interaction) # Update the message
 
-    # --- REVISED change_view_mode ---
+# --- REVISED change_view_mode (within HCPagesView class) ---
     async def change_view_mode(self, interaction: discord.Interaction, new_mode: str):
         """Called by the ViewModeSelect. Handles data fetching for activity views."""
         if self.view_mode == new_mode or self.is_fetching_activity:
@@ -765,11 +788,13 @@ class HCPagesView(View):
         # --- Set Loading State ---
         self.is_fetching_activity = True
         self.view_mode = new_mode # Update mode immediately for UI feedback
-        await self.edit_message(interaction, show_loading=True) # Show loading state
+        # This is the FIRST response to the interaction - OK
+        await self.edit_message(interaction, show_loading=True)
 
         guild = interaction.guild # Needed for logging/fetching
 
         try:
+            # ... [Keep all the data fetching logic exactly as it is] ...
             start_date: Optional[datetime.date] = None
             end_date: Optional[datetime.date] = None
             today_utc = datetime.datetime.now(pytz.utc).date()
@@ -838,9 +863,24 @@ class HCPagesView(View):
             self.sort_mode = SORT_MODE_IGN
             self.sort_data()
             self.is_fetching_activity = False # Release lock on error
-            await self.edit_message(interaction) # Update UI to reflect error state (via footer?)
+
+            # --- EDIT BLOCK IN ERROR CASE ---
+            # Update UI state (buttons etc.) before creating final embed
+            self.update_buttons_and_ui()
+            # Create the embed reflecting the error/reset state
+            embed = self.create_page_embed()
+            # Edit the original message directly
+            if self.message:
+                 try:
+                      await self.message.edit(embed=embed, view=self)
+                 except (discord.NotFound, discord.HTTPException) as edit_err:
+                      await log_error(guild, "Failed to edit message in view change error handler", error=edit_err)
+            # --- END EDIT BLOCK ---
+
             # Send a follow-up error message
             try:
+                # Use edit_original_response if the initial response was just a deferral,
+                # otherwise use followup. Since we already sent an edit_message, use followup.
                 await interaction.followup.send("❌ An error occurred while fetching data for the selected view.", ephemeral=True)
             except Exception: pass # Ignore if followup fails
             return # Stop further processing
@@ -848,8 +888,29 @@ class HCPagesView(View):
         finally:
             # --- Release Loading State ---
             self.is_fetching_activity = False
+
+            # --- START MODIFIED BLOCK ---
             # Edit message one last time to remove loading state and show final data
-            await self.edit_message(interaction)
+            # Update the view's UI state (buttons, select default etc.) BEFORE creating embed
+            self.update_buttons_and_ui()
+            # Create the final embed reflecting the loaded data and correct state
+            final_embed = self.create_page_embed()
+            # Edit the MESSAGE OBJECT directly, not the interaction response again
+            if self.message:
+                try:
+                    await self.message.edit(embed=final_embed, view=self)
+                except discord.NotFound:
+                    print(f"Paginator edit fail: Message {self.message.id} not found in finally block.")
+                    self.stop() # Stop view if message gone
+                except discord.HTTPException as e:
+                    # Log HTTP errors during the final edit
+                    await log_error(guild, "Paginator final edit fail (HTTP)", error=e, interaction=interaction)
+                except Exception as e:
+                     # Log any other errors during the final edit
+                     await log_error(guild, "Paginator final edit fail (General)", error=e, interaction=interaction)
+            else:
+                 print("Warning: self.message object was None in change_view_mode finally block. Cannot update view.")
+            # --- END MODIFIED BLOCK ---
 
 
     # --- on_timeout (Disable lock) ---
@@ -1306,6 +1367,59 @@ async def update_hc_member_list(guild: discord.Guild):
         # Log as error if any step had issues, otherwise info
         log_level = log_error if total_errors > 0 else log_info
         await log_level(guild, status_msg)
+
+        # 5. Log final status (Moved up slightly to log list update completion first)
+        EXPLANATORY_FOOTER_TEXT = "This list is automatically updated." # Keep for identification, shortened footer
+        BOT_CREATOR_ID = SELF_PROTECTED_ID # Use the constant
+
+        # --- NEW Concise Explanatory Embed ---
+        explanatory_embed = discord.Embed(
+            description=(
+                f"# ✅ \[HC1] Guild Member List\n"
+                f"*Official list of **\[HC1]** Florr.io guild members.*\n\n"
+                f"**Format:** `Discord ➔ IGN (Activity)`\n"
+                f"*Activity is a count of logged active days.*\n\n"
+                f"**Want more detail?**\n"
+                f"• Use {get_cmd_mention('hcmembers')} for **search, filters, and detailed activity dates**.\n"
+                f"• Mark yourself active today with {get_cmd_mention('activatemyself')}! 🤓\n\n"
+                f"--- \n"
+                f"*Bot built by <@{BOT_CREATOR_ID}>.*"
+            ),
+            color=discord.Color.blue() # Or NERDY_YELLOW
+        )
+        explanatory_embed.set_footer(text=EXPLANATORY_FOOTER_TEXT)
+        # Removed timestamp for a cleaner look, optional
+        # explanatory_embed.timestamp = discord.utils.utcnow()
+
+        # --- Keep the rest of the logic for fetching/editing/sending the message ---
+        last_message: Optional[discord.Message] = None
+        try:
+            # Fetch the very last message in the channel
+            async for message in chan.history(limit=1, oldest_first=False):
+                 last_message = message
+                 break # We only need the last one
+
+            if last_message and last_message.author.id == bot_user_id and last_message.embeds:
+                 # Check if the last message is already our explanatory embed
+                 if last_message.embeds[0].footer and last_message.embeds[0].footer.text == EXPLANATORY_FOOTER_TEXT:
+                      # It exists, just edit it to ensure content is up-to-date
+                      print(f"Static List: Found existing explanatory message ({last_message.id}), editing.")
+                      await last_message.edit(embed=explanatory_embed)
+                 else:
+                      # It's a bot message, but not the right one
+                      print(f"Static List: Last bot message ({last_message.id}) is not the explanatory message. Sending new one.")
+                      await chan.send(embed=explanatory_embed)
+            else:
+                 # No message, or last message not from bot, or no embeds. Send fresh.
+                 print(f"Static List: No existing explanatory message found at the end. Sending new one.")
+                 await chan.send(embed=explanatory_embed)
+
+        except discord.Forbidden:
+             await log_error(guild, f"Static list explanatory message failed: Bot lacks Send/Read History/Embed Links permissions in {chan.mention}.")
+        except discord.HTTPException as http_err:
+             await log_error(guild, f"Static list explanatory message failed: HTTP Error", error=http_err)
+        except Exception as e_explain:
+             await log_error(guild, f"Static list explanatory message failed: Unexpected error", error=e_explain)
 
     except Exception as e:
         # Catch-all for unexpected errors in the main orchestration logic
@@ -2312,6 +2426,62 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         await log_error(guild, f"Unexpected error during /hconly for IGN: {cleaned_ign}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
+# --- Activate Myself Command ---
+@tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
+# No extra permissions needed by default, relies on user having a linked IGN
+async def activatemyself(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not await check_supabase_available(interaction):
+        return
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        return
+
+    # Defer ephemerally as it's a personal action confirmation
+    await interaction.response.defer(thinking=True, ephemeral=False) # Change to False since we are not making it ephemeral
+
+    user_id = interaction.user.id
+    user_mention = interaction.user.mention
+
+    # 1. Fetch User's IGN
+    stored_ign = await get_ign_from_user(guild, user_id)
+
+    if not stored_ign:
+        await interaction.followup.send(
+            f"❌ {user_mention}, I couldn't find a linked In-Game Name (IGN) for you in the database. "
+            f"You might need to be verified with {get_cmd_mention('hcverify')} or contact an admin to link your account.",
+            ephemeral=False # Change to False since we are not making it ephemeral
+        )
+        await log_info(guild, f"{user_mention} tried /activatemyself but has no linked IGN.")
+        return
+
+    # 2. Get Today's Date
+    activity_date, date_error = get_utc_date() # No date string needed, defaults to today
+    if date_error or not activity_date:
+        await interaction.followup.send(f"❌ Could not determine today's date. Please try again later.", ephemeral=False) # Change to False since we are not making it ephemeral
+        await log_error(guild, f"/activatemyself internal error: Failed to get today's date ({date_error})", interaction=interaction)
+        return
+
+    # 3. Upsert Activity Log
+    success, message = await upsert_activity_log(guild, stored_ign, activity_date, user_id)
+
+    prefix = "✅" if success else "⚠️"
+    # Tailor the message slightly
+    response_msg = f"{prefix} {user_mention}, "
+    if success:
+        response_msg += f"you've been marked as active for today ({format_date_dmy(activity_date)}) with IGN `{discord.utils.escape_markdown(stored_ign)}`."
+    else:
+        # Provide the error message from upsert_activity_log
+        response_msg += f"failed to mark you as active: {message.split(': ', 1)[-1]}" # Get message part after "IGN `...`:" if structure is consistent
+
+    await interaction.followup.send(response_msg, ephemeral=False) # Change to False since we are not making it ephemeral
+
+    # 4. Log and Trigger Update (if successful)
+    if success:
+        await log_info(guild, f"`{interaction.user}` used /activatemyself. Marked IGN `{stored_ign}` active for {format_date_dmy(activity_date)}. Triggering list update.")
+        asyncio.create_task(update_hc_member_list(guild))
+    # else: Error already logged by upsert_activity_log if it failed internally
+
 # --- Active Command ---
 @tree.command(name="active", description="Mark an In-Game Name (IGN) as active for a specific date.")
 @app_commands.describe(
@@ -2500,46 +2670,79 @@ async def hcmembers(interaction: discord.Interaction):
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
-    # --- MODIFIED CHANNEL CHECK ---
-    # Check if channel is allowed, UNLESS the user is the protected ID
+    # Channel check (same as before)
     if interaction.user.id != SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
         allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
         msg = f"❌ This command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
-        # Log attempt if not the protected user trying in wrong channel
         if interaction.user.id != SELF_PROTECTED_ID:
             await log_info(guild, f"User `{interaction.user}` attempted /hcmembers in disallowed channel {interaction.channel.mention if interaction.channel else interaction.channel_id}.")
-        # Send response regardless of who tried (unless they are protected user)
         await interaction.response.send_message(msg, ephemeral=False)
         return
-    # --- END MODIFIED CHECK ---
 
-    await interaction.response.defer(thinking=True, ephemeral=False) # Keep public defer
+    await interaction.response.defer(thinking=True, ephemeral=False)
 
     try:
-        # Fetch data using the updated function which now includes activity
-        data_list, total = await fetch_hc_member_data(guild)
+        # 1. Fetch base data (includes all-time activity)
+        original_data, total = await fetch_hc_member_data(guild)
 
-        if not data_list:
-            # Simplified no members found message
+        if not original_data:
             embed = create_embed(title=HC_LIST_EMBED_TITLE, description="No HC members found in the database or matching roles.", color=discord.Color.orange())
             await interaction.followup.send(embed=embed)
             return
 
-        # Create and send the updated paginated view
-        view = HCPagesView(data_list, total) # Pass the list of dicts
-        initial_embed = view.create_page_embed() # create_page_embed handles the dict format
+        # 2. Fetch initial data for the default view (Monthly Activity)
+        initial_display_data = list(original_data) # Start with a copy of original data
+        try:
+            # Calculate date range for monthly view
+            today_utc = datetime.datetime.now(pytz.utc).date()
+            end_date_monthly = today_utc
+            start_date_monthly = today_utc - datetime.timedelta(days=29)
+            all_igns = [item['ign'] for item in original_data if item.get('ign')]
+
+            if all_igns:
+                print(f"/hcmembers: Fetching initial monthly activity for {len(all_igns)} IGNs...")
+                monthly_activity_data = await fetch_activity_data(guild, all_igns, start_date_monthly, end_date_monthly)
+                print(f"/hcmembers: Fetched {len(monthly_activity_data)} monthly activity results.")
+
+                # Update initial_display_data with the monthly activity
+                temp_data = []
+                for item in original_data: # Iterate original to keep structure
+                    ign_lower = item.get('ign', '').lower()
+                    activity_info = monthly_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
+                    updated_item = item.copy() # Create a new dict
+                    # Overwrite activity_count and last_seen with monthly data
+                    updated_item['activity_count'] = activity_info['count']
+                    updated_item['last_seen'] = activity_info['last_seen']
+                    temp_data.append(updated_item)
+                initial_display_data = temp_data # Replace with monthly-updated data
+                print("/hcmembers: Updated initial_display_data with monthly activity.")
+            else:
+                 print("/hcmembers: No IGNs found, skipping initial monthly fetch.")
+
+        except Exception as fetch_err:
+             # Log error during initial fetch but proceed with original (all-time) data
+             await log_error(guild, "Failed to fetch initial monthly activity for /hcmembers", error=fetch_err, interaction=interaction)
+             initial_display_data = list(original_data) # Fallback to original data
+
+        # 3. Create and send the view, passing BOTH original and initial data
+        # The view will handle sorting the initial_display_data based on default sort mode
+        view = HCPagesView(
+            original_data=original_data, # Pass the base data with all-time activity
+            initial_display_data=initial_display_data, # Pass the data prepped for the default view
+            total_members=total,
+            guild=guild # Pass guild for potential future use in view if needed
+        )
+        initial_embed = view.create_page_embed() # create_page_embed uses self.current_data
         message = await interaction.followup.send(embed=initial_embed, view=view)
         view.message = message # Link message to view
 
-        # Log success, including if the protected user bypassed channel check
+        # Log success (same as before)
         log_detail = ""
         if interaction.user.id == SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
             log_detail = " (Protected user bypass)"
-
         await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}{log_detail}.")
 
-
-    # Keep existing error handling for DB connection/API errors
+    # Keep existing error handling (same as before)
     except ConnectionError as e:
         await log_error(guild, "/hcmembers DB connection error", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ Database Connection Error.", discord.Color.red()))
@@ -2550,16 +2753,15 @@ async def hcmembers(interaction: discord.Interaction):
         await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()))
 
-# --- Refresh Static List Command (MODIFIED WITH AUTO-DELETE) ---
-@tree.command(name="refresh", description="Manually refresh static [HC1] list (auto-deletes confirmation).")
+# --- Refresh Static List Command (MODIFIED - Removed manual delete logic) ---
+@tree.command(name="refresh", description="Manually refresh static [HC1] list.") # Removed "(auto-deletes confirmation)" from description
 @app_commands.checks.has_permissions(manage_roles=True) # Keep permission check
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
     if not await check_supabase_available(interaction):
-        # Helper sends ephemeral msg & logs. We need to ensure the interaction isn't left hanging if deferred.
         try:
-             if interaction.response.is_done(): # Check if already deferred (unlikely here, but defensive)
+             if interaction.response.is_done():
                   await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
         except (discord.NotFound, discord.HTTPException): pass
         return
@@ -2574,16 +2776,12 @@ async def refresh(interaction: discord.Interaction):
     list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
     if not isinstance(list_channel, discord.TextChannel):
         msg = f"❌ Configuration Error: Static list channel (ID: {HC_MEMBER_LIST_CHANNEL_ID}) is invalid or not found."
-        # Use send_message here as we haven't deferred yet for this specific error path
         await interaction.response.send_message(msg, ephemeral=False)
         await log_error(guild, f"/refresh failed: Static list channel invalid.", interaction=interaction)
         return
 
     # --- Defer Publicly ---
-    # Shows "Bot is thinking..." while the update runs.
     await interaction.response.defer(thinking=True, ephemeral=False)
-
-    confirmation_message: Optional[discord.Message] = None # Initialize variable
 
     try:
         await log_info(guild, f"Manual static list refresh initiated by `{interaction.user}`.")
@@ -2592,45 +2790,26 @@ async def refresh(interaction: discord.Interaction):
         await update_hc_member_list(guild)
         # --- List update is now complete ---
 
-        # --- Send Confirmation (NOT ephemeral, so bot can delete it) ---
+        # --- Send Confirmation (NOT ephemeral) ---
+        # REMOVED: ", This message will self-destruct shortly."
         confirmation_message = await interaction.followup.send(
-            f"✅ Refresh complete for the static list in {list_channel.mention}. This message will self-destruct shortly.",
-            ephemeral=False # MUST be False for the bot to delete it later
+            f"✅ Refresh complete for the static list in {list_channel.mention}.",
+            ephemeral=False # MUST be False for the bot's on_message to see and potentially delete it
         )
         await log_info(guild, f"Refresh command confirmed complete to user {interaction.user}.")
 
-        # --- Wait a few seconds for the user to read ---
-        delete_delay_seconds = 7 # Adjust as needed (e.g., 5, 7, 10)
-        await asyncio.sleep(delete_delay_seconds)
-
-        # --- Attempt to delete the confirmation message ---
-        try:
-            await confirmation_message.delete()
-            await log_info(guild, f"Auto-deleted refresh confirmation message (ID: {confirmation_message.id}).")
-        except discord.NotFound:
-            # Message might have been deleted manually - this is fine.
-            await log_info(guild, f"Refresh confirmation message (ID: {confirmation_message.id}) was already deleted.")
-        except discord.Forbidden:
-            # Bot lacks permissions in the interaction channel
-            await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): Missing Permissions in channel {interaction.channel.mention if interaction.channel else interaction.channel_id}", interaction=interaction)
-            # Optionally notify the user ephemerally that auto-delete failed?
-            # try: await interaction.followup.send("⚠️ Couldn't auto-delete the confirmation message (Missing Permissions).", ephemeral=True)
-            # except Exception: pass
-        except discord.HTTPException as e:
-             await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): HTTP Error", error=e, interaction=interaction)
-        except Exception as e:
-             await log_error(guild, f"Failed to auto-delete refresh confirmation message (ID: {confirmation_message.id}): Unexpected Error", error=e, interaction=interaction)
+        # --- REMOVED ASYNCIO.SLEEP AND MANUAL DELETE BLOCK ---
+        # The on_message event handler will now take care of deleting
+        # the confirmation_message if interaction.channel_id == AUTODELETE_CHANNEL_ID
 
     except Exception as e:
         # Catch errors during the main refresh process or sending the initial confirmation
         await log_error(guild, "Error during /refresh process", error=e, interaction=interaction)
-        # Try to inform the user if the main process failed (and confirmation wasn't sent)
-        if confirmation_message is None: # Check if confirmation was successfully sent before error
-             try:
-                 # Use edit_original_response since we definitely deferred
-                 await interaction.edit_original_response(content="❌ An unexpected error occurred during the refresh process.", embed=None, view=None)
-             except Exception: pass # Ignore errors during error reporting
-             
+        # Try to inform the user if the main process failed
+        try:
+            # Use edit_original_response since we definitely deferred
+            await interaction.edit_original_response(content="❌ An unexpected error occurred during the refresh process.", embed=None, view=None)
+        except Exception: pass # Ignore errors during error reporting             
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
@@ -3209,37 +3388,28 @@ async def on_message(message: discord.Message):
                 except Exception: pass
         # --- END OF PASTED .p LOGIC ---
 
-# --- MODIFIED Nerd Help Command (Added Spacing and Activity Commands) ---
+# --- MODIFIED Nerd Help Command (Added activatemyself) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
-    # Ensure bot object and user are available
     if not bot or not bot.user:
         print("Error: Bot object not available in nerdhelp command.")
         await interaction.response.send_message("Bot is not fully ready, cannot generate help. Please try again shortly.", ephemeral=False)
         return
-
-    # Check if command_ids dictionary is populated (important for clickable links)
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
-        # Optionally inform user if needed, but fallback will still show command name
 
     embed = discord.Embed(
         title="🤓 Pingslave Bot Commands",
         color=NERDY_YELLOW
     )
-
-    # --- ADDED EMPTY FIELD FOR SPACING ---
     embed.add_field(name="\u200B", value="\u200B", inline=False)
-    # --- END ADDED FIELD ---
-
-    # --- Build Embed Fields (Command + Description in Name, Value is empty) ---
 
     # Section: Verification & HC Management
-    embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False) # Section Title remains separate
+    embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify a standard user.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('unverify')}  · Revert a user to unverified.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify a user into HC.", value="\u200B", inline=False)
@@ -3247,30 +3417,29 @@ async def nerdhelp(interaction: discord.Interaction):
     embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove member from HC.", value="\u200B", inline=False)
 
     # Section: [HC1] Member List
-    embed.add_field(name="\u200B\n📊 [HC1] Member List", value="\u200B", inline=False) # Section Title
+    embed.add_field(name="\u200B\n📊 [HC1] Member List", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh the static HC member list.", value="\u200B", inline=False)
 
     # Section: Activity Tracking
-    embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False) # Section Title
-    embed.add_field(name=f"{get_cmd_mention('active')}  · Mark a member as active for a date.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False) # <-- ADDED
+    embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False) # <-- ADDED
+    embed.add_field(name=f"{get_cmd_mention('active')}  · Mark *any* member as active for a date.", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
 
     # Section: Utilities
-    embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False) # Section Title
+    embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
 
-    # --- Footer and Thumbnail ---
     embed.set_footer(text="Bot by TheNerd | sweet_honey")
     if bot.user and bot.user.display_avatar:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
 
-    # --- Send Response ---
     try:
-        await interaction.response.send_message(embed=embed, ephemeral=False) # Keep it public
+        await interaction.response.send_message(embed=embed, ephemeral=False)
     except Exception as e:
         print(f"Error sending nerdhelp response: {e}")
         await log_error(guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
@@ -3278,7 +3447,7 @@ async def nerdhelp(interaction: discord.Interaction):
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
-
+        
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
