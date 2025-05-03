@@ -81,6 +81,7 @@ ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
 COMMAND_PREFIX = "." # Define the prefix
 AUTODELETE_CHANNEL_ID = 1354431395140731165
 AUTODELETE_DELAY_SECONDS = 5.0
+TARGET_GUILD_ID = 1200476681803137024 # Catercord server ID
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -110,6 +111,81 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Fetches ALL HC member data directly from Supabase (IGN, Discord ID/Name)
+    and correlates with ALL activity data. Used when Discord context is unavailable/irrelevant.
+    Returns a list of dicts: [{'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
+    and the total count. Sorted by IGN case-insensitive.
+    """
+    print("Fetch All Supabase Data: Starting fetch...")
+    if not supabase:
+        await log_error(guild_for_log, "fetch_all_supabase_hc_data failed: Supabase client unavailable.", ping_owner=True)
+        return [], 0
+
+    # 1. Fetch all members from hc_members table
+    all_members_data = []
+    try:
+        print("Fetch All Supabase Data: Fetching all from hc_members...")
+        resp_members = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("discord_id, discord_name, ingame_name")
+                           .execute()
+        )
+        if resp_members and hasattr(resp_members, 'data') and resp_members.data:
+            all_members_data = resp_members.data
+            print(f"Fetch All Supabase Data: Found {len(all_members_data)} total entries in hc_members.")
+        else:
+            print("Fetch All Supabase Data: No data returned from hc_members.")
+            # No need to fetch activity if no members found
+            return [], 0
+
+    except (ConnectionError, APIError, Exception) as e:
+        await log_error(guild_for_log, "Failed to fetch all data from Supabase hc_members", error=e, ping_owner=True)
+        return [], 0 # Return empty on critical DB failure
+
+    # 2. Fetch all activity data
+    activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
+    all_igns_in_db = [entry['ingame_name'] for entry in all_members_data if entry.get('ingame_name')]
+
+    if not all_igns_in_db:
+         print("Fetch All Supabase Data: No IGNs found in fetched member data. Skipping activity fetch.")
+    else:
+        print(f"Fetch All Supabase Data: Fetching all-time activity for {len(all_igns_in_db)} IGNs...")
+        try:
+            # Use fetch_activity_data with no date range to get all-time counts/last_seen
+            activity_summary = await fetch_activity_data(guild_for_log, all_igns_in_db)
+            print(f"Fetch All Supabase Data: Fetched activity summary for {len(activity_summary)} IGNs.")
+        except Exception as e_act:
+             # Log error but proceed, activity will be 0
+             await log_error(guild_for_log, "Failed during all-time activity fetch in fetch_all_supabase_hc_data", error=e_act, ping_owner=True)
+
+
+    # 3. Combine Member and Activity Data
+    final_data: List[Dict[str, Any]] = []
+    for member_entry in all_members_data:
+        ign = member_entry.get("ingame_name")
+        if not ign: continue # Skip entries without an IGN (shouldn't happen based on fetch)
+
+        ign_lower = ign.lower()
+        activity = activity_summary.get(ign_lower, {'count': 0, 'last_seen': None})
+
+        final_data.append({
+            "discord_id": member_entry.get("discord_id"), # Can be None
+            "discord_name": member_entry.get("discord_name"), # Can be None
+            "ign": ign,
+            "activity_count": activity.get('count', 0),
+            "last_seen": activity.get('last_seen') # date object or None
+            # No 'member' object here
+        })
+
+    # 4. Sort by IGN (case-insensitive) as default
+    final_data.sort(key=lambda item: item['ign'].lower())
+
+    total_members = len(final_data)
+    print(f"Fetch All Supabase Data: Finished. Total entries prepared: {total_members}.")
+    return final_data, total_members
 
 async def activity_date_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Provides autocomplete choices for activity dates: Today, Yesterday, Last 7 days (D/M/YYYY format)."""
@@ -584,8 +660,8 @@ async def run_supabase_sync(func):
     except Exception as e: print(f"Supabase executor Error: {e}"); raise
 
 # --- Logging ---
-async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], message: Optional[str] = None, embed: Optional[discord.Embed] = None):
-    """Sends log to a channel, checking permissions."""
+async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], message: Optional[str] = None, embed: Optional[discord.Embed] = None, ping_mention: Optional[str] = None):
+    """Sends log to a channel, checking permissions, optionally prepending a ping."""
     if not guild: print(f"Log Error: No Guild for channel {channel_id}."); return
     log_channel = guild.get_channel(channel_id)
     if not isinstance(log_channel, discord.TextChannel): print(f"Log Error: Channel {channel_id} invalid in {guild.name}."); return
@@ -595,12 +671,69 @@ async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], messag
     if not bot_member: print(f"Log Error: Cannot find bot ({bot.user.id if bot.user else 'N/A'}) in {guild.name}."); return
     perms = log_channel.permissions_for(bot_member)
     if not perms.send_messages or (embed and not perms.embed_links): print(f"Log Error: Missing Send/Embed perms in {log_channel.mention}."); return
+
+    content_to_send = ping_mention if ping_mention else None
+
     try:
-        if embed: await log_channel.send(embed=embed)
-        elif message: await log_channel.send((message[:1997] + "...") if len(message) > 2000 else message)
+        if embed:
+            # Send ping as content separate from embed if needed
+            await log_channel.send(content=content_to_send, embed=embed, allowed_mentions=discord.AllowedMentions(users=True)) # Ensure user pings work
+        elif message:
+            # Prepend ping to text message if provided
+            full_message = f"{ping_mention} {message}" if ping_mention else message
+            # Truncate combined message if needed
+            await log_channel.send((full_message[:1997] + "...") if len(full_message) > 2000 else full_message, allowed_mentions=discord.AllowedMentions(users=True)) # Ensure user pings work
     except discord.Forbidden: print(f"Log Error: Forbidden in {log_channel.mention}.")
     except discord.HTTPException as e: print(f"Log Error: HTTP {e.status} in {log_channel.mention}: {e.text}")
     except Exception as e: print(f"Log Error: Send fail in {log_channel.mention}: {e}")
+
+async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
+    """Logs an info message."""
+    # Simplified: always create an embed for consistency if only message is passed
+    if not embed:
+        embed = discord.Embed(description=message, color=NERDY_YELLOW)
+        embed.timestamp = discord.utils.utcnow()
+    # Use log_to_channel but target INFO channel and no ping
+    await log_to_channel(INFO_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=None)
+
+# --- REVISED log_error (Always pings owner) ---
+async def log_error(guild: Optional[discord.Guild], message: str, error: Optional[Exception] = None, interaction: Optional[discord.Interaction] = None, embed: Optional[discord.Embed] = None):
+    """Logs an error to the error channel, ALWAYS pinging the owner."""
+
+    # --- Always set ping content for the error channel ---
+    ping_content = f"<@{SELF_PROTECTED_ID}>"
+
+    if not embed:
+        # Use a consistent "Critical Error" title since it always pings
+        title_prefix = "🚨 Bot Critical Error"
+        embed = discord.Embed(title=title_prefix, description=message, color=discord.Color.red())
+        embed.timestamp = discord.utils.utcnow()
+        if interaction:
+            cmd_name = interaction.command.name if interaction.command else 'N/A'
+            cmd = f"`/{cmd_name}`"
+            chan_mention = interaction.channel.mention if isinstance(interaction.channel, discord.TextChannel) else ""
+            chan_info = f" in {chan_mention}" if chan_mention else f" Ch:{interaction.channel_id}" if interaction.channel else ""
+            user = f"{interaction.user.mention} (`{interaction.user.id}`)"
+            embed.add_field(name="Context", value=f"Cmd: {cmd}{chan_info}\nUser: {user}", inline=False)
+        if error:
+            etype, emsg = type(error).__name__, str(error)
+            tb = "".join(traceback.format_exception(type(error), error, error.__traceback__, limit=6))
+            # Truncate traceback more aggressively
+            tb_short = (tb[:900] + "\n... (Truncated)") if len(tb) > 900 else tb # ADJUSTED TRUNCATION
+            details = f"**Type:** `{etype}`\n" + (f"**Msg:** `{emsg}`\n" if emsg else "") + f"**Traceback:**\n```py\n{tb_short}\n```"
+            # Keep the final check, but reduce its limit slightly too for safety
+            if len(details) > 1024:
+                 details = details[:1000] + "...```" # ADJUSTED TRUNCATION
+            embed.add_field(name="Error Details", value=details, inline=False)
+            full_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            # Print to console with ping indication
+            print(f"---\nERROR LOGGED (OWNER PING SENT):\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---\n")
+        else:
+             # Print non-exception errors too, indicating ping status
+             print(f"---\nERROR/WARN LOGGED (OWNER PING SENT):\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\n---\n")
+
+    # Pass the ping content to log_to_channel, targeting the ERROR channel
+    await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=ping_content)
 
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
     """Logs an info message."""
@@ -674,21 +807,24 @@ class ViewModeSelect(discord.ui.Select):
 
 class HCPagesView(View):
     # Data is List[Dict[str, Any]] from fetch_hc_member_data (includes ALL-TIME activity)
-    def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: discord.Guild, timeout=300.0): # Added guild parameter
+    def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: Optional[discord.Guild], is_catercord_context: bool, timeout=300.0):
         super().__init__(timeout=timeout)
-        # original_data holds the base info + all-time activity fetched initially
+        # original_data holds the base info fetched for the context
         self.original_data = original_data
         # current_data is initialized with the pre-fetched data for the default view
         self.current_data = initial_display_data # Use the passed initial data
         self.total_members = total_members
         self.current_page = 0
         self.message: Optional[discord.Message] = None
-        self.guild = guild # Store guild if needed later
+        self.guild = guild # Store guild if needed later (e.g., for logging inside view)
+        self.is_catercord_context = is_catercord_context # Store the context flag
 
         # --- State ---
-        # SET DEFAULTS HERE
-        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY # <<< DEFAULT VIEW
-        self.sort_mode = SORT_MODE_ACTIVITY       # <<< DEFAULT SORT for activity views
+        # Set default view based on context
+        # If in Catercord, default to monthly. If outside, default to all-time activity.
+        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY if is_catercord_context else VIEW_MODE_ACTIVITY_ALL
+        # Default sort depends on default view - activity seems reasonable for both contexts
+        self.sort_mode = SORT_MODE_ACTIVITY
         self.is_fetching_activity = False # Lock to prevent concurrent fetches
 
         # --- Initial Sort ---
@@ -703,7 +839,7 @@ class HCPagesView(View):
         self.add_item(ActivitySortButton(current_sort=self.sort_mode, row=1))
         # Pass the INITIAL view mode to the select menu
         self.add_item(ViewModeSelect(current_mode=self.view_mode, row=2))
-        # Buttons added via decorators
+        # Buttons added via decorators (@discord.ui.button)
 
         # Update UI elements based on the initial state
         self.update_buttons_and_ui()
@@ -756,24 +892,25 @@ class HCPagesView(View):
 
     # --- REVISED create_page_embed (within HCPagesView class) ---
     def create_page_embed(self) -> discord.Embed:
-        """Creates embed based on current view_mode and sort_mode."""
+        """Creates embed based on current view_mode, sort_mode, and context."""
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
 
         IDX_WIDTH = 3
         if self.view_mode == VIEW_MODE_DISCORD:
-             NAME_WIDTH = 15
+             # Use a slightly wider name column to accommodate potentially longer stored names
+             NAME_WIDTH = 18
              IGN_WIDTH = 15
              ACT_WIDTH = 0 # No activity column
              TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
+             header = (f"{'#':<{IDX_WIDTH}}{'Discord (Stored)':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}") # Indicate stored name might be shown
         # All activity views use the same layout now
         elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
              IGN_WIDTH = 20
              ACT_WIDTH = ACTIVITY_COLUMN_WIDTH # Use constant
              TOTAL_WIDTH = IDX_WIDTH + IGN_WIDTH + ACT_WIDTH
              header = (f"{'#':<{IDX_WIDTH}}{'In-Game':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
-        else: # Fallback
+        else: # Fallback (shouldn't happen)
              NAME_WIDTH = 15; IGN_WIDTH = 15; ACT_WIDTH = 0
              TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
              header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
@@ -787,28 +924,37 @@ class HCPagesView(View):
             desc_lines = ["```\nNo members found matching criteria.\n```"]
         else:
             for item_dict in page_data:
-                member = item_dict.get('member')
                 ign = item_dict.get('ign', 'Unknown')
 
                 if self.view_mode == VIEW_MODE_DISCORD:
-                    if member: user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                    else: user_display = "[No Discord]"
+                    # Check if live discord.Member object exists (only available in Catercord context)
+                    member = item_dict.get('member')
+                    if member: # If we have the live member object (Catercord context)
+                        user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+                    else: # Use the stored name from Supabase (Outside Catercord or member left/no longer has role)
+                        user_display = item_dict.get('discord_name') or "[No Discord]" # Use DB name or fallback placeholder
+
                     ign_display = ign
+                    # Truncate display names if necessary
                     if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
                     if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
+                    # Format line
                     line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
                             f"{user_display:<{NAME_WIDTH}}"
                             f"{ign_display:<{IGN_WIDTH}}")
 
                 elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+                    # Activity view logic remains the same, using data present in item_dict
                     activity_count = item_dict.get('activity_count', 0)
                     last_seen_date = item_dict.get('last_seen') # date object or None
                     ign_display = ign
                     # Format activity: Count (Last Seen DD/MM/YY)
                     activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
 
+                    # Truncate display names if necessary
                     if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
                     if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
+                    # Format line
                     line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
                             f"{ign_display:<{IGN_WIDTH}}"
                             f"{activity_display:<{ACT_WIDTH}}")
@@ -819,13 +965,17 @@ class HCPagesView(View):
                 idx += 1
             desc_lines.append("```")
 
+        # Use context flag to potentially adjust title
+        # If in Catercord, use standard title. Otherwise, indicate it's DB-only.
+        title = HC_LIST_EMBED_TITLE if self.is_catercord_context else "HC Database Members (All)"
+
         embed = discord.Embed(
-            title=HC_LIST_EMBED_TITLE,
+            title=title,
             description="\n".join(desc_lines),
             color=NERDY_YELLOW
         )
 
-        # --- Update Footer Text Based on View Mode ---
+        # --- Footer Update (Remains the same) ---
         sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
         view_text_map = {
             VIEW_MODE_DISCORD: "Discord+IGN",
@@ -835,23 +985,15 @@ class HCPagesView(View):
             VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
         }
         view_text = view_text_map.get(self.view_mode, "Unknown View")
-
-        # --- MODIFIED FOOTER ---
-        # Get current unix timestamp
         current_unix_ts = int(discord.utils.utcnow().timestamp())
-        # Construct footer text with dynamic timestamp (using :R for relative time)
         footer_text = (
             f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
             f"View: {view_text} | Sort: {sort_text}"
         )
         if self.is_fetching_activity:
              footer_text += " | Fetching data..."
-        # Append the dynamic timestamp
-        footer_text += f" | <t:{current_unix_ts}:R>"
-        # --- END MODIFIED FOOTER ---
-
+        footer_text += f" | <t:{current_unix_ts}:R>" # Dynamic timestamp
         embed.set_footer(text=footer_text)
-        # REMOVED: embed.timestamp = discord.utils.utcnow()
         return embed
 
 
@@ -1062,10 +1204,11 @@ class HCPagesView(View):
                  await log_error(self.message.guild, f"Paginator timeout edit general fail", error=e)
         self.stop()
 
-# --- REVISED fetch_hc_member_data ---
+# --- REVISED fetch_hc_member_data (Adding logs for scenario 2) ---
 async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any]], int]:
     """
     Fetches HC members from Discord and Supabase, including all-time activity counts.
+    Logs warnings for mismatches (Role w/o DB, DB w/o Role/Member).
     Returns a list of dicts: [{'member': discord.Member | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
     and the total count.
     Data is sorted by Discord name (if available), then IGN (case-insensitive).
@@ -1073,7 +1216,7 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
     print(f"Fetch HC Data ({guild.name}): Starting fetch...")
     hc_role = guild.get_role(ADD_ROLE_ID_HC)
     if not hc_role:
-        await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found during fetch.")
+        await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found during fetch.", ping_owner=True) # Ping owner on critical role missing
         return [], 0
 
     # 1. Fetch ALL entries from Supabase hc_members table
@@ -1094,6 +1237,7 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
                 all_igns_in_db.append(ign) # Add original case IGN
                 d_id = entry.get("discord_id")
                 if d_id:
+                    # Store discord_id as string consistently
                     all_db_members[str(d_id)] = {"ign": ign, "processed": False}
                 else:
                     ign_only_members[ign.lower()] = {"ign_original": ign, "processed": False}
@@ -1101,8 +1245,14 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         else:
             print(f"Fetch HC Data ({guild.name}): No data returned from Supabase hc_members.")
 
-    except (ConnectionError, APIError, Exception) as e:
-        await log_error(guild, "Failed to fetch all data from Supabase hc_members", error=e)
+    except ConnectionError as e: # Specific catch for connection error
+        await log_error(guild, "Failed to fetch data from Supabase hc_members: Connection Error.", error=e, ping_owner=True)
+        return [], 0
+    except APIError as e: # Specific catch for API errors
+         await log_error(guild, "Failed to fetch data from Supabase hc_members: API Error.", error=e, ping_owner=True)
+         return [], 0
+    except Exception as e: # Catch other exceptions during Supabase fetch
+        await log_error(guild, "Failed to fetch data from Supabase hc_members: Unexpected Error.", error=e, ping_owner=True)
         return [], 0 # Return empty on critical DB failure
 
     # 2. Fetch ALL activity data for the IGNs found
@@ -1119,13 +1269,13 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         if not guild.chunked and guild.member_count is not None and guild.member_count > 1000:
              try:
                  print(f"Fetch HC Data ({guild.name}): Chunking guild..."); await guild.chunk(cache=True)
-             except Exception as chunk_e: print(f"WARN: Chunking failed: {chunk_e}")
+             except Exception as chunk_e: print(f"WARN: Chunking failed: {chunk_e}") # Log warning, don't stop
 
         discord_hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
         print(f"Fetch HC Data ({guild.name}): Found {len(discord_hc_members)} Discord members with HC role.")
     except Exception as e:
-        await log_error(guild, "Guild chunking/member fetch failed", error=e)
-        # Continue, Supabase entries might still exist
+        # Log as error but continue if possible, Supabase entries might still be processed
+        await log_error(guild, "Guild chunking/member fetch failed during data fetch. List might be incomplete.", error=e, ping_owner=False) # Don't necessarily ping for this unless severe
 
     # 4. Correlate and Build Final Data Structure
     final_data: List[Dict[str, Any]] = []
@@ -1143,6 +1293,7 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
             # Get activity for this member's IGN (use lowercase for lookup)
             activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
         else:
+            # *** SCENARIO 1 LOG ***
             # Member has role but no DB entry? Log it.
             await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
 
@@ -1159,14 +1310,44 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         if not entry_data["processed"]:
             ign = entry_data["ign"]
             activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
+
+            # *** SCENARIO 2 LOGGING ***
+            try:
+                member_in_guild = guild.get_member(int(d_id)) # Check cache first
+                if not member_in_guild and not guild.chunked: # If not found and not chunked, maybe try fetching? Risky performance-wise.
+                     # Optional: try fetch member, but be careful with performance impact
+                     # try: member_in_guild = await guild.fetch_member(int(d_id))
+                     # except discord.NotFound: member_in_guild = None
+                     # except Exception: member_in_guild = None # Ignore other fetch errors
+                     pass
+
+                if member_in_guild:
+                    # User is IN the guild, check if they have the HC role
+                    if hc_role not in member_in_guild.roles:
+                        await log_info(guild, f"Fetch HC Data Warning: DB entry exists for {member_in_guild.mention} (`{d_id}`), but they do **not** currently have the HC role.")
+                    # else: # User exists and HAS the role, but wasn't processed in loop 1? This is odd.
+                    #     await log_warning(guild, f"Fetch HC Data Anomaly: DB entry for {member_in_guild.mention} (`{d_id}`) has HC role but wasn't processed initially.")
+                else:
+                    # User is NOT in the guild (or couldn't be found)
+                    # Fetch discord name from DB if available, fallback to ID
+                    db_name = entry_data.get("discord_name", f"ID {d_id}")
+                    await log_info(guild, f"Fetch HC Data Info: DB entry exists for user `{db_name}` (`{d_id}`), but they are not currently in this server (or couldn't be found). IGN: `{ign}`")
+
+            except ValueError: # Handle if d_id is somehow not a valid integer string
+                 await log_error(guild, f"Fetch HC Data Error: Invalid Discord ID '{d_id}' found in database for IGN '{ign}'.", ping_owner=True)
+            except Exception as e_log: # Catch errors during the logging check itself
+                 await log_error(guild, f"Fetch HC Data Error: Failed during Scenario 2 check for ID '{d_id}'", error=e_log, ping_owner=False) # Don't ping for logging errors
+
+            # Add to final data regardless of log status
             final_data.append({
-                "member": None,
+                "member": None, # Display as [No Discord]
                 "ign": ign,
                 "activity_count": activity['count'],
                 "last_seen": activity['last_seen']
             })
+            # *** END SCENARIO 2 LOGGING ***
 
-    # Add IGN-only entries
+    # Add IGN-only entries (no discord_id)
     for ign_lower, entry_data in ign_only_members.items():
          # No need to check 'processed' here as they weren't handled by Discord member loop
          ign = entry_data["ign_original"]
@@ -2722,101 +2903,142 @@ async def bulkactive(interaction: discord.Interaction, date: str):
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (username#tag ➔ IGN / Activity).")
+# --- REVISED /hcmembers Command ---
+@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
-    # Keep Supabase check
+    # --- Initial Checks ---
     if not await check_supabase_available(interaction):
         try: # Attempt cleanup if deferred
             if interaction.response.is_done(): await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
         except (discord.NotFound, discord.HTTPException): pass
         return
     if not guild:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
-        return
+        # Allow command in DMs or other contexts, but treat as non-target guild
+        current_guild_id = None
+        print("/hcmembers: Command used outside a guild context.")
+    else:
+        current_guild_id = guild.id
 
-    # Channel check (same as before)
-    if interaction.user.id != SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
-        allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
-        msg = f"❌ This command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
-        if interaction.user.id != SELF_PROTECTED_ID:
-            await log_info(guild, f"User `{interaction.user}` attempted /hcmembers in disallowed channel {interaction.channel.mention if interaction.channel else interaction.channel_id}.")
-        await interaction.response.send_message(msg, ephemeral=False)
-        return
+    is_target_guild = current_guild_id == TARGET_GUILD_ID
 
+    # --- Defer Publicly ---
+    # Defer early before potentially long data fetch
     await interaction.response.defer(thinking=True, ephemeral=False)
 
+    # --- Channel Check (only relevant if in a guild) ---
+    # Perform check *after* deferral
+    if guild and not is_target_guild: # If in a guild, but not Catercord
+        # Log info but allow command to proceed with DB-only data
+        await log_info(guild, f"/hcmembers used by `{interaction.user}` in non-target guild {guild.name} ({guild.id}). Showing DB data only.")
+    elif guild and is_target_guild: # If in Catercord guild
+         # Check allowed channels ONLY if in Catercord
+         if interaction.channel_id not in ALLOWED_CHANNEL_IDS and interaction.user.id != SELF_PROTECTED_ID:
+             allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
+             msg = f"❌ In this server, the command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
+             await log_info(guild, f"User `{interaction.user}` attempted /hcmembers in disallowed channel {interaction.channel.mention if interaction.channel else interaction.channel_id} within target guild.")
+             # Edit the deferred response
+             await interaction.edit_original_response(content=msg, embed=None, view=None)
+             return
+         else:
+             # Log successful use in allowed channel/by owner
+             log_detail = ""
+             if interaction.user.id == SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+                 log_detail = " (Protected user bypass)"
+             await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}{log_detail} (Target Guild).")
+    # Else (outside a guild entirely): No channel check needed, proceed with DB data
+
+    # --- Data Fetching based on Context ---
     try:
-        # 1. Fetch base data (includes all-time activity)
-        original_data, total = await fetch_hc_member_data(guild)
+        data_for_view = []
+        total_count = 0
+        initial_fetch_error = False
 
-        if not original_data:
-            embed = create_embed(title=HC_LIST_EMBED_TITLE, description="No HC members found in the database or matching roles.", color=discord.Color.orange())
-            await interaction.followup.send(embed=embed)
-            return
+        if is_target_guild:
+            print("/hcmembers: Running in Target Guild context.")
+            # Fetch data using the original function that includes Discord context
+            original_data, total_count = await fetch_hc_member_data(guild) # Fetches all-time activity initially
 
-        # 2. Fetch initial data for the default view (Monthly Activity)
-        initial_display_data = list(original_data) # Start with a copy of original data
-        try:
-            # Calculate date range for monthly view
-            today_utc = datetime.datetime.now(pytz.utc).date()
-            end_date_monthly = today_utc
-            start_date_monthly = today_utc - datetime.timedelta(days=29)
-            all_igns = [item['ign'] for item in original_data if item.get('ign')]
+            if not original_data:
+                embed = create_embed(title=HC_LIST_EMBED_TITLE, description="No HC members found matching roles/DB.", color=discord.Color.orange())
+                await interaction.edit_original_response(embed=embed, view=None)
+                return
 
-            if all_igns:
-                print(f"/hcmembers: Fetching initial monthly activity for {len(all_igns)} IGNs...")
-                monthly_activity_data = await fetch_activity_data(guild, all_igns, start_date_monthly, end_date_monthly)
-                print(f"/hcmembers: Fetched {len(monthly_activity_data)} monthly activity results.")
+            # Fetch initial data for the default view (Monthly Activity) - Keep this logic
+            initial_display_data = list(original_data)
+            try:
+                today_utc = datetime.datetime.now(pytz.utc).date()
+                end_date_monthly = today_utc
+                start_date_monthly = today_utc - datetime.timedelta(days=29)
+                all_igns = [item['ign'] for item in original_data if item.get('ign')]
 
-                # Update initial_display_data with the monthly activity
-                temp_data = []
-                for item in original_data: # Iterate original to keep structure
-                    ign_lower = item.get('ign', '').lower()
-                    activity_info = monthly_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                    updated_item = item.copy() # Create a new dict
-                    # Overwrite activity_count and last_seen with monthly data
-                    updated_item['activity_count'] = activity_info['count']
-                    updated_item['last_seen'] = activity_info['last_seen']
-                    temp_data.append(updated_item)
-                initial_display_data = temp_data # Replace with monthly-updated data
-                print("/hcmembers: Updated initial_display_data with monthly activity.")
-            else:
-                 print("/hcmembers: No IGNs found, skipping initial monthly fetch.")
+                if all_igns:
+                    print(f"/hcmembers (Target Guild): Fetching initial monthly activity...")
+                    monthly_activity_data = await fetch_activity_data(guild, all_igns, start_date_monthly, end_date_monthly)
+                    print(f"/hcmembers (Target Guild): Fetched monthly activity.")
+                    temp_data = []
+                    for item in original_data:
+                        ign_lower = item.get('ign', '').lower()
+                        activity_info = monthly_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
+                        updated_item = item.copy()
+                        updated_item['activity_count'] = activity_info['count']
+                        updated_item['last_seen'] = activity_info['last_seen']
+                        temp_data.append(updated_item)
+                    initial_display_data = temp_data
+                else:
+                    print("/hcmembers (Target Guild): No IGNs found, skipping initial monthly fetch.")
+            except Exception as fetch_err:
+                 await log_error(guild, "Failed to fetch initial monthly activity for /hcmembers (Target Guild)", error=fetch_err, interaction=interaction)
+                 initial_display_data = list(original_data) # Fallback to original data
 
-        except Exception as fetch_err:
-             # Log error during initial fetch but proceed with original (all-time) data
-             await log_error(guild, "Failed to fetch initial monthly activity for /hcmembers", error=fetch_err, interaction=interaction)
-             initial_display_data = list(original_data) # Fallback to original data
+            # Set the data for the view in this context
+            data_for_view = initial_display_data
+            # Pass original_data as well for the view to hold base info
+            original_data_param = original_data
 
-        # 3. Create and send the view, passing BOTH original and initial data
-        # The view will handle sorting the initial_display_data based on default sort mode
+        else: # Outside Target Guild (or no guild context)
+            print("/hcmembers: Running in Non-Target Guild / DM context.")
+            # Fetch data using the new Supabase-only function
+            # Pass guild object if available for logging context inside fetch function
+            supabase_only_data, total_count = await fetch_all_supabase_hc_data(guild)
+
+            if not supabase_only_data:
+                embed = create_embed(title="HC Database Members (All)", description="No members found in the HC database.", color=discord.Color.orange())
+                await interaction.edit_original_response(embed=embed, view=None)
+                return
+
+            # In this context, the fetched data IS the only data set.
+            data_for_view = supabase_only_data
+            # Pass the same list for both initial display and "original" base data
+            original_data_param = supabase_only_data
+
+
+        # --- Create and Send View ---
+        # Pass the context flag to the view constructor
         view = HCPagesView(
-            original_data=original_data, # Pass the base data with all-time activity
-            initial_display_data=initial_display_data, # Pass the data prepped for the default view
-            total_members=total,
-            guild=guild # Pass guild for potential future use in view if needed
+            original_data=original_data_param,
+            initial_display_data=data_for_view, # Use the prepared data
+            total_members=total_count,
+            guild=guild, # Pass guild if available
+            is_catercord_context=is_target_guild # Pass the flag
         )
-        initial_embed = view.create_page_embed() # create_page_embed uses self.current_data
-        message = await interaction.followup.send(embed=initial_embed, view=view)
+        initial_embed = view.create_page_embed()
+        message = await interaction.edit_original_response(embed=initial_embed, view=view)
         view.message = message # Link message to view
 
-        # Log success (same as before)
-        log_detail = ""
-        if interaction.user.id == SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
-            log_detail = " (Protected user bypass)"
-        await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}{log_detail}.")
-
-    # Keep existing error handling (same as before)
+    # --- Error Handling ---
     except ConnectionError as e:
-        await log_error(guild, "/hcmembers DB connection error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ Database Connection Error.", discord.Color.red()))
+        await log_error(guild, "/hcmembers DB connection error", error=e, interaction=interaction, ping_owner=True)
+        try: await interaction.edit_original_response(content=None, embed=create_embed("❌ Database Connection Error.", discord.Color.red()), view=None)
+        except (discord.NotFound, discord.HTTPException): pass
     except APIError as e:
-        await log_error(guild, "/hcmembers Supabase API error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ Database API Error.", discord.Color.red()))
+        await log_error(guild, "/hcmembers Supabase API error", error=e, interaction=interaction, ping_owner=True)
+        try: await interaction.edit_original_response(content=None, embed=create_embed("❌ Database API Error.", discord.Color.red()), view=None)
+        except (discord.NotFound, discord.HTTPException): pass
     except Exception as e:
-        await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction)
-        await interaction.followup.send(embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()))
+        await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction, ping_owner=True)
+        try: await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
+        except (discord.NotFound, discord.HTTPException): pass
 
 # --- Refresh Static List Command (MODIFIED - Use channel.send for confirmation) ---
 @tree.command(name="refresh", description="Manually refresh static [HC1] list.")
