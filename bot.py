@@ -545,11 +545,12 @@ class StaticHCPagesView(View):
             view_select.callback = self.view_select_callback
             self.add_item(view_select)
 
-    # --- create_page_embed (Unchanged) ---
+    # --- REVISED create_page_embed (v3 - Handles Mentions Outside Code Block) ---
     def create_page_embed(self) -> discord.Embed:
-        """Creates embed based on current view_mode, sort_mode, and page."""
-        # ... (rest of method unchanged) ...
-        if self.info_mode_active:
+        """Creates embed based on current view_mode, sort_mode, and context."""
+        # --- Info Mode Embed (Specific to StaticHCPagesView - remains the same) ---
+        if hasattr(self, 'info_mode_active') and self.info_mode_active: # Check if it's the static view
+             # ... (Keep the existing info mode embed logic as is) ...
              info_description = (
                  "This is an interactive list of members in the **[HC1]** Florr.io guild.\n\n"
                  "**Features:**\n"
@@ -571,72 +572,119 @@ class StaticHCPagesView(View):
              embed.set_footer(text=f"Info Mode | Updated: <t:{current_unix_ts}:R>")
              return embed
 
-        # --- Standard Page Embed (Copied/Adapted from HCPagesView) ---
+        # --- Standard Page Embed Logic ---
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
-
-        IDX_WIDTH = 3
-        if self.view_mode == VIEW_MODE_DISCORD:
-             NAME_WIDTH = 18; IGN_WIDTH = 15; ACT_WIDTH = 0
-             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'Discord (Stored)':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
-        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-             IGN_WIDTH = 20; ACT_WIDTH = ACTIVITY_COLUMN_WIDTH
-             TOTAL_WIDTH = IDX_WIDTH + IGN_WIDTH + ACT_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'In-Game':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
-        else: # Fallback
-             NAME_WIDTH = 15; IGN_WIDTH = 15; ACT_WIDTH = 0
-             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
-
-        separator = "-" * TOTAL_WIDTH
-        desc_lines = [f"```", header, separator]
         idx = start + 1
+        desc_lines = []
 
         if not page_data:
-            desc_lines = ["```\nNo members found matching criteria.\n```"]
-        else:
+            desc_lines = ["No members found matching criteria."]
+        elif self.view_mode == VIEW_MODE_DISCORD:
+            # Format: #. `IGN` DiscordMention (Mention is OUTSIDE code block)
+            IDX_WIDTH = 3
+            # Define a visual width for the IGN part within backticks
+            # Let's try 18 characters for the IGN display area.
+            IGN_DISPLAY_WIDTH = 18
+
             for item_dict in page_data:
                 ign = item_dict.get('ign', 'Unknown')
-                if self.view_mode == VIEW_MODE_DISCORD:
-                    member = item_dict.get('member') # May be None if fetched via Supabase only
-                    if member: user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                    else: user_display = item_dict.get('discord_name') or "[No Discord]"
-                    ign_display = ign
-                    if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
-                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
-                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}{user_display:<{NAME_WIDTH}}{ign_display:<{IGN_WIDTH}}")
-                elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-                    activity_count = item_dict.get('activity_count', 0)
-                    last_seen_date = item_dict.get('last_seen') # date object or None
-                    ign_display = ign
-                    activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
-                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
-                    if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
-                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}{ign_display:<{IGN_WIDTH}}{activity_display:<{ACT_WIDTH}}")
-                else: line = f"{str(idx)+'.':<{IDX_WIDTH}} Error: Invalid View Mode"
+                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} " # Index with padding and space
+
+                # Get User ID for mention
+                user_id_str: Optional[str] = None
+                member = item_dict.get('member') # discord.Member object or None
+                if member:
+                    user_id_str = str(member.id)
+                else:
+                    user_id_str = item_dict.get("discord_id")
+
+                # Construct mention or fallback text
+                if user_id_str:
+                    mention_display = f"<@{user_id_str}>"
+                else:
+                    mention_display = "`[No Discord]`" # Use backticks for placeholder
+
+                # Truncate IGN
+                ign_display = ign
+                if len(ign_display) > IGN_DISPLAY_WIDTH:
+                     ign_display = ign_display[:IGN_DISPLAY_WIDTH-1] + "…"
+
+                # Format line: Index<space> `IGN (padded)`<space>Mention
+                # Note: Alignment might not be perfect due to variable mention width vs fixed IGN block width
+                line = f"{index_str}`{ign_display:<{IGN_DISPLAY_WIDTH}}` {mention_display}"
+                desc_lines.append(line)
+                idx += 1
+
+        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+            # Format: ``` #. IGN Activity ``` (Uses fixed-width code block)
+            IDX_WIDTH = 3
+            SPACE_WIDTH = 1
+            IDX_PLUS_SPACE_WIDTH = IDX_WIDTH + SPACE_WIDTH # 4
+            CONTENT_WIDTH = 34 # 38 - 4
+            ACT_WIDTH = 18
+            IGN_WIDTH = 16 # CONTENT_WIDTH - ACT_WIDTH = 34 - 18 = 16
+            TOTAL_WIDTH = IDX_PLUS_SPACE_WIDTH + CONTENT_WIDTH # Should be 38
+
+            header = (f"{'#':<{IDX_WIDTH}} {'IGN':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
+            # Correct separator width
+            separator = "-" * TOTAL_WIDTH
+
+            desc_lines.append("```")
+            desc_lines.append(header)
+            desc_lines.append(separator)
+
+            for item_dict in page_data:
+                ign = item_dict.get('ign', 'Unknown')
+                activity_count = item_dict.get('activity_count', 0)
+                last_seen_date = item_dict.get('last_seen') # date object or None
+                activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
+
+                # Add space after index number
+                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} " # Pad index and add space
+
+                # Truncate IGN and Activity
+                ign_display = ign
+                if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
+                if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
+
+                # Format Line: #<space>IGN<padding>Activity<padding>
+                line = (f"{index_str}{ign_display:<{IGN_WIDTH}}{activity_display:<{ACT_WIDTH}}")
                 desc_lines.append(line)
                 idx += 1
             desc_lines.append("```")
 
-        # Use the standard title
+        else: # Fallback
+            desc_lines = ["Error: Invalid View Mode"]
+
+        # --- Title (Handles context for HCPagesView) ---
         title = HC_LIST_EMBED_TITLE
+        if hasattr(self, 'is_catercord_context') and not self.is_catercord_context:
+            title = "HC Database Members (All)"
 
         embed = discord.Embed(
             title=title,
-            description="\n".join(desc_lines),
+            description="\n".join(desc_lines), # Join the constructed lines
             color=NERDY_YELLOW
         )
 
+        # --- Footer Update (Remains the same logic) ---
         sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
-        view_text_map = { VIEW_MODE_DISCORD: "Discord+IGN", VIEW_MODE_ACTIVITY_ALL: "Activity (All)", VIEW_MODE_ACTIVITY_DAILY: "Activity (Today)", VIEW_MODE_ACTIVITY_WEEKLY: "Activity (7d)", VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)" }
+        view_text_map = {
+            VIEW_MODE_DISCORD: "IGN+Discord", # Keep updated text
+            VIEW_MODE_ACTIVITY_ALL: "Activity (All)",
+            VIEW_MODE_ACTIVITY_DAILY: "Activity (Today)",
+            VIEW_MODE_ACTIVITY_WEEKLY: "Activity (7d)",
+            VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
+        }
         view_text = view_text_map.get(self.view_mode, "Unknown View")
         current_unix_ts = int(discord.utils.utcnow().timestamp())
         footer_text = (
             f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
             f"View: {view_text} | Sort: {sort_text}"
         )
-        if self.is_fetching_activity: footer_text += " | Fetching data..."
+        if hasattr(self, 'is_fetching_activity') and self.is_fetching_activity:
+             footer_text += " | Fetching data..."
         footer_text += f" | Updated: <t:{current_unix_ts}:R>"
         embed.set_footer(text=footer_text)
         return embed
