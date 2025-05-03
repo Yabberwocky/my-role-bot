@@ -86,6 +86,7 @@ AUTODELETE_DELAY_SECONDS = 5.0
 TARGET_GUILD_ID = 1200476681803137024 # Catercord server ID
 active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view': StaticHCPagesView, 'message_id': int, 'task': tasks.Loop}
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
+SORT_MODE_DISCORD_NAME = "sort_discord_name"
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -307,6 +308,46 @@ class MyProfileButton(discord.ui.Button):
 # --- Static List View (New Class, borrows heavily from HCPagesView) ---
 # Inherits directly from View, copies logic as needed.
 class StaticHCPagesView(View):
+
+    async def update_data_and_refresh(self, new_original_data: List[Dict[str, Any]], new_initial_display_data: List[Dict[str, Any]], new_total_members: int):
+        """Updates the view's internal data and refreshes its display."""
+        print(f"[Static View {self.message_id}] Updating internal data and refreshing.")
+        self.original_data = new_original_data
+        self.current_data = new_initial_display_data # Use the new pre-fetched data
+        self.total_members = new_total_members
+
+        # Reset state to default view/sort/page
+        self.current_page = 0
+        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY
+        self.sort_mode = SORT_MODE_ACTIVITY
+        self.info_mode_active = False
+        self.is_fetching_activity = False # Ensure lock is released
+
+        self.sort_data() # Sort the new initial data
+
+        # Recalculate total pages
+        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
+
+        # Now, edit the message with the updated state
+        if self.message_id and self.guild:
+            channel = self.guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
+            if channel and isinstance(channel, discord.TextChannel):
+                 try:
+                      message = await channel.fetch_message(self.message_id)
+                      await self.edit_message(message=message) # Use the internal edit method
+                      self.last_interaction_time = discord.utils.utcnow() # Update timestamp on successful refresh
+                 except discord.NotFound:
+                      print(f"[Static View Update] Message {self.message_id} not found during data update. Stopping view.")
+                      self.stop()
+                      if self.guild.id in active_static_list_views: del active_static_list_views[self.guild.id]
+                 except Exception as e:
+                      print(f"[Static View Update] Error editing message {self.message_id} during data update: {e}")
+                      await log_error(self.guild, f"Static View: Error editing message {self.message_id} during data update", error=e)
+            else:
+                 print(f"[Static View Update] Could not find channel {HC_MEMBER_LIST_CHANNEL_ID} during data update.")
+        else:
+             print("[Static View Update] Cannot edit message: Missing message ID or guild context.")
+
     # Data is List[Dict[str, Any]] from fetch_hc_member_data (includes ALL-TIME activity)
     def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: discord.Guild, message_id: Optional[int] = None, timeout=None): # NO TIMEOUT BY DEFAULT!
         super().__init__(timeout=timeout) # Timeout managed by external task + reset
@@ -393,13 +434,39 @@ class StaticHCPagesView(View):
     def sort_data(self):
         """Sorts self.current_data based on self.sort_mode."""
         stored_page = self.current_page
-        if self.sort_mode == SORT_MODE_IGN:
-            self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
-        elif self.sort_mode == SORT_MODE_ACTIVITY:
+
+        if self.view_mode == VIEW_MODE_DISCORD:
+            if self.sort_mode == SORT_MODE_DISCORD_NAME:
+                # Sort by Discord name (case-insensitive), push None members ('[No Discord]') last
+                def sort_key_discord(item):
+                    member = item.get('member')
+                    db_name = item.get('discord_name')
+                    if member:
+                        # Use name and discriminator for uniqueness
+                        key_part = (member.name.lower(), member.discriminator)
+                        is_none_equivalent = False
+                    elif db_name:
+                        key_part = (db_name.lower(),) # Sort by stored name if no member object
+                        is_none_equivalent = False
+                    else:
+                        key_part = ('zzz',) # Fallback sorting value
+                        is_none_equivalent = True
+                    # Tuple key: (is_none, actual_name_parts...)
+                    return (is_none_equivalent, key_part)
+                self.current_data.sort(key=sort_key_discord)
+
+            else: # Default to IGN sort in Discord view if sort_mode isn't discord_name
+                self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
+
+        elif self.sort_mode == SORT_MODE_ACTIVITY: # Activity views
+            # Sort descending by count, then ascending by IGN as tie-breaker
             self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
+        else: # Default to IGN sort for Activity views if sort_mode isn't activity
+             self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
+
 
         self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-        self.current_page = min(stored_page, max(0, self.total_pages - 1)) # Keep page if valid, else adjust
+        self.current_page = min(stored_page, max(0, self.total_pages - 1))
 
 
     def update_ui_elements(self):
@@ -416,12 +483,23 @@ class StaticHCPagesView(View):
             self.add_item(discord.ui.Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="static_next", row=0, disabled=self.current_page >= self.total_pages - 1 or self.is_fetching_activity))
 
             # Row 1: Sorting & Info
-            sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
-            self.add_item(discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1, disabled=self.is_fetching_activity or self.view_mode == VIEW_MODE_DISCORD))
+            sort_button_disabled = self.is_fetching_activity # Base condition
+
+            if self.view_mode == VIEW_MODE_DISCORD:
+                # Toggle between IGN and Discord Name sort in Discord view mode
+                sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_DISCORD_NAME else "Sort by Discord Name"
+                # Sort button is generally enabled in Discord view unless fetching
+            else:
+                # Toggle between IGN and Activity sort in Activity view modes
+                sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
+                # Disable sort button if fetching OR if not in an activity view (redundant but safe)
+                # sort_button_disabled = sort_button_disabled or self.view_mode == VIEW_MODE_DISCORD # This line is actually not needed here as Discord view handled above
+
+            self.add_item(discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1, disabled=sort_button_disabled))
             self.add_item(InfoButton(is_info_active=False, row=1))
 
             # Row 2: Actions (Self Activate & My Profile)
-            self.add_item(SelfActivateButton(row=2)) # <--- ADDED
+            self.add_item(SelfActivateButton(row=2))
             self.add_item(MyProfileButton(row=2))
 
             # Row 3: View Mode Select (Moved to bottom)
@@ -432,8 +510,9 @@ class StaticHCPagesView(View):
                discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, description="Show IGNs active in the last 30 days.", emoji="📅"),
                discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, description="Show IGNs and total activity count.", emoji="📊"),
             ]
+            # Ensure the current mode is set as default
             for option in options: option.default = option.value == self.view_mode
-            self.add_item(discord.ui.Select(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="static_view_select", row=3, disabled=self.is_fetching_activity)) # <--- MOVED TO ROW 3
+            self.add_item(discord.ui.Select(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="static_view_select", row=3, disabled=self.is_fetching_activity))
 
 
     def create_page_embed(self) -> discord.Embed:
@@ -594,14 +673,24 @@ class StaticHCPagesView(View):
         else:
             await interaction.response.defer() # Ack
 
-    @discord.ui.button(label="Sort by Activity/IGN", style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1) # Label updated in update_ui_elements
+    @discord.ui.button(label="Sort by Activity/IGN", style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1)
     async def sort_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.is_fetching_activity or self.view_mode == VIEW_MODE_DISCORD:
-            await interaction.response.send_message("Sorting is only available in Activity views.", ephemeral=True)
-            return # Don't update last interaction time if invalid
+        if self.is_fetching_activity:
+            await interaction.response.defer()
+            return # Don't update last interaction time if fetching
 
         self.last_interaction_time = discord.utils.utcnow() # Update timestamp
-        self.sort_mode = SORT_MODE_ACTIVITY if self.sort_mode == SORT_MODE_IGN else SORT_MODE_IGN
+
+        if self.view_mode == VIEW_MODE_DISCORD:
+            # Toggle between Discord Name and IGN sort
+            self.sort_mode = SORT_MODE_IGN if self.sort_mode == SORT_MODE_DISCORD_NAME else SORT_MODE_DISCORD_NAME
+        else:
+            # Toggle between Activity and IGN sort for Activity views
+             if self.sort_mode == SORT_MODE_IGN:
+                 self.sort_mode = SORT_MODE_ACTIVITY
+             else:
+                 self.sort_mode = SORT_MODE_IGN
+
         self.sort_data() # Re-sort the current data
         await self.edit_message(interaction) # Update the message
 
@@ -710,10 +799,11 @@ class StaticHCPagesView(View):
         print(f"[Static View] Resetting view state for message {self.message_id} due to inactivity.")
         self.current_page = 0
         self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY
-        self.sort_mode = SORT_MODE_ACTIVITY
+        self.sort_mode = SORT_MODE_ACTIVITY # Default sort for activity view
         self.info_mode_active = False
         self.is_fetching_activity = True # Prevent interactions during reset fetch
 
+        # Ensure we have a valid guild and channel
         if not self.guild:
              print("[Static View] Reset Error: Guild object is None.")
              self.is_fetching_activity = False
@@ -724,36 +814,58 @@ class StaticHCPagesView(View):
              self.is_fetching_activity = False
              return
 
+        # --- Refetch Data and Update ---
         message_to_edit = None
+        success = False # Flag to track success
         try:
-             # Directly await the async method
-             await self.fetch_and_set_data_for_mode(self.view_mode) # <--- CHANGE HERE
-             self.sort_data()
+             # Directly await the async method to fetch data for the default mode
+             await self.fetch_and_set_data_for_mode(self.view_mode)
+             self.sort_data() # Sort the newly fetched default data
 
+             # Fetch the message to edit
              if self.message_id:
                   message_to_edit = await channel.fetch_message(self.message_id)
 
         except discord.NotFound:
              print(f"[Static View] Reset Error: Message {self.message_id} not found. Stopping tracking.")
+             # Remove from global tracking
              if self.guild.id in active_static_list_views:
-                 del active_static_list_views[self.guild.id]
+                 # Add check if key exists before deleting
+                 if channel.id in active_static_list_views:
+                     del active_static_list_views[channel.id]
              self.stop()
-             return
+             return # Don't proceed if message is gone
         except Exception as e:
              print(f"[Static View] Reset Error during data fetch or message fetch: {e}")
              await log_error(self.guild, "[Static View] Reset Error during data/message fetch", error=e) # Log error
-             self.is_fetching_activity = False
-             return
+             self.is_fetching_activity = False # Release lock even on error
+             return # Stop reset if data fetch failed critically
         finally:
-             self.is_fetching_activity = False
+             # Ensure lock is always released unless we returned early
+             self.is_fetching_activity = False # Release lock
 
+        # --- Edit the Message ---
         if message_to_edit:
              try:
                   await self.edit_message(message=message_to_edit)
                   print(f"[Static View] Successfully reset and edited message {self.message_id}.")
+                  self.last_interaction_time = discord.utils.utcnow() # Update timestamp on successful reset
+                  success = True
+             except discord.NotFound:
+                # Message disappeared between fetch and edit
+                print(f"[Static View] Reset Error: Message {self.message_id} not found during final edit. Stopping tracking.")
+                if self.guild.id in active_static_list_views:
+                     if channel.id in active_static_list_views:
+                        del active_static_list_views[channel.id]
+                self.stop()
              except Exception as e_edit:
                   print(f"[Static View] Reset Error: Failed to edit message {self.message_id} after reset: {e_edit}")
                   await log_error(self.guild, f"[Static View] Failed to edit message {self.message_id} after reset", error=e_edit) # Log error
+        else:
+             print(f"[Static View] Reset Warning: message_to_edit object was None, could not finalize reset edit.")
+
+        # Optional: return success status if needed elsewhere
+        # return success
 
 async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> Tuple[List[Dict[str, Any]], int]:
     """
@@ -2018,53 +2130,45 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
 
 @tasks.loop(minutes=1.0) # Check every minute
 async def check_static_view_timeout():
-    # Wait until the bot is ready
-    await bot.wait_until_ready()
+    await bot.wait_until_ready() # Wait until the bot is ready
 
-    # Use a copy of the keys to avoid modification errors during iteration
     channel_ids_to_check = list(active_static_list_views.keys())
 
     for channel_id in channel_ids_to_check:
         view_data = active_static_list_views.get(channel_id)
-        if not view_data:
-            continue # Entry removed during check? Skip.
-
+        # ... (keep checks for view_data, view_instance, message_id, is_finished) ...
+        if not view_data: continue
         view_instance = view_data.get('view')
         message_id = view_data.get('message_id')
-
         if not view_instance or not message_id or not isinstance(view_instance, StaticHCPagesView):
             print(f"[Task Loop] Invalid data found for channel {channel_id}. Cleaning up.")
             if channel_id in active_static_list_views: del active_static_list_views[channel_id]
             continue
-
-        # Check if view is stopped (e.g., manually or timed out already)
         if view_instance.is_finished():
              print(f"[Task Loop] View for message {message_id} already finished. Cleaning up.")
              if channel_id in active_static_list_views: del active_static_list_views[channel_id]
              continue
 
-        # --- Calculate Time Difference ---
         now = discord.utils.utcnow()
         last_active = view_instance.last_interaction_time
         time_since_last_active = now - last_active
 
-        # --- Check for Reset Condition ---
         if time_since_last_active.total_seconds() > (STATIC_LIST_RESET_TIMEOUT_MINUTES * 60):
-            # --- Trigger Reset ---
-            # Ensure info mode isn't active before resetting (user might be reading)
             if not view_instance.info_mode_active:
                 try:
-                    # Call the view's reset method
+                    # --- Directly await the async reset method ---
                     await view_instance.reset_view()
-                    # Update the last interaction time AFTER reset to prevent immediate re-reset
-                    view_instance.last_interaction_time = discord.utils.utcnow()
+                    # --- Update timestamp AFTER reset ---
+                    # (reset_view should ideally update this internally upon success,
+                    # but doing it here is a safety measure if reset_view fails early)
+                    # Let's rely on reset_view updating it upon successful edit.
+                    # view_instance.last_interaction_time = discord.utils.utcnow() # Removed for now
                 except Exception as e:
                     print(f"[Task Loop] Error occurred during view reset for message {message_id}: {e}")
-                    # Consider logging with log_error if possible from task context
-                    # Maybe remove tracking if reset fails persistently?
-            # else:
-                 # print(f"[Task Loop] Skipping reset for message {message_id}: Info mode active.")
-                 # pass # Don't reset if user is actively viewing info
+                    # Log error properly
+                    guild = bot.get_guild(view_instance.guild.id) if view_instance.guild else None
+                    await log_error(guild, f"Task Loop: Error during view reset for message {message_id}", error=e)
+            # else: keep comment about skipping if info mode active
 
 # --- Start the task in on_ready ---
 @bot.event
@@ -2093,11 +2197,22 @@ async def update_static_list_message(guild: discord.Guild):
     """ Creates or updates the SINGLE interactive HC list message."""
     list_channel_id = HC_MEMBER_LIST_CHANNEL_ID
     chan = guild.get_channel(list_channel_id)
-    # ... (keep initial checks for channel, bot, perms) ...
+
+    # --- Initial Checks ---
+    if not isinstance(chan, discord.TextChannel):
+        await log_error(guild, f"Static list update failed: Channel {list_channel_id} invalid.")
+        return
+    if not bot or not bot.user:
+        await log_error(guild, "Static list update failed: Bot not ready.")
+        return
+    bot_perms = chan.permissions_for(guild.me)
+    if not bot_perms.send_messages or not bot_perms.embed_links or not bot_perms.read_message_history:
+        await log_error(guild, f"Static list update failed: Bot missing Send/Embed/History permissions in {chan.mention}.")
+        return
 
     await log_info(guild, f"Updating interactive static list in {chan.mention}...")
 
-    # --- Fetch Base Data ---
+    # --- Fetch Fresh Base Data ---
     member_data = []
     total_count = 0
     try:
@@ -2105,14 +2220,13 @@ async def update_static_list_message(guild: discord.Guild):
         if not member_data:
             await log_info(guild, "Static list update: No HC members found. Will show empty state.")
             # Proceeding with empty member_data is fine, the view handles it.
-            pass
 
     except Exception as e_fetch:
         await log_error(guild, "Static list update failed: Error fetching base member data.", error=e_fetch)
         return
 
-    # --- Fetch Initial Display Data (Monthly Activity) ASYNCHRONOUSLY --- <--- NEW SECTION
-    initial_display_data = list(member_data) # Default to base data if fetch fails or no IGNs
+    # --- Fetch Initial Display Data (Monthly Activity) ASYNCHRONOUSLY ---
+    initial_display_data = list(member_data) # Default to base data
     try:
         today_utc = datetime.datetime.now(pytz.utc).date()
         end_date_monthly = today_utc
@@ -2138,97 +2252,96 @@ async def update_static_list_message(guild: discord.Guild):
          await log_error(guild, "[Static Update] Failed to fetch initial monthly activity", error=fetch_err)
          # initial_display_data already defaults to member_data, so we fallback safely
 
-    # --- Find Existing Message ---
-    # ... (keep existing message finding logic) ...
+    # --- Try to Get Existing View and Message ---
+    existing_view_instance: Optional[StaticHCPagesView] = None
     existing_message: Optional[discord.Message] = None
-    target_message_id: Optional[int] = None
+    tracked_data = active_static_list_views.get(list_channel_id)
+
+    if tracked_data:
+        view = tracked_data.get('view')
+        msg_id = tracked_data.get('message_id')
+        # Check if view is the correct type and not stopped
+        if msg_id and isinstance(view, StaticHCPagesView) and not view.is_finished():
+            try:
+                existing_message = await chan.fetch_message(msg_id)
+                if existing_message:
+                    # Minimal check: does it have components? A more robust check is complex.
+                    if existing_message.components:
+                        existing_view_instance = view
+                        print(f"[Static Update] Found existing tracked message {msg_id} and running view instance.")
+                    else:
+                        print(f"[Static Update] Tracked message {msg_id} has no components. Will send new.")
+                        existing_message = None # Treat as non-existent for view update
+            except discord.NotFound:
+                print(f"[Static Update] Tracked message {msg_id} not found. Cleaning up tracker.")
+                if list_channel_id in active_static_list_views: del active_static_list_views[list_channel_id]
+            except Exception as e_fetch_tracked:
+                 print(f"[Static Update] Error fetching/validating tracked message {msg_id}: {e_fetch_tracked}. Will send new.")
+                 # Clear potentially bad references
+                 existing_message = None
+                 existing_view_instance = None
+
+    # --- Update Existing View or Send New Message ---
     try:
-        # Check our tracker first
-        tracked_data = active_static_list_views.get(list_channel_id)
-        if tracked_data and tracked_data.get('message_id'):
-             try:
-                 print(f"[Static Update] Found tracked message ID: {tracked_data['message_id']}")
-                 existing_message = await chan.fetch_message(tracked_data['message_id'])
-                 target_message_id = existing_message.id
-                 print(f"[Static Update] Successfully fetched tracked message.")
-             except discord.NotFound:
-                 print(f"[Static Update] Tracked message {tracked_data['message_id']} not found. Searching history.")
-                 if list_channel_id in active_static_list_views: del active_static_list_views[list_channel_id] # Clean up bad tracking
-             except Exception as e_fetch_tracked:
-                  print(f"[Static Update] Error fetching tracked message: {e_fetch_tracked}. Searching history.")
-
-        # If not found via tracker, search history briefly
-        if not existing_message:
-            async for msg in chan.history(limit=10): # Search last 10 messages
-                if msg.author.id == bot.user.id and msg.embeds:
-                     print(f"[Static Update] Found potential message {msg.id} in history.")
-                     existing_message = msg
-                     target_message_id = msg.id
-                     break
-
-    except discord.Forbidden:
-        await log_error(guild, f"Static list update failed: Bot lacks Read Message History in {chan.mention}.")
-        return
-    except Exception as e_hist:
-        await log_error(guild, "Static list update failed: Error fetching message history.", error=e_hist)
-
-
-    # --- Create or Update View Instance ---
-    new_view = StaticHCPagesView(
-        original_data=member_data,          # Pass the base data
-        initial_display_data=initial_display_data, # Pass the pre-fetched monthly data <--- NEW
-        total_members=total_count,
-        guild=guild,
-        message_id=target_message_id
-    )
-    initial_embed = new_view.create_page_embed() # Create initial embed
-
-    # --- Send or Edit Message ---
-    # ... (keep send/edit logic and tracking update logic) ...
-    sent_message: Optional[discord.Message] = None
-    try:
-        if existing_message:
-            print(f"[Static Update] Editing existing message {existing_message.id}")
-            await existing_message.edit(embed=initial_embed, view=new_view)
-            sent_message = existing_message
+        if existing_view_instance and existing_message:
+            print(f"[Static Update] Updating data within existing view for message {existing_message.id}")
+            # Call the new method to update data and refresh
+            await existing_view_instance.update_data_and_refresh(
+                new_original_data=member_data,
+                new_initial_display_data=initial_display_data,
+                new_total_members=total_count
+            )
+            await log_info(guild, f"Interactive static list updated (existing view) successfully in {chan.mention}.") # Log specific action
         else:
-            print("[Static Update] Sending new message.")
+            # --- No existing view found or it was invalid, create and send new ---
+            print("[Static Update] No valid existing view found/reusable. Creating and sending new message.")
+
+            # Optionally delete old message(s) here if desired, checking history
+            # ... (history checking logic omitted for clarity, focus on sending new) ...
+
+            new_view = StaticHCPagesView(
+                original_data=member_data,
+                initial_display_data=initial_display_data,
+                total_members=total_count,
+                guild=guild,
+                message_id=None # Will be set after sending
+            )
+            initial_embed = new_view.create_page_embed()
+            sent_message: Optional[discord.Message] = None
+
             sent_message = await chan.send(embed=initial_embed, view=new_view)
             print(f"[Static Update] New message sent: {sent_message.id}")
 
-        # --- Update Global Tracking ---
-        if sent_message:
-            if list_channel_id in active_static_list_views:
-                 old_view_data = active_static_list_views[list_channel_id]
-                 if old_view_data.get('view') and not old_view_data['view'].is_finished():
-                     old_view_data['view'].stop()
-                 print(f"[Static Update] Stopped previous view instance for channel {list_channel_id}.")
+            # Update tracking with the NEW view instance
+            if sent_message:
+                 # Stop previous view if accidentally tracked but not reused
+                 if list_channel_id in active_static_list_views:
+                      old_view_data = active_static_list_views[list_channel_id]
+                      if old_view_data.get('view') and not old_view_data['view'].is_finished():
+                           old_view_data['view'].stop()
+                      print(f"[Static Update] Stopped previous tracked view instance (if any).")
 
-            active_static_list_views[list_channel_id] = {
-                'view': new_view,
-                'message_id': sent_message.id
-            }
-            new_view.message_id = sent_message.id
-            print(f"[Static Update] Updated tracking for channel {list_channel_id} with message {sent_message.id}")
+                 # Track the new message and view
+                 active_static_list_views[list_channel_id] = {
+                      'view': new_view,
+                      'message_id': sent_message.id
+                 }
+                 new_view.message_id = sent_message.id # Ensure view instance knows its message ID
+                 print(f"[Static Update] Updated tracking for channel {list_channel_id} with NEW message {sent_message.id}")
 
-            if not check_static_view_timeout.is_running():
-                print("[Static Update] Background task wasn't running. Starting it.")
-                try: check_static_view_timeout.start()
-                except RuntimeError: print("[Static Update] Background task already started (RuntimeError).")
+                 # Ensure background task is running
+                 if not check_static_view_timeout.is_running():
+                      print("[Static Update] Background task wasn't running. Starting it.")
+                      try: check_static_view_timeout.start()
+                      except RuntimeError: print("[Static Update] Background task already started (RuntimeError).")
+            await log_info(guild, f"Interactive static list updated (new message) successfully in {chan.mention}.") # Log specific action
 
-        await log_info(guild, f"Interactive static list updated successfully in {chan.mention}.")
-
-    # ... (keep except blocks for send/edit errors) ...
-    except discord.NotFound:
-         await log_error(guild, "Static list update failed: Existing message not found during edit.", interaction=None)
-         if existing_message and list_channel_id in active_static_list_views and active_static_list_views[list_channel_id]['message_id'] == existing_message.id:
-              del active_static_list_views[list_channel_id]
-    except discord.Forbidden:
-        await log_error(guild, f"Static list update failed: Bot lacks Send/Embed/Manage permissions in {chan.mention}.")
+    except discord.Forbidden as e:
+        await log_error(guild, f"Static list update failed: Bot lacks permissions in {chan.mention}.", error=e)
     except discord.HTTPException as e:
         await log_error(guild, "Static list update failed: Discord API error.", error=e)
     except Exception as e:
-        await log_error(guild, "Static list update failed: Unexpected error during send/edit.", error=e)
+        await log_error(guild, "Static list update failed: Unexpected error during send/edit/update.", error=e)
 
 # --- Discord Events ---
 @bot.event
@@ -3003,7 +3116,7 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
     if db_removed:
         print(f"hcleave: Triggering list update for {target_identifier} (DB removed: {db_removed}).")
         asyncio.create_task(update_static_list_message(guild))
-        
+
 @tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
 @app_commands.describe(ingame_name="The player's unique in-game name.")
 @app_commands.checks.has_permissions(manage_roles=True) # Or another suitable permission
