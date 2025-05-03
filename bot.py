@@ -116,6 +116,70 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+class SelfActivateButton(discord.ui.Button):
+    """Button for users to mark themselves active for today."""
+    def __init__(self, row: int):
+        super().__init__(label="Activate Myself Today", style=discord.ButtonStyle.success, emoji="✅", custom_id="static_activate_self", row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: StaticHCPagesView = self.view
+        guild = interaction.guild # Should always be the static list's guild
+
+        if not view or not guild:
+            await interaction.response.send_message("❌ Cannot perform action: View or Guild context lost.", ephemeral=True)
+            return
+
+        # --- Mimic /activatemyself logic ---
+        user_id = interaction.user.id
+        user_mention = interaction.user.mention
+
+        # Use check_supabase_available helper first
+        if not await check_supabase_available(interaction):
+             # Helper handles ephemeral message + logging if needed
+             return # Stop if DB down
+
+        # 1. Fetch User's IGN
+        stored_ign = await get_ign_from_user(guild, user_id)
+
+        if not stored_ign:
+            await interaction.response.send_message(
+                f"❌ {user_mention}, I couldn't find a linked In-Game Name (IGN) for you in the database. "
+                f"Use {get_cmd_mention('hcverify')} or contact an admin.",
+                ephemeral=True
+            )
+            # Don't update last interaction time for view if user can't activate
+            return
+
+        # 2. Get Today's Date
+        activity_date, date_error = get_utc_date()
+        if date_error or not activity_date:
+            await interaction.response.send_message(f"❌ Could not determine today's date.", ephemeral=True)
+            await log_error(guild, f"SelfActivateButton error: Failed to get today's date ({date_error})", interaction=interaction)
+            return
+
+        # 3. Upsert Activity Log
+        success, message = await upsert_activity_log(guild, stored_ign, activity_date, user_id)
+
+        prefix = "✅" if success else "⚠️"
+        response_msg = f"{prefix} {user_mention}, "
+        if success:
+            response_msg += f"you've been marked as active for today ({format_date_dmy(activity_date)}) with IGN `{discord.utils.escape_markdown(stored_ign)}`."
+            # Update the main view's last interaction time ONLY on success
+            view.last_interaction_time = discord.utils.utcnow()
+        else:
+            response_msg += f"failed to mark you as active: {message.split(': ', 1)[-1]}"
+
+        # Send ephemeral confirmation/error
+        await interaction.response.send_message(response_msg, ephemeral=True)
+
+        # 4. Log and Trigger Update (if successful)
+        if success:
+            await log_info(guild, f"`{interaction.user}` used SelfActivateButton. Marked IGN `{stored_ign}` active for {format_date_dmy(activity_date)}. Triggering list update.")
+            # Trigger the main list update task
+            asyncio.create_task(update_static_list_message(guild))
+            # Note: The view the user is looking at won't immediately reflect the change.
+            # The update_static_list_message task will eventually refresh the data and edit the message.
+
 # --- Buttons and Views for the NEW Static List ---
 
 class PingDevButton(discord.ui.Button):
@@ -355,7 +419,7 @@ class StaticHCPagesView(View):
             # Only show the "Back" button in info mode
             self.add_item(InfoButton(is_info_active=True, row=0))
         else:
-            # Add standard controls
+            # --- UPDATED ROW LAYOUT ---
             # Row 0: Navigation
             self.add_item(discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="static_prev", row=0, disabled=self.current_page == 0 or self.is_fetching_activity))
             self.add_item(discord.ui.Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="static_next", row=0, disabled=self.current_page >= self.total_pages - 1 or self.is_fetching_activity))
@@ -363,9 +427,13 @@ class StaticHCPagesView(View):
             # Row 1: Sorting & Info
             sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
             self.add_item(discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1, disabled=self.is_fetching_activity or self.view_mode == VIEW_MODE_DISCORD))
-            self.add_item(InfoButton(is_info_active=False, row=1)) # Add Info button
+            self.add_item(InfoButton(is_info_active=False, row=1))
 
-            # Row 2: View Mode Select
+            # Row 2: Actions (Self Activate & My Profile)
+            self.add_item(SelfActivateButton(row=2)) # <--- ADDED
+            self.add_item(MyProfileButton(row=2))
+
+            # Row 3: View Mode Select (Moved to bottom)
             options = [
                discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, description="Show Discord usernames and IGNs.", emoji="👤"),
                discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, description="Show IGNs active today.", emoji="📅"),
@@ -374,35 +442,28 @@ class StaticHCPagesView(View):
                discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, description="Show IGNs and total activity count.", emoji="📊"),
             ]
             for option in options: option.default = option.value == self.view_mode
-            self.add_item(discord.ui.Select(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="static_view_select", row=2, disabled=self.is_fetching_activity))
-
-            # Row 3: My Profile
-            self.add_item(MyProfileButton(row=3)) # Add My Profile button
+            self.add_item(discord.ui.Select(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="static_view_select", row=3, disabled=self.is_fetching_activity)) # <--- MOVED TO ROW 3
 
 
     def create_page_embed(self) -> discord.Embed:
         """Creates embed based on current view_mode, sort_mode, and page."""
         # --- Info Mode Embed ---
         if self.info_mode_active:
+             # --- UPDATED EMBED COLOR ---
              embed = discord.Embed(
                   title=f"ℹ️ About the {HC_LIST_EMBED_TITLE} List",
                   description=(
-                       "This is an interactive list of members in the **[HC1]** Florr.io guild.\n\n"
-                       "**Features:**\n"
-                       f"• **Pagination:** Use `Previous`/`Next` buttons.\n"
-                       f"• **View Modes:** Use the dropdown to see different activity periods (Today, 7/30 days, All-Time) or Discord names.\n"
-                       f"• **Sorting:** Toggle between sorting by IGN (A-Z) or Activity (most active first) using the `Sort by...` button (only in Activity views).\n"
-                       f"• **My Profile:** Check your own (upcoming) profile stats.\n\n"
-                       f"**Activity Tracking:**\n"
-                       f"• Activity means a member was marked present on a given day using {get_cmd_mention('active')}, {get_cmd_mention('a')}, {get_cmd_mention('bulkactive')} or {get_cmd_mention('activatemyself')}.\n"
-                       f"• The `Activity` column shows: `Count (Last Seen DD/MM/YY)` within the selected view period.\n\n"
-                       f"*This message automatically resets to the default view ({VIEW_MODE_ACTIVITY_MONTHLY.replace('_view','')}) after {STATIC_LIST_RESET_TIMEOUT_MINUTES} minutes of inactivity.*\n"
+                       # ... (keep description content) ...
                   ),
-                  color=discord.Color.blue()
+                  color=NERDY_YELLOW # Use bot's standard color
              )
              current_unix_ts = int(discord.utils.utcnow().timestamp())
              embed.set_footer(text=f"Info Mode | Updated: <t:{current_unix_ts}:R>")
              return embed
+
+        # --- Standard Page Embed ---
+        # ... (keep standard embed creation logic - it already uses NERDY_YELLOW) ...
+        # ... (rest of the function) ...
 
         # --- Standard Page Embed (Copied/Adapted from HCPagesView) ---
         start = self.current_page * MEMBERS_PER_PAGE
@@ -612,14 +673,14 @@ class StaticHCPagesView(View):
 
     async def show_my_profile(self, interaction: discord.Interaction):
         """Callback for the MyProfileButton."""
-        # No need to update last_interaction_time for ephemeral messages
         wip_message = (
              f"👋 Hey {interaction.user.mention}!\n\n"
              "The **My Profile** feature is still under construction 🚧.\n\n"
              "It will eventually show your personal stats like activity history, verification date, etc.\n\n"
              "Thanks for your interest! Click the button below if you'd like to let the developer know you're waiting eagerly for this feature."
         )
-        wip_embed = discord.Embed(description=wip_message, color=discord.Color.blue())
+        # --- UPDATED EMBED COLOR ---
+        wip_embed = discord.Embed(description=wip_message, color=NERDY_YELLOW)
         wip_view = MyProfileWIPView(requesting_user=interaction.user, bot_owner_id=self.bot_owner_id)
         await interaction.response.send_message(embed=wip_embed, view=wip_view, ephemeral=True)
 
