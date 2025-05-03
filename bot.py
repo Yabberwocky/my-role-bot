@@ -754,7 +754,7 @@ class HCPagesView(View):
              for option in select_menu.options:
                   option.default = option.value == self.view_mode
 
-    # --- REVISED create_page_embed ---
+    # --- REVISED create_page_embed (within HCPagesView class) ---
     def create_page_embed(self) -> discord.Embed:
         """Creates embed based on current view_mode and sort_mode."""
         start = self.current_page * MEMBERS_PER_PAGE
@@ -835,13 +835,25 @@ class HCPagesView(View):
             VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
         }
         view_text = view_text_map.get(self.view_mode, "Unknown View")
-        footer_text=f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | View: {view_text} | Sort: {sort_text}"
+
+        # --- MODIFIED FOOTER ---
+        # Get current unix timestamp
+        current_unix_ts = int(discord.utils.utcnow().timestamp())
+        # Construct footer text with dynamic timestamp (using :R for relative time)
+        footer_text = (
+            f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
+            f"View: {view_text} | Sort: {sort_text}"
+        )
         if self.is_fetching_activity:
              footer_text += " | Fetching data..."
+        # Append the dynamic timestamp
+        footer_text += f" | <t:{current_unix_ts}:R>"
+        # --- END MODIFIED FOOTER ---
 
         embed.set_footer(text=footer_text)
-        embed.timestamp = discord.utils.utcnow()
+        # REMOVED: embed.timestamp = discord.utils.utcnow()
         return embed
+
 
     async def edit_message(self, interaction: discord.Interaction, show_loading: bool = False):
         """Updates the message embed and view components. Optionally shows loading state."""
@@ -1196,8 +1208,10 @@ def generate_hc_list_embeds(data: List[Dict[str, Any]], total: int) -> List[disc
             description="```\nNo HC members found.\n```",
             color=discord.Color.orange()
         )
-        embed.set_footer(text="Page 1/1 | Total: 0")
-        embed.timestamp = discord.utils.utcnow()
+        # Get timestamp for the single 'no members' embed
+        update_unix_ts_empty = int(discord.utils.utcnow().timestamp())
+        embed.set_footer(text=f"Page 1/1 | Total: 0 | Updated: <t:{update_unix_ts_empty}:R>")
+        # REMOVED: embed.timestamp = discord.utils.utcnow()
         return [embed]
 
     embeds = []
@@ -1211,6 +1225,9 @@ def generate_hc_list_embeds(data: List[Dict[str, Any]], total: int) -> List[disc
         f"{'Act':<{ACT_WIDTH}}" # New Activity column header
     )
     separator = "-" * TOTAL_WIDTH
+
+    # --- Get timestamp ONCE before the loop ---
+    update_unix_ts = int(discord.utils.utcnow().timestamp())
 
     for page in range(pages):
         start = page * MEMBERS_PER_PAGE
@@ -1261,8 +1278,10 @@ def generate_hc_list_embeds(data: List[Dict[str, Any]], total: int) -> List[disc
             description=full_desc,
             color=NERDY_YELLOW
         )
-        e.set_footer(text=f"Page {page+1}/{pages} | Total: {total}")
-        e.timestamp = discord.utils.utcnow()
+        # --- MODIFIED FOOTER ---
+        # Use the timestamp generated *before* the loop
+        e.set_footer(text=f"Page {page+1}/{pages} | Total: {total} | Updated: <t:{update_unix_ts}:R>")
+        # REMOVED: e.timestamp = discord.utils.utcnow()
         embeds.append(e)
 
     return embeds
@@ -2661,7 +2680,7 @@ async def active_alias(interaction: discord.Interaction, ingame_name: str, date:
     # Directly call the implementation of the original /active command
     # Pass the interaction and all arguments along
     await active(interaction, ingame_name, date)
-    
+
 
 # --- Inactive Command (CORRECTED DECORATOR and Date Handling) ---
 @tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
@@ -2933,7 +2952,7 @@ async def syncnicknames(interaction: discord.Interaction):
     loading_emoji = "🔄" # Simple fallback emoji
     await interaction.edit_original_response(content=f"{loading_emoji} Fetching members...")
 
-    # 1. Get all members with the HC role first
+    # ... (keep member fetching logic) ...
     hc_members: List[discord.Member] = []
     try:
         # Ensure members are cached
@@ -2952,14 +2971,12 @@ async def syncnicknames(interaction: discord.Interaction):
         await interaction.edit_original_response(content=f"ℹ️ No members found with the `{hc_role.name}` role. Nothing to sync.")
         return
 
-    # Get IDs of members with the HC role
     hc_member_ids = [str(m.id) for m in hc_members]
 
-    # 2. Fetch IGNs *only* for these specific members from Supabase
+    # ... (keep IGN fetching logic) ...
     await interaction.edit_original_response(content=f"{loading_emoji} Fetching IGN data for {total_hc_members} members...")
     ign_data = {} # discord_id (str) -> ingame_name (str)
     try:
-        # Chunk the query if there are many members (e.g., > 500)
         chunk_size = 500
         for i in range(0, len(hc_member_ids), chunk_size):
             id_chunk = hc_member_ids[i:i+chunk_size]
@@ -2975,7 +2992,6 @@ async def syncnicknames(interaction: discord.Interaction):
                                  for item in resp.data
                                  if item.get('discord_id') and item.get('ingame_name')})
             await asyncio.sleep(0.1) # Small delay between chunks
-
         print(f"SyncNick ({guild.name}): Fetched {len(ign_data)} relevant IGNs from database.")
     except ConnectionError as e:
         await log_error(guild, "SyncNick: Database connection failed during IGN fetch.", error=e, interaction=interaction)
@@ -2990,79 +3006,75 @@ async def syncnicknames(interaction: discord.Interaction):
         await interaction.edit_original_response(content="❌ Database fetch failed. Cannot proceed.")
         return
 
-    # 3. Iterate and Update Nicknames
+    # ... (keep nickname update logic) ...
     await interaction.edit_original_response(content=f"{loading_emoji} Syncing {total_hc_members} members...")
     counts = {'proc': 0, 'upd': 0, 'skip_match': 0, 'skip_no_ign': 0, 'skip_empty': 0, 'skip_hier': 0, 'fail_forbid': 0, 'fail_http': 0, 'fail_other': 0}
-    bot_member = guild.me # Get bot member once
+    bot_member = guild.me
     bot_pos = bot_member.top_role.position
     last_prog_update_time = asyncio.get_event_loop().time()
-    update_interval = 5.0 # Update progress every 5 seconds
+    update_interval = 5.0
 
     for idx, member in enumerate(hc_members):
         counts['proc'] += 1
         member_id_str = str(member.id)
-
-        # Hierarchy check: Bot must be higher than the member to change nick
-        # Still important even if bot has admin, as owner/higher roles can exist
         if bot_pos <= member.top_role.position:
             counts['skip_hier'] += 1
             continue
-
-        # Get stored IGN from the data we fetched
         stored_ign = ign_data.get(member_id_str)
         if not stored_ign:
             counts['skip_no_ign'] += 1
-            continue # Skip if no IGN stored for this specific member
-
+            continue
         target_nick = stored_ign.strip()
         if not target_nick:
             counts['skip_empty'] += 1
-            continue # Skip if stored IGN is empty/whitespace
-
-        target_nick = target_nick[:32] # Truncate
-
+            continue
+        target_nick = target_nick[:32]
         if member.nick == target_nick:
             counts['skip_match'] += 1
-            continue # Skip if nickname already matches
-
-        # Attempt nickname update
+            continue
         try:
             await member.edit(nick=target_nick, reason=f"Nickname Sync initiated by {interaction.user.id}")
             counts['upd'] += 1
-            await asyncio.sleep(0.2) # Keep delay to avoid rate limits
-        except discord.Forbidden:
-            counts['fail_forbid'] += 1
+            await asyncio.sleep(0.2)
+        except discord.Forbidden: counts['fail_forbid'] += 1
         except discord.HTTPException as e_http:
             counts['fail_http'] += 1
-            if e_http.status == 429: print(f"SyncNick ({guild.name}): Rate limit hit!") # Log rate limits
+            if e_http.status == 429: print(f"SyncNick ({guild.name}): Rate limit hit!")
         except Exception as e_other:
             counts['fail_other'] += 1
             await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention}", error=e_other, interaction=interaction)
 
-        # Update progress periodically
         now = asyncio.get_event_loop().time()
         if (now - last_prog_update_time > update_interval) or (counts['proc'] == total_hc_members):
-             if interaction.is_expired(): # Check if interaction expired before editing
+             if interaction.is_expired():
                   print(f"SyncNick ({guild.name}): Interaction expired, cannot update progress.")
-                  last_prog_update_time = now + 999 # Prevent further attempts
+                  last_prog_update_time = now + 999
                   continue
              try:
                 await interaction.edit_original_response(content=f"{loading_emoji} Syncing... ({counts['proc']}/{total_hc_members})")
                 last_prog_update_time = now
              except (discord.NotFound, discord.HTTPException):
                 print(f"SyncNick ({guild.name}): Progress update failed. Continuing sync...")
-                last_prog_update_time = now + 999 # Prevent further attempts
+                last_prog_update_time = now + 999
 
-    # 4. Send Final Summary (Same as before)
+
+    # 4. Send Final Summary
     end_time = discord.utils.utcnow()
     duration = (end_time - start_time).total_seconds()
-    summary_embed = discord.Embed(title="✅ Nickname Sync Complete!", color=NERDY_YELLOW, timestamp=end_time)
+
+    # --- MODIFIED EMBED CREATION ---
+    # Get Unix timestamp from the datetime object
+    end_unix_ts = int(end_time.timestamp())
+    # Create embed without the timestamp attribute
+    summary_embed = discord.Embed(title="✅ Nickname Sync Complete!", color=NERDY_YELLOW)
+    # --- END MODIFIED EMBED CREATION ---
+
     total_skipped = counts['skip_match'] + counts['skip_no_ign'] + counts['skip_empty'] + counts['skip_hier']
     total_failed = counts['fail_forbid'] + counts['fail_http'] + counts['fail_other']
     summary_lines = [
         f"⏱️ **Duration:** {duration:.2f} seconds",
         f"👥 **Total HC Members Found:** {total_hc_members}",
-        f"📊 **Relevant IGNs Fetched:** {len(ign_data)}", # Added relevant fetch count
+        f"📊 **Relevant IGNs Fetched:** {len(ign_data)}",
         f"🔄 **Members Processed:** {counts['proc']}",
         f"✅ **Nicknames Updated:** {counts['upd']}",
         f"ℹ️ **Skipped (No Change/Hierarchy/No IGN):** {total_skipped}",
@@ -3076,7 +3088,13 @@ async def syncnicknames(interaction: discord.Interaction):
     ]
     summary_embed.description = "\n".join(summary_lines)
 
-    # Try edit first, then followup
+    # --- MODIFIED FOOTER ---
+    # Add the dynamic timestamp to the footer
+    summary_embed.set_footer(text=f"Completed: <t:{end_unix_ts}:R>")
+    # REMOVED: summary_embed.timestamp = end_time
+    # --- END MODIFIED FOOTER ---
+
+    # ... (keep the final sending logic) ...
     try:
         if not interaction.is_expired():
             await interaction.edit_original_response(content=None, embed=summary_embed)
@@ -3087,16 +3105,17 @@ async def syncnicknames(interaction: discord.Interaction):
         print(f"SyncNick ({guild.name}): Final summary edit failed ({e_edit}). Attempting followup.")
         try: await interaction.followup.send(embed=summary_embed, ephemeral=False)
         except Exception as e_followup: print(f"SyncNick ({guild.name}): Final followup send also failed: {e_followup}")
-        await log_error(guild, "SyncNick: Could not send final summary to user.", embed=summary_embed, interaction=interaction) # Log summary if user notification failed
+        await log_error(guild, "SyncNick: Could not send final summary to user.", embed=summary_embed, interaction=interaction)
     except Exception as e_outer:
         print(f"SyncNick ({guild.name}): Unknown error sending final summary: {e_outer}")
         await log_error(guild, "SyncNick: Unknown error sending final summary.", error=e_outer, embed=summary_embed, interaction=interaction)
 
     # Log detailed summary internally
     log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
-    log_embed.set_footer(text=f"Initiated by {interaction.user}")
+    # Add dynamic timestamp to log embed footer as well
+    log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: <t:{end_unix_ts}:R>")
     await log_info(guild, "", embed=log_embed)
-
+    
 
 # --- Wither Command ---
 @tree.command(name="wither", description="Temporarily remove roles from a user.")
