@@ -3106,21 +3106,21 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
          print(f"HCVerify: Triggering list update for {user.name} (HC role added: {role_hc in roles_to_add_final}, DB success: {db_success}).")
          asyncio.create_task(update_static_list_message(guild))
 
-# --- New HCLeave Command (MODIFIED: IGN Only, Required, Autocomplete) ---
-@tree.command(name="hcleave", description="Remove member from HC database by IGN.") # MODIFIED Description
+# --- New HCLeave Command (MODIFIED: Includes Role Changes if Discord ID found) ---
+@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.") # MODIFIED Description
 @app_commands.describe(
-    # REMOVED user description
-    ingame_name="The IGN to remove from the database." # MODIFIED Description
+    ingame_name="The IGN to remove from the database."
 )
-@app_commands.autocomplete(ingame_name=ign_autocomplete) # Kept autocomplete for IGN
-@app_commands.checks.has_permissions(manage_roles=True) # Or adjust permission
-# REMOVED bot_has_permissions for manage_nicknames as it's no longer used
-@app_commands.checks.bot_has_permissions(manage_roles=True) # Keep manage_roles check (though maybe not strictly needed now?)
-# MODIFIED: Removed 'user' parameter, made 'ingame_name' required (no Optional)
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+@app_commands.checks.has_permissions(manage_roles=True) # User needs permission to trigger potential role changes
+@app_commands.checks.bot_has_permissions(manage_roles=True) # Bot needs permission to manage roles
 async def hcleave(interaction: discord.Interaction, ingame_name: str):
-    """Removes HC database entry based on IGN."""
+    """Removes HC database entry based on IGN and handles linked user roles."""
     guild = interaction.guild
     if not await check_supabase_available(interaction):
+        try: # Attempt cleanup if deferred
+            if interaction.response.is_done(): await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException): pass
         return
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
@@ -3130,76 +3130,195 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
         await log_error(guild, "hcleave failed: Supabase unavailable.", interaction=interaction)
         return
 
-    # REMOVED Input Validation check for user/ign as IGN is now required.
+    # Defer publicly as it might involve visible role changes
+    await interaction.response.defer(thinking=True, ephemeral=False)
 
-    # Defer ephemerally (admin action)
-    await interaction.response.defer(thinking=True, ephemeral=False) # Keep ephemeral=False
+    # --- Role Setup ---
+    role_hc = guild.get_role(ADD_ROLE_ID_HC)
+    role_maybe_exhc = guild.get_role(ROLE_ID_MAYBE_EXHC)
+    bot_member = guild.me
 
-    # REMOVED Role Setup (role_hc, role_maybe_exhc, bot_member) as roles aren't changed
+    # --- Role Existence Checks ---
+    critical_roles_found = True
+    missing_roles_log = []
+    if not role_hc:
+        critical_roles_found = False
+        missing_roles_log.append(f"HC Role ({ADD_ROLE_ID_HC})")
+        print(f"hcleave Warning ({guild.name}): HC Role {ADD_ROLE_ID_HC} not found.")
+    if not role_maybe_exhc:
+        # Not strictly critical for DB delete, but needed for role add
+        # Consider if this should prevent the command entirely or just the role part
+        # For now, let it proceed but log warning
+        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role {ROLE_ID_MAYBE_EXHC} not found.")
+        # If Maybe-ExHC MUST be added, uncomment below:
+        # critical_roles_found = False
+        # missing_roles_log.append(f"Maybe-ExHC Role ({ROLE_ID_MAYBE_EXHC})")
 
-    # REMOVED Role Existence Checks as roles aren't changed
+    # Stop if critical HC role is missing
+    if not role_hc:
+        msg = f"❌ Setup Error: HC Role (ID: {ADD_ROLE_ID_HC}) not found. Cannot perform role actions."
+        await interaction.followup.send(msg, ephemeral=False)
+        await log_error(guild, f"hcleave failed: Missing critical HC role {ADD_ROLE_ID_HC}", interaction=interaction)
+        return
 
     # --- Prepare for actions ---
     log_summary = []
     result_summary = []
     errors_occurred = False
     db_removed = False
-    # REMOVED flags: hc_role_removed, exhc_role_added, nick_reset
-    reason = f"HC DB Entry Removed by {interaction.user} (ID: {interaction.user.id})" # Updated reason
-    cleaned_ign = ingame_name.strip() # Already required, but strip anyway
-    # MODIFIED target identifier: Always based on IGN now
-    target_identifier = f"IGN: `{discord.utils.escape_markdown(cleaned_ign)}`" if cleaned_ign else "Invalid Target (Empty IGN)"
+    role_changes_attempted = False
+    role_changes_succeeded = False
+    hc_role_removed_flag = False
+    exhc_role_added_flag = False
+    reason = f"HC Leave processed by {interaction.user} (ID: {interaction.user.id})"
+    cleaned_ign = ingame_name.strip()
+    target_identifier_log = f"IGN: `{discord.utils.escape_markdown(cleaned_ign)}`" if cleaned_ign else "Invalid Target (Empty IGN)"
+    found_discord_id: Optional[str] = None
+    member_to_modify: Optional[discord.Member] = None
 
-    # --- Database Deletion ---
-    # MODIFIED: Logic simplified as identifier is always IGN
-    if cleaned_ign:
-        identifier_for_db = {'ingame_name': cleaned_ign}
-        target_identifier_db = f"IGN `{discord.utils.escape_markdown(cleaned_ign)}`"
-        try:
-            print(f"hcleave: Attempting to delete DB entry matching {identifier_for_db}")
-            delete_result = await run_supabase_sync(
-                lambda: supabase.table("hc_members")
-                               .delete()
-                               .match(identifier_for_db)
-                               .execute()
-            )
-            if delete_result and hasattr(delete_result, 'data') and delete_result.data:
-                 db_removed = True
-                 result_summary.append(f"🗑️ Database entry removed for {target_identifier_db}.")
-                 log_summary.append(f"DB entry delete OK for {identifier_for_db}")
-            else:
-                 result_summary.append(f"ℹ️ No database entry found matching {target_identifier_db} to remove.")
-                 log_summary.append(f"DB entry delete: No match found for {identifier_for_db}")
-        # Keep existing error handling for DB delete
-        except APIError as e: errors_occurred = True; result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: {e.message}"); log_summary.append(f"DB delete fail: APIError {e.code} - {e.message}"); await log_error(guild, f"hcleave DB delete APIError for {identifier_for_db}", error=e, interaction=interaction)
-        except ConnectionError as e: errors_occurred = True; result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Connection failed."); log_summary.append("DB delete fail: ConnectionError"); await log_error(guild, f"hcleave DB delete ConnectionError for {identifier_for_db}", error=e, interaction=interaction)
-        except Exception as e: errors_occurred = True; result_summary.append(f"⚠️ DB Error removing {target_identifier_db}: Unexpected error."); log_summary.append(f"DB delete fail: {type(e).__name__}"); await log_error(guild, f"hcleave DB delete unexpected error for {identifier_for_db}", error=e, interaction=interaction)
-    else:
-        # This case should not be reachable since IGN is required
+    if not cleaned_ign:
+        await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=False)
+        return
+
+    # --- Step 1: Check Database for IGN and potential Discord ID ---
+    try:
+        print(f"hcleave: Checking DB for entry matching IGN '{cleaned_ign}'...")
+        fetch_resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("discord_id, ingame_name") # Fetch discord_id
+                           .eq("ingame_name", cleaned_ign)
+                           .maybe_single()
+                           .execute()
+        )
+
+        if fetch_resp and hasattr(fetch_resp, 'data') and fetch_resp.data:
+            found_discord_id = fetch_resp.data.get("discord_id")
+            print(f"hcleave: Found DB entry for '{cleaned_ign}'. Linked Discord ID: {found_discord_id or 'None'}")
+            if found_discord_id:
+                 try:
+                      member_to_modify = guild.get_member(int(found_discord_id))
+                      if member_to_modify:
+                           print(f"hcleave: Found Discord member {member_to_modify} ({found_discord_id}) linked to IGN '{cleaned_ign}'.")
+                      else:
+                           result_summary.append(f"ℹ️ DB entry found for `{cleaned_ign}`, but linked user ID `{found_discord_id}` is not in this server.")
+                           log_summary.append(f"DB fetch OK, linked user {found_discord_id} not found in guild.")
+                 except ValueError:
+                      result_summary.append(f"⚠️ DB data issue: Invalid Discord ID '{found_discord_id}' found for IGN `{cleaned_ign}`.")
+                      log_summary.append(f"DB fetch OK, but invalid Discord ID '{found_discord_id}' found.")
+                      errors_occurred = True
+                      found_discord_id = None # Treat as unlinked if ID is invalid
+        else:
+            print(f"hcleave: No DB entry found matching IGN '{cleaned_ign}'.")
+            result_summary.append(f"ℹ️ No database entry found matching {target_identifier_log}.")
+            log_summary.append(f"DB check: No match found for {cleaned_ign}")
+            # If no DB entry, send message and stop. Nothing to delete or change roles for.
+            await interaction.followup.send(embed=create_embed(title="ℹ️ HC Leave: No Action Needed", description="\n".join(result_summary), color=discord.Color.blue()))
+            return # Exit the command
+
+    except (APIError, ConnectionError, Exception) as e:
         errors_occurred = True
-        result_summary.append(f"⚠️ Logic Error: In-game name was empty despite being required.")
-        log_summary.append("DB delete skipped: Empty IGN (Error)")
+        result_summary.append(f"⚠️ DB Error checking for {target_identifier_log}: Could not proceed.")
+        log_summary.append(f"DB check fail: {type(e).__name__}")
+        await log_error(guild, f"hcleave DB check error for {cleaned_ign}", error=e, interaction=interaction)
+        await interaction.followup.send(embed=create_embed(title="❌ HC Leave Failed", description="\n".join(result_summary), color=discord.Color.red()))
+        return # Exit command on DB check failure
 
-    # REMOVED --- Discord User Actions block (if user:) ---
-    # This includes role removal, ExHC role addition, nickname reset
+    # --- Step 2: Attempt Role Changes (if member found) ---
+    if member_to_modify and role_hc: # Ensure member and HC role objects exist
+        role_changes_attempted = True
+        can_manage_member = bot_member.top_role.position > member_to_modify.top_role.position
+        can_remove_hc = bot_member.top_role.position > role_hc.position
+        can_add_exhc = role_maybe_exhc and (bot_member.top_role.position > role_maybe_exhc.position)
+
+        if not can_manage_member:
+            errors_occurred = True
+            result_summary.append(f"⚠️ Role Skipped: Bot hierarchy too low to manage {member_to_modify.mention}.")
+            log_summary.append(f"Role change skipped (Bot hierarchy vs member {member_to_modify.id})")
+        elif not (role_hc in member_to_modify.roles):
+            result_summary.append(f"ℹ️ Role Info: {member_to_modify.mention} did not have the `{role_hc.name}` role.")
+            log_summary.append(f"Role removal skipped ({member_to_modify.id} didn't have HC role)")
+        else:
+            roles_to_remove = []
+            roles_to_add = []
+
+            if can_remove_hc:
+                roles_to_remove.append(role_hc)
+            else:
+                errors_occurred = True
+                result_summary.append(f"⚠️ Role Skipped: Bot hierarchy too low to remove `{role_hc.name}`.")
+                log_summary.append(f"Role removal skipped (Bot hierarchy vs HC role)")
+
+            if role_maybe_exhc: # Only attempt add if the role exists
+                if can_add_exhc:
+                    if role_maybe_exhc not in member_to_modify.roles:
+                         roles_to_add.append(role_maybe_exhc)
+                else:
+                    # Don't mark as error, just log inability to add maybe_exhc
+                    result_summary.append(f"ℹ️ Role Info: Bot hierarchy too low to add `{role_maybe_exhc.name}`.")
+                    log_summary.append(f"Role add skipped (Bot hierarchy vs Maybe-ExHC role)")
+
+            if roles_to_remove or roles_to_add:
+                try:
+                    current_roles = member_to_modify.roles
+                    final_role_set = [r for r in current_roles if r not in roles_to_remove] + roles_to_add
+                    final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] # Ensure @everyone isn't duplicated
+
+                    await member_to_modify.edit(roles=final_role_set, reason=reason)
+                    role_changes_succeeded = True
+                    if role_hc in roles_to_remove:
+                         hc_role_removed_flag = True
+                         result_summary.append(f"➖ Role Removed: `{role_hc.name}` from {member_to_modify.mention}.")
+                    if role_maybe_exhc in roles_to_add:
+                         exhc_role_added_flag = True
+                         result_summary.append(f"➕ Role Added: `{role_maybe_exhc.name}` to {member_to_modify.mention}.")
+                    log_summary.append(f"Role update successful for {member_to_modify.id}. Removed: {hc_role_removed_flag}, Added ExHC: {exhc_role_added_flag}")
+                except discord.Forbidden: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Permissions error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: Forbidden for {member_to_modify.id}"); await log_error(guild, f"hcleave role update Forbidden for {member_to_modify.id}", interaction=interaction)
+                except discord.HTTPException as e: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Discord API Error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: HTTP {e.status} for {member_to_modify.id}"); await log_error(guild, f"hcleave role update HTTP for {member_to_modify.id}", error=e, interaction=interaction)
+                except Exception as e: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Unknown error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: {type(e).__name__} for {member_to_modify.id}"); await log_error(guild, f"hcleave role update unexpected error for {member_to_modify.id}", error=e, interaction=interaction)
+
+    # --- Step 3: Database Deletion (if entry was found initially) ---
+    # This runs regardless of role change success, as long as DB entry was found.
+    try:
+        print(f"hcleave: Attempting to delete DB entry matching IGN '{cleaned_ign}'...")
+        delete_result = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .delete()
+                           .eq("ingame_name", cleaned_ign) # Match by IGN
+                           .execute()
+        )
+        # Check if deletion happened based on response data
+        if delete_result and hasattr(delete_result, 'data') and delete_result.data:
+             db_removed = True
+             result_summary.append(f"🗑️ Database entry removed for {target_identifier_log}.")
+             log_summary.append(f"DB entry delete OK for {cleaned_ign}")
+        else:
+             # This case *shouldn't* happen if we found the entry earlier, but handle defensively
+             result_summary.append(f"ℹ️ Database entry for {target_identifier_log} seems to have disappeared before deletion.")
+             log_summary.append(f"DB entry delete: No match found (unexpected) for {cleaned_ign}")
+             # Consider setting errors_occurred=True here if this is unexpected
+    except (APIError, ConnectionError, Exception) as e:
+        errors_occurred = True
+        result_summary.append(f"⚠️ DB Error removing {target_identifier_log}: {getattr(e, 'message', type(e).__name__)}")
+        log_summary.append(f"DB delete fail: {type(e).__name__}")
+        await log_error(guild, f"hcleave DB delete error for {cleaned_ign}", error=e, interaction=interaction)
 
     # --- Final Response & Logging ---
     final_color = discord.Color.green() if not errors_occurred else discord.Color.orange()
-    final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Leave Processed: {target_identifier}" # Uses IGN identifier
+    final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Leave Processed: {target_identifier_log}"
     if errors_occurred: final_title += " (with issues/skips)"
-    if not result_summary: result_summary.append("ℹ️ No actions were performed or needed.")
+    if not result_summary: result_summary.append("ℹ️ No specific actions were performed or needed (check logs).") # Fallback if logic somehow leads here
 
     final_embed = create_embed(title=final_title, description="\n".join(result_summary), color=final_color)
     try:
-        await interaction.followup.send(embed=final_embed, ephemeral=False) # Kept ephemeral=False
+        await interaction.followup.send(embed=final_embed, ephemeral=False)
     except (discord.NotFound, discord.HTTPException) as e:
         await log_error(guild, "hcleave failed final followup send", error=e, interaction=interaction)
 
-    await log_info(guild, f"`{interaction.user}` processed /hcleave for {target_identifier}. Summary: {'; '.join(log_summary)}.")
+    await log_info(guild, f"`{interaction.user}` processed /hcleave for {target_identifier_log}. Summary: {'; '.join(log_summary)}.")
 
-    # MODIFIED List Update Trigger: Only depends on DB removal now
+    # Trigger list update ONLY if DB entry was successfully removed
     if db_removed:
-        print(f"hcleave: Triggering list update for {target_identifier} (DB removed: {db_removed}).")
+        print(f"hcleave: Triggering list update for {target_identifier_log} (DB removed: {db_removed}).")
         asyncio.create_task(update_static_list_message(guild))
 
 @tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
@@ -3400,16 +3519,14 @@ async def active_alias(interaction: discord.Interaction, ingame_name: str, date:
     await active(interaction, ingame_name, date)
 
 
-# --- Inactive Command (CORRECTED DECORATOR and Date Handling) ---
+# --- Inactive Command (CORRECTED DECORATOR and Date Handling, ADDED PERMISSION CHECK) ---
 @tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark inactive.",
-    # MODIFIED: Changed description, date is now required via autocomplete
     date="Date of activity to remove (Select from list)."
 )
-@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete) # ADDED date autocomplete
-# @app_commands.checks.has_permissions(manage_roles=True) # Optional permission check
-# MODIFIED: date type is now str (required), removed Optional and default
+@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
+@app_commands.checks.has_permissions(manage_guild=True) # <<<--- ADDED PERMISSION CHECK
 async def inactive(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
@@ -3417,9 +3534,15 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
 
+    # Check if bot has manage_guild permission (optional but good practice if the check might fail often)
+    # bot_member = guild.me
+    # if not bot_member.guild_permissions.manage_guild:
+    #     await interaction.response.send_message("Bot configuration error: I need 'Manage Server' permission for internal checks.", ephemeral=True)
+    #     await log_error(guild, "/inactive command cannot run: Bot missing Manage Server permission.", interaction=interaction)
+    #     return
+
     await interaction.response.defer(thinking=True, ephemeral=False)
 
-    # MODIFIED: No need to check if date is None, it's now required.
     activity_date, date_error = get_utc_date(date)
     if date_error:
         await interaction.followup.send(f"❌ Error parsing selected date: {date_error}", ephemeral=False)
@@ -3446,6 +3569,7 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
         asyncio.create_task(update_static_list_message(guild))
     elif prefix == "ℹ️":
          await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
+    # Errors are logged within remove_activity_log if needed
 
 
 # --- Bulk Active Command (MODIFIED: No date, Manage Server perm required) ---
