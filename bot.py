@@ -1575,87 +1575,64 @@ async def on_ready():
         print(f"Discord.py v{discord.__version__}")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
+        # Consider adding a persistent log here or exiting if this happens
         return
 
+    # --- Command Syncing (Usually OK, but monitor time) ---
     print("Syncing application commands...")
     synced_commands = []
     try:
-        # Sync globally. Consider syncing per-guild if commands are guild-specific
-        synced_commands = await tree.sync() # Global sync
+        synced_commands = await tree.sync()
         print(f"Synced {len(synced_commands)} application commands globally.")
-
-        command_ids.clear() # Clear old IDs before populating
-
-        # --- CORRECTED LOOP ---
-        # Iterate through the AppCommand objects returned by tree.sync()
-        # These objects directly have .name and .id attributes.
+        command_ids.clear()
         for cmd in synced_commands:
-            # Check if it's a command object with name and id (should generally be true)
             if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
                 command_ids[cmd.name] = cmd.id
-                print(f"  Stored ID for /{cmd.name}: {cmd.id}")
             else:
-                # Log if we encounter something unexpected in the synced list
-                print(f"  Skipped storing ID for an item during sync (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        # --- END CORRECTED LOOP ---
-
-        # Check if the dictionary is populated after the loop
-        if command_ids:
-            print(f"Stored command IDs: {command_ids}")
-        else:
-             # This warning should now only appear if sync returned nothing or encountered issues
-             print("Warning: command_ids dictionary is empty after sync. Help command may not show clickable links.")
-
+                print(f"  Skipped storing ID during sync (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
+        if command_ids: print(f"Stored command IDs: {command_ids}")
+        else: print("Warning: command_ids dictionary is empty after sync.")
     except discord.HTTPException as e:
         print(f"Command Sync failed (HTTPException): {e}")
-        first_guild = bot.guilds[0] if bot.guilds else None
-        if first_guild:
-            # Avoid await in except block if it causes issues, log directly
-            print(f"Error logged for Guild {first_guild.id}: Command Sync failed (HTTPException).")
-            # Consider a non-async logging mechanism here if needed
-            # await log_error(first_guild, "Application Command Sync failed on startup (HTTPException).", error=e)
+        # Log error if needed, but don't block startup
     except Exception as e:
         print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
-        first_guild = bot.guilds[0] if bot.guilds else None
-        if first_guild:
-            print(f"Error logged for Guild {first_guild.id}: Command Sync failed (Exception).")
-            # await log_error(first_guild, "Application Command Sync failed on startup (Exception).", error=e)
+        # Log error if needed
 
-    # Ensure the bot has guilds before proceeding with guild-specific setup
-    if not bot.guilds:
-        print("Bot is not currently in any guilds. Skipping guild setup.")
-        print("--- on_ready event finished (no guilds) ---")
-        return
-
-    print(f"Performing initial setup for {len(bot.guilds)} guild(s)...")
-    # Process guilds one by one to avoid potential rate limits on setup tasks
-    guilds_to_process = list(bot.guilds) # Create a copy
-    for guild in guilds_to_process:
-        print(f"  Processing guild: {guild.name} (ID: {guild.id})")
+    # --- Signal Bot is Ready QUICKLY ---
+    print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
+    # Send ONE simple log message if possible (avoid looping guilds here)
+    first_guild = bot.guilds[0] if bot.guilds else None
+    if first_guild: # Log readiness in the first guild found or a specific one
         try:
-            # Ensure member cache is populated for this guild if necessary
-            if not guild.chunked and guild.member_count is not None and guild.member_count > 1000: # Optional: Only chunk larger guilds
-                 print(f"    Attempting to chunk guild {guild.name} (Members: {guild.member_count})...")
-                 try:
-                     await guild.chunk(cache=True)
-                     print(f"    Successfully chunked guild {guild.name}.")
-                 except Exception as chunk_e:
-                     print(f"    Warning: Guild chunking failed for {guild.name}: {chunk_e}")
-                     # Log this error using your logger if needed
-                     # await log_error(guild, "Guild chunking failed during on_ready setup", error=chunk_e)
+             # Simplified log message
+             await log_info(first_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
+        except Exception as log_e:
+             print(f"Failed to send initial ready log message: {log_e}")
+             # Log this failure locally if needed
 
+    # --- DO NOT RUN HEAVY TASKS SYNCHRONOUSLY HERE ---
+    # Option 1: Do nothing more in on_ready. Rely on events or manual refresh.
+    # Option 2: Launch background task (using discord.ext.tasks - requires setup)
+    # Option 3 (Less Ideal): Create an asyncio task to run the update *later*
+    # Example for Option 3 (update for ONE specific guild after a delay):
+    # async def delayed_update():
+    #     await asyncio.sleep(30) # Wait 30 seconds after ready
+    #     target_guild_id = 1234567890 # Replace with your Catercord Guild ID
+    #     guild = bot.get_guild(target_guild_id)
+    #     if guild:
+    #         print(f"Running delayed initial static list update for {guild.name}...")
+    #         try:
+    #             await update_hc_member_list(guild)
+    #         except Exception as e:
+    #              await log_error(guild, "Error during delayed initial list update", error=e)
+    #     else:
+    #          print(f"Could not find target guild {target_guild_id} for delayed update.")
+    #
+    # if first_guild: # Only schedule if bot is in guilds
+    #      bot.loop.create_task(delayed_update())
 
-            # Log bot readiness per guild
-            await log_info(guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
-            # Update the static list on startup for each relevant guild
-            await update_hc_member_list(guild)
-            # Add a small delay between processing guilds if necessary
-            await asyncio.sleep(1)
-        except Exception as e:
-            # Log errors specific to the guild setup
-            await log_error(guild, f"Error during on_ready setup for this guild", error=e)
-
-    print("--- on_ready event finished ---")
+    print("--- on_ready event finished ---") # This should print quickly now
 
 
 @bot.event
@@ -3115,7 +3092,7 @@ async def syncnicknames(interaction: discord.Interaction):
     # Add dynamic timestamp to log embed footer as well
     log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: <t:{end_unix_ts}:R>")
     await log_info(guild, "", embed=log_embed)
-    
+
 
 # --- Wither Command ---
 @tree.command(name="wither", description="Temporarily remove roles from a user.")
