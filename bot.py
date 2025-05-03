@@ -3285,15 +3285,17 @@ async def activatemyself(interaction: discord.Interaction):
         asyncio.create_task(update_static_list_message(guild))
     # else: Error already logged by upsert_activity_log if it failed internally
 
-# --- Active Command ---
-@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for a specific date.")
+# --- Active Command (MODIFIED: No date, Manage Server perm required) ---
+@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.") # MODIFIED Description
 @app_commands.describe(
-    ingame_name="The In-Game Name (IGN) to mark active.",
-    date="Date of activity (Select from list)."
+    ingame_name="The In-Game Name (IGN) to mark active."
+    # REMOVED date description
 )
-@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
+@app_commands.autocomplete(ingame_name=ign_autocomplete) # REMOVED date autocomplete
+@app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
 # VV Ensure this 'async' keyword is present VV
-async def active(interaction: discord.Interaction, ingame_name: str, date: str):
+# MODIFIED: Removed 'date: str' parameter
+async def active(interaction: discord.Interaction, ingame_name: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
     if not guild:
@@ -3302,12 +3304,12 @@ async def active(interaction: discord.Interaction, ingame_name: str, date: str):
 
     await interaction.response.defer(thinking=True, ephemeral=False)
 
-    activity_date, date_error = get_utc_date(date)
-    if date_error:
-        await interaction.followup.send(f"❌ Error parsing selected date: {date_error}", ephemeral=False)
-        return
+    # MODIFIED: Get today's date by default, no date string needed
+    activity_date, date_error = get_utc_date()
+    # REMOVED check for date_error specifically from parsing, but kept check if date fetch failed internally
     if not activity_date:
-         await interaction.followup.send("❌ Could not determine activity date from selection.", ephemeral=False)
+         await interaction.followup.send("❌ Could not determine today's activity date.", ephemeral=False)
+         await log_error(guild, f"/active internal error: Failed to get today's date", interaction=interaction) # Log internal error
          return
 
     target_ign = ingame_name.strip()
@@ -3394,18 +3396,15 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
          await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
 
 
-# --- Bulk Active Command ---
-@tree.command(name="bulkactive", description="Mark multiple members active via IGNs using a modal.")
-@app_commands.describe(
-    # MODIFIED: Changed description, date is now required via autocomplete
-    date="Date of activity (Select from list)."
-)
-@app_commands.autocomplete(date=activity_date_autocomplete) # ADDED date autocomplete
-# @app_commands.checks.has_permissions(manage_roles=True) # Or your chosen permission
-# MODIFIED: date type is now str (required), removed Optional and default
-async def bulkactive(interaction: discord.Interaction, date: str):
-    # Pass the date string (now always YYYY-MM-DD) to the modal constructor
-    modal = BulkActiveModal(date_str=date)
+# --- Bulk Active Command (MODIFIED: No date, Manage Server perm required) ---
+@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.") # MODIFIED Description
+# REMOVED date describe
+# REMOVED date autocomplete decorator entirely
+@app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
+# MODIFIED: Removed 'date: str' parameter
+async def bulkactive(interaction: discord.Interaction):
+    # MODIFIED: Pass None to the modal constructor, indicating no specific date was provided.
+    modal = BulkActiveModal(date_str=None)
     await interaction.response.send_modal(modal)
 
 
