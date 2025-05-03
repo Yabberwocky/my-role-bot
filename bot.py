@@ -202,7 +202,6 @@ class PingDevButton(discord.ui.Button):
         self.already_clicked = True # Set flag immediately
 
         # --- 1. Respond to the interaction FIRST ---
-        # Disable the button and edit the original message
         self.disabled = True
         self.label = "Developer Notified"
         try:
@@ -210,10 +209,8 @@ class PingDevButton(discord.ui.Button):
             await interaction.response.edit_message(view=self.view)
             print("[PingDevButton] Successfully edited original ephemeral message.")
         except discord.NotFound:
-            # User likely dismissed the message, which is fine. Log for info.
             print("[PingDevButton] Original ephemeral message not found (likely dismissed by user). Skipping edit.")
         except discord.HTTPException as e:
-             # Log other errors during edit but continue if possible
              print(f"[PingDevButton] HTTP Error editing original ephemeral message: {e}. Proceeding with logging.")
              await log_error(interaction.guild, "[PingDevButton] HTTP Error editing original ephemeral message", error=e, interaction=interaction)
         except Exception as e:
@@ -221,43 +218,37 @@ class PingDevButton(discord.ui.Button):
              await log_error(interaction.guild, "[PingDevButton] Unknown Error editing original ephemeral message", error=e, interaction=interaction)
 
 
-        # Send the ephemeral confirmation *immediately* after acknowledging the interaction (via edit)
-        # This is now the FIRST followup, increasing its chance of success.
+        # Send the ephemeral confirmation
         try:
             await interaction.followup.send("✅ The developer has been notified of your interest!", ephemeral=True)
             print("[PingDevButton] Successfully sent ephemeral confirmation.")
         except discord.NotFound as e_followup:
-            # This means the webhook token likely expired completely (e.g., > 15 mins)
             print(f"[PingDevButton] Failed to send ephemeral followup (NotFound - Unknown Webhook): {e_followup}. Interaction likely expired.")
-            # Log this, as the user didn't get confirmation.
             await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (NotFound/Unknown Webhook)", error=e_followup, interaction=interaction)
-            # No need to proceed with logging if the interaction is fully dead
             return
         except discord.HTTPException as e_followup:
              print(f"[PingDevButton] Failed to send ephemeral followup (HTTPException): {e_followup}.")
              await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (HTTPException)", error=e_followup, interaction=interaction)
-             # Proceed with logging anyway, developer should still be notified
         except Exception as e_followup:
              print(f"[PingDevButton] Failed to send ephemeral followup (Unknown): {e_followup}.")
              await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (Unknown)", error=e_followup, interaction=interaction)
-             # Proceed with logging
 
 
         # --- 2. Perform Logging Action LAST ---
         guild = interaction.guild
         if not guild:
-             # Should not happen if interaction worked, but check defensively
              print("[PingDevButton] Guild object became None before logging.")
              return
 
         owner_mention = f"<@{self.bot_owner_id}>"
-        notification_channel_id = ERROR_LOG_CHANNEL_ID
+        # --- UPDATED CHANNEL ID ---
+        notification_channel_id = 1200476682973364246 # <--- CHANGE HERE
 
         notification_message = f"User {self.requesting_user.mention} (`{self.requesting_user.id}`) is interested in the 'My Profile' feature!"
         notification_embed = discord.Embed(
             title="Interest Notification: 'My Profile' Feature",
             description=notification_message,
-            color=discord.Color.blue()
+            color=NERDY_YELLOW # Use bot's standard color
         )
         notification_embed.timestamp = discord.utils.utcnow()
         notification_embed.set_footer(text=f"Triggered by: {self.requesting_user}")
@@ -265,16 +256,16 @@ class PingDevButton(discord.ui.Button):
         # Call log_to_channel
         try:
             await log_to_channel(
-                channel_id=notification_channel_id,
+                channel_id=notification_channel_id, # Uses the updated ID
                 guild=guild,
                 embed=notification_embed,
                 ping_mention=owner_mention
             )
-            print("[PingDevButton] Successfully logged notification to developer.")
+            print(f"[PingDevButton] Successfully logged notification to developer channel {notification_channel_id}.")
         except Exception as e_log:
             # Log failure to log
-            print(f"[PingDevButton] CRITICAL: Failed to send log notification to developer channel: {e_log}")
-            await log_error(guild, "[PingDevButton] CRITICAL: Failed to send log notification to developer channel", error=e_log)
+            print(f"[PingDevButton] CRITICAL: Failed to send log notification to developer channel {notification_channel_id}: {e_log}")
+            await log_error(guild, f"[PingDevButton] CRITICAL: Failed to send log notification to developer channel {notification_channel_id}", error=e_log)
 
 
 class MyProfileWIPView(discord.ui.View):
@@ -449,23 +440,30 @@ class StaticHCPagesView(View):
         """Creates embed based on current view_mode, sort_mode, and page."""
         # --- Info Mode Embed ---
         if self.info_mode_active:
-             # --- UPDATED EMBED COLOR ---
+             # --- ENSURE THIS DESCRIPTION IS CORRECT ---
+             info_description = (
+                 "This is an interactive list of members in the **[HC1]** Florr.io guild.\n\n"
+                 "**Features:**\n"
+                 f"• **Pagination:** Use `Previous`/`Next` buttons.\n"
+                 f"• **View Modes:** Use the dropdown to see different activity periods (Today, 7/30 days, All-Time) or Discord names.\n"
+                 f"• **Sorting:** Toggle between sorting by IGN (A-Z) or Activity (most active first) using the `Sort by...` button (only in Activity views).\n"
+                 f"• **Actions:** Use `Activate Myself Today` or check the WIP `My Profile`.\n\n" # Added Activate Myself here
+                 f"**Activity Tracking:**\n"
+                 f"• Activity means a member was marked present on a given day using {get_cmd_mention('active')}, {get_cmd_mention('a')}, {get_cmd_mention('bulkactive')} or {get_cmd_mention('activatemyself')}.\n"
+                 f"• The `Activity` column shows: `Count (Last Seen DD/MM/YY)` within the selected view period.\n\n"
+                 f"*This message automatically resets to the default view ({VIEW_MODE_ACTIVITY_MONTHLY.replace('_view','')}) after {STATIC_LIST_RESET_TIMEOUT_MINUTES} minutes of inactivity.*\n"
+             )
              embed = discord.Embed(
                   title=f"ℹ️ About the {HC_LIST_EMBED_TITLE} List",
-                  description=(
-                       # ... (keep description content) ...
-                  ),
+                  description=info_description, # Use the variable here
                   color=NERDY_YELLOW # Use bot's standard color
              )
              current_unix_ts = int(discord.utils.utcnow().timestamp())
              embed.set_footer(text=f"Info Mode | Updated: <t:{current_unix_ts}:R>")
              return embed
 
-        # --- Standard Page Embed ---
-        # ... (keep standard embed creation logic - it already uses NERDY_YELLOW) ...
-        # ... (rest of the function) ...
-
         # --- Standard Page Embed (Copied/Adapted from HCPagesView) ---
+        # ... (rest of the standard page embed logic remains the same) ...
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
 
@@ -2243,15 +2241,17 @@ async def on_ready():
         print(f"Discord.py v{discord.__version__}")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
-        # Consider adding a persistent log here or exiting if this happens
         return
 
-    # --- Command Syncing (Usually OK, but monitor time) ---
+    # --- Command Syncing ---
     print("Syncing application commands...")
     synced_commands = []
     try:
-        synced_commands = await tree.sync()
-        print(f"Synced {len(synced_commands)} application commands globally.")
+        # Consider syncing only within the target guild if commands are guild-specific
+        # target = discord.Object(id=TARGET_GUILD_ID) # Optional: Specify target guild
+        # synced_commands = await tree.sync(guild=target)
+        synced_commands = await tree.sync() # Global sync (current implementation)
+        print(f"Synced {len(synced_commands)} application commands.")
         command_ids.clear()
         for cmd in synced_commands:
             if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
@@ -2262,45 +2262,61 @@ async def on_ready():
         else: print("Warning: command_ids dictionary is empty after sync.")
     except discord.HTTPException as e:
         print(f"Command Sync failed (HTTPException): {e}")
-        # Log error if needed, but don't block startup
     except Exception as e:
         print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
-        # Log error if needed
 
-    # --- Signal Bot is Ready QUICKLY ---
+    # --- Signal Bot Ready ---
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    # Send ONE simple log message if possible (avoid looping guilds here)
     first_guild = bot.guilds[0] if bot.guilds else None
-    if first_guild: # Log readiness in the first guild found or a specific one
+    if first_guild:
         try:
-             # Simplified log message
              await log_info(first_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
         except Exception as log_e:
              print(f"Failed to send initial ready log message: {log_e}")
-             # Log this failure locally if needed
 
-    # --- DO NOT RUN HEAVY TASKS SYNCHRONOUSLY HERE ---
-    # Option 1: Do nothing more in on_ready. Rely on events or manual refresh.
-    # Option 2: Launch background task (using discord.ext.tasks - requires setup)
-    # Option 3 (Less Ideal): Create an asyncio task to run the update *later*
-    # Example for Option 3 (update for ONE specific guild after a delay):
-    # async def delayed_update():
-    #     await asyncio.sleep(30) # Wait 30 seconds after ready
-    #     target_guild_id = 1234567890 # Replace with your Catercord Guild ID
-    #     guild = bot.get_guild(target_guild_id)
-    #     if guild:
-    #         print(f"Running delayed initial static list update for {guild.name}...")
-    #         try:
-    #             await update_static_list_message(guild)
-    #         except Exception as e:
-    #              await log_error(guild, "Error during delayed initial list update", error=e)
-    #     else:
-    #          print(f"Could not find target guild {target_guild_id} for delayed update.")
-    #
-    # if first_guild: # Only schedule if bot is in guilds
-    #      bot.loop.create_task(delayed_update())
+    # --- Start Background Tasks ---
+    print("Starting background tasks...")
+    if not check_static_view_timeout.is_running():
+        try:
+            check_static_view_timeout.start()
+            print(" Static view timeout checker task started.")
+        except Exception as e_task:
+            print(f"Failed to start static view timeout task: {e_task}")
+            await log_error(first_guild, "Failed to start static view timeout task", error=e_task)
 
-    print("--- on_ready event finished ---") # This should print quickly now
+
+    # --- Schedule Delayed Static List Update --- <--- NEW SECTION
+    async def delayed_update(delay_seconds: int):
+        await asyncio.sleep(delay_seconds)
+        print(f"--- Running delayed static list update after {delay_seconds}s ---")
+        guild = bot.get_guild(TARGET_GUILD_ID)
+        if not guild:
+            print(f"ERROR: Could not find target guild {TARGET_GUILD_ID} for delayed update.")
+            # Log error if guild isn't found
+            await log_error(None, f"Delayed update failed: Target guild {TARGET_GUILD_ID} not found.")
+            return
+
+        if not supabase:
+            print("ERROR: Supabase client not available for delayed update.")
+            await log_error(guild, "Delayed update failed: Supabase client not available.")
+            return
+
+        try:
+            await update_static_list_message(guild)
+        except Exception as e:
+             print(f"ERROR during delayed initial list update: {e}\n{traceback.format_exc()}")
+             await log_error(guild, "Error during delayed initial list update", error=e)
+        print(f"--- Delayed static list update finished ---")
+
+    # Schedule the task to run 60 seconds after on_ready finishes
+    # Ensure bot is connected to guilds before scheduling
+    if bot.is_ready() and any(g.id == TARGET_GUILD_ID for g in bot.guilds):
+        print("Scheduling delayed static list update for target guild...")
+        bot.loop.create_task(delayed_update(delay_seconds=60))
+    else:
+        print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
+
+    print("--- on_ready event finished ---")
 
 
 @bot.event
