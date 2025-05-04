@@ -20,6 +20,10 @@ from dateutil.parser import parse as date_parse # Add this import at the top
 from dateutil.relativedelta import relativedelta # Add this import at the top
 from discord.ext import tasks
 import time # For timestamp comparison if needed, although discord.utils.utcnow() is better
+import re
+import uuid # For UUID handling
+import asyncio
+from collections import namedtuple
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -87,6 +91,12 @@ TARGET_GUILD_ID = 1200476681803137024 # Catercord server ID
 active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view': StaticHCPagesView, 'message_id': int, 'task': tasks.Loop}
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
 SORT_MODE_DISCORD_NAME = "sort_discord_name"
+KEYWORD_TABLE_NAME = "keyword_phrases" # Supabase table name
+KEYWORD_COOLDOWN_MINUTES = 5.0
+keyword_data_cache: Dict[str, Any] = {} # id (str) -> KeywordRule details
+keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
+total_keywords = 0
+discovered_keywords_count = 0
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -116,6 +126,128 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def load_keyword_data(guild_for_log: Optional[discord.Guild]):
+    """Loads enabled keyword rules from Supabase into the in-memory cache."""
+    global keyword_data_cache, total_keywords, discovered_keywords_count
+    if not supabase:
+        await log_error(guild_for_log, "Keyword loading failed: Supabase unavailable.", ping_owner=True)
+        return
+
+    print("Loading keyword data from Supabase...")
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table(KEYWORD_TABLE_NAME)
+                           .select("id, phrase_identifier, inclusion_regex, exclusion_regex, standard_response_message, first_discovery_message_template, response_emoji, discovered_by_user_id, discovered_at")
+                           .eq("is_enabled", True)
+                           .execute()
+        )
+
+        if not resp or not hasattr(resp, 'data'):
+            await log_info(guild_for_log, "No keyword data found or failed to fetch.")
+            keyword_data_cache = {}
+            total_keywords = 0
+            discovered_keywords_count = 0
+            return
+
+        temp_cache = {}
+        temp_discovered_count = 0
+        compile_errors = []
+
+        for entry in resp.data:
+            entry_id_str = str(entry['id']) # Ensure ID is stored as string key
+            incl_regex_str = entry['inclusion_regex']
+            excl_regex_str = entry['exclusion_regex']
+            incl_compiled = None
+            excl_compiled = None
+
+            # Compile Inclusion Regex
+            try:
+                if not incl_regex_str: raise ValueError("Inclusion regex cannot be empty")
+                incl_compiled = re.compile(incl_regex_str, re.IGNORECASE)
+            except (re.error, ValueError) as e:
+                compile_errors.append(f"ID '{entry_id_str}' (Identifier: {entry.get('phrase_identifier', 'N/A')}): Inclusion Regex Error: {e}")
+                continue # Skip this rule if inclusion regex fails
+
+            # Compile Exclusion Regex (optional)
+            try:
+                if excl_regex_str:
+                    excl_compiled = re.compile(excl_regex_str, re.IGNORECASE)
+            except re.error as e:
+                 compile_errors.append(f"ID '{entry_id_str}' (Identifier: {entry.get('phrase_identifier', 'N/A')}): Exclusion Regex Error: {e}")
+                 # Proceed without exclusion if it fails, but log it
+
+            # Store compiled data
+            temp_cache[entry_id_str] = {
+                'id': entry_id_str, # Store as string
+                'phrase_identifier': entry.get('phrase_identifier', f'Rule_{entry_id_str[:8]}'),
+                'inclusion_regex': incl_compiled,
+                'exclusion_regex': excl_compiled, # Can be None
+                'standard_response': entry.get('standard_response_message'),
+                'first_discovery_template': entry.get('first_discovery_message_template'),
+                'response_emoji': entry.get('response_emoji'),
+                'discovered_by': entry.get('discovered_by_user_id'), # String or None
+                'discovered_at': date_parse(entry['discovered_at']) if entry.get('discovered_at') else None # Parse timestamp
+            }
+
+            if temp_cache[entry_id_str]['discovered_by']:
+                temp_discovered_count += 1
+
+        keyword_data_cache = temp_cache
+        total_keywords = len(keyword_data_cache)
+        discovered_keywords_count = temp_discovered_count
+
+        print(f"Loaded {total_keywords} enabled keyword rules. Discovered: {discovered_keywords_count}.")
+        if compile_errors:
+            log_message = "Keyword Regex Compilation Errors:\n- " + "\n- ".join(compile_errors)
+            print(f"WARNING: {log_message}")
+            await log_error(guild_for_log, log_message, ping_owner=False) # Log errors but don't ping
+
+    except (APIError, ConnectionError, Exception) as e:
+        await log_error(guild_for_log, "Failed to load keyword data from Supabase", error=e, ping_owner=True)
+        keyword_data_cache = {}
+        total_keywords = 0
+        discovered_keywords_count = 0
+
+
+async def record_discovery_in_db(guild_for_log: Optional[discord.Guild], keyword_id_str: str, user_id: int, discovery_time: datetime.datetime):
+    """Updates the Supabase table to record the first discovery."""
+    if not supabase:
+        await log_error(guild_for_log, f"Discovery recording failed for {keyword_id_str}: Supabase unavailable.", ping_owner=True)
+        return False # Indicate failure
+
+    print(f"Recording discovery for keyword ID {keyword_id_str} by user {user_id}...")
+    try:
+        await run_supabase_sync(
+            lambda: supabase.table(KEYWORD_TABLE_NAME)
+                           .update({
+                               'discovered_by_user_id': str(user_id),
+                               'discovered_at': discovery_time.isoformat() # Use ISO format with timezone
+                           })
+                           .eq('id', keyword_id_str) # Match by UUID string
+                           .is_('discovered_by_user_id', 'null') # Ensure we only update if not already discovered
+                           .execute()
+        )
+        # Assuming success if no error. Check affected rows if needed via response inspection.
+        print(f"Successfully recorded discovery for keyword ID {keyword_id_str}.")
+        return True # Indicate success
+    except (APIError, ConnectionError, Exception) as e:
+        await log_error(guild_for_log, f"Failed to record discovery for keyword ID {keyword_id_str} in Supabase", error=e, ping_owner=True)
+        return False # Indicate failure
+
+def format_time_difference(seconds: float) -> str:
+    """Formats remaining cooldown time."""
+    if seconds < 1:
+        return "less than a second"
+    elif seconds < 60:
+        return f"{int(seconds)} second{'s' if int(seconds) != 1 else ''}"
+    else:
+        minutes = int(seconds // 60)
+        remaining_seconds = int(seconds % 60)
+        if remaining_seconds == 0:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        else:
+            return f"{minutes} minute{'s' if minutes != 1 else ''} and {remaining_seconds} second{'s' if remaining_seconds != 1 else ''}"
 
 class SelfActivateButton(discord.ui.Button):
     """Button for users to mark themselves active for today."""
@@ -1525,53 +1657,85 @@ async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], messag
     except discord.HTTPException as e: print(f"Log Error: HTTP {e.status} in {log_channel.mention}: {e.text}")
     except Exception as e: print(f"Log Error: Send fail in {log_channel.mention}: {e}")
 
+# --- REVISED log_info ---
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
-    """Logs an info message."""
-    # Simplified: always create an embed for consistency if only message is passed
+    """Logs an info message. Sends to Discord channel only if in the target guild, otherwise prints to console."""
+    is_target = guild and guild.id == TARGET_GUILD_ID
+
+    log_prefix = f"[{guild.name if guild else 'No Guild'}] INFO:"
+    if not is_target:
+        log_prefix = f"[Console Log Only - Non-Target Guild] INFO:"
+
+    # Print to console regardless
+    print(f"{log_prefix} {message}")
+    if embed:
+        # Basic console representation of embed title/desc if printing only
+        embed_title = getattr(embed, 'title', None)
+        embed_desc = getattr(embed, 'description', None)
+        if embed_title: print(f"{log_prefix} Embed Title: {embed_title}")
+        if embed_desc: print(f"{log_prefix} Embed Desc: {embed_desc[:200]}{'...' if len(embed_desc) > 200 else ''}")
+
+    # Only attempt Discord channel logging if in the target guild
+    if is_target and guild: # Ensure guild object exists for log_to_channel
+        if not embed:
+            embed = discord.Embed(description=message, color=NERDY_YELLOW)
+            embed.timestamp = discord.utils.utcnow()
+        # Use log_to_channel but target INFO channel and no ping
+        await log_to_channel(INFO_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=None)
+    # else:
+    #     print(f"[Skipping Discord log - Non-Target Guild or No Guild] INFO: {message}") # Optional extra console print
+
+# --- REVISED log_error ---
+async def log_error(guild: Optional[discord.Guild], message: str, error: Optional[Exception] = None, interaction: Optional[discord.Interaction] = None, embed: Optional[discord.Embed] = None, ping_owner: bool = False):
+    """
+    Logs an error. Always prints to console.
+    Sends to Discord error channel ONLY if in the target guild.
+    Pings owner ONLY if in the target guild AND ping_owner is True.
+    """
+    is_target = guild and guild.id == TARGET_GUILD_ID
+    log_prefix = f"[{guild.name if guild else 'No Guild'}] ERROR:"
+    discord_ping_content: Optional[str] = None
+
+    # --- Prepare Embed Details (Done Regardless of Target Guild) ---
     if not embed:
-        embed = discord.Embed(description=message, color=NERDY_YELLOW)
-        embed.timestamp = discord.utils.utcnow()
-    # Use log_to_channel but target INFO channel and no ping
-    await log_to_channel(INFO_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=None)
-
-# --- REVISED log_error (Always pings owner) ---
-async def log_error(guild: Optional[discord.Guild], message: str, error: Optional[Exception] = None, interaction: Optional[discord.Interaction] = None, embed: Optional[discord.Embed] = None):
-    """Logs an error to the error channel, ALWAYS pinging the owner."""
-
-    # --- Always set ping content for the error channel ---
-    ping_content = f"<@{SELF_PROTECTED_ID}>"
-
-    if not embed:
-        # Use a consistent "Critical Error" title since it always pings
-        title_prefix = "🚨 Bot Critical Error"
+        title_prefix = f"🚨 Bot {'Critical ' if ping_owner else ''}Error" if is_target else "⚠️ Bot Error / Warning"
         embed = discord.Embed(title=title_prefix, description=message, color=discord.Color.red())
         embed.timestamp = discord.utils.utcnow()
         if interaction:
             cmd_name = interaction.command.name if interaction.command else 'N/A'
-            cmd = f"`/{cmd_name}`"
-            chan_mention = interaction.channel.mention if isinstance(interaction.channel, discord.TextChannel) else ""
-            chan_info = f" in {chan_mention}" if chan_mention else f" Ch:{interaction.channel_id}" if interaction.channel else ""
-            user = f"{interaction.user.mention} (`{interaction.user.id}`)"
-            embed.add_field(name="Context", value=f"Cmd: {cmd}{chan_info}\nUser: {user}", inline=False)
+            cmd = f"`/{cmd_name}`" if cmd_name != 'N/A' else 'N/A'
+            chan_mention = interaction.channel.mention if isinstance(interaction.channel, discord.TextChannel) else f"Ch:{interaction.channel_id}" if interaction.channel_id else "N/A"
+            user = f"{interaction.user.mention} (`{interaction.user.id}`)" if interaction.user else "N/A"
+            embed.add_field(name="Context", value=f"Cmd: {cmd} in {chan_mention}\nUser: {user}", inline=False)
         if error:
             etype, emsg = type(error).__name__, str(error)
             tb = "".join(traceback.format_exception(type(error), error, error.__traceback__, limit=6))
-            # Truncate traceback more aggressively
-            tb_short = (tb[:900] + "\n... (Truncated)") if len(tb) > 900 else tb # ADJUSTED TRUNCATION
+            tb_short = (tb[:900] + "\n... (Truncated)") if len(tb) > 900 else tb
             details = f"**Type:** `{etype}`\n" + (f"**Msg:** `{emsg}`\n" if emsg else "") + f"**Traceback:**\n```py\n{tb_short}\n```"
-            # Keep the final check, but reduce its limit slightly too for safety
-            if len(details) > 1024:
-                 details = details[:1000] + "...```" # ADJUSTED TRUNCATION
+            if len(details) > 1024: details = details[:1000] + "...```"
             embed.add_field(name="Error Details", value=details, inline=False)
             full_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-            # Print to console with ping indication
-            print(f"---\nERROR LOGGED (OWNER PING SENT):\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---\n")
+             # Print full traceback to console immediately
+            print(f"---\n{log_prefix} Details:\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---")
         else:
-             # Print non-exception errors too, indicating ping status
-             print(f"---\nERROR/WARN LOGGED (OWNER PING SENT):\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\n---\n")
+            # Print basic error context to console if no exception object
+            print(f"---\n{log_prefix} Context:\nGuild: {guild.id if guild else 'N/A'}\nMsg: {message}\n---")
 
-    # Pass the ping content to log_to_channel, targeting the ERROR channel
-    await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=ping_content)
+    # --- Console Logging (Always Happens) ---
+    # Console logging of the error context/traceback is handled above
+
+    # --- Discord Channel Logging (Conditional) ---
+    if is_target and guild: # Check if target guild and guild object exists
+        # Determine if owner ping is needed *for Discord*
+        if ping_owner:
+            discord_ping_content = f"<@{SELF_PROTECTED_ID}>"
+            print(f"{log_prefix} (Owner Ping Queued for Discord)")
+
+        # Call log_to_channel, targeting the ERROR channel
+        await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=discord_ping_content)
+    else:
+        # Optionally print a note that Discord logging was skipped
+        print(f"[Skipping Discord log - Non-Target Guild or No Guild] ERROR: {message}")
 
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
     """Logs an info message."""
@@ -2258,10 +2422,6 @@ async def check_static_view_timeout():
 async def on_ready():
     # ... (your existing on_ready code) ...
 
-    print("Starting background tasks...")
-    if not check_static_view_timeout.is_running():
-        check_static_view_timeout.start()
-        print(" Static view timeout checker task started.")
 
     print("--- on_ready event finished ---")
 
@@ -2463,14 +2623,20 @@ async def on_ready():
     except Exception as e:
         print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
 
-    # --- Signal Bot Ready ---
+    # --- Signal Bot Ready & Load Initial Data ---
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    first_guild = bot.guilds[0] if bot.guilds else None
-    if first_guild:
+    # Get a guild object for logging, preferably the target guild
+    log_guild = bot.get_guild(TARGET_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    if log_guild:
         try:
-             await log_info(first_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
+             await log_info(log_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
         except Exception as log_e:
              print(f"Failed to send initial ready log message: {log_e}")
+
+    print("--- Loading initial data ---")
+    # --- Load Keyword Data ---
+    print("Loading keyword data...")
+    await load_keyword_data(log_guild) # Call the loading function
 
     # --- Start Background Tasks ---
     print("Starting background tasks...")
@@ -2480,17 +2646,16 @@ async def on_ready():
             print(" Static view timeout checker task started.")
         except Exception as e_task:
             print(f"Failed to start static view timeout task: {e_task}")
-            await log_error(first_guild, "Failed to start static view timeout task", error=e_task)
+            await log_error(log_guild, "Failed to start static view timeout task", error=e_task)
 
 
-    # --- Schedule Delayed Static List Update --- <--- NEW SECTION
+    # --- Schedule Delayed Static List Update ---
     async def delayed_update(delay_seconds: int):
         await asyncio.sleep(delay_seconds)
         print(f"--- Running delayed static list update after {delay_seconds}s ---")
         guild = bot.get_guild(TARGET_GUILD_ID)
         if not guild:
             print(f"ERROR: Could not find target guild {TARGET_GUILD_ID} for delayed update.")
-            # Log error if guild isn't found
             await log_error(None, f"Delayed update failed: Target guild {TARGET_GUILD_ID} not found.")
             return
 
@@ -2507,7 +2672,6 @@ async def on_ready():
         print(f"--- Delayed static list update finished ---")
 
     # Schedule the task to run 60 seconds after on_ready finishes
-    # Ensure bot is connected to guilds before scheduling
     if bot.is_ready() and any(g.id == TARGET_GUILD_ID for g in bot.guilds):
         print("Scheduling delayed static list update for target guild...")
         bot.loop.create_task(delayed_update(delay_seconds=60))
@@ -3721,37 +3885,132 @@ async def hcmembers(interaction: discord.Interaction):
         try: await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
         except (discord.NotFound, discord.HTTPException): pass
 
-@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message.") # Updated description
+@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
-    # ... (keep initial checks: supabase, guild, channel config) ...
+    # --- Initial Checks ---
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    # Use check_supabase_available helper
+    if not await check_supabase_available(interaction):
+        # Helper handles ephemeral response/logging
+        return
+    # Ensure target guild for list refresh
+    if guild.id != TARGET_GUILD_ID:
+        await interaction.response.send_message("List refresh commands can only be used in the target server.", ephemeral=True)
+        return
+    # Ensure list channel exists (relevant for list update part)
+    list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
+    if not isinstance(list_channel, discord.TextChannel):
+        await interaction.response.send_message(f"❌ Configuration Error: Static list channel (ID: {HC_MEMBER_LIST_CHANNEL_ID}) not found or invalid.", ephemeral=True)
+        await log_error(guild, f"/refresh failed: Static list channel invalid.", interaction=interaction)
+        return
 
-    await interaction.response.defer(thinking=True, ephemeral=False) # Defer publicly
+    # --- Defer Publicly ---
+    await interaction.response.defer(thinking=True, ephemeral=False)
 
+    # --- Initial Feedback ---
     try:
-         # Send immediate feedback using followup
-         list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID) # Assume valid from checks
-         await interaction.followup.send(f"⏳ Starting interactive list refresh in {list_channel.mention if list_channel else 'the list channel'}...", ephemeral=False)
+        # Mention both actions in the initial feedback
+        feedback_msg = f"⏳ Starting refresh...\n- Reloading keyword data from Supabase.\n- Updating interactive list in {list_channel.mention}."
+        await interaction.followup.send(feedback_msg, ephemeral=False)
     except Exception as e_followup:
-         await log_error(guild, "Failed initial refresh followup", error=e_followup, interaction=interaction)
+        # Log if the initial followup fails, but continue the refresh process
+        await log_error(guild, "Failed initial /refresh followup send", error=e_followup, interaction=interaction)
+        # Attempt to edit original response if followup failed (might also fail)
+        try: await interaction.edit_original_response(content="⏳ Starting refresh...", embed=None, view=None)
+        except Exception: pass
 
+
+    # --- Execute Refresh Actions ---
+    keyword_load_success = False
+    list_update_success = False
+    error_details = ""
 
     try:
-        await log_info(guild, f"Manual interactive static list refresh initiated by `{interaction.user}`.")
-        # --- Run the NEW update function ---
-        await update_static_list_message(guild) # <--- CHANGE HERE
-        # --- Update complete ---
+        # 1. Reload Keyword Data
+        await log_info(guild, f"Manual keyword data reload initiated by `{interaction.user}` via /refresh.")
+        await load_keyword_data(guild)
+        # Basic check: does the cache have items? Could be 0 legitimately.
+        # A more robust check might involve comparing counts before/after, but let's rely on load_keyword_data's logging for errors.
+        keyword_load_success = True # Assume success if no exception bubbled up
+        print(f"Keyword reload complete. Cache size: {len(keyword_data_cache)}")
 
-        # Edit the original deferred response to show completion
-        await interaction.edit_original_response(content=f"✅ Interactive list refresh complete in {list_channel.mention if list_channel else 'the list channel'}.", embed=None, view=None) # Clear embed/view
-        await log_info(guild, f"Refresh command confirmed complete for user {interaction.user}.")
+        # 2. Update Static List Message
+        await log_info(guild, f"Manual interactive static list refresh initiated by `{interaction.user}` via /refresh.")
+        await update_static_list_message(guild) # This function logs its own success/failure
+        list_update_success = True # Assume success if no exception bubbled up from here
+        print(f"Static list update triggered.")
+
+        # --- Update Complete ---
+        completion_msg = f"✅ Refresh complete!\n- Keyword data reloaded ({len(keyword_data_cache)} rules).\n- Interactive list update triggered in {list_channel.mention}."
+        await interaction.edit_original_response(content=completion_msg, embed=None, view=None)
+        await log_info(guild, f"/refresh command confirmed complete for user {interaction.user}.")
 
     except Exception as e:
-        await log_error(guild, "Error during /refresh process execution", error=e, interaction=interaction)
+        action = "keyword loading" if not keyword_load_success else "list updating"
+        error_details = f" An error occurred during {action}."
+        await log_error(guild, f"Error during /refresh process execution ({action})", error=e, interaction=interaction)
         try:
-            await interaction.edit_original_response(content=f"❌ An error occurred during refresh.", embed=None, view=None)
-        except Exception: pass
+            # Edit original response to show failure
+            await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
+        except Exception: pass # Ignore if editing final response fails
+
+@tree.command(name="discoveries", description="Show progress on finding secret phrases.")
+async def discoveries(interaction: discord.Interaction):
+    guild = interaction.guild # Can be None if used in DMs
+    if not keyword_data_cache:
+        await interaction.response.send_message("Keyword data hasn't been loaded yet. Please wait a moment or contact an admin if this persists.", ephemeral=True)
+        return
+
+    # Prepare data for the embed
+    discovered_list = []
+    undiscovered_count = 0
+    now = discord.utils.utcnow()
+
+    # Sort cached items by phrase identifier for consistent display
+    sorted_rules = sorted(keyword_data_cache.values(), key=lambda r: r['phrase_identifier'])
+
+    for rule in sorted_rules:
+        if rule['discovered_by']:
+            user_id = rule['discovered_by']
+            timestamp_dt = rule['discovered_at']
+            timestamp_unix = int(timestamp_dt.timestamp()) if timestamp_dt else None
+            timestamp_str = f" on <t:{timestamp_unix}:D>" if timestamp_unix else ""
+            try:
+                 mention = f"<@{int(user_id)}>"
+            except ValueError:
+                 mention = f"(ID: {user_id})" # Fallback
+            discovered_list.append(f"• `{rule['phrase_identifier']}` - Found by {mention}{timestamp_str}")
+        else:
+            undiscovered_count += 1
+
+    # Build Embed
+    embed = discord.Embed(
+        title="🕵️ Secret Phrase Discoveries 🕵️‍♀️",
+        description=f"**Progress:** {discovered_keywords_count} out of {total_keywords} phrases found!",
+        color=NERDY_YELLOW
+    )
+    embed.timestamp = now
+
+    if discovered_list:
+        discovered_text = "\n".join(discovered_list)
+        if len(discovered_text) > 1024:
+            discovered_text = discovered_text[:1020] + "\n..."
+        embed.add_field(name="✅ Discovered Phrases", value=discovered_text, inline=False)
+    else:
+         embed.add_field(name="✅ Discovered Phrases", value="None found yet!", inline=False)
+
+    if undiscovered_count > 0:
+        embed.add_field(name="❓ Undiscovered Phrases", value=f"{undiscovered_count} phrases remaining...", inline=False)
+    else:
+        embed.add_field(name="❓ Undiscovered Phrases", value="All phrases have been found! 🎉", inline=False)
+
+    embed.set_footer(text="Keep chatting to find more!")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False) # Send publicly
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
@@ -4187,150 +4446,272 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
 @bot.event
 async def on_message(message: discord.Message):
-    # --- Initial Checks (Ignore DMs, ensure bot user is ready) ---
-    if not message.guild or not bot.user:
+    # --- Initial Checks: Ignore DMs, ensure bot user is ready, ignore bots ---
+    if not message.guild or not bot.user or message.author.bot:
         return
 
-    # --- Auto-Delete Logic ---
-    # Check if the message is from the bot itself AND in the target channel
+    # --- Auto-Delete Logic for Bot's Own Messages ---
     if message.author.id == bot.user.id and message.channel.id == AUTODELETE_CHANNEL_ID:
-        # Check if this message is a response to a slash command interaction
-        # This works for interaction.response.send_message and interaction.followup.send
         if message.interaction is not None:
             try:
-                # Schedule the deletion using the defined delay
                 await message.delete(delay=AUTODELETE_DELAY_SECONDS)
-                # Optional: Print log for debugging scheduled deletions
-                # print(f"Scheduled auto-delete for bot message {message.id} in channel {message.channel.id}")
             except discord.Forbidden:
-                # Log an error ONCE if the bot lacks permissions in that channel
-                # You might want a flag to prevent spamming this log
                 print(f"ERROR: Cannot auto-delete in channel {message.channel.id}. Bot lacks 'Manage Messages' permission.")
-                # Consider logging this via your log_error function too, perhaps less frequently.
-            except discord.NotFound:
-                pass # Message was likely deleted manually before delay expired
-            except discord.HTTPException as e:
-                await log_error(message.guild, f"Failed to schedule auto-delete for message {message.id}: HTTP Error.", error=e)
-            except Exception as e:
-                await log_error(message.guild, f"Unexpected error during auto-delete scheduling for message {message.id}.", error=e)
-            finally:
-                # IMPORTANT: Return after handling bot's own message to prevent processing as a command
-                return
+            except discord.NotFound: pass
+            except discord.HTTPException as e: await log_error(message.guild, f"Failed to schedule auto-delete for message {message.id}: HTTP Error.", error=e)
+            except Exception as e: await log_error(message.guild, f"Unexpected error during auto-delete scheduling for message {message.id}.", error=e)
+            finally: return
 
     # --- Prefix Command Logic (e.g., .p) ---
-    # Now, handle messages *from users* that start with the command prefix
-    if message.author.bot: # Double check we are not processing bot messages here
-        return
-    if not message.content.startswith(COMMAND_PREFIX):
-        # If you used `await bot.process_commands(message)` before, call it here for other potential prefix commands.
-        # If ONLY .p exists, you don't need process_commands.
-        # await bot.process_commands(message) # Uncomment if using discord.ext.commands framework features
-        return
-    if not isinstance(message.channel, discord.TextChannel): # Ensure it's a text channel for .p
-         return
+    if message.content.startswith(COMMAND_PREFIX):
+        if not isinstance(message.channel, discord.TextChannel): return
+        content_without_prefix = message.content[len(COMMAND_PREFIX):].strip()
+        parts = content_without_prefix.split()
+        if not parts: return
+        command_name = parts[0].lower()
+        args = parts[1:]
 
-    # --- Parse Prefix Command ---
-    content_without_prefix = message.content[len(COMMAND_PREFIX):].strip()
-    parts = content_without_prefix.split()
-    if not parts: return
-    command_name = parts[0].lower()
-    args = parts[1:]
+        # --- Handle the '.p' command ---
+        if command_name == "p":
+            guild = message.guild
+            channel = message.channel
+            author = message.author
 
-    # --- Handle the '.p' command ---
-    if command_name == "p":
-        guild = message.guild
-        channel = message.channel # Already confirmed TextChannel
-        author = message.author # Member object
-
-        # --- PASTE YOUR ENTIRE .p COMMAND LOGIC HERE ---
-        # (Starting from the argument check down to the error handling)
-        # Example structure:
-        # 1. Argument Check (Amount)
-        if not args:
-            try: await channel.send("❌ Please specify the number of messages to delete (e.g., `.p 10`).", delete_after=5.0)
-            except (discord.Forbidden, discord.HTTPException): pass
-            return
-        # ... (rest of your .p logic: amount parsing, permission checks, purge execution, logging, confirmation delete) ...
-        try:
-            amount = int(args[0])
-            if not 1 <= amount <= 100:
-                raise ValueError("Amount out of range.")
-        except ValueError:
-            try: await channel.send("❌ Invalid amount. Please provide a number between 1 and 100.", delete_after=5.0)
-            except (discord.Forbidden, discord.HTTPException): pass
-            return
-
-        bot_perms = channel.permissions_for(guild.me)
-        user_perms = channel.permissions_for(author)
-
-        if not bot_perms.manage_messages:
-            try: await channel.send(f"{author.mention}, I lack the `Manage Messages` permission here.")
-            except (discord.Forbidden, discord.HTTPException): pass
-            await log_error(guild, f".p command failed in {channel.mention}: Bot missing Manage Messages permission (invoked by {author}).")
-            return
-
-        if not user_perms.manage_messages:
-            try: await channel.send(f"{author.mention}, you need the `Manage Messages` permission to use this.", delete_after=7.0)
-            except (discord.Forbidden, discord.HTTPException): pass
-            try: await message.delete()
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
-            return
-
-        confirmation_message: Optional[discord.Message] = None
-        try:
-            try:
-                await message.delete()
-            except discord.NotFound: pass # Already gone
-            except discord.Forbidden: await log_error(guild, f".p: Failed to delete trigger message {message.id} (Forbidden) in {channel.mention}.")
-            except discord.HTTPException as e_trig_del: await log_error(guild, f".p: Failed to delete trigger message {message.id} (HTTP Error)", error=e_trig_del)
-
-            deleted_messages = await channel.purge(limit=amount)
-            delete_count = len(deleted_messages)
-
-            if delete_count == 0:
-                try: confirmation_message = await channel.send("ℹ️ No messages were found to delete.", delete_after=2.0);
-                except (discord.Forbidden, discord.HTTPException): pass
-                return
-
-            author_counts: Dict[str, int] = {}
-            for msg in deleted_messages:
-                author_name = str(msg.author)
-                author_counts[author_name] = author_counts.get(author_name, 0) + 1
-            authors_log = ", ".join(f"{name}({count})" for name, count in author_counts.items())
-            if len(authors_log) > 100: authors_log = authors_log[:97]+"..."
-
-            confirm_content = f"🗑️ Deleted {delete_count} message(s). ({authors_log})"
-            confirmation_message = await channel.send(confirm_content)
-
-            await log_info(guild, f"`{author}` used .p to delete {delete_count} messages in {channel.mention}. Authors: {authors_log}")
-
-            delete_delay_seconds_p = 1.5 # Use a different variable name if needed
-            await asyncio.sleep(delete_delay_seconds_p)
-
-            try:
-                if confirmation_message: await confirmation_message.delete()
-            except discord.NotFound: pass
-            except discord.Forbidden: await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): Bot Missing Permissions in channel {channel.mention}")
-            except discord.HTTPException as e_del_conf: await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): HTTP Error", error=e_del_conf)
-
-        except discord.Forbidden:
-            await log_error(guild, f".p command failed during purge in {channel.mention}: Bot missing Manage Messages permission (Invoked by {author}).")
-            try: await channel.send(f"{author.mention}, I lack permissions to delete messages here.")
-            except Exception: pass
-        except discord.HTTPException as e:
-            await log_error(guild, f".p command failed during purge/send in {channel.mention}: HTTP Exception.", error=e)
-            try: await channel.send(f"⚠️ Discord API error during purge (HTTP {e.status}). Some messages might not be deletable.", delete_after=7.0)
-            except Exception: pass
-        except Exception as e:
-            await log_error(guild, f".p command failed unexpectedly in {channel.mention}.", error=e)
-            if confirmation_message:
+            # 1. Argument Check (Amount)
+            if not args:
                 try:
-                    await asyncio.sleep(1)
-                    await confirmation_message.delete()
-                except Exception: pass
-        # --- END OF PASTED .p LOGIC ---
+                    await channel.send("❌ Please specify the number of messages to delete (e.g., `.p 10`).", delete_after=5.0)
+                except (discord.Forbidden, discord.HTTPException): pass
+                return # Exit if no amount specified
 
-# --- MODIFIED Nerd Help Command (Added activatemyself) ---
+            # 2. Parse Amount
+            try:
+                amount = int(args[0])
+                if not 1 <= amount <= 100:
+                    raise ValueError("Amount out of range.")
+            except ValueError:
+                try:
+                    await channel.send("❌ Invalid amount. Please provide a number between 1 and 100.", delete_after=5.0)
+                except (discord.Forbidden, discord.HTTPException): pass
+                return # Exit if invalid amount
+
+            # 3. Permission Checks
+            bot_perms = channel.permissions_for(guild.me)
+            user_perms = channel.permissions_for(author)
+
+            if not bot_perms.manage_messages:
+                try:
+                    await channel.send(f"{author.mention}, I lack the `Manage Messages` permission here.")
+                except (discord.Forbidden, discord.HTTPException): pass
+                await log_error(guild, f".p command failed in {channel.mention}: Bot missing Manage Messages permission (invoked by {author}).")
+                return # Exit if bot lacks permissions
+
+            if not user_perms.manage_messages:
+                try:
+                    await channel.send(f"{author.mention}, you need the `Manage Messages` permission to use this.", delete_after=7.0)
+                except (discord.Forbidden, discord.HTTPException): pass
+                # Delete the trigger message even if user lacks perms, if bot can
+                try:
+                    if bot_perms.manage_messages: await message.delete()
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
+                return # Exit if user lacks permissions
+
+            # 4. Execute Purge Logic
+            confirmation_message: Optional[discord.Message] = None
+            try:
+                # Delete the trigger message first
+                try:
+                    await message.delete()
+                except discord.NotFound: pass # Already gone, that's fine
+                except discord.Forbidden:
+                    # Log if bot couldn't delete trigger, but continue purge attempt
+                    await log_error(guild, f".p: Failed to delete trigger message {message.id} (Forbidden) in {channel.mention}.")
+                except discord.HTTPException as e_trig_del:
+                    await log_error(guild, f".p: Failed to delete trigger message {message.id} (HTTP Error)", error=e_trig_del)
+
+                # Perform the purge
+                deleted_messages = await channel.purge(limit=amount)
+                delete_count = len(deleted_messages)
+
+                if delete_count == 0:
+                    try:
+                        confirmation_message = await channel.send("ℹ️ No messages were found to delete.", delete_after=2.0)
+                    except (discord.Forbidden, discord.HTTPException): pass
+                    # No return here, might need cleanup below if confirmation sent
+
+                else: # Only process authors and send confirmation if messages were deleted
+                    # Log deleted authors
+                    author_counts: Dict[str, int] = {}
+                    for msg in deleted_messages:
+                        author_name = str(msg.author) # Use str() for safety
+                        author_counts[author_name] = author_counts.get(author_name, 0) + 1
+
+                    authors_log = ", ".join(f"{name}({count})" for name, count in author_counts.items())
+                    if len(authors_log) > 100: # Truncate log if too long
+                        authors_log = authors_log[:97] + "..."
+
+                    # Send confirmation message
+                    confirm_content = f"🗑️ Deleted {delete_count} message(s). ({authors_log})"
+                    confirmation_message = await channel.send(confirm_content)
+
+                    # Log successful purge
+                    await log_info(guild, f"`{author}` used .p to delete {delete_count} messages in {channel.mention}. Authors: {authors_log}")
+
+                    # Schedule deletion of the confirmation message
+                    delete_delay_seconds_p = 1.5
+                    await asyncio.sleep(delete_delay_seconds_p)
+
+                    try:
+                        if confirmation_message: # Check if message exists before deleting
+                            await confirmation_message.delete()
+                            confirmation_message = None # Clear reference after deletion
+                    except discord.NotFound: pass # Already gone
+                    except discord.Forbidden:
+                        await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): Bot Missing Permissions in channel {channel.mention}")
+                    except discord.HTTPException as e_del_conf:
+                        await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): HTTP Error", error=e_del_conf)
+
+            # 5. Handle Specific Errors during Purge/Confirmation
+            except discord.Forbidden as e_forbid:
+                await log_error(guild, f".p command failed during purge in {channel.mention}: Bot missing Manage Messages permission (Invoked by {author}).", error=e_forbid)
+                # Try to inform the user, but might fail too
+                try: await channel.send(f"{author.mention}, I lack permissions to delete messages here.")
+                except Exception: pass
+            except discord.HTTPException as e_http:
+                await log_error(guild, f".p command failed during purge/send in {channel.mention}: HTTP Exception.", error=e_http)
+                try: await channel.send(f"⚠️ Discord API error during purge (HTTP {e_http.status}). Some messages might not be deletable.", delete_after=7.0)
+                except Exception: pass
+            except Exception as e_other:
+                await log_error(guild, f".p command failed unexpectedly in {channel.mention}.", error=e_other)
+                # Attempt to clean up confirmation message if it exists and an error occurred
+                if confirmation_message:
+                    try:
+                        await asyncio.sleep(1) # Short delay
+                        await confirmation_message.delete()
+                    except Exception: pass # Ignore cleanup failure
+
+            return # IMPORTANT: Return after handling the prefix command
+
+    # --- Keyword Detection Logic ---
+    if not keyword_data_cache: return # If no keywords loaded, do nothing
+
+    message_content_lower = message.content.lower()
+    now = discord.utils.utcnow()
+    is_owner: bool = message.author.id == SELF_PROTECTED_ID
+    is_target_guild_context: bool = message.guild.id == TARGET_GUILD_ID
+
+    # Iterate through cached rules
+    for rule_id_str, rule in keyword_data_cache.items():
+        triggered = False
+        excluded = False
+
+        # 1. Check Exclusion Regex first
+        if rule['exclusion_regex'] and rule['exclusion_regex'].search(message_content_lower):
+            excluded = True
+            continue
+
+        # 2. Check Inclusion Regex
+        if not excluded and rule['inclusion_regex'].search(message_content_lower):
+            triggered = True
+        else:
+            continue
+
+        # --- If Triggered & Not Excluded ---
+        if triggered:
+            is_discovered = rule.get('discovered_by') is not None
+
+            # --- Determine Permissions *for this specific rule* ---
+            specific_can_trigger: bool = False
+            specific_can_discover: bool = False
+
+            if is_target_guild_context:
+                specific_can_trigger = True # Anyone can trigger in target guild
+                specific_can_discover = not is_owner # Owner cannot discover in target guild
+            else: # Outside target guild
+                specific_can_trigger = is_owner or is_discovered # Owner OR if already discovered
+                specific_can_discover = is_owner # Only owner can "discover" outside
+
+            # --- Check if user can trigger this specific rule ---
+            if not specific_can_trigger:
+                # print(f"DBG: Trigger prevented for {rule['phrase_identifier']} by user {message.author.id} due to permissions (trigger check).")
+                continue # Skip to the next rule if user cannot trigger this one
+
+            # 3. Check Cooldown (Only if user could potentially trigger)
+            cooldown_end_time = keyword_cooldowns.get(rule_id_str)
+            if cooldown_end_time and now < cooldown_end_time:
+                # On cooldown - Send public self-deleting reply WITHOUT PING
+                remaining_seconds = (cooldown_end_time - now).total_seconds()
+                time_left_str = format_time_difference(remaining_seconds)
+                # Message still includes user's name for context, but won't ping
+                cooldown_msg = f"⏳ Psst {message.author.display_name}, '{rule['phrase_identifier']}' is on cooldown for {time_left_str}." # Use display_name instead of mention
+                try:
+                    # Send reply in channel, DO NOT mention user, set delete_after
+                    # VVV Changed mention_author to False VVV
+                    await message.reply(cooldown_msg, delete_after=4.0, mention_author=False) # Delete after 4 seconds
+                    # print(f"DBG: Sent self-deleting cooldown reply for {rule['phrase_identifier']} (no ping)")
+                except (discord.Forbidden, discord.HTTPException) as e:
+                     # Log if sending/deleting the reply fails
+                     print(f"WARN: Failed to send self-deleting keyword cooldown reply for {rule_id_str}: {e}")
+                     await log_error(message.guild, f"Failed self-deleting cooldown reply for '{rule['phrase_identifier']}'", error=e) # Optional: Log error properly
+                continue # Stop processing THIS rule if on cooldown
+
+            # 4. Not on Cooldown - Process Discovery or Standard Reply
+
+            if not is_discovered:
+                # --- First Discovery Attempt ---
+                if specific_can_discover: # Check discovery permission for THIS context/user
+                    global discovered_keywords_count
+                    print(f"First discovery attempt: {rule['phrase_identifier']} by {message.author} ({message.author.id}) in guild {message.guild.id}")
+                    discovery_recorded = await record_discovery_in_db(message.guild, rule_id_str, message.author.id, now)
+
+                    if discovery_recorded:
+                        # Update Cache
+                        rule['discovered_by'] = str(message.author.id)
+                        rule['discovered_at'] = now
+                        discovered_keywords_count += 1
+
+                        # Send First Discovery Message
+                        template = rule.get('first_discovery_template') or "🎉 {user_mention} just discovered the {nth} secret phrase out of {total}! Phrase: `{phrase_identifier}`"
+                        try:
+                            formatted_message = template.format(user_mention=message.author.mention, nth=discovered_keywords_count, total=total_keywords, phrase_identifier=rule['phrase_identifier'])
+                            reply_content = f"{rule.get('response_emoji', '')} {formatted_message}".strip()
+                            await message.reply(reply_content, mention_author=True) # Reply publicly
+                            await log_info(message.guild, f"First Discovery! '{rule['phrase_identifier']}' found by {message.author.mention}. ({discovered_keywords_count}/{total_keywords})")
+                        except KeyError as e_fmt:
+                            await log_error(message.guild, f"First discovery message format error for '{rule['phrase_identifier']}'. Template: '{template}', Error: {e_fmt}", ping_owner=True)
+                            await message.reply(f"🎉 You discovered '{rule['phrase_identifier']}'! ({discovered_keywords_count}/{total_keywords})", mention_author=True) # Fallback
+                        except (discord.Forbidden, discord.HTTPException) as e:
+                            await log_error(message.guild, f"Failed to send first discovery reply for '{rule['phrase_identifier']}'", error=e)
+
+                        # Set Cooldown
+                        keyword_cooldowns[rule_id_str] = now + datetime.timedelta(minutes=KEYWORD_COOLDOWN_MINUTES)
+                    else:
+                        print(f"WARN: Failed to record discovery for {rule['phrase_identifier']} in DB, not sending message.")
+                else:
+                    # User cannot discover this (e.g., owner in target guild, or non-owner outside trying undiscovered)
+                    # print(f"DBG: Discovery prevented for {rule['phrase_identifier']} by user {message.author.id} due to permissions (discover check).")
+                    pass # Do nothing in this case
+
+            else:
+                # --- Already Discovered ---
+                # Trigger permission ('specific_can_trigger') was already checked earlier
+                # Send Standard Reply (if defined)
+                standard_msg = rule.get('standard_response')
+                if standard_msg:
+                    reply_content = f"{rule.get('response_emoji', '')} {standard_msg}".strip()
+                    try:
+                        await message.reply(reply_content, mention_author=True) # Reply publicly
+                        # print(f"DBG: Sent standard reply for {rule['phrase_identifier']} in guild {message.guild.id}")
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        await log_error(message.guild, f"Failed to send standard keyword reply for '{rule['phrase_identifier']}'", error=e)
+
+                # Set Cooldown (even if no message sent)
+                keyword_cooldowns[rule_id_str] = now + datetime.timedelta(minutes=KEYWORD_COOLDOWN_MINUTES)
+
+            # IMPORTANT: Break loop after first successful action for a rule
+            break
+    # --- End of on_message logic ---
+   
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
@@ -4365,16 +4746,21 @@ async def nerdhelp(interaction: discord.Interaction):
 
     # Section: Activity Tracking
     embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False) # <-- ADDED
+    embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('active')}  · Mark *any* member as active for a date.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
+
+    # Section: Secret Phrase Discovery
+    embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
+    embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False) # <-- ADDED
 
     # Section: Utilities
     embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
+
 
     embed.set_footer(text="Bot by TheNerd | sweet_honey")
     if bot.user and bot.user.display_avatar:
