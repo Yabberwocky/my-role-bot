@@ -2,42 +2,6 @@
 import discord # Keep your original discord import
 import sys     # <--- Ensure this import is present
 import os      # <--- Ensure this import is present
-
-# --- Diagnostic Print Block (Corrected) ---
-print("-" * 20)
-try:
-    print(f"Python Executable: {sys.executable}")
-    print(f"Running discord.py version: {discord.__version__}")
-    print(f"discord.py location: {discord.__file__}")
-    # Use getattr for safety in case discord module is broken/shadowed
-    has_context_type = getattr(discord, 'InteractionContextType', None) is not None
-    has_install_type = getattr(discord, 'AppInstallationType', None) is not None
-    print(f"Has InteractionContextType: {has_context_type}")
-    print(f"Has AppInstallationType: {has_install_type}")
-except Exception as diag_err:
-    print(f"Error during diagnostic print: {diag_err}")
-print("-" * 20)
-# --- End Diagnostic Print Block ---
-
-print("-" * 20)
-try:
-    from discord import InteractionContextType
-    print("Direct import of InteractionContextType: SUCCESSFUL")
-    print(f"Type is: {type(InteractionContextType)}")
-except ImportError:
-    print("Direct import of InteractionContextType: FAILED (ImportError)")
-except Exception as direct_err:
-    print(f"Direct import test FAILED with other error: {type(direct_err).__name__} - {direct_err}")
-
-try:
-    # Re-check using getattr just in case the direct import behaves differently
-    attr_check = getattr(discord, 'InteractionContextType', 'MISSING')
-    print(f"getattr(discord, 'InteractionContextType'): {attr_check}")
-except Exception as getattr_err:
-     print(f"getattr test FAILED with error: {type(getattr_err).__name__} - {getattr_err}")
-print("-" * 20)
-
-
 import threading
 import asyncio
 from discord import app_commands
@@ -2855,7 +2819,7 @@ def get_cmd_mention(name: str) -> str:
 # --- Slash Commands ---
 
 # --- Verify Command ---
-@tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified).")
 @app_commands.describe(user="The user to verify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
@@ -2969,7 +2933,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 
 
 # --- Unverify Command ---
-@tree.command(name="unverify", description="Revert user to Unverified (adds Unverified, removes Verified).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="unverify", description="Revert user to Unverified (adds Unverified, removes Verified).")
 @app_commands.describe(user="The user to unverify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
@@ -3081,7 +3045,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 
 
 # --- REFINED HC Verify Command (Handles existing IGN-only entries, EX_MEMBER_ROLE_ID removal) ---
-@tree.command(name="hcverify", description="Verify user into HC, store/link IGN, set nickname.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # Slightly updated description
+@tree.command(name="hcverify", description="Verify user into HC, store/link IGN, set nickname.") # Slightly updated description
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will link/update DB & set nickname).") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
@@ -3307,7 +3271,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
          asyncio.create_task(update_static_list_message(guild))
 
 # --- New HCLeave Command (MODIFIED: Includes Role Changes if Discord ID found) ---
-@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
+@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.") # MODIFIED Description
 @app_commands.describe(
     ingame_name="The IGN to remove from the database."
 )
@@ -3521,7 +3485,7 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
         print(f"hcleave: Triggering list update for {target_identifier_log} (DB removed: {db_removed}).")
         asyncio.create_task(update_static_list_message(guild))
 
-@tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
 @app_commands.describe(ingame_name="The player's unique in-game name.")
 @app_commands.checks.has_permissions(manage_roles=True) # Or another suitable permission
 async def hconly(interaction: discord.Interaction, ingame_name: str):
@@ -3601,7 +3565,7 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
 # --- Activate Myself Command ---
-@tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
 # No extra permissions needed by default, relies on user having a linked IGN
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
@@ -3657,7 +3621,7 @@ async def activatemyself(interaction: discord.Interaction):
     # else: Error already logged by upsert_activity_log if it failed internally
 
 # --- Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
+@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.") # MODIFIED Description
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark active."
     # REMOVED date description
@@ -3700,7 +3664,7 @@ async def active(interaction: discord.Interaction, ingame_name: str):
 
 
 # --- Alias Command /a for /active ---
-@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # New command name "a"
+@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.") # New command name "a"
 @app_commands.describe( # Use the SAME descriptions as /active
     ingame_name="The In-Game Name (IGN) to mark active.",
     date="Date of activity (Select from list)."
@@ -3720,7 +3684,7 @@ async def active_alias(interaction: discord.Interaction, ingame_name: str, date:
 
 
 # --- Inactive Command (CORRECTED DECORATOR and Date Handling, ADDED PERMISSION CHECK) ---
-@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark inactive.",
     date="Date of activity to remove (Select from list)."
@@ -3773,7 +3737,7 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
 
 
 # --- Bulk Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
+@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.") # MODIFIED Description
 # REMOVED date describe
 # REMOVED date autocomplete decorator entirely
 @app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
@@ -3785,7 +3749,7 @@ async def bulkactive(interaction: discord.Interaction):
 
 
 # --- REVISED /hcmembers Command ---
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -3921,7 +3885,7 @@ async def hcmembers(interaction: discord.Interaction):
         try: await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
         except (discord.NotFound, discord.HTTPException): pass
 
-@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # Updated description
+@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
@@ -3994,7 +3958,7 @@ async def refresh(interaction: discord.Interaction):
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass # Ignore if editing final response fails
 
-@tree.command(name="discoveries", description="Show progress on finding secret phrases.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="discoveries", description="Show progress on finding secret phrases.")
 async def discoveries(interaction: discord.Interaction):
     guild = interaction.guild # Can be None if used in DMs
     if not keyword_data_cache:
@@ -4049,7 +4013,7 @@ async def discoveries(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False) # Send publicly
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
-@tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
 @app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
 async def syncnicknames(interaction: discord.Interaction):
@@ -4244,7 +4208,7 @@ async def syncnicknames(interaction: discord.Interaction):
 
 
 # --- Wither Command ---
-@tree.command(name="wither", description="Temporarily remove roles from a user.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="wither", description="Temporarily remove roles from a user.")
 @app_commands.describe(
     user="User to wither.",
     time="Duration in minutes (0.1 to 10, default 2)."
@@ -4765,7 +4729,7 @@ async def on_message(message: discord.Message):
             break
     # --- End of on_message logic ---
    
-@tree.command(name="nerdhelp", description="Show the list of available bot commands.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
+@tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
