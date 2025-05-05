@@ -1,8 +1,45 @@
 # -*- coding: utf-8 -*-
-import os
+import discord # Keep your original discord import
+import sys     # <--- Ensure this import is present
+import os      # <--- Ensure this import is present
+
+# --- Diagnostic Print Block (Corrected) ---
+print("-" * 20)
+try:
+    print(f"Python Executable: {sys.executable}")
+    print(f"Running discord.py version: {discord.__version__}")
+    print(f"discord.py location: {discord.__file__}")
+    # Use getattr for safety in case discord module is broken/shadowed
+    has_context_type = getattr(discord, 'InteractionContextType', None) is not None
+    has_install_type = getattr(discord, 'AppInstallationType', None) is not None
+    print(f"Has InteractionContextType: {has_context_type}")
+    print(f"Has AppInstallationType: {has_install_type}")
+except Exception as diag_err:
+    print(f"Error during diagnostic print: {diag_err}")
+print("-" * 20)
+# --- End Diagnostic Print Block ---
+
+print("-" * 20)
+try:
+    from discord import InteractionContextType
+    print("Direct import of InteractionContextType: SUCCESSFUL")
+    print(f"Type is: {type(InteractionContextType)}")
+except ImportError:
+    print("Direct import of InteractionContextType: FAILED (ImportError)")
+except Exception as direct_err:
+    print(f"Direct import test FAILED with other error: {type(direct_err).__name__} - {direct_err}")
+
+try:
+    # Re-check using getattr just in case the direct import behaves differently
+    attr_check = getattr(discord, 'InteractionContextType', 'MISSING')
+    print(f"getattr(discord, 'InteractionContextType'): {attr_check}")
+except Exception as getattr_err:
+     print(f"getattr test FAILED with error: {type(getattr_err).__name__} - {getattr_err}")
+print("-" * 20)
+
+
 import threading
 import asyncio
-import discord
 from discord import app_commands
 from typing import Dict, Optional
 from discord.ext import commands
@@ -69,7 +106,7 @@ HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165 # Channel for static list
 HC_LIST_EMBED_TITLE = "**\[HC1\] Guild Members**"
 ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692} # User IDs for /wither
 OWNER_USER_ID = 1230848174218940416 # Protected from /wither
-BOT_USER_ID: Optional[int] = 1365572437185400893 # Bot's own User ID (set in on_ready)
+BOT_USER_ID: Optional[int] = None # Bot's own User ID (set in on_ready)
 MAX_WITHER_SECONDS = 600 # Max duration for /wither (10 minutes)
 ORDINARY_LOGS_CHANNEL_ID = 1317943895606165579 # Info log channel
 EXTRAORDINARY_LOGS_CHANNEL_ID = 1362988767367135453 # Error log channel
@@ -85,7 +122,6 @@ SORT_MODE_IGN = "sort_ign"
 SORT_MODE_ACTIVITY = "sort_activity"
 ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
 COMMAND_PREFIX = "." # Define the prefix
-HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165
 AUTODELETE_DELAY_SECONDS = 5.0
 CATERCORD_GUILD_ID = 1200476681803137024 # Catercord server ID
 active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view': StaticHCPagesView, 'message_id': int, 'task': tasks.Loop}
@@ -2819,7 +2855,7 @@ def get_cmd_mention(name: str) -> str:
 # --- Slash Commands ---
 
 # --- Verify Command ---
-@tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified).")
+@tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.describe(user="The user to verify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
@@ -2933,7 +2969,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 
 
 # --- Unverify Command ---
-@tree.command(name="unverify", description="Revert user to Unverified (adds Unverified, removes Verified).")
+@tree.command(name="unverify", description="Revert user to Unverified (adds Unverified, removes Verified).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.describe(user="The user to unverify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
@@ -3045,7 +3081,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 
 
 # --- REFINED HC Verify Command (Handles existing IGN-only entries, EX_MEMBER_ROLE_ID removal) ---
-@tree.command(name="hcverify", description="Verify user into HC, store/link IGN, set nickname.") # Slightly updated description
+@tree.command(name="hcverify", description="Verify user into HC, store/link IGN, set nickname.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # Slightly updated description
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will link/update DB & set nickname).") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
@@ -3271,7 +3307,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
          asyncio.create_task(update_static_list_message(guild))
 
 # --- New HCLeave Command (MODIFIED: Includes Role Changes if Discord ID found) ---
-@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.") # MODIFIED Description
+@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
 @app_commands.describe(
     ingame_name="The IGN to remove from the database."
 )
@@ -3485,7 +3521,7 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
         print(f"hcleave: Triggering list update for {target_identifier_log} (DB removed: {db_removed}).")
         asyncio.create_task(update_static_list_message(guild))
 
-@tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
+@tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.describe(ingame_name="The player's unique in-game name.")
 @app_commands.checks.has_permissions(manage_roles=True) # Or another suitable permission
 async def hconly(interaction: discord.Interaction, ingame_name: str):
@@ -3565,7 +3601,7 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
 # --- Activate Myself Command ---
-@tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
+@tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 # No extra permissions needed by default, relies on user having a linked IGN
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
@@ -3621,7 +3657,7 @@ async def activatemyself(interaction: discord.Interaction):
     # else: Error already logged by upsert_activity_log if it failed internally
 
 # --- Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.") # MODIFIED Description
+@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark active."
     # REMOVED date description
@@ -3664,7 +3700,7 @@ async def active(interaction: discord.Interaction, ingame_name: str):
 
 
 # --- Alias Command /a for /active ---
-@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.") # New command name "a"
+@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # New command name "a"
 @app_commands.describe( # Use the SAME descriptions as /active
     ingame_name="The In-Game Name (IGN) to mark active.",
     date="Date of activity (Select from list)."
@@ -3684,7 +3720,7 @@ async def active_alias(interaction: discord.Interaction, ingame_name: str, date:
 
 
 # --- Inactive Command (CORRECTED DECORATOR and Date Handling, ADDED PERMISSION CHECK) ---
-@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
+@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.describe(
     ingame_name="The In-Game Name (IGN) to mark inactive.",
     date="Date of activity to remove (Select from list)."
@@ -3737,7 +3773,7 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
 
 
 # --- Bulk Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.") # MODIFIED Description
+@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # MODIFIED Description
 # REMOVED date describe
 # REMOVED date autocomplete decorator entirely
 @app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
@@ -3749,7 +3785,7 @@ async def bulkactive(interaction: discord.Interaction):
 
 
 # --- REVISED /hcmembers Command ---
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
+@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -3885,7 +3921,7 @@ async def hcmembers(interaction: discord.Interaction):
         try: await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
         except (discord.NotFound, discord.HTTPException): pass
 
-@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.") # Updated description
+@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all) # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
@@ -3958,7 +3994,7 @@ async def refresh(interaction: discord.Interaction):
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass # Ignore if editing final response fails
 
-@tree.command(name="discoveries", description="Show progress on finding secret phrases.")
+@tree.command(name="discoveries", description="Show progress on finding secret phrases.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 async def discoveries(interaction: discord.Interaction):
     guild = interaction.guild # Can be None if used in DMs
     if not keyword_data_cache:
@@ -4013,7 +4049,7 @@ async def discoveries(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False) # Send publicly
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
-@tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
+@tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
 @app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
 async def syncnicknames(interaction: discord.Interaction):
@@ -4208,7 +4244,7 @@ async def syncnicknames(interaction: discord.Interaction):
 
 
 # --- Wither Command ---
-@tree.command(name="wither", description="Temporarily remove roles from a user.")
+@tree.command(name="wither", description="Temporarily remove roles from a user.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 @app_commands.describe(
     user="User to wither.",
     time="Duration in minutes (0.1 to 10, default 2)."
@@ -4477,17 +4513,17 @@ async def on_message(message: discord.Message):
             channel = message.channel
             author = message.author
 
-            # 1. Argument Check (Amount)
+            # 1. Argument Check (Amount) - Keep as is
             if not args:
                 try:
                     await channel.send("❌ Please specify the number of messages to delete (e.g., `.p 10`).", delete_after=5.0)
                 except (discord.Forbidden, discord.HTTPException): pass
                 return # Exit if no amount specified
 
-            # 2. Parse Amount
+            # 2. Parse Amount - Keep as is
             try:
                 amount = int(args[0])
-                if not 1 <= amount <= 100:
+                if not 1 <= amount <= 100: # Discord API limit for bulk delete is 100
                     raise ValueError("Amount out of range.")
             except ValueError:
                 try:
@@ -4495,7 +4531,7 @@ async def on_message(message: discord.Message):
                 except (discord.Forbidden, discord.HTTPException): pass
                 return # Exit if invalid amount
 
-            # 3. Permission Checks
+            # 3. Permission Checks - Keep as is
             bot_perms = channel.permissions_for(guild.me)
             user_perms = channel.permissions_for(author)
 
@@ -4510,37 +4546,49 @@ async def on_message(message: discord.Message):
                 try:
                     await channel.send(f"{author.mention}, you need the `Manage Messages` permission to use this.", delete_after=7.0)
                 except (discord.Forbidden, discord.HTTPException): pass
-                # Delete the trigger message even if user lacks perms, if bot can
+                # Try deleting trigger even if user lacks perms (if bot can)
                 try:
                     if bot_perms.manage_messages: await message.delete()
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
                 return # Exit if user lacks permissions
 
-            # 4. Execute Purge Logic
+            # --- OPTIMIZATION START ---
+            # 4. Calculate the 14-day limit for bulk delete
+            fourteen_days_ago = discord.utils.utcnow() - datetime.timedelta(days=14)
+            # --- OPTIMIZATION END ---
+
+            # 5. Execute Optimized Purge Logic
             confirmation_message: Optional[discord.Message] = None
+            deleted_messages: List[discord.Message] = []
+            delete_count = 0
             try:
-                # Delete the trigger message first
+                # Delete the trigger message first (common pattern, ensures 'amount' applies to messages *before* it)
                 try:
                     await message.delete()
                 except discord.NotFound: pass # Already gone, that's fine
                 except discord.Forbidden:
-                    # Log if bot couldn't delete trigger, but continue purge attempt
                     await log_error(guild, f".p: Failed to delete trigger message {message.id} (Forbidden) in {channel.mention}.")
+                    # Attempt to continue purge anyway
                 except discord.HTTPException as e_trig_del:
                     await log_error(guild, f".p: Failed to delete trigger message {message.id} (HTTP Error)", error=e_trig_del)
+                    # Attempt to continue purge anyway
 
-                # Perform the purge
-                deleted_messages = await channel.purge(limit=amount)
+                # --- OPTIMIZATION START ---
+                # Perform the purge, only considering messages AFTER the 14-day cutoff
+                # This forces discord.py to use the bulk delete endpoint and prevents
+                # falling back to slow individual deletion for messages older than 14 days.
+                deleted_messages = await channel.purge(limit=amount, after=fourteen_days_ago)
                 delete_count = len(deleted_messages)
+                # --- OPTIMIZATION END ---
 
                 if delete_count == 0:
+                    # No messages deleted (either none were recent enough or channel was empty)
                     try:
-                        confirmation_message = await channel.send("ℹ️ No messages were found to delete.", delete_after=2.0)
+                        confirmation_message = await channel.send("ℹ️ No recent messages found to delete (within 14 days).", delete_after=3.0)
                     except (discord.Forbidden, discord.HTTPException): pass
-                    # No return here, might need cleanup below if confirmation sent
-
-                else: # Only process authors and send confirmation if messages were deleted
-                    # Log deleted authors
+                else:
+                    # Messages were deleted
+                    # Log deleted authors (keep this logic)
                     author_counts: Dict[str, int] = {}
                     for msg in deleted_messages:
                         author_name = str(msg.author) # Use str() for safety
@@ -4551,14 +4599,19 @@ async def on_message(message: discord.Message):
                         authors_log = authors_log[:97] + "..."
 
                     # Send confirmation message
-                    confirm_content = f"🗑️ Deleted {delete_count} message(s). ({authors_log})"
+                    confirm_content = f"🗑️ Deleted {delete_count} recent message(s)."
+                    # Inform user if fewer messages were deleted than requested due to the age limit
+                    if delete_count < amount:
+                        confirm_content += f" (Less than {amount} requested due to age limit of 14 days)."
+                    confirm_content += f" ({authors_log})" # Add authors summary
+
                     confirmation_message = await channel.send(confirm_content)
 
                     # Log successful purge
-                    await log_info(guild, f"`{author}` used .p to delete {delete_count} messages in {channel.mention}. Authors: {authors_log}")
+                    await log_info(guild, f"`{author}` used .p to delete {delete_count} recent messages in {channel.mention}. Authors: {authors_log}")
 
-                    # Schedule deletion of the confirmation message
-                    delete_delay_seconds_p = 1.5
+                    # Schedule deletion of the confirmation message (keep this)
+                    delete_delay_seconds_p = 2.0 # Maybe slightly longer now
                     await asyncio.sleep(delete_delay_seconds_p)
 
                     try:
@@ -4571,15 +4624,15 @@ async def on_message(message: discord.Message):
                     except discord.HTTPException as e_del_conf:
                         await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): HTTP Error", error=e_del_conf)
 
-            # 5. Handle Specific Errors during Purge/Confirmation
+            # 6. Handle Specific Errors during Purge/Confirmation (Keep this block largely as is)
             except discord.Forbidden as e_forbid:
-                await log_error(guild, f".p command failed during purge in {channel.mention}: Bot missing Manage Messages permission (Invoked by {author}).", error=e_forbid)
-                # Try to inform the user, but might fail too
-                try: await channel.send(f"{author.mention}, I lack permissions to delete messages here.")
+                # This might happen during purge or confirmation send/delete
+                await log_error(guild, f".p command failed during operation in {channel.mention}: Bot missing permissions (Invoked by {author}).", error=e_forbid)
+                try: await channel.send(f"{author.mention}, I lack permissions to complete the operation here.")
                 except Exception: pass
             except discord.HTTPException as e_http:
-                await log_error(guild, f".p command failed during purge/send in {channel.mention}: HTTP Exception.", error=e_http)
-                try: await channel.send(f"⚠️ Discord API error during purge (HTTP {e_http.status}). Some messages might not be deletable.", delete_after=7.0)
+                await log_error(guild, f".p command failed during operation in {channel.mention}: HTTP Exception.", error=e_http)
+                try: await channel.send(f"⚠️ Discord API error during purge (HTTP {e_http.status}). Some messages might not have been deleted.", delete_after=7.0)
                 except Exception: pass
             except Exception as e_other:
                 await log_error(guild, f".p command failed unexpectedly in {channel.mention}.", error=e_other)
