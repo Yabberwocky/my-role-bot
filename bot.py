@@ -42,7 +42,7 @@ from collections import namedtuple
 #   - Platform: Render (Free Tier) via a private GitHub repository.
 #   - Keep-Alive: Uses a basic Flask web server (`keep_alive` function) monitored by an external
 #     service (like Uptime Robot) hitting the Flask endpoint to prevent Render's free instance from sleeping.
-#   - Environment Variables: DISCORD_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY are set directly in Render's environment settings.
+#   - Environment Variables: DISCORD_BOT_MAIN_TOKEN, SUPABASE_URL, SUPABASE_ADMIN_KEY are set directly in Render's environment settings.
 # Database: Supabase (PostgreSQL) used to store HC member IGNs linked to Discord IDs.
 # Key Features: /verify, /hcverify (stores IGN), static list updates, /hcmembers (interactive list), /syncnicknames, /wither, /nerdhelp.
 # (Check /nerdhelp's code for latest list of features. This list might be outdated.)
@@ -58,24 +58,24 @@ from collections import namedtuple
 
 # --- Configuration ---
 load_dotenv()  # harmless in production; only loads if a .env file exists
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+MAIN_TOKEN = os.getenv("MAIN_DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-REMOVE_ROLE_ID = 1360176495947022447 # "Unverified" role
-ADD_ROLE_ID_VERIFY = 1248708073019805717 # "Verified" role
-ADD_ROLE_ID_HC = 1230235110415274004 # "HC" role
-ALLOWED_CHANNEL_IDS = {1354431395140731165, 1330664430148780102, 1248710731407560835, 1367362849122549801} # Channels for /hcmembers
+SUPABASE_ADMIN_KEY = os.getenv("SUPABASE_ADMIN_KEY")
+NEWBEE_ROLE_ID = 1360176495947022447 # "Unverified" role
+FLORRIST_ROLE_ID = 1248708073019805717 # "Verified" role
+HC1_ROLE_ID = 1230235110415274004 # "HC" role
+BOT_COMMANDS_ALLOWED_CHANNEL_IDS = {1354431395140731165, 1330664430148780102, 1248710731407560835, 1367362849122549801} # Channels for /hcmembers
 HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165 # Channel for static list
 HC_LIST_EMBED_TITLE = "**\[HC1\] Guild Members**"
-ALLOWED_WITHER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692} # User IDs for /wither
-SELF_PROTECTED_ID = 1230848174218940416 # Protected from /wither
-BOT_ID: Optional[int] = None # Bot's own User ID (set in on_ready)
+ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692} # User IDs for /wither
+OWNER_USER_ID = 1230848174218940416 # Protected from /wither
+BOT_USER_ID: Optional[int] = 1365572437185400893 # Bot's own User ID (set in on_ready)
 MAX_WITHER_SECONDS = 600 # Max duration for /wither (10 minutes)
-INFO_LOG_CHANNEL_ID = 1317943895606165579 # Info log channel
-ERROR_LOG_CHANNEL_ID = 1362988767367135453 # Error log channel
+ORDINARY_LOGS_CHANNEL_ID = 1317943895606165579 # Info log channel
+EXTRAORDINARY_LOGS_CHANNEL_ID = 1362988767367135453 # Error log channel
 MEMBERS_PER_PAGE = 50 # Members per page in lists
 NERDY_YELLOW = discord.Color.gold() # Embed color
-ROLE_ID_MAYBE_EXHC = 1267882075390873681 # Role to add on HC leave, remove on HC verify
+EX_MEMBER_ROLE_ID = 1267882075390873681 # Role to add on HC leave, remove on HC verify
 VIEW_MODE_DISCORD = "discord_view"
 VIEW_MODE_ACTIVITY_ALL = "activity_all_view" # Renamed for clarity
 VIEW_MODE_ACTIVITY_DAILY = "activity_daily_view"
@@ -85,9 +85,9 @@ SORT_MODE_IGN = "sort_ign"
 SORT_MODE_ACTIVITY = "sort_activity"
 ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
 COMMAND_PREFIX = "." # Define the prefix
-AUTODELETE_CHANNEL_ID = 1354431395140731165
+HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165
 AUTODELETE_DELAY_SECONDS = 5.0
-TARGET_GUILD_ID = 1200476681803137024 # Catercord server ID
+CATERCORD_GUILD_ID = 1200476681803137024 # Catercord server ID
 active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view': StaticHCPagesView, 'message_id': int, 'task': tasks.Loop}
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
 SORT_MODE_DISCORD_NAME = "sort_discord_name"
@@ -100,8 +100,8 @@ discovered_keywords_count = 0
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try: supabase = create_client(SUPABASE_URL, SUPABASE_KEY); print("Supabase client created successfully.")
+if SUPABASE_URL and SUPABASE_ADMIN_KEY:
+    try: supabase = create_client(SUPABASE_URL, SUPABASE_ADMIN_KEY); print("Supabase client created successfully.")
     except Exception as e: print(f"CRITICAL: Failed Supabase client creation: {e}"); supabase = None
 else: print("CRITICAL: Supabase credentials missing."); supabase = None
 
@@ -497,7 +497,7 @@ class StaticHCPagesView(View):
         self.message_id: Optional[int] = message.id if message else None
         self.guild = guild
         self.is_target_guild = True
-        self.bot_owner_id = SELF_PROTECTED_ID
+        self.bot_owner_id = OWNER_USER_ID
 
         # --- State (Unchanged) ---
         self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY
@@ -1660,7 +1660,7 @@ async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], messag
 # --- REVISED log_info ---
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
     """Logs an info message. Sends to Discord channel only if in the target guild, otherwise prints to console."""
-    is_target = guild and guild.id == TARGET_GUILD_ID
+    is_target = guild and guild.id == CATERCORD_GUILD_ID
 
     log_prefix = f"[{guild.name if guild else 'No Guild'}] INFO:"
     if not is_target:
@@ -1681,7 +1681,7 @@ async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional
             embed = discord.Embed(description=message, color=NERDY_YELLOW)
             embed.timestamp = discord.utils.utcnow()
         # Use log_to_channel but target INFO channel and no ping
-        await log_to_channel(INFO_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=None)
+        await log_to_channel(ORDINARY_LOGS_CHANNEL_ID, guild, embed=embed, ping_mention=None)
     # else:
     #     print(f"[Skipping Discord log - Non-Target Guild or No Guild] INFO: {message}") # Optional extra console print
 
@@ -1692,7 +1692,7 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
     Sends to Discord error channel ONLY if in the target guild.
     Pings owner ONLY if in the target guild AND ping_owner is True.
     """
-    is_target = guild and guild.id == TARGET_GUILD_ID
+    is_target = guild and guild.id == CATERCORD_GUILD_ID
     log_prefix = f"[{guild.name if guild else 'No Guild'}] ERROR:"
     discord_ping_content: Optional[str] = None
 
@@ -1728,11 +1728,11 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
     if is_target and guild: # Check if target guild and guild object exists
         # Determine if owner ping is needed *for Discord*
         if ping_owner:
-            discord_ping_content = f"<@{SELF_PROTECTED_ID}>"
+            discord_ping_content = f"<@{OWNER_USER_ID}>"
             print(f"{log_prefix} (Owner Ping Queued for Discord)")
 
         # Call log_to_channel, targeting the ERROR channel
-        await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed, ping_mention=discord_ping_content)
+        await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=embed, ping_mention=discord_ping_content)
     else:
         # Optionally print a note that Discord logging was skipped
         print(f"[Skipping Discord log - Non-Target Guild or No Guild] ERROR: {message}")
@@ -1740,7 +1740,7 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
     """Logs an info message."""
     if not embed: embed = discord.Embed(description=message, color=NERDY_YELLOW); embed.timestamp = discord.utils.utcnow()
-    await log_to_channel(INFO_LOG_CHANNEL_ID, guild, embed=embed)
+    await log_to_channel(ORDINARY_LOGS_CHANNEL_ID, guild, embed=embed)
 
 async def log_error(guild: Optional[discord.Guild], message: str, error: Optional[Exception] = None, interaction: Optional[discord.Interaction] = None, embed: Optional[discord.Embed] = None):
     """Logs an error with context and traceback."""
@@ -1765,7 +1765,7 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
             embed.add_field(name="Error Details", value=details, inline=False)
             full_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
             print(f"---\nERROR LOGGED:\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---\n")
-    await log_to_channel(ERROR_LOG_CHANNEL_ID, guild, embed=embed)
+    await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=embed)
 
 # --- Embed Pagination View ---
 
@@ -2216,9 +2216,9 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
     Data is sorted by Discord name (if available), then IGN (case-insensitive).
     """
     print(f"Fetch HC Data ({guild.name}): Starting fetch...")
-    hc_role = guild.get_role(ADD_ROLE_ID_HC)
+    hc_role = guild.get_role(HC1_ROLE_ID)
     if not hc_role:
-        await log_error(guild, f"HC Role {ADD_ROLE_ID_HC} not found during fetch.", ping_owner=True) # Ping owner on critical role missing
+        await log_error(guild, f"HC Role {HC1_ROLE_ID} not found during fetch.", ping_owner=True) # Ping owner on critical role missing
         return [], 0
 
     # 1. Fetch ALL entries from Supabase hc_members table
@@ -2592,10 +2592,10 @@ async def update_static_list_message(guild: discord.Guild):
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
-    global BOT_ID, command_ids
+    global BOT_USER_ID, command_ids
     if bot.user:
-        BOT_ID = bot.user.id
-        print(f"Logged in as {bot.user} (ID: {BOT_ID})")
+        BOT_USER_ID = bot.user.id
+        print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
         print(f"Discord.py v{discord.__version__}")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
@@ -2606,7 +2606,7 @@ async def on_ready():
     synced_commands = []
     try:
         # Consider syncing only within the target guild if commands are guild-specific
-        # target = discord.Object(id=TARGET_GUILD_ID) # Optional: Specify target guild
+        # target = discord.Object(id=CATERCORD_GUILD_ID) # Optional: Specify target guild
         # synced_commands = await tree.sync(guild=target)
         synced_commands = await tree.sync() # Global sync (current implementation)
         print(f"Synced {len(synced_commands)} application commands.")
@@ -2626,7 +2626,7 @@ async def on_ready():
     # --- Signal Bot Ready & Load Initial Data ---
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     # Get a guild object for logging, preferably the target guild
-    log_guild = bot.get_guild(TARGET_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     if log_guild:
         try:
              await log_info(log_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
@@ -2653,10 +2653,10 @@ async def on_ready():
     async def delayed_update(delay_seconds: int):
         await asyncio.sleep(delay_seconds)
         print(f"--- Running delayed static list update after {delay_seconds}s ---")
-        guild = bot.get_guild(TARGET_GUILD_ID)
+        guild = bot.get_guild(CATERCORD_GUILD_ID)
         if not guild:
-            print(f"ERROR: Could not find target guild {TARGET_GUILD_ID} for delayed update.")
-            await log_error(None, f"Delayed update failed: Target guild {TARGET_GUILD_ID} not found.")
+            print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed update.")
+            await log_error(None, f"Delayed update failed: Target guild {CATERCORD_GUILD_ID} not found.")
             return
 
         if not supabase:
@@ -2672,7 +2672,7 @@ async def on_ready():
         print(f"--- Delayed static list update finished ---")
 
     # Schedule the task to run 60 seconds after on_ready finishes
-    if bot.is_ready() and any(g.id == TARGET_GUILD_ID for g in bot.guilds):
+    if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
         print("Scheduling delayed static list update for target guild...")
         bot.loop.create_task(delayed_update(delay_seconds=60))
     else:
@@ -2689,9 +2689,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     guild = after.guild # Define guild here
     # If HC role isn't configured or found, no need to proceed
-    hc_role = guild.get_role(ADD_ROLE_ID_HC) # Define hc_role here
+    hc_role = guild.get_role(HC1_ROLE_ID) # Define hc_role here
     if not hc_role:
-        print(f"on_member_update ({guild.name}): HC Role {ADD_ROLE_ID_HC} not found, cannot check role change.")
+        print(f"on_member_update ({guild.name}): HC Role {HC1_ROLE_ID} not found, cannot check role change.")
         return # Exit early if the role doesn't exist
 
     # Define had_hc_role and has_hc_role *after* defining hc_role
@@ -2829,13 +2829,13 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
-    role_to_remove = guild.get_role(REMOVE_ROLE_ID)
-    role_to_add = guild.get_role(ADD_ROLE_ID_VERIFY)
+    role_to_remove = guild.get_role(NEWBEE_ROLE_ID)
+    role_to_add = guild.get_role(FLORRIST_ROLE_ID)
 
     # Role existence checks
     missing_roles = []
-    if REMOVE_ROLE_ID and not role_to_remove: missing_roles.append(f"Unverified Role (ID: {REMOVE_ROLE_ID})")
-    if ADD_ROLE_ID_VERIFY and not role_to_add: missing_roles.append(f"Verified Role (ID: {ADD_ROLE_ID_VERIFY})")
+    if NEWBEE_ROLE_ID and not role_to_remove: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
+    if FLORRIST_ROLE_ID and not role_to_add: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
     if missing_roles:
         msg = f"❌ Setup Error: Roles not found: {', '.join(missing_roles)}. Please configure the bot."
         await interaction.response.send_message(msg, ephemeral=False)
@@ -2843,7 +2843,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         return
     # We definitely need the role to add
     if not role_to_add:
-         msg = f"❌ Setup Error: Verified Role (ID: {ADD_ROLE_ID_VERIFY}) not configured correctly."
+         msg = f"❌ Setup Error: Verified Role (ID: {FLORRIST_ROLE_ID}) not configured correctly."
          await interaction.response.send_message(msg, ephemeral=False)
          await log_error(guild, msg, interaction=interaction)
          return
@@ -2943,13 +2943,13 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
-    role_to_add = guild.get_role(REMOVE_ROLE_ID) # Role to ADD is 'Unverified'
-    role_to_remove = guild.get_role(ADD_ROLE_ID_VERIFY) # Role to REMOVE is 'Verified'
+    role_to_add = guild.get_role(NEWBEE_ROLE_ID) # Role to ADD is 'Unverified'
+    role_to_remove = guild.get_role(FLORRIST_ROLE_ID) # Role to REMOVE is 'Verified'
 
     # Role existence checks
     missing_roles = []
-    if REMOVE_ROLE_ID and not role_to_add: missing_roles.append(f"Unverified Role (ID: {REMOVE_ROLE_ID})")
-    if ADD_ROLE_ID_VERIFY and not role_to_remove: missing_roles.append(f"Verified Role (ID: {ADD_ROLE_ID_VERIFY})")
+    if NEWBEE_ROLE_ID and not role_to_add: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
+    if FLORRIST_ROLE_ID and not role_to_remove: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
     if missing_roles:
         msg = f"❌ Setup Error: Roles not found: {', '.join(missing_roles)}. Please configure the bot."
         await interaction.response.send_message(msg, ephemeral=False)
@@ -2957,7 +2957,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
         return
     # We definitely need the 'Unverified' role to add it
     if not role_to_add:
-         msg = f"❌ Setup Error: Unverified Role (ID: {REMOVE_ROLE_ID}) not configured correctly."
+         msg = f"❌ Setup Error: Unverified Role (ID: {NEWBEE_ROLE_ID}) not configured correctly."
          await interaction.response.send_message(msg, ephemeral=False)
          await log_error(guild, msg, interaction=interaction)
          return
@@ -3044,7 +3044,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
 
-# --- REFINED HC Verify Command (Handles existing IGN-only entries, ROLE_ID_MAYBE_EXHC removal) ---
+# --- REFINED HC Verify Command (Handles existing IGN-only entries, EX_MEMBER_ROLE_ID removal) ---
 @tree.command(name="hcverify", description="Verify user into HC, store/link IGN, set nickname.") # Slightly updated description
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will link/update DB & set nickname).") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
@@ -3068,22 +3068,22 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     # --- Role Setup & Checks ---
-    role_unverified = guild.get_role(REMOVE_ROLE_ID)
-    role_verified = guild.get_role(ADD_ROLE_ID_VERIFY)
-    role_hc = guild.get_role(ADD_ROLE_ID_HC)
-    role_maybe_exhc = guild.get_role(ROLE_ID_MAYBE_EXHC)
+    role_unverified = guild.get_role(NEWBEE_ROLE_ID)
+    role_verified = guild.get_role(FLORRIST_ROLE_ID)
+    role_hc = guild.get_role(HC1_ROLE_ID)
+    role_maybe_exhc = guild.get_role(EX_MEMBER_ROLE_ID)
     bot_member = guild.me
 
     missing_roles = []
     critical_roles_found = True
-    if ADD_ROLE_ID_VERIFY and not role_verified:
-        missing_roles.append(f"Verified (ID: {ADD_ROLE_ID_VERIFY})")
+    if FLORRIST_ROLE_ID and not role_verified:
+        missing_roles.append(f"Verified (ID: {FLORRIST_ROLE_ID})")
         critical_roles_found = False
-    if ADD_ROLE_ID_HC and not role_hc:
-        missing_roles.append(f"HC (ID: {ADD_ROLE_ID_HC})")
+    if HC1_ROLE_ID and not role_hc:
+        missing_roles.append(f"HC (ID: {HC1_ROLE_ID})")
         critical_roles_found = False
-    if REMOVE_ROLE_ID and not role_unverified: print(f"HCVerify Warning ({guild.name}): Unverified Role (ID: {REMOVE_ROLE_ID}) not found.")
-    if ROLE_ID_MAYBE_EXHC and not role_maybe_exhc: print(f"HCVerify Warning ({guild.name}): Maybe-ExHC Role (ID: {ROLE_ID_MAYBE_EXHC}) not found.")
+    if NEWBEE_ROLE_ID and not role_unverified: print(f"HCVerify Warning ({guild.name}): Unverified Role (ID: {NEWBEE_ROLE_ID}) not found.")
+    if EX_MEMBER_ROLE_ID and not role_maybe_exhc: print(f"HCVerify Warning ({guild.name}): Maybe-ExHC Role (ID: {EX_MEMBER_ROLE_ID}) not found.")
 
     if not critical_roles_found:
         msg = f"❌ Setup Error: Missing critical roles: {', '.join(missing_roles)}. Configure the bot."
@@ -3298,8 +3298,8 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     # --- Role Setup ---
-    role_hc = guild.get_role(ADD_ROLE_ID_HC)
-    role_maybe_exhc = guild.get_role(ROLE_ID_MAYBE_EXHC)
+    role_hc = guild.get_role(HC1_ROLE_ID)
+    role_maybe_exhc = guild.get_role(EX_MEMBER_ROLE_ID)
     bot_member = guild.me
 
     # --- Role Existence Checks ---
@@ -3307,22 +3307,22 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
     missing_roles_log = []
     if not role_hc:
         critical_roles_found = False
-        missing_roles_log.append(f"HC Role ({ADD_ROLE_ID_HC})")
-        print(f"hcleave Warning ({guild.name}): HC Role {ADD_ROLE_ID_HC} not found.")
+        missing_roles_log.append(f"HC Role ({HC1_ROLE_ID})")
+        print(f"hcleave Warning ({guild.name}): HC Role {HC1_ROLE_ID} not found.")
     if not role_maybe_exhc:
         # Not strictly critical for DB delete, but needed for role add
         # Consider if this should prevent the command entirely or just the role part
         # For now, let it proceed but log warning
-        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role {ROLE_ID_MAYBE_EXHC} not found.")
+        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role {EX_MEMBER_ROLE_ID} not found.")
         # If Maybe-ExHC MUST be added, uncomment below:
         # critical_roles_found = False
-        # missing_roles_log.append(f"Maybe-ExHC Role ({ROLE_ID_MAYBE_EXHC})")
+        # missing_roles_log.append(f"Maybe-ExHC Role ({EX_MEMBER_ROLE_ID})")
 
     # Stop if critical HC role is missing
     if not role_hc:
-        msg = f"❌ Setup Error: HC Role (ID: {ADD_ROLE_ID_HC}) not found. Cannot perform role actions."
+        msg = f"❌ Setup Error: HC Role (ID: {HC1_ROLE_ID}) not found. Cannot perform role actions."
         await interaction.followup.send(msg, ephemeral=False)
-        await log_error(guild, f"hcleave failed: Missing critical HC role {ADD_ROLE_ID_HC}", interaction=interaction)
+        await log_error(guild, f"hcleave failed: Missing critical HC role {HC1_ROLE_ID}", interaction=interaction)
         return
 
     # --- Prepare for actions ---
@@ -3765,7 +3765,7 @@ async def hcmembers(interaction: discord.Interaction):
     else:
         current_guild_id = guild.id
 
-    is_target_guild = current_guild_id == TARGET_GUILD_ID
+    is_target_guild = current_guild_id == CATERCORD_GUILD_ID
 
     # --- Defer Publicly ---
     # Defer early before potentially long data fetch
@@ -3778,8 +3778,8 @@ async def hcmembers(interaction: discord.Interaction):
         await log_info(guild, f"/hcmembers used by `{interaction.user}` in non-target guild {guild.name} ({guild.id}). Showing DB data only.")
     elif guild and is_target_guild: # If in Catercord guild
          # Check allowed channels ONLY if in Catercord
-         if interaction.channel_id not in ALLOWED_CHANNEL_IDS and interaction.user.id != SELF_PROTECTED_ID:
-             allowed_mentions = [f"<#{ch_id}>" for ch_id in ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
+         if interaction.channel_id not in BOT_COMMANDS_ALLOWED_CHANNEL_IDS and interaction.user.id != OWNER_USER_ID:
+             allowed_mentions = [f"<#{ch_id}>" for ch_id in BOT_COMMANDS_ALLOWED_CHANNEL_IDS if guild.get_channel(ch_id)]
              msg = f"❌ In this server, the command only works in: {', '.join(allowed_mentions) or 'configured channels'}"
              await log_info(guild, f"User `{interaction.user}` attempted /hcmembers in disallowed channel {interaction.channel.mention if interaction.channel else interaction.channel_id} within target guild.")
              # Edit the deferred response
@@ -3788,7 +3788,7 @@ async def hcmembers(interaction: discord.Interaction):
          else:
              # Log successful use in allowed channel/by owner
              log_detail = ""
-             if interaction.user.id == SELF_PROTECTED_ID and interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+             if interaction.user.id == OWNER_USER_ID and interaction.channel_id not in BOT_COMMANDS_ALLOWED_CHANNEL_IDS:
                  log_detail = " (Protected user bypass)"
              await log_info(guild, f"/hcmembers used by `{interaction.user}` in {interaction.channel.mention if interaction.channel else 'N/A'}{log_detail} (Target Guild).")
     # Else (outside a guild entirely): No channel check needed, proceed with DB data
@@ -3898,7 +3898,7 @@ async def refresh(interaction: discord.Interaction):
         # Helper handles ephemeral response/logging
         return
     # Ensure target guild for list refresh
-    if guild.id != TARGET_GUILD_ID:
+    if guild.id != CATERCORD_GUILD_ID:
         await interaction.response.send_message("List refresh commands can only be used in the target server.", ephemeral=True)
         return
     # Ensure list channel exists (relevant for list update part)
@@ -4030,9 +4030,9 @@ async def syncnicknames(interaction: discord.Interaction):
         await log_error(guild, "/syncnicknames failed: Supabase unavailable.", interaction=interaction)
         return
 
-    hc_role = guild.get_role(ADD_ROLE_ID_HC)
+    hc_role = guild.get_role(HC1_ROLE_ID)
     if not hc_role:
-        await interaction.edit_original_response(content=f"❌ Configuration Error: HC Role (ID: {ADD_ROLE_ID_HC}) not found.")
+        await interaction.edit_original_response(content=f"❌ Configuration Error: HC Role (ID: {HC1_ROLE_ID}) not found.")
         await log_error(guild, f"/syncnicknames failed: HC role not found.", interaction=interaction)
         return
 
@@ -4240,7 +4240,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
 
     # 1. Permission Check (Invoker)
-    if invoker.id not in ALLOWED_WITHER_IDS:
+    if invoker.id not in ALLOWED_WITHERER_IDS:
         # Defer ephemerally *before* sending fail message if not already done
         if not interaction.response.is_done():
             try: await interaction.response.defer(ephemeral=False)
@@ -4262,8 +4262,8 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     # 3. Target Checks (Self, Protected, Bot, Hierarchy)
     if user.id == invoker.id: await fail_check("Target self.", "🤨 You cannot wither yourself."); return
     # Check protected ID, allow if invoker IS the protected ID
-    if user.id == SELF_PROTECTED_ID and invoker.id != SELF_PROTECTED_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{SELF_PROTECTED_ID}>)."); return
-    if user.id == BOT_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
+    if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>)."); return
+    if user.id == BOT_USER_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
     if user.bot: await fail_check("Target other bot.", "🤖 You cannot wither other bots."); return
     # Check guild owner, allow if invoker IS the owner
     if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target guild owner.", f"👑 You cannot wither the server owner (<@{guild.owner_id}>)."); return
@@ -4451,7 +4451,7 @@ async def on_message(message: discord.Message):
         return
 
     # --- Auto-Delete Logic for Bot's Own Messages ---
-    if message.author.id == bot.user.id and message.channel.id == AUTODELETE_CHANNEL_ID:
+    if message.author.id == bot.user.id and message.channel.id == HC_MEMBER_LIST_CHANNEL_ID:
         if message.interaction is not None:
             try:
                 await message.delete(delay=AUTODELETE_DELAY_SECONDS)
@@ -4597,8 +4597,8 @@ async def on_message(message: discord.Message):
 
     message_content_lower = message.content.lower()
     now = discord.utils.utcnow()
-    is_owner: bool = message.author.id == SELF_PROTECTED_ID
-    is_target_guild_context: bool = message.guild.id == TARGET_GUILD_ID
+    is_owner: bool = message.author.id == OWNER_USER_ID
+    is_target_guild_context: bool = message.guild.id == CATERCORD_GUILD_ID
 
     # Iterate through cached rules
     for rule_id_str, rule in keyword_data_cache.items():
@@ -4712,7 +4712,7 @@ async def on_message(message: discord.Message):
             break
     # --- End of on_message logic ---
    
-@tree.command(name="nerdhelp", description="Show the list of available bot commands.")
+@tree.command(name="nerdhelp", description="Show the list of available bot commands.", allowed_contexts=discord.InteractionContextType.all, allowed_installs=discord.AppInstallationType.all)
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
@@ -4780,14 +4780,14 @@ async def nerdhelp(interaction: discord.Interaction):
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
     # Essential checks before starting
-    if not TOKEN:
-        print("CRITICAL: DISCORD_BOT_TOKEN environment variable not found. Bot cannot start.")
+    if not MAIN_TOKEN:
+        print("CRITICAL: DISCORD_BOT_MAIN_TOKEN environment variable not found. Bot cannot start.")
     elif not supabase:
         print("CRITICAL: Supabase client initialization failed. Check URL/Key and connection. Bot may have limited functionality.")
         # Decide if you want the bot to run without Supabase or exit
         # exit(1) # Example: exit if Supabase fails
     else:
-        print("Discord Token and Supabase Client OK.")
+        print("Discord MAIN_TOKEN and Supabase Client OK.")
         print("Starting Keep Alive Flask server...")
         keep_alive() # Starts Flask in a separate thread
 
@@ -4795,10 +4795,10 @@ if __name__ == "__main__":
             print("Attempting to start Discord Bot...")
             # --- IMPORTANT: REMOVED log_handler=None ---
             # This allows default discord.py logging to show connection/sync status
-            bot.run(TOKEN)
+            bot.run(MAIN_TOKEN)
         except discord.LoginFailure:
-            # Token is invalid
-            print("CRITICAL: Discord Login Failed. The provided DISCORD_BOT_TOKEN is invalid or expired.")
+            # MAIN_TOKEN is invalid
+            print("CRITICAL: Discord Login Failed. The provided DISCORD_BOT_MAIN_TOKEN is invalid or expired.")
         except discord.PrivilegedIntentsRequired:
             # Member intent is likely missing in Discord Dev Portal settings
             print("CRITICAL: Privileged Intents (Server Members Intent) required but not enabled in the Discord Developer Portal.")
