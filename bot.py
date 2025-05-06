@@ -2694,6 +2694,9 @@ async def on_ready():
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
         return
+    
+    activity = discord.Activity(type=discord.ActivityType.watching, name="out for Pings to Reply using AI")
+    await bot.change_presence(status=discord.Status.online, activity=activity)
 
     # --- Command Syncing ---
     # ... (keep existing sync logic) ...
