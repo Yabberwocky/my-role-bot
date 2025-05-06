@@ -4069,57 +4069,127 @@ async def refresh(interaction: discord.Interaction):
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass # Ignore if editing final response fails
 
-@tree.command(name="discoveries", description="Show progress on finding secret phrases.")
+@tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!") # Updated description
 async def discoveries(interaction: discord.Interaction):
-    guild = interaction.guild # Can be None if used in DMs
-    if not keyword_data_cache:
-        await interaction.response.send_message("Keyword data hasn't been loaded yet. Please wait a moment or contact an admin if this persists.", ephemeral=True)
+    # Guild object is useful for logging context if needed, but not strictly for this command's display logic now.
+    # guild = interaction.guild
+
+    if not keyword_data_cache: # Check if keywords are loaded
+        await interaction.response.send_message(
+            "🔍 The keyword scrolls are currently being transcribed... Please check back in a moment!",
+            ephemeral=True
+        )
+        # Optionally log this state if it's unexpected
+        # await log_info(guild, "/discoveries: Keyword data cache is empty.")
         return
 
-    # Prepare data for the embed
-    discovered_list = []
-    undiscovered_count = 0
+    # Attempt to get the target server's name for more dynamic messaging
+    catercord_server_name = "the main server (Catercord)" # Fallback name
+    if bot and CATERCORD_GUILD_ID: # Ensure bot is ready and ID is defined
+        target_guild = bot.get_guild(CATERCORD_GUILD_ID)
+        if target_guild:
+            catercord_server_name = f"**{target_guild.name}**"
+
     now = discord.utils.utcnow()
+    discovered_list_formatted = []
+    undiscovered_count = 0
 
     # Sort cached items by phrase identifier for consistent display
-    sorted_rules = sorted(keyword_data_cache.values(), key=lambda r: r['phrase_identifier'])
+    # Only iterate through rules that have all necessary fields for display
+    valid_rules = [rule for rule_id, rule in keyword_data_cache.items() if all(k in rule for k in ['phrase_identifier', 'discovered_by', 'discovered_at'])]
+    sorted_rules = sorted(valid_rules, key=lambda r: r['phrase_identifier'])
+
 
     for rule in sorted_rules:
-        if rule['discovered_by']:
-            user_id = rule['discovered_by']
-            timestamp_dt = rule['discovered_at']
-            timestamp_unix = int(timestamp_dt.timestamp()) if timestamp_dt else None
-            timestamp_str = f" on <t:{timestamp_unix}:D>" if timestamp_unix else ""
-            try:
-                 mention = f"<@{int(user_id)}>"
-            except ValueError:
-                 mention = f"(ID: {user_id})" # Fallback
-            discovered_list.append(f"• `{rule['phrase_identifier']}` - Found by {mention}{timestamp_str}")
+        if rule.get('discovered_by'): # Check if 'discovered_by' key exists and is not None
+            user_id_str = rule['discovered_by']
+            timestamp_dt = rule.get('discovered_at') # Use .get() for safety
+
+            user_mention = f"<@{user_id_str}>" # Assume user_id_str is valid for mention
+            time_display = ""
+            if timestamp_dt and isinstance(timestamp_dt, datetime.datetime):
+                timestamp_unix = int(timestamp_dt.timestamp())
+                time_display = f" (<t:{timestamp_unix}:R>)" # Relative time
+
+            discovered_list_formatted.append(
+                f"🔹 `{rule['phrase_identifier']}` - Unveiled by {user_mention}{time_display}"
+            )
         else:
             undiscovered_count += 1
 
-    # Build Embed
+    # --- Main Embed ---
+    embed_title = "🔮 AI Keyword Mysteries & Discoveries 🔮"
+    intro_description = (
+        f"Greetings, seeker! I can react to secret **keyword phrases** hidden throughout Discord.\n"
+        f"Successfully uttering one will summon a unique AI-generated message, just for you!\n\n"
+        f"🕵️‍♂️ **The Hunt for New Phrases:**\n"
+        f"New keywords can **only be discovered** within {catercord_server_name}.\n"
+        f"If you're the first to find one there, I'll congratulate you specially!\n\n"
+        f"📊 **Current Progress:**"
+    )
+
     embed = discord.Embed(
-        title="🕵️ Secret Phrase Discoveries 🕵️‍♀️",
-        description=f"**Progress:** {discovered_keywords_count} out of {total_keywords} phrases found!",
-        color=NERDY_YELLOW
+        title=embed_title,
+        description=intro_description,
+        color=NERDY_YELLOW # Or a more mystical color like discord.Color.purple()
     )
     embed.timestamp = now
+    if bot.user and bot.user.display_avatar:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
 
-    if discovered_list:
-        discovered_text = "\n".join(discovered_list)
-        if len(discovered_text) > 1024:
-            discovered_text = discovered_text[:1020] + "\n..."
-        embed.add_field(name="✅ Discovered Phrases", value=discovered_text, inline=False)
+    # --- Progress Field ---
+    progress_bar_text = "All phrases found! Amazing!"
+    if total_keywords > 0 and discovered_keywords_count < total_keywords:
+        # Simple text-based progress bar (optional)
+        # filled_slots = int((discovered_keywords_count / total_keywords) * 10) # 10 slots for bar
+        # empty_slots = 10 - filled_slots
+        # bar = '🟩' * filled_slots + '⬜' * empty_slots
+        # progress_bar_text = f"{bar} ({discovered_keywords_count}/{total_keywords})"
+        progress_bar_text = f"{discovered_keywords_count} out of {total_keywords} phrases revealed!"
+    elif total_keywords == 0:
+        progress_bar_text = "No keyword phrases are currently configured."
+
+
+    embed.add_field(
+        name=f"Global Discovery Status: {discovered_keywords_count} / {total_keywords}",
+        value=f"*{progress_bar_text}*",
+        inline=False
+    )
+    embed.add_field(name="\u200B", value="---", inline=False) # Separator
+
+    # --- Discovered Phrases Field ---
+    if discovered_list_formatted:
+        discovered_text_joined = "\n".join(discovered_list_formatted)
+        # Truncate if necessary (Discord field value limit is 1024)
+        if len(discovered_text_joined) > 1000:
+            discovered_text_joined = discovered_text_joined[:995] + "\n... (and more)"
+        embed.add_field(name="📜 Scroll of Known Phrases 📜", value=discovered_text_joined, inline=False)
     else:
-         embed.add_field(name="✅ Discovered Phrases", value="None found yet!", inline=False)
+        embed.add_field(name="📜 Scroll of Known Phrases 📜", value="The scroll is currently blank... Be the first to add an entry in Catercord!", inline=False)
 
-    if undiscovered_count > 0:
-        embed.add_field(name="❓ Undiscovered Phrases", value=f"{undiscovered_count} phrases remaining...", inline=False)
-    else:
-        embed.add_field(name="❓ Undiscovered Phrases", value="All phrases have been found! 🎉", inline=False)
+    # --- Undiscovered Phrases Field ---
+    undiscovered_message = ""
+    if total_keywords == 0:
+        undiscovered_message = "No mysteries await at this time."
+    elif undiscovered_count > 0:
+        undiscovered_message = f"There are still **{undiscovered_count}** secret phrases hiding in the shadows, waiting to be found in {catercord_server_name}!"
+    else: # All discovered
+        undiscovered_message = "🌌 **All mysteries have been solved!** You are true Keyword Masters! 🌌"
+    embed.add_field(name="❓ The Uncharted Mysteries ❓", value=undiscovered_message, inline=False)
 
-    embed.set_footer(text="Keep chatting to find more!")
+    embed.add_field(name="\u200B", value="---", inline=False) # Separator
+
+    # --- How to Play / Tips ---
+    tips_text = (
+        f"▪️ **Discovery Zone:** New phrases are found exclusively in {catercord_server_name}.\n"
+        f"▪️ **AI Surprises:** Triggering any known phrase (anywhere else it's enabled) gets you an AI response!\n"
+        f"▪️ **Chat Naturally:** Keywords often relate to common topics or server happenings.\n"
+        f"▪️ **Be Alert:** My responses are unique each time – enjoy the surprise!\n"
+    )
+    embed.add_field(name="💡 How to Join the Hunt & Get AI Surprises 💡", value=tips_text, inline=False)
+
+
+    embed.set_footer(text=f"Explore, discover, and enjoy the AI magic! | Bot by {bot.user.name if bot.user else 'TheNerd'}")
 
     await interaction.response.send_message(embed=embed, ephemeral=False) # Send publicly
 
@@ -4815,83 +4885,6 @@ async def on_message(message: discord.Message):
 
         # If no prefix commands matched (or none exist anymore), processing just continues.
         pass # Pass if no command matched
-
-# --- AI Chat Command (Enhanced with History & Personality) ---
-@tree.command(name="chat", description="Send a prompt to the AI model (includes recent chat history).")
-@app_commands.describe(prompt="The text prompt to send to the AI.")
-async def chat_command(interaction: discord.Interaction, *, prompt: str):
-    # Get guild from interaction (can be None if in DMs, log functions handle this)
-    guild = interaction.guild # <<< DEFINE guild HERE
-
-    # Log the command usage (optional, good practice)
-    await log_info(guild, f"`{interaction.user}` used /chat. Prompt: '{prompt[:50]}{'...' if len(prompt)>50 else ''}'") # Example log
-
-    if not ai_model: # Check if AI is enabled
-        await interaction.response.send_message("My AI circuits are currently offline. 🤖 Please try again later!", ephemeral=False)
-        await log_info(guild, "/chat command failed: AI model is not available.")
-        return
-
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    message_history: List[discord.Message] = []
-    try:
-        # Fetch history (limit to avoid huge context)
-        # Ensure channel is accessible
-        if interaction.channel and hasattr(interaction.channel, 'history'):
-            async for msg in interaction.channel.history(limit=10, before=interaction.created_at):
-                message_history.append(msg)
-            message_history.reverse() # Oldest first
-        else:
-             await log_info(guild, f"/chat: Cannot fetch history (channel type: {type(interaction.channel)})")
-    except discord.Forbidden:
-        await log_info(guild, "/chat: Cannot fetch history (Forbidden). Proceeding without.")
-    except Exception as e:
-        await log_error(guild, "Error fetching history for /chat", error=e, interaction=interaction)
-        # Decide if you want to proceed without history or stop
-
-    # --- Use the Nerdy System Instruction ---
-    chat_specific_instruction = (
-        "The user initiated this conversation using the `/chat` command. "
-        "Below is the recent chat history (oldest first), followed by the user's latest prompt. "
-        "Respond naturally, using the history for context. Prioritize the most recent messages."
-    )
-    # Use the constant defined earlier
-    effective_system_instruction = f"{HUMAN_SYSTEM_INSTRUCTION}\n\n{chat_specific_instruction}"
-    # --- End Instruction Update ---
-
-    try:
-        # Call the reusable AI function with the new instruction
-        ai_reply = await get_ai_response(
-            prompt=prompt,
-            history=message_history,
-            system_instruction=effective_system_instruction # Pass the combined instruction
-        )
-
-        if ai_reply is None:
-            await interaction.followup.send("Blast! 💥 My circuits encountered an error, or maybe the AI mainframe is offline? 🤔")
-            # Error is logged within get_ai_response or the exception block below
-            return
-
-        if not ai_reply:
-            ai_reply = "Hmm, my processors returned null data. 🤔 Perhaps the query was too paradoxical, or maybe cosmic rays interfered? 🤷‍♂️"
-            # *** CORRECTED LOG CALL ***
-            await log_info(interaction.guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response (with history).")
-
-        if len(ai_reply) > 1900:
-            ai_reply = ai_reply[:1900] + "\n... (Data stream truncated! ✂️ Exceeded buffer limits!)"
-
-        # Send reply without repeating prompt (AI response should flow)
-        # Personality should be IN the reply itself now.
-        await interaction.followup.send(f"{ai_reply}") # Just send the AI reply
-
-    except Exception as e:
-        print(f"Chat command: An error occurred after AI call for user {interaction.user.id}: {e}")
-        # *** CORRECTED LOG CALL ***
-        await log_error(interaction.guild, f"Error processing /chat command (after AI generation)", error=e, interaction=interaction)
-        try:
-            await interaction.followup.send("⚠️ Whoops! A critical error occurred in my positronic brain! 🧠💥 Please notify my creator!")
-        except (discord.NotFound, discord.HTTPException):
-            print("Chat command: Could not send final error followup (interaction likely gone).")
 
 # NEW Command: Add Keyword (Owner Only)
 @tree.command(name="addkeyword", description="[Owner Only] Add a new keyword rule to the database.")
