@@ -4076,129 +4076,90 @@ async def refresh(interaction: discord.Interaction):
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass # Ignore if editing final response fails
 
-@tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!") # Updated description
+@tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!")
 async def discoveries(interaction: discord.Interaction):
-    # Guild object is useful for logging context if needed, but not strictly for this command's display logic now.
-    # guild = interaction.guild
-
-    if not keyword_data_cache: # Check if keywords are loaded
+    if not keyword_data_cache:
         await interaction.response.send_message(
-            "🔍 The keyword scrolls are currently being transcribed... Please check back in a moment!",
+            "🔍 Keyword data is still loading. Please try again shortly!",
             ephemeral=True
         )
-        # Optionally log this state if it's unexpected
-        # await log_info(guild, "/discoveries: Keyword data cache is empty.")
         return
 
-    # Attempt to get the target server's name for more dynamic messaging
-    catercord_server_name = "the main server (Catercord)" # Fallback name
-    if bot and CATERCORD_GUILD_ID: # Ensure bot is ready and ID is defined
+    # --- Catercord Name and Link Setup (Unchanged) ---
+    catercord_link = "https://discord.gg/5Qj4UYFW"
+    catercord_linked_name_in_sentence = f"[{'Catercord'}]({catercord_link})"
+    if bot and CATERCORD_GUILD_ID:
         target_guild = bot.get_guild(CATERCORD_GUILD_ID)
         if target_guild:
-            catercord_server_name = f"**{target_guild.name}**"
+            catercord_linked_name_in_sentence = f"[**{target_guild.name}**]({catercord_link})"
 
     now = discord.utils.utcnow()
     discovered_list_formatted = []
     undiscovered_count = 0
 
-    # Sort cached items by phrase identifier for consistent display
-    # Only iterate through rules that have all necessary fields for display
     valid_rules = [rule for rule_id, rule in keyword_data_cache.items() if all(k in rule for k in ['phrase_identifier', 'discovered_by', 'discovered_at'])]
     sorted_rules = sorted(valid_rules, key=lambda r: r['phrase_identifier'])
 
-
     for rule in sorted_rules:
-        if rule.get('discovered_by'): # Check if 'discovered_by' key exists and is not None
+        if rule.get('discovered_by'):
             user_id_str = rule['discovered_by']
-            timestamp_dt = rule.get('discovered_at') # Use .get() for safety
-
-            user_mention = f"<@{user_id_str}>" # Assume user_id_str is valid for mention
+            timestamp_dt = rule.get('discovered_at')
+            user_mention = f"<@{user_id_str}>"
             time_display = ""
             if timestamp_dt and isinstance(timestamp_dt, datetime.datetime):
                 timestamp_unix = int(timestamp_dt.timestamp())
-                time_display = f" (<t:{timestamp_unix}:R>)" # Relative time
-
+                time_display = f" (<t:{timestamp_unix}:R>)"
             discovered_list_formatted.append(
-                f"🔹 `{rule['phrase_identifier']}` - Unveiled by {user_mention}{time_display}"
+                f"🔹 `{rule['phrase_identifier']}` by {user_mention}{time_display}"
             )
         else:
             undiscovered_count += 1
 
-    # --- Main Embed ---
-    embed_title = "🔮 AI Keyword Mysteries & Discoveries 🔮"
-    intro_description = (
-        f"Greetings, seeker! I can react to secret **keyword phrases** hidden throughout Discord.\n"
-        f"Successfully uttering one will summon a unique AI-generated message, just for you!\n\n"
-        f"🕵️‍♂️ **The Hunt for New Phrases:**\n"
-        f"New keywords can **only be discovered** within {catercord_server_name}.\n"
-        f"If you're the first to find one there, I'll congratulate you specially!\n\n"
-        f"📊 **Current Progress:**"
-    )
+    # --- Condensed Embed ---
+    embed_title = "🔮 AI Keyword Mysteries 🔮"
+
+    # MODIFIED: Combined intro, discovery rule, and progress into description
+    description_lines = [
+        f"New keywords can **only be discovered** within {catercord_linked_name_in_sentence}.",
+        f"If you're first, I'll congratulate you!"
+    ]
+    if total_keywords > 0:
+        description_lines.append(f"\n**Progress:** {discovered_keywords_count} / {total_keywords} phrases revealed.")
+    else:
+        description_lines.append("\n*No keyword phrases are currently configured.*")
 
     embed = discord.Embed(
         title=embed_title,
-        description=intro_description,
-        color=NERDY_YELLOW # Or a more mystical color like discord.Color.purple()
+        description="\n".join(description_lines),
+        color=NERDY_YELLOW
     )
-    embed.timestamp = now
-    if bot.user and bot.user.display_avatar:
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    # embed.timestamp = now # Optional: Keep timestamp if desired, but removing for max brevity
+    # if bot.user and bot.user.display_avatar: # Optional: Remove thumbnail for brevity
+    #     embed.set_thumbnail(url=bot.user.display_avatar.url)
 
-    # --- Progress Field ---
-    progress_bar_text = "All phrases found! Amazing!"
-    if total_keywords > 0 and discovered_keywords_count < total_keywords:
-        # Simple text-based progress bar (optional)
-        # filled_slots = int((discovered_keywords_count / total_keywords) * 10) # 10 slots for bar
-        # empty_slots = 10 - filled_slots
-        # bar = '🟩' * filled_slots + '⬜' * empty_slots
-        # progress_bar_text = f"{bar} ({discovered_keywords_count}/{total_keywords})"
-        progress_bar_text = f"{discovered_keywords_count} out of {total_keywords} phrases revealed!"
-    elif total_keywords == 0:
-        progress_bar_text = "No keyword phrases are currently configured."
-
-
-    embed.add_field(
-        name=f"Global Discovery Status: {discovered_keywords_count} / {total_keywords}",
-        value=f"*{progress_bar_text}*",
-        inline=False
-    )
-    embed.add_field(name="\u200B", value="---", inline=False) # Separator
-
-    # --- Discovered Phrases Field ---
+    # --- Discovered Phrases Field (Only if there are any) ---
     if discovered_list_formatted:
         discovered_text_joined = "\n".join(discovered_list_formatted)
-        # Truncate if necessary (Discord field value limit is 1024)
-        if len(discovered_text_joined) > 1000:
-            discovered_text_joined = discovered_text_joined[:995] + "\n... (and more)"
-        embed.add_field(name="📜 Scroll of Known Phrases 📜", value=discovered_text_joined, inline=False)
-    else:
-        embed.add_field(name="📜 Scroll of Known Phrases 📜", value="The scroll is currently blank... Be the first to add an entry in Catercord!", inline=False)
-
-    # --- Undiscovered Phrases Field ---
-    undiscovered_message = ""
-    if total_keywords == 0:
-        undiscovered_message = "No mysteries await at this time."
-    elif undiscovered_count > 0:
-        undiscovered_message = f"There are still **{undiscovered_count}** secret phrases hiding in the shadows, waiting to be found in {catercord_server_name}!"
-    else: # All discovered
-        undiscovered_message = "🌌 **All mysteries have been solved!** You are true Keyword Masters! 🌌"
-    embed.add_field(name="❓ The Uncharted Mysteries ❓", value=undiscovered_message, inline=False)
-
-    embed.add_field(name="\u200B", value="---", inline=False) # Separator
-
-    # --- How to Play / Tips ---
-    tips_text = (
-        f"▪️ **Discovery Zone:** New phrases are found exclusively in {catercord_server_name}.\n"
-        f"▪️ **AI Surprises:** Triggering any known phrase (anywhere else it's enabled) gets you an AI response!\n"
-        f"▪️ **Chat Naturally:** Keywords often relate to common topics or server happenings.\n"
-        f"▪️ **Be Alert:** My responses are unique each time – enjoy the surprise!\n"
-    )
-    embed.add_field(name="💡 How to Join the Hunt & Get AI Surprises 💡", value=tips_text, inline=False)
+        if len(discovered_text_joined) > 1020: # Adjusted for potential heading
+            discovered_text_joined = discovered_text_joined[:1015] + "\n... (more)"
+        embed.add_field(name="📜 Known Phrases", value=discovered_text_joined, inline=False)
+    elif total_keywords > 0: # Only show "scroll is blank" if keywords are configured but none found
+        embed.add_field(name="📜 Known Phrases", value=f"The scroll is blank... Be the first to find one in {catercord_linked_name_in_sentence}!", inline=False)
 
 
-    embed.set_footer(text=f"Explore, discover, and enjoy the AI magic! | Bot by {bot.user.name if bot.user else 'TheNerd'}")
+    # --- Undiscovered Phrases Info (Combined into a field if needed) ---
+    if total_keywords > 0 and undiscovered_count > 0:
+        embed.add_field(
+            name=f"❓ {undiscovered_count} Secret Phrase{'s' if undiscovered_count != 1 else ''} Still Hidden",
+            value=f"*Find them in {catercord_linked_name_in_sentence}!*",
+            inline=False
+        )
+    elif total_keywords > 0 and undiscovered_count == 0:
+         embed.add_field(name="🎉 All Mysteries Solved! 🎉", value="*You are true Keyword Masters!*", inline=False)
 
-    await interaction.response.send_message(embed=embed, ephemeral=False) # Send publicly
+    embed.set_footer(text=f"Bot by {bot.user.name if bot.user else 'TheNerd'}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
