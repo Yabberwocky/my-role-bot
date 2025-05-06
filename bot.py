@@ -16,15 +16,18 @@ import math
 from typing import Optional, Tuple, List, Dict, Any # Keep this one, it's used more broadly
 from dotenv import load_dotenv
 import datetime
-import pytz # Add this import at the top
-from dateutil.parser import parse as date_parse # Add this import at the top
-from dateutil.relativedelta import relativedelta # Add this import at the top
+import pytz
+from dateutil.parser import parse as date_parse
+from dateutil.relativedelta import relativedelta
 from discord.ext import tasks
 import time # For timestamp comparison if needed, although discord.utils.utcnow() is better
 import re
 import uuid # For UUID handling
 import asyncio
 from collections import namedtuple
+import discord.utils
+import random
+from collections import defaultdict # Helpful for the interjection data
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -98,6 +101,26 @@ keyword_data_cache: Dict[str, Any] = {} # id (str) -> KeywordRule details
 keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
 total_keywords = 0
 discovered_keywords_count = 0
+NERDY_SYSTEM_INSTRUCTION = (
+    "You are a helpful chat assistant integrated into a Discord bot called Pingslave. "
+    "Act nerdy, but in a funny, enthusiastic, and slightly quirky way. "
+    "Feel free to sprinkle in the 🤓 emoji occasionally when appropriate, make lighthearted tech/sci-fi references, "
+    "or express nerdy excitement. Keep responses helpful and suitable for chat. "
+    "You are interacting with users in a Discord server related to the game Florr.io and a guild called [HC1]." # Added context
+)
+# Structure: {channel_id: {'count': int, 'target': int, 'last_interject_time': Optional[datetime.datetime]}}
+# Use defaultdict for easier initialization
+def default_channel_data():
+    return {
+        'count': 0,
+        'target': random.randint(15, 20), # Initial random target
+        'last_interject_time': None
+    }
+channel_interjection_data: Dict[int, Dict[str, Any]] = defaultdict(default_channel_data)
+
+RANDOM_INTERJECT_MIN_MSGS = 15 # Min messages before potential interjection
+RANDOM_INTERJECT_MAX_MSGS = 25 # Max messages (increased range slightly)
+RANDOM_INTERJECT_COOLDOWN = datetime.timedelta(minutes=5.0) # Cooldown duration
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -149,6 +172,65 @@ if GEMINI_API_KEY:
 else:
     print("INFO: GEMINI_API_KEY not found in environment variables. AI features disabled.")
     ai_model = None
+
+async def get_ai_response(
+    prompt: str,
+    history: Optional[List[discord.Message]] = None,
+    system_instruction: Optional[str] = None
+) -> Optional[str]:
+    # ... (keep the initial check for ai_model) ...
+
+    formatted_history = []
+
+    # --- MODIFIED SYSTEM INSTRUCTION HANDLING ---
+    # Place system instruction strategically if provided
+    has_system_instruction = bool(system_instruction)
+    # --- END MODIFICATION ---
+
+    # Format the message history
+    if history:
+        for i, msg in enumerate(history): # Assuming history is oldest to newest
+            sender_name = msg.author.display_name
+            relative_time = discord.utils.format_dt(msg.created_at, style='R')
+            content = msg.content[:200] + ('...' if len(msg.content) > 200 else '')
+            message_context = f"[{sender_name} | {relative_time}]: {content}"
+            role = 'model' if msg.author.id == bot.user.id else 'user'
+
+            # --- MODIFICATION: Inject system instruction before the first user message ---
+            if has_system_instruction and role == 'user' and not any(item['role'] == 'system' for item in formatted_history):
+                # Prepend the system instruction as a separate 'user' turn before the first actual user message
+                # This is a common pattern, though Gemini's official docs might vary.
+                formatted_history.append({'role': 'user', 'parts': [{'text': system_instruction}]})
+                # Add a placeholder 'model' response to maintain alternation IF NEEDED
+                # formatted_history.append({'role': 'model', 'parts': [{'text': "Okay, I'll keep that in mind."}]}) # Optional placeholder
+                has_system_instruction = False # Prevent adding it again
+
+            # --- END MODIFICATION ---
+
+            formatted_history.append({'role': role, 'parts': [{'text': message_context}]})
+
+    # Add the final user prompt
+    # --- MODIFICATION: Handle system instruction if history was empty ---
+    if has_system_instruction: # If system instruction was provided but history was empty
+         formatted_history.append({'role': 'user', 'parts': [{'text': system_instruction}]})
+         # formatted_history.append({'role': 'model', 'parts': [{'text': "Understood!"}]}) # Optional placeholder
+    # --- END MODIFICATION ---
+    formatted_history.append({'role': 'user', 'parts': [{'text': prompt}]})
+
+    # ... (keep the rest of the function: try/except block for generate_content_async) ...
+    try:
+        # print(f"DEBUG: Sending to Gemini: {formatted_history}") # Uncomment for debugging history format
+        response = await ai_model.generate_content_async(
+            contents=formatted_history,
+        )
+        ai_reply = response.text
+        # print(f"DEBUG: Received from Gemini: {ai_reply}") # Uncomment for debugging response
+        return ai_reply
+
+    except Exception as e:
+        print(f"AI Error: Exception during AI generation: {e}")
+        await log_error(None, "Error during AI generation in get_ai_response", error=e) # Guild context is tricky here
+        return None # Indicate error
 
 async def load_keyword_data(guild_for_log: Optional[discord.Guild]):
     """Loads enabled keyword rules from Supabase into the in-memory cache."""
@@ -1759,36 +1841,6 @@ async def log_error(guild: Optional[discord.Guild], message: str, error: Optiona
     else:
         # Optionally print a note that Discord logging was skipped
         print(f"[Skipping Discord log - Non-Target Guild or No Guild] ERROR: {message}")
-
-async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
-    """Logs an info message."""
-    if not embed: embed = discord.Embed(description=message, color=NERDY_YELLOW); embed.timestamp = discord.utils.utcnow()
-    await log_to_channel(ORDINARY_LOGS_CHANNEL_ID, guild, embed=embed)
-
-async def log_error(guild: Optional[discord.Guild], message: str, error: Optional[Exception] = None, interaction: Optional[discord.Interaction] = None, embed: Optional[discord.Embed] = None):
-    """Logs an error with context and traceback."""
-    if not embed:
-        embed = discord.Embed(title="⚠️ Bot Error / Warning", description=message, color=discord.Color.red()); embed.timestamp = discord.utils.utcnow()
-        if interaction:
-            cmd_name = interaction.command.name if interaction.command else 'N/A'
-            cmd = f"`/{cmd_name}`"
-            chan_mention = interaction.channel.mention if isinstance(interaction.channel, discord.TextChannel) else ""
-            chan_info = f" in {chan_mention}" if chan_mention else f" Ch:{interaction.channel_id}" if interaction.channel else ""
-            user = f"{interaction.user.mention} (`{interaction.user.id}`)"
-            embed.add_field(name="Context", value=f"Cmd: {cmd}{chan_info}\nUser: {user}", inline=False)
-        if error:
-            etype, emsg = type(error).__name__, str(error)
-            tb = "".join(traceback.format_exception(type(error), error, error.__traceback__, limit=6))
-            # Truncate traceback more aggressively
-            tb_short = (tb[:900] + "\n... (Truncated)") if len(tb) > 900 else tb # ADJUSTED TRUNCATION
-            details = f"**Type:** `{etype}`\n" + (f"**Msg:** `{emsg}`\n" if emsg else "") + f"**Traceback:**\n```py\n{tb_short}\n```"
-            # Keep the final check, but reduce its limit slightly too for safety
-            if len(details) > 1024:
-                 details = details[:1000] + "...```" # ADJUSTED TRUNCATION
-            embed.add_field(name="Error Details", value=details, inline=False)
-            full_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-            print(f"---\nERROR LOGGED:\nGuild: {guild.id if guild else 'N/A'}\nCtx: {message}\nErr: {etype}: {emsg}\n{full_tb}---\n")
-    await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=embed)
 
 # --- Embed Pagination View ---
 
@@ -4469,21 +4521,179 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
 @bot.event
 async def on_message(message: discord.Message):
-    # --- Initial Checks: Ignore DMs, ensure bot user is ready, ignore bots ---
-    if not message.guild or not bot.user or message.author.bot:
+    # --- Initial Checks: Ignore DMs, self, other bots ---
+    # Using bot.user requires the bot to be ready, add a check
+    if not message.guild or not bot.is_ready() or not bot.user or message.author.id == bot.user.id or message.author.bot:
         return
 
-    # --- Auto-Delete Logic for Bot's Own Messages ---
-    if message.author.id == bot.user.id and message.channel.id == HC_MEMBER_LIST_CHANNEL_ID:
-        if message.interaction is not None:
+    # --- Reply/Mention Trigger ---
+    should_trigger_ai = False
+    is_reply_to_bot = False
+    is_mention = False
+    referenced_message = None
+    bot_mention_formats = [f'<@{bot.user.id}>', f'<@!{bot.user.id}>'] # Cache bot mention formats
+
+    # Check 1: Is it a reply to the bot?
+    if message.reference and message.reference.message_id:
+        try:
+            # Fetch the message being replied to
+            if isinstance(message.reference.resolved, discord.Message):
+                referenced_message = message.reference.resolved
+            else:
+                referenced_message = await message.channel.fetch_message(message.reference.message_id)
+
+            if referenced_message and referenced_message.author.id == bot.user.id:
+                should_trigger_ai = True
+                is_reply_to_bot = True
+                print(f"AI Trigger: Reply to bot message {referenced_message.id} by {message.author}")
+        except (discord.NotFound, discord.Forbidden): pass # Ignore if message deleted or no perms
+        except Exception as e:
+            print(f"ERROR: Unexpected error fetching replied-to message: {e}")
+            await log_error(message.guild, "Error fetching replied-to message for AI trigger", error=e)
+
+    # Check 2: Is the bot mentioned? (Only if not already triggered by reply)
+    if not should_trigger_ai and any(mention in message.content for mention in bot_mention_formats):
+        should_trigger_ai = True
+        is_mention = True
+        print(f"AI Trigger: Mention of bot by {message.author}")
+
+    # --- Handle AI Trigger If Necessary ---
+    if should_trigger_ai:
+        if not ai_model:
+            print("AI Trigger: AI module disabled, cannot respond.")
+            # Optionally reply that AI is offline: await message.reply("My AI circuits are offline...", delete_after=10)
+            return # Stop processing if AI is disabled
+
+        # Fetch history
+        trigger_history: List[discord.Message] = []
+        try:
+            async for msg in message.channel.history(limit=10, before=message.created_at):
+                 trigger_history.append(msg)
+            trigger_history.reverse()
+        except discord.Forbidden:
+             print(f"AI Trigger: Cannot fetch history in {message.channel.mention} (Forbidden).")
+        except Exception as e:
+             print(f"AI Trigger: Error fetching history: {e}")
+             await log_error(message.guild, "Error fetching history for AI reply/mention trigger", error=e)
+
+        # Prepare prompt (clean mentions)
+        ai_prompt = message.content
+        for mention in bot_mention_formats:
+             ai_prompt = ai_prompt.replace(mention, "").strip()
+        if not ai_prompt:
+             ai_prompt = ("User mentioned or replied to me without additional text. "
+                          "Respond naturally based on the conversation history.")
+
+        # Prepare instruction
+        trigger_type = "replied to one of your messages" if is_reply_to_bot else "mentioned you directly"
+        reply_mention_instruction = (
+             f"The user has {trigger_type}. Engage with their message ('{ai_prompt[:50].strip().replace('`','')}...') " # Prevent escaping issues
+             "using the provided chat history for context."
+        )
+        effective_system_instruction = f"{NERDY_SYSTEM_INSTRUCTION}\n\n{reply_mention_instruction}"
+
+        # Get response and send
+        async with message.channel.typing():
+            ai_response = await get_ai_response(
+                prompt=ai_prompt,
+                history=trigger_history,
+                system_instruction=effective_system_instruction
+            )
+
+        if ai_response:
+            if len(ai_response) > 1950: ai_response = ai_response[:1950] + "\n... (Truncated ✂️)"
+            try:
+                # Avoid pinging user if they mentioned the bot, but ping if it was just a reply
+                await message.reply(f"{ai_response}", mention_author=is_reply_to_bot)
+            except (discord.Forbidden, discord.HTTPException) as reply_err:
+                 await log_error(message.guild, f"Failed to send AI reply/mention response for msg {message.id}", error=reply_err)
+        else:
+            await log_info(message.guild, f"AI for reply/mention trigger ({message.id}) returned no response.")
+
+        return # IMPORTANT: Stop processing after handling reply/mention
+
+    # --- Random Interjection Logic ---
+    # Don't interject in specific channels like the HC list channel
+    if message.channel.id != HC_MEMBER_LIST_CHANNEL_ID and ai_model: # Check AI is enabled
+        channel_id = message.channel.id
+        now = discord.utils.utcnow() # Use timezone-aware UTC time
+
+        # Get or initialize data for the channel using defaultdict's behavior
+        data = channel_interjection_data[channel_id]
+        data['count'] += 1
+
+        # Check if count target is met
+        if data['count'] >= data['target']:
+            # Check cooldown
+            can_interject = False
+            if data['last_interject_time'] is None:
+                can_interject = True # First time in this channel
+            else:
+                time_since_last = now - data['last_interject_time']
+                if time_since_last >= RANDOM_INTERJECT_COOLDOWN:
+                    can_interject = True
+
+            if can_interject:
+                print(f"AI Trigger: Random interjection condition met in channel {channel_id}")
+                # Reset count and set new random target
+                data['count'] = 0
+                data['target'] = random.randint(RANDOM_INTERJECT_MIN_MSGS, RANDOM_INTERJECT_MAX_MSGS)
+                data['last_interject_time'] = now
+
+                # Fetch history
+                interject_history: List[discord.Message] = []
+                try:
+                    # Fetch a bit more history maybe?
+                    async for msg in message.channel.history(limit=10, before=message.created_at):
+                         interject_history.append(msg)
+                    interject_history.reverse()
+                except Exception as e:
+                     print(f"AI Interject: Error fetching history: {e}")
+                     await log_error(message.guild, "Error fetching history for AI random interjection", error=e)
+                     interject_history = [] # Try to proceed without history
+
+                # Craft prompt & instruction
+                interject_prompt = "Observe the recent chat history. Briefly chime in with a relevant, quirky, funny, and nerdy comment or question, acting like a participant joining the flow naturally. Don't announce that you're interjecting."
+                effective_system_instruction = f"{NERDY_SYSTEM_INSTRUCTION}\n\n{interject_prompt}" # Combine persona with task
+
+                # Get response and send
+                async with message.channel.typing():
+                    ai_interjection = await get_ai_response(
+                        prompt=interject_prompt, # Main prompt is the task itself
+                        history=interject_history,
+                        system_instruction=effective_system_instruction # System instruction defines persona+task
+                    )
+
+                if ai_interjection:
+                    if len(ai_interjection) > 1000: ai_interjection = ai_interjection[:1000] + "\n... (ramble truncated!)" # Shorter limit for interjections?
+                    try:
+                        await message.channel.send(f"{ai_interjection}") # Send directly to channel
+                        await log_info(message.guild, f"AI randomly interjected in {message.channel.mention}.")
+                    except (discord.Forbidden, discord.HTTPException) as send_err:
+                         await log_error(message.guild, f"Failed to send AI random interjection in {message.channel.mention}", error=send_err)
+                else:
+                    await log_info(message.guild, f"AI random interjection for channel {channel_id} returned no response.")
+
+                # Decide if keyword/prefix check should happen *after* interjection. Let's allow it for now.
+                # If you want interjection to stop further processing, uncomment the next line:
+                # return
+
+            # else: print(f"DBG: Interject count {data['count']}/{data['target']} met, but cooldown active in {channel_id}") # Debug cooldown
+        # else: print(f"DBG: Interject count {data['count']}/{data['target']} in {channel_id}") # Debug count increment
+
+    # --- Auto-Delete Logic for Bot's Own Messages in Specific Channel ---
+    # This handles ephemeral followup messages sent by the bot in the list channel
+    if message.channel.id == HC_MEMBER_LIST_CHANNEL_ID:
+        # Check if the message is from the bot AND has interaction data (likely ephemeral followup)
+        if message.interaction is not None and message.author.id == bot.user.id:
             try:
                 await message.delete(delay=AUTODELETE_DELAY_SECONDS)
             except discord.Forbidden:
-                print(f"ERROR: Cannot auto-delete in channel {message.channel.id}. Bot lacks 'Manage Messages' permission.")
+                print(f"ERROR: Cannot auto-delete bot interaction msg in {message.channel.id}. Missing 'Manage Messages' perm.")
             except discord.NotFound: pass
-            except discord.HTTPException as e: await log_error(message.guild, f"Failed to schedule auto-delete for message {message.id}: HTTP Error.", error=e)
-            except Exception as e: await log_error(message.guild, f"Unexpected error during auto-delete scheduling for message {message.id}.", error=e)
-            finally: return
+            except discord.HTTPException as e: await log_error(message.guild, f"Failed to schedule auto-delete for msg {message.id}: HTTP Error.", error=e)
+            except Exception as e: await log_error(message.guild, f"Unexpected error scheduling auto-delete for msg {message.id}.", error=e)
+            finally: return # Return after handling bot's own message deletion
 
     # --- Prefix Command Logic (e.g., .p) ---
     if message.content.startswith(COMMAND_PREFIX):
@@ -4500,14 +4710,14 @@ async def on_message(message: discord.Message):
             channel = message.channel
             author = message.author
 
-            # 1. Argument Check (Amount) - Keep as is
+            # 1. Argument Check (Amount)
             if not args:
                 try:
                     await channel.send("❌ Please specify the number of messages to delete (e.g., `.p 10`).", delete_after=5.0)
                 except (discord.Forbidden, discord.HTTPException): pass
                 return # Exit if no amount specified
 
-            # 2. Parse Amount - Keep as is
+            # 2. Parse Amount
             try:
                 amount = int(args[0])
                 if not 1 <= amount <= 100: # Discord API limit for bulk delete is 100
@@ -4518,7 +4728,7 @@ async def on_message(message: discord.Message):
                 except (discord.Forbidden, discord.HTTPException): pass
                 return # Exit if invalid amount
 
-            # 3. Permission Checks - Keep as is
+            # 3. Permission Checks
             bot_perms = channel.permissions_for(guild.me)
             user_perms = channel.permissions_for(author)
 
@@ -4539,81 +4749,64 @@ async def on_message(message: discord.Message):
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
                 return # Exit if user lacks permissions
 
-            # --- OPTIMIZATION START ---
             # 4. Calculate the 14-day limit for bulk delete
             fourteen_days_ago = discord.utils.utcnow() - datetime.timedelta(days=14)
-            # --- OPTIMIZATION END ---
 
             # 5. Execute Optimized Purge Logic
             confirmation_message: Optional[discord.Message] = None
             deleted_messages: List[discord.Message] = []
             delete_count = 0
             try:
-                # Delete the trigger message first (common pattern, ensures 'amount' applies to messages *before* it)
+                # Delete the trigger message first
                 try:
                     await message.delete()
-                except discord.NotFound: pass # Already gone, that's fine
+                except discord.NotFound: pass # Already gone
                 except discord.Forbidden:
                     await log_error(guild, f".p: Failed to delete trigger message {message.id} (Forbidden) in {channel.mention}.")
-                    # Attempt to continue purge anyway
                 except discord.HTTPException as e_trig_del:
                     await log_error(guild, f".p: Failed to delete trigger message {message.id} (HTTP Error)", error=e_trig_del)
-                    # Attempt to continue purge anyway
 
-                # --- OPTIMIZATION START ---
                 # Perform the purge, only considering messages AFTER the 14-day cutoff
-                # This forces discord.py to use the bulk delete endpoint and prevents
-                # falling back to slow individual deletion for messages older than 14 days.
                 deleted_messages = await channel.purge(limit=amount, after=fourteen_days_ago)
                 delete_count = len(deleted_messages)
-                # --- OPTIMIZATION END ---
 
                 if delete_count == 0:
-                    # No messages deleted (either none were recent enough or channel was empty)
                     try:
                         confirmation_message = await channel.send("ℹ️ No recent messages found to delete (within 14 days).", delete_after=3.0)
                     except (discord.Forbidden, discord.HTTPException): pass
                 else:
-                    # Messages were deleted
-                    # Log deleted authors (keep this logic)
+                    # Log deleted authors
                     author_counts: Dict[str, int] = {}
                     for msg in deleted_messages:
                         author_name = str(msg.author) # Use str() for safety
                         author_counts[author_name] = author_counts.get(author_name, 0) + 1
-
                     authors_log = ", ".join(f"{name}({count})" for name, count in author_counts.items())
-                    if len(authors_log) > 100: # Truncate log if too long
-                        authors_log = authors_log[:97] + "..."
+                    if len(authors_log) > 100: authors_log = authors_log[:97] + "..."
 
                     # Send confirmation message
                     confirm_content = f"🗑️ Deleted {delete_count} recent message(s)."
-                    # Inform user if fewer messages were deleted than requested due to the age limit
                     if delete_count < amount:
                         confirm_content += f" (Less than {amount} requested due to age limit of 14 days)."
-                    confirm_content += f" ({authors_log})" # Add authors summary
-
+                    confirm_content += f" ({authors_log})"
                     confirmation_message = await channel.send(confirm_content)
 
                     # Log successful purge
                     await log_info(guild, f"`{author}` used .p to delete {delete_count} recent messages in {channel.mention}. Authors: {authors_log}")
 
-                    # Schedule deletion of the confirmation message (keep this)
-                    delete_delay_seconds_p = 2.0 # Maybe slightly longer now
+                    # Schedule deletion of the confirmation message
+                    delete_delay_seconds_p = 2.0
                     await asyncio.sleep(delete_delay_seconds_p)
 
                     try:
-                        if confirmation_message: # Check if message exists before deleting
-                            await confirmation_message.delete()
-                            confirmation_message = None # Clear reference after deletion
+                        if confirmation_message: await confirmation_message.delete()
                     except discord.NotFound: pass # Already gone
                     except discord.Forbidden:
                         await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): Bot Missing Permissions in channel {channel.mention}")
                     except discord.HTTPException as e_del_conf:
                         await log_error(guild, f"Failed to auto-delete .p confirmation message (ID: {confirmation_message.id if confirmation_message else 'N/A'}): HTTP Error", error=e_del_conf)
 
-            # 6. Handle Specific Errors during Purge/Confirmation (Keep this block largely as is)
+            # 6. Handle Specific Errors during Purge/Confirmation
             except discord.Forbidden as e_forbid:
-                # This might happen during purge or confirmation send/delete
                 await log_error(guild, f".p command failed during operation in {channel.mention}: Bot missing permissions (Invoked by {author}).", error=e_forbid)
                 try: await channel.send(f"{author.mention}, I lack permissions to complete the operation here.")
                 except Exception: pass
@@ -4623,12 +4816,11 @@ async def on_message(message: discord.Message):
                 except Exception: pass
             except Exception as e_other:
                 await log_error(guild, f".p command failed unexpectedly in {channel.mention}.", error=e_other)
-                # Attempt to clean up confirmation message if it exists and an error occurred
                 if confirmation_message:
                     try:
-                        await asyncio.sleep(1) # Short delay
+                        await asyncio.sleep(1)
                         await confirmation_message.delete()
-                    except Exception: pass # Ignore cleanup failure
+                    except Exception: pass
 
             return # IMPORTANT: Return after handling the prefix command
 
@@ -4648,19 +4840,19 @@ async def on_message(message: discord.Message):
         # 1. Check Exclusion Regex first
         if rule['exclusion_regex'] and rule['exclusion_regex'].search(message_content_lower):
             excluded = True
-            continue
+            continue # Skip this rule entirely if excluded
 
         # 2. Check Inclusion Regex
         if not excluded and rule['inclusion_regex'].search(message_content_lower):
             triggered = True
         else:
-            continue
+            continue # Skip if not triggered
 
         # --- If Triggered & Not Excluded ---
         if triggered:
             is_discovered = rule.get('discovered_by') is not None
 
-            # --- Determine Permissions *for this specific rule* ---
+            # Determine Permissions *for this specific rule*
             specific_can_trigger: bool = False
             specific_can_discover: bool = False
 
@@ -4671,41 +4863,34 @@ async def on_message(message: discord.Message):
                 specific_can_trigger = is_owner or is_discovered # Owner OR if already discovered
                 specific_can_discover = is_owner # Only owner can "discover" outside
 
-            # --- Check if user can trigger this specific rule ---
+            # Check if user can trigger this specific rule
             if not specific_can_trigger:
                 # print(f"DBG: Trigger prevented for {rule['phrase_identifier']} by user {message.author.id} due to permissions (trigger check).")
                 continue # Skip to the next rule if user cannot trigger this one
 
-            # 3. Check Cooldown (Only if user could potentially trigger)
+            # 3. Check Cooldown
             cooldown_end_time = keyword_cooldowns.get(rule_id_str)
             if cooldown_end_time and now < cooldown_end_time:
-                # On cooldown - Send public self-deleting reply WITHOUT PING
                 remaining_seconds = (cooldown_end_time - now).total_seconds()
                 time_left_str = format_time_difference(remaining_seconds)
-                # Message still includes user's name for context, but won't ping
-                cooldown_msg = f"⏳ Psst {message.author.display_name}, '{rule['phrase_identifier']}' is on cooldown for {time_left_str}." # Use display_name instead of mention
+                cooldown_msg = f"⏳ Psst {message.author.display_name}, '{rule['phrase_identifier']}' is on cooldown for {time_left_str}."
                 try:
-                    # Send reply in channel, DO NOT mention user, set delete_after
-                    # VVV Changed mention_author to False VVV
-                    await message.reply(cooldown_msg, delete_after=4.0, mention_author=False) # Delete after 4 seconds
-                    # print(f"DBG: Sent self-deleting cooldown reply for {rule['phrase_identifier']} (no ping)")
+                    await message.reply(cooldown_msg, delete_after=4.0, mention_author=False)
                 except (discord.Forbidden, discord.HTTPException) as e:
-                     # Log if sending/deleting the reply fails
                      print(f"WARN: Failed to send self-deleting keyword cooldown reply for {rule_id_str}: {e}")
-                     await log_error(message.guild, f"Failed self-deleting cooldown reply for '{rule['phrase_identifier']}'", error=e) # Optional: Log error properly
+                     await log_error(message.guild, f"Failed self-deleting cooldown reply for '{rule['phrase_identifier']}'", error=e)
                 continue # Stop processing THIS rule if on cooldown
 
             # 4. Not on Cooldown - Process Discovery or Standard Reply
-
             if not is_discovered:
-                # --- First Discovery Attempt ---
-                if specific_can_discover: # Check discovery permission for THIS context/user
-                    global discovered_keywords_count
+                # First Discovery Attempt
+                if specific_can_discover:
+                    global discovered_keywords_count # Allow modification
                     print(f"First discovery attempt: {rule['phrase_identifier']} by {message.author} ({message.author.id}) in guild {message.guild.id}")
                     discovery_recorded = await record_discovery_in_db(message.guild, rule_id_str, message.author.id, now)
 
                     if discovery_recorded:
-                        # Update Cache
+                        # Update Cache & Count
                         rule['discovered_by'] = str(message.author.id)
                         rule['discovered_at'] = now
                         discovered_keywords_count += 1
@@ -4715,7 +4900,7 @@ async def on_message(message: discord.Message):
                         try:
                             formatted_message = template.format(user_mention=message.author.mention, nth=discovered_keywords_count, total=total_keywords, phrase_identifier=rule['phrase_identifier'])
                             reply_content = f"{rule.get('response_emoji', '')} {formatted_message}".strip()
-                            await message.reply(reply_content, mention_author=True) # Reply publicly
+                            await message.reply(reply_content, mention_author=True)
                             await log_info(message.guild, f"First Discovery! '{rule['phrase_identifier']}' found by {message.author.mention}. ({discovered_keywords_count}/{total_keywords})")
                         except KeyError as e_fmt:
                             await log_error(message.guild, f"First discovery message format error for '{rule['phrase_identifier']}'. Template: '{template}', Error: {e_fmt}", ping_owner=True)
@@ -4728,88 +4913,118 @@ async def on_message(message: discord.Message):
                     else:
                         print(f"WARN: Failed to record discovery for {rule['phrase_identifier']} in DB, not sending message.")
                 else:
-                    # User cannot discover this (e.g., owner in target guild, or non-owner outside trying undiscovered)
-                    # print(f"DBG: Discovery prevented for {rule['phrase_identifier']} by user {message.author.id} due to permissions (discover check).")
-                    pass # Do nothing in this case
+                    # User cannot discover this (e.g., owner in target guild)
+                    pass # Do nothing
 
             else:
-                # --- Already Discovered ---
-                # Trigger permission ('specific_can_trigger') was already checked earlier
-                # Send Standard Reply (if defined)
+                # Already Discovered - Send Standard Reply (if defined)
                 standard_msg = rule.get('standard_response')
-                if standard_msg:
+
+                # --- Example of adding optional AI response to a keyword ---
+                call_ai_for_this_keyword = False # Set this based on rule maybe? e.g., rule.get('use_ai_response', False)
+
+                if call_ai_for_this_keyword and ai_model:
+                    # Fetch history if needed for AI
+                    keyword_history: List[discord.Message] = []
+                    try:
+                        async for msg in message.channel.history(limit=5, before=message.created_at):
+                            keyword_history.append(msg)
+                        keyword_history.reverse()
+                    except Exception as hist_err:
+                         await log_error(message.guild, f"Error fetching history for AI keyword '{rule['phrase_identifier']}'", error=hist_err)
+
+                    keyword_ai_prompt = f"User mentioned keyword '{rule['phrase_identifier']}'. Provide a brief, nerdy, helpful response based on this trigger and recent context."
+                    keyword_ai_instruction = "You are assisting users based on specific keywords they mention. Respond nerdily and helpfully."
+                    effective_keyword_instruction = f"{NERDY_SYSTEM_INSTRUCTION}\n\n{keyword_ai_instruction}"
+
+                    async with message.channel.typing():
+                        ai_keyword_reply = await get_ai_response(
+                            prompt=keyword_ai_prompt,
+                            history=keyword_history,
+                            system_instruction=effective_keyword_instruction
+                        )
+
+                    if ai_keyword_reply:
+                        try:
+                            await message.reply(f"{ai_keyword_reply}", mention_author=False)
+                        except (discord.Forbidden, discord.HTTPException) as reply_err:
+                            await log_error(message.guild, f"Failed to send AI keyword reply for '{rule['phrase_identifier']}'", error=reply_err)
+                    else:
+                        # Fallback to standard message if AI fails or returns nothing?
+                        if standard_msg:
+                            reply_content = f"{rule.get('response_emoji', '')} {standard_msg}".strip()
+                            try: await message.reply(reply_content, mention_author=True)
+                            except Exception as e: await log_error(message.guild, f"Failed fallback standard keyword reply for '{rule['phrase_identifier']}'", error=e)
+
+                elif standard_msg: # If not calling AI, use standard message
                     reply_content = f"{rule.get('response_emoji', '')} {standard_msg}".strip()
                     try:
-                        await message.reply(reply_content, mention_author=True) # Reply publicly
-                        # print(f"DBG: Sent standard reply for {rule['phrase_identifier']} in guild {message.guild.id}")
+                        await message.reply(reply_content, mention_author=True)
                     except (discord.Forbidden, discord.HTTPException) as e:
                         await log_error(message.guild, f"Failed to send standard keyword reply for '{rule['phrase_identifier']}'", error=e)
 
-                # Set Cooldown (even if no message sent)
+                # Set Cooldown (even if no message sent, e.g., AI error or no standard_msg)
                 keyword_cooldowns[rule_id_str] = now + datetime.timedelta(minutes=KEYWORD_COOLDOWN_MINUTES)
 
             # IMPORTANT: Break loop after first successful action for a rule
+            # This prevents multiple keywords in one message triggering multiple replies
             break
     # --- End of on_message logic ---
 
-    # --- AI Chat Command ---
-@tree.command(name="chat", description="Send a prompt to the AI model.")
+# --- AI Chat Command (Enhanced with History & Personality) ---
+@tree.command(name="chat", description="Send a prompt to the AI model (includes recent chat history).")
 @app_commands.describe(prompt="The text prompt to send to the AI.")
 async def chat_command(interaction: discord.Interaction, *, prompt: str):
-    """Handles the /chat command, sends the prompt to Gemini, and replies."""
-    guild = interaction.guild # For logging context
+    # ... (keep initial checks and logging) ...
 
-    # Check if AI is configured and ready
-    if not ai_model:
-        await interaction.response.send_message("❌ The AI module is not configured or enabled. Please contact the bot owner.", ephemeral=True)
-        # Optional: Log this attempt if desired
-        # await log_info(guild, f"User `{interaction.user}` tried /chat but AI module is disabled.")
-        return
-
-    # Log the command usage using your existing logger
-    # Truncate prompt for logging if it's very long
-    log_prompt = prompt[:150] + ('...' if len(prompt) > 150 else '')
-    await log_info(guild, f"`{interaction.user}` used /chat. Prompt: '{log_prompt}'")
-
-    # Defer the response - make it non-ephemeral so "Thinking..." is visible
     await interaction.response.defer(thinking=True, ephemeral=False)
 
+    message_history: List[discord.Message] = []
+    # ... (keep history fetching logic) ...
+
+    # --- Use the Nerdy System Instruction ---
+    # Combine general instruction with the nerdy persona
+    chat_specific_instruction = (
+        "The user initiated this conversation using the `/chat` command. "
+        "Below is the recent chat history (oldest first), followed by the user's latest prompt. "
+        "Respond naturally, using the history for context. Prioritize the most recent messages."
+    )
+    # Use the constant defined earlier
+    effective_system_instruction = f"{NERDY_SYSTEM_INSTRUCTION}\n\n{chat_specific_instruction}"
+    # --- End Instruction Update ---
+
     try:
-        # Send the prompt to the Gemini model
-        print(f"Chat command: Sending prompt to Gemini API for user {interaction.user.id}...")
-        # Use the asynchronous method
-        response = await ai_model.generate_content_async(prompt)
-        print(f"Chat command: Received response from Gemini API for user {interaction.user.id}.")
+        # Call the reusable AI function with the new instruction
+        ai_reply = await get_ai_response(
+            prompt=prompt,
+            history=message_history,
+            system_instruction=effective_system_instruction # Pass the combined instruction
+        )
 
-        # Extract the text response
-        ai_reply = response.text
+        # ... (keep the rest of the response handling: error checks, length trim, followup.send) ...
+        if ai_reply is None:
+            await interaction.followup.send("Blast! 💥 My circuits encountered an error, or maybe the AI mainframe is offline? 🤔")
+            return
 
-        # Basic check for empty or potentially problematic responses
         if not ai_reply:
-            ai_reply = "Sorry, I couldn't generate a response for that prompt (it might have been empty or filtered by the AI)."
-            print("Chat command: Gemini API returned an empty/filtered response.")
-            await log_info(guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response.")
+            ai_reply = "Hmm, my processors returned null data. 🤔 Perhaps the query was too paradoxical, or maybe cosmic rays interfered? 🤷‍♂️"
+            await log_info(guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response (with history).")
 
-        # Ensure reply isn't too long for Discord (max ~2000 chars in a message)
         if len(ai_reply) > 1900:
-            ai_reply = ai_reply[:1900] + "\n... (trimmed due to length)"
+            ai_reply = ai_reply[:1900] + "\n... (Data stream truncated! ✂️ Exceeded buffer limits!)"
 
-        # Send the AI's response back to Discord using followup.send
-        # Format it nicely showing the original prompt
-        await interaction.followup.send(f"> **You:** {discord.utils.escape_markdown(prompt)}\n\n**AI:** {ai_reply}")
-        print("Chat command: Sent AI response to Discord.")
+        # Send reply without repeating prompt (AI response should flow)
+        # Personality should be IN the reply itself now.
+        await interaction.followup.send(f"{ai_reply}") # Just send the AI reply
 
+    # ... (keep the final Exception catch block) ...
     except Exception as e:
-        # Log the error using your existing logger
-        print(f"Chat command: An error occurred processing prompt for user {interaction.user.id}: {e}")
-        await log_error(guild, f"Error processing /chat command", error=e, interaction=interaction)
-
-        # Inform the user about the error using followup.send
+        print(f"Chat command: An error occurred after AI call for user {interaction.user.id}: {e}")
+        await log_error(guild, f"Error processing /chat command (after AI generation)", error=e, interaction=interaction)
         try:
-            await interaction.followup.send(f"Sorry, an error occurred while talking to the AI. Please try again later or contact an admin if it persists.")
+            await interaction.followup.send("⚠️ Whoops! A critical error occurred in my positronic brain! 🧠💥 Please notify my creator!")
         except (discord.NotFound, discord.HTTPException):
-            # Interaction might be gone if error took too long or user dismissed
-            print("Chat command: Could not send error followup (interaction likely gone).")
+            print("Chat command: Could not send final error followup (interaction likely gone).")
    
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
