@@ -857,7 +857,7 @@ class StaticHCPagesView(View):
 
                 # Construct mention or fallback text
                 if user_id_str:
-                    mention_display = f"<@{user_id_str}>"
+                    mention_display = f"<@!{user_id_str}>"
                 else:
                     mention_display = "`[No Discord]`" # Use backticks for placeholder
 
