@@ -4975,15 +4975,36 @@ async def on_message(message: discord.Message):
 @tree.command(name="chat", description="Send a prompt to the AI model (includes recent chat history).")
 @app_commands.describe(prompt="The text prompt to send to the AI.")
 async def chat_command(interaction: discord.Interaction, *, prompt: str):
-    # ... (keep initial checks and logging) ...
+    # Get guild from interaction (can be None if in DMs, log functions handle this)
+    guild = interaction.guild # <<< DEFINE guild HERE
+
+    # Log the command usage (optional, good practice)
+    await log_info(guild, f"`{interaction.user}` used /chat. Prompt: '{prompt[:50]}{'...' if len(prompt)>50 else ''}'") # Example log
+
+    if not ai_model: # Check if AI is enabled
+        await interaction.response.send_message("My AI circuits are currently offline. 🤖 Please try again later!", ephemeral=False)
+        await log_info(guild, "/chat command failed: AI model is not available.")
+        return
 
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     message_history: List[discord.Message] = []
-    # ... (keep history fetching logic) ...
+    try:
+        # Fetch history (limit to avoid huge context)
+        # Ensure channel is accessible
+        if interaction.channel and hasattr(interaction.channel, 'history'):
+            async for msg in interaction.channel.history(limit=10, before=interaction.created_at):
+                message_history.append(msg)
+            message_history.reverse() # Oldest first
+        else:
+             await log_info(guild, f"/chat: Cannot fetch history (channel type: {type(interaction.channel)})")
+    except discord.Forbidden:
+        await log_info(guild, "/chat: Cannot fetch history (Forbidden). Proceeding without.")
+    except Exception as e:
+        await log_error(guild, "Error fetching history for /chat", error=e, interaction=interaction)
+        # Decide if you want to proceed without history or stop
 
     # --- Use the Nerdy System Instruction ---
-    # Combine general instruction with the nerdy persona
     chat_specific_instruction = (
         "The user initiated this conversation using the `/chat` command. "
         "Below is the recent chat history (oldest first), followed by the user's latest prompt. "
@@ -5001,14 +5022,15 @@ async def chat_command(interaction: discord.Interaction, *, prompt: str):
             system_instruction=effective_system_instruction # Pass the combined instruction
         )
 
-        # ... (keep the rest of the response handling: error checks, length trim, followup.send) ...
         if ai_reply is None:
             await interaction.followup.send("Blast! 💥 My circuits encountered an error, or maybe the AI mainframe is offline? 🤔")
+            # Error is logged within get_ai_response or the exception block below
             return
 
         if not ai_reply:
             ai_reply = "Hmm, my processors returned null data. 🤔 Perhaps the query was too paradoxical, or maybe cosmic rays interfered? 🤷‍♂️"
-            await log_info(guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response (with history).")
+            # *** CORRECTED LOG CALL ***
+            await log_info(interaction.guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response (with history).")
 
         if len(ai_reply) > 1900:
             ai_reply = ai_reply[:1900] + "\n... (Data stream truncated! ✂️ Exceeded buffer limits!)"
@@ -5017,21 +5039,25 @@ async def chat_command(interaction: discord.Interaction, *, prompt: str):
         # Personality should be IN the reply itself now.
         await interaction.followup.send(f"{ai_reply}") # Just send the AI reply
 
-    # ... (keep the final Exception catch block) ...
     except Exception as e:
         print(f"Chat command: An error occurred after AI call for user {interaction.user.id}: {e}")
-        await log_error(guild, f"Error processing /chat command (after AI generation)", error=e, interaction=interaction)
+        # *** CORRECTED LOG CALL ***
+        await log_error(interaction.guild, f"Error processing /chat command (after AI generation)", error=e, interaction=interaction)
         try:
             await interaction.followup.send("⚠️ Whoops! A critical error occurred in my positronic brain! 🧠💥 Please notify my creator!")
         except (discord.NotFound, discord.HTTPException):
             print("Chat command: Could not send final error followup (interaction likely gone).")
    
+# --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
+    # guild is still useful for the initial check
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
-        return
+        return # Exit if not in a guild
+
+    # Ensure bot and command_ids are ready (as before)
     if not bot or not bot.user:
         print("Error: Bot object not available in nerdhelp command.")
         await interaction.response.send_message("Bot is not fully ready, cannot generate help. Please try again shortly.", ephemeral=False)
@@ -5039,42 +5065,38 @@ async def nerdhelp(interaction: discord.Interaction):
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
 
+    # --- Embed creation (Keep all the embed building logic exactly as is) ---
     embed = discord.Embed(
         title="🤓 Pingslave Bot Commands",
         color=NERDY_YELLOW
     )
     embed.add_field(name="\u200B", value="\u200B", inline=False)
-
-    # Section: Verification & HC Management
+    # Verification & HC Management
     embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify a standard user.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('unverify')}  · Revert a user to unverified.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify a user into HC.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hconly')} · Register member by IGN only.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove member from HC.", value="\u200B", inline=False)
-
-    # Section: [HC1] Member List
+    # [HC1] Member List
     embed.add_field(name="\u200B\n📊 [HC1] Member List", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh the static HC member list.", value="\u200B", inline=False)
-
-    # Section: Activity Tracking
+    # Activity Tracking
     embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('active')}  · Mark *any* member as active for a date.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
-
-    # Section: Secret Phrase Discovery
+    # Secret Phrase Discovery
     embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False) # <-- ADDED
-
-    # Section: Utilities
+    embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
+    # Utilities
     embed.add_field(name="\u200B\n⚙️ Utilities", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
     embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-
+    # --- End Embed Building ---
 
     embed.set_footer(text="Bot by TheNerd | sweet_honey")
     if bot.user and bot.user.display_avatar:
@@ -5084,8 +5106,13 @@ async def nerdhelp(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=False)
     except Exception as e:
         print(f"Error sending nerdhelp response: {e}")
-        await log_error(guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
+        # *** MODIFICATION HERE ***
+        # Pass interaction.guild directly to log_error.
+        # log_error handles the case where interaction.guild might be None.
+        await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
+        # *** END MODIFICATION ***
         try:
+            # Keep the followup logic as is
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
