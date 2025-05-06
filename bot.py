@@ -4714,6 +4714,8 @@ async def on_message(message: discord.Message):
             allow_keywords_here = True
         elif is_private_server_context and is_owner:
             allow_keywords_here = True
+        if channel.id in BOT_COMMANDS_ALLOWED_CHANNEL_IDS:
+            allow_keywords_here = False
 
         if allow_keywords_here:
             message_content_lower = message.content.lower()
