@@ -62,6 +62,7 @@ load_dotenv()  # harmless in production; only loads if a .env file exists
 MAIN_TOKEN = os.getenv("MAIN_DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ADMIN_KEY = os.getenv("SUPABASE_ADMIN_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 NEWBEE_ROLE_ID = 1360176495947022447 # "Unverified" role
 FLORRIST_ROLE_ID = 1248708073019805717 # "Verified" role
 HC1_ROLE_ID = 1230235110415274004 # "HC" role
@@ -126,6 +127,28 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+# --- Google Gemini AI Client ---
+ai_model = None # Initialize as None
+if GEMINI_API_KEY:
+    try:
+        # Import the library conditionally or ensure it's at the top
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Using a recent, efficient model suitable for free tier
+        ai_model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or 'gemini-pro' if flash isn't available/preferred
+        print("Google Gemini AI client configured successfully.")
+    except ImportError:
+        print("WARNING: 'google-generativeai' library not found. AI features disabled. Run 'pip install google-generativeai'")
+        ai_model = None # Ensure it's None if import fails
+    except Exception as e:
+        print(f"CRITICAL: Failed Google Gemini configuration: {e}")
+        # Log using your existing logger if available here, otherwise print
+        # await log_error(None, f"Failed Google Gemini configuration", error=e, ping_owner=True) # Can't await here
+        ai_model = None # Ensure it's None on config error
+else:
+    print("INFO: GEMINI_API_KEY not found in environment variables. AI features disabled.")
+    ai_model = None
 
 async def load_keyword_data(guild_for_log: Optional[discord.Guild]):
     """Loads enabled keyword rules from Supabase into the in-memory cache."""
@@ -4728,6 +4751,65 @@ async def on_message(message: discord.Message):
             # IMPORTANT: Break loop after first successful action for a rule
             break
     # --- End of on_message logic ---
+
+    # --- AI Chat Command ---
+@tree.command(name="chat", description="Send a prompt to the AI model.")
+@app_commands.describe(prompt="The text prompt to send to the AI.")
+async def chat_command(interaction: discord.Interaction, *, prompt: str):
+    """Handles the /chat command, sends the prompt to Gemini, and replies."""
+    guild = interaction.guild # For logging context
+
+    # Check if AI is configured and ready
+    if not ai_model:
+        await interaction.response.send_message("❌ The AI module is not configured or enabled. Please contact the bot owner.", ephemeral=True)
+        # Optional: Log this attempt if desired
+        # await log_info(guild, f"User `{interaction.user}` tried /chat but AI module is disabled.")
+        return
+
+    # Log the command usage using your existing logger
+    # Truncate prompt for logging if it's very long
+    log_prompt = prompt[:150] + ('...' if len(prompt) > 150 else '')
+    await log_info(guild, f"`{interaction.user}` used /chat. Prompt: '{log_prompt}'")
+
+    # Defer the response - make it non-ephemeral so "Thinking..." is visible
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    try:
+        # Send the prompt to the Gemini model
+        print(f"Chat command: Sending prompt to Gemini API for user {interaction.user.id}...")
+        # Use the asynchronous method
+        response = await ai_model.generate_content_async(prompt)
+        print(f"Chat command: Received response from Gemini API for user {interaction.user.id}.")
+
+        # Extract the text response
+        ai_reply = response.text
+
+        # Basic check for empty or potentially problematic responses
+        if not ai_reply:
+            ai_reply = "Sorry, I couldn't generate a response for that prompt (it might have been empty or filtered by the AI)."
+            print("Chat command: Gemini API returned an empty/filtered response.")
+            await log_info(guild, f"/chat for `{interaction.user}` resulted in empty/filtered AI response.")
+
+        # Ensure reply isn't too long for Discord (max ~2000 chars in a message)
+        if len(ai_reply) > 1900:
+            ai_reply = ai_reply[:1900] + "\n... (trimmed due to length)"
+
+        # Send the AI's response back to Discord using followup.send
+        # Format it nicely showing the original prompt
+        await interaction.followup.send(f"> **You:** {discord.utils.escape_markdown(prompt)}\n\n**AI:** {ai_reply}")
+        print("Chat command: Sent AI response to Discord.")
+
+    except Exception as e:
+        # Log the error using your existing logger
+        print(f"Chat command: An error occurred processing prompt for user {interaction.user.id}: {e}")
+        await log_error(guild, f"Error processing /chat command", error=e, interaction=interaction)
+
+        # Inform the user about the error using followup.send
+        try:
+            await interaction.followup.send(f"Sorry, an error occurred while talking to the AI. Please try again later or contact an admin if it persists.")
+        except (discord.NotFound, discord.HTTPException):
+            # Interaction might be gone if error took too long or user dismissed
+            print("Chat command: Could not send error followup (interaction likely gone).")
    
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
