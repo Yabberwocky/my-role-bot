@@ -30,6 +30,7 @@ import random
 from collections import defaultdict # Helpful for the interjection data
 import io # <--- ADD THIS IMPORT
 from PIL import Image
+import aiohttp
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -154,6 +155,10 @@ Example of expected output if "PlayerName1" and "PlayerName2" (both appearing on
 PlayerName1
 PlayerName2
 """
+EVIL_CATERPILLAR_NAME = "Evil Caterpillar"
+EVIL_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369656931089649794/861b3510338fa7ba0bb36baf12c36643.webp?size=160"
+GOOD_CATERPILLAR_NAME = "Good Caterpillar"
+GOOD_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369660290316111933/bf299249c71ee328dba5d821547fab56.webp?size=160"
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -5538,6 +5543,122 @@ async def addkeyword(
     except (ConnectionError, Exception) as e:
         await log_error(guild, f"Keyword add failed: Unexpected Error for `{phrase_identifier}`.", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred while adding the keyword.")
+
+# Constants for personality choices (can remain the same)
+PERSONALITY_NORMAL = "Normal Bot"
+PERSONALITY_EVIL = "Evil Caterpillar"
+PERSONALITY_GOOD = "Good Caterpillar"
+
+async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+    """Fetches image bytes from a URL."""
+    if not url:
+        return None
+    try:
+        async with session.get(url) as response:
+            if response.status == 200:
+                return await response.read()
+            else:
+                print(f"Failed to fetch avatar from {url}, status: {response.status}")
+                return None
+    except Exception as e:
+        print(f"Error fetching avatar from {url}: {e}")
+        return None
+
+@tree.command(name="message", description="Send a message as a specified personality.")
+@app_commands.describe(
+    personality="Choose the personality to send the message as.",
+    content="The message content to send."
+)
+@app_commands.choices(personality=[
+    app_commands.Choice(name=PERSONALITY_NORMAL, value=PERSONALITY_NORMAL),
+    app_commands.Choice(name=PERSONALITY_EVIL, value=PERSONALITY_EVIL),
+    app_commands.Choice(name=PERSONALITY_GOOD, value=PERSONALITY_GOOD),
+])
+@app_commands.checks.has_permissions(manage_messages=True) # User permission
+# Bot needs Manage Webhooks if creating them, or Send Messages if normal
+@app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
+async def message_as(interaction: discord.Interaction, personality: str, content: str):
+    if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True) # Defer acknowledgment
+
+    target_channel: discord.TextChannel = interaction.channel
+    guild = interaction.guild # For logging
+
+    if personality == PERSONALITY_NORMAL:
+        try:
+            await target_channel.send(content)
+            await interaction.followup.send(f"✅ Message sent as '{PERSONALITY_NORMAL}'.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(f"❌ I don't have permission to send messages here as '{PERSONALITY_NORMAL}'.", ephemeral=True)
+            await log_error(guild, f"/message as Normal Bot failed: Forbidden in {target_channel.mention}", interaction=interaction)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Failed to send message as '{PERSONALITY_NORMAL}': {e}", ephemeral=True)
+            await log_error(guild, f"/message as Normal Bot failed: HTTP Error in {target_channel.mention}", error=e, interaction=interaction)
+        return
+
+    # --- Personality Webhook Logic (Dynamic Creation) ---
+    personality_name_to_use: Optional[str] = None
+    personality_avatar_url_to_use: Optional[str] = None
+
+    if personality == PERSONALITY_EVIL:
+        personality_name_to_use = EVIL_CATERPILLAR_NAME
+        personality_avatar_url_to_use = EVIL_CATERPILLAR_AVATAR_URL
+    elif personality == PERSONALITY_GOOD:
+        personality_name_to_use = GOOD_CATERPILLAR_NAME
+        personality_avatar_url_to_use = GOOD_CATERPILLAR_AVATAR_URL
+
+    if not personality_name_to_use or not personality_avatar_url_to_use:
+        error_msg = f"⚠️ Configuration error for '{personality}'. Name or Avatar URL missing. Contact bot owner."
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, f"/message failed: Config missing for '{personality}' (Name: {personality_name_to_use}, Avatar: {personality_avatar_url_to_use})", interaction=interaction, ping_owner=True)
+        return
+
+    temp_webhook = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            avatar_bytes = await fetch_avatar_bytes(session, personality_avatar_url_to_use)
+            if not avatar_bytes:
+                await interaction.followup.send(f"⚠️ Could not fetch avatar for '{personality}'. Using default avatar.", ephemeral=True)
+                # Log this, but proceed with default avatar for the webhook
+                await log_info(guild, f"Could not fetch avatar for '{personality_name_to_use}' from {personality_avatar_url_to_use}. Webhook will use default avatar.")
+
+            # Create the webhook in the current channel
+            temp_webhook = await target_channel.create_webhook(
+                name=personality_name_to_use,
+                avatar=avatar_bytes, # Pass bytes, or None if fetch failed
+                reason=f"Temporary webhook for /message command by {interaction.user}"
+            )
+            
+            # Send the message using the temporary webhook
+            # discord.Webhook.from_url is not needed here as we have the Webhook object
+            await temp_webhook.send(
+                content=content,
+                # username=personality_name_to_use, # Already set on webhook creation
+                # avatar_url=personality_avatar_url_to_use # Already set on webhook creation
+                # allowed_mentions=discord.AllowedMentions.none() # Optional: disable pings
+            )
+        await interaction.followup.send(f"✅ Message sent as '{personality}'.", ephemeral=True)
+        await log_info(guild, f"User `{interaction.user}` sent message as '{personality}' in {target_channel.mention} via temp webhook.")
+
+    except discord.Forbidden: # Bot lacks Manage Webhooks permission
+        await interaction.followup.send(f"❌ I need the 'Manage Webhooks' permission in this channel to send as '{personality}'. Please ask an admin to grant it.", ephemeral=True)
+        await log_error(guild, f"/message failed: Bot missing 'Manage Webhooks' in {target_channel.mention} for '{personality}'.", interaction=interaction)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Failed to send/create webhook for '{personality}': {e.text}", ephemeral=True)
+        await log_error(guild, f"/message failed: HTTP error with temp webhook for '{personality}'.", error=e, interaction=interaction)
+    except Exception as e:
+        await interaction.followup.send(f"❌ An unexpected error occurred with '{personality}'.", ephemeral=True)
+        await log_error(guild, f"/message failed: Unexpected error with temp webhook for '{personality}'.", error=e, interaction=interaction, ping_owner=True)
+    finally:
+        if temp_webhook:
+            try:
+                await temp_webhook.delete(reason="Temporary webhook cleanup for /message command")
+            except Exception as e_del:
+                # Log if deletion fails, but don't bother the user
+                await log_error(guild, f"Failed to delete temporary webhook for '{personality}'. ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")

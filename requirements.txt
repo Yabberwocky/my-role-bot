@@ -6,3 +6,4 @@ pytz
 python-dateutil
 google-generativeai
 Pillow
+aiohttp
