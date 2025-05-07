@@ -115,7 +115,6 @@ def default_channel_data():
         'last_interject_time': None
     }
 channel_interjection_data: Dict[int, Dict[str, Any]] = defaultdict(default_channel_data)
-
 RANDOM_INTERJECT_MIN_MSGS = 5 # Lower minimum
 RANDOM_INTERJECT_MAX_MSGS = 10 # Lower maximum
 RANDOM_INTERJECT_COOLDOWN = datetime.timedelta(minutes=2.0) # Shorter cooldown
@@ -125,6 +124,7 @@ REPLY_MENTION_COOLDOWN_MINUTES = 5.0
 UNRESTRICTED_AI_CHANNEL_ID = 1330664430148780102 # Channel for unrestricted AI use in Catercord
 keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
 user_reply_mention_cooldowns: Dict[int, datetime.datetime] = {} # user_id (int) -> timestamp when cooldown ends for reply/mention AI
+ingame_name_cache: List[str] = [] # Cache for In-Game Names from hc_members
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -154,6 +154,45 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
+    """Loads all In-Game Names from Supabase into an in-memory cache."""
+    global ingame_name_cache
+    if not supabase:
+        await log_error(guild_for_log, "IGN Cache loading failed: Supabase unavailable.", ping_owner=True)
+        ingame_name_cache = [] # Ensure it's empty on failure
+        return
+
+    print("Loading IGN cache from Supabase...")
+    try:
+        # Fetch all non-null ingame_name entries
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("ingame_name")
+                           .not_.is_("ingame_name", "null") # Ensure we only get non-null IGNs
+                           .execute()
+        )
+
+        if not resp or not hasattr(resp, 'data') or not resp.data:
+            await log_info(guild_for_log, "No IGN data found or failed to fetch for cache. IGN cache will be empty.")
+            ingame_name_cache = []
+            return
+
+        # Extract unique IGNs from the response
+        temp_igns = set()
+        for entry in resp.data:
+            ign = entry.get("ingame_name")
+            if ign: # Check if ign is not None and not an empty string
+                temp_igns.add(str(ign)) # Convert to string just in case
+
+        ingame_name_cache = sorted(list(temp_igns), key=str.lower) # Store as a sorted list (case-insensitive sort)
+
+        print(f"Loaded {len(ingame_name_cache)} unique In-Game Names into cache.")
+        await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs into local cache.")
+
+    except (APIError, ConnectionError, Exception) as e:
+        await log_error(guild_for_log, "Failed to load IGN cache from Supabase", error=e, ping_owner=True)
+        ingame_name_cache = [] # Clear cache on error
 
 # --- Google Gemini AI Client ---
 ai_model = None # Initialize as None
@@ -1514,18 +1553,35 @@ class BulkActiveModal(Modal, title="Bulk Mark Active"):
              pass
                 
 async def ign_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocompletes In-Game Names from the hc_members table."""
-    if not supabase:
-        print("IGN Autocomplete: Supabase unavailable.")
-        return [] # Return empty list if DB is down
-
-    # Limit the number of suggestions returned
-    limit = 25
+    """Autocompletes In-Game Names from the local cache or hc_members table."""
     choices = []
+    limit = 25 # Max choices Discord allows for autocomplete
 
-    # Avoid querying if input is too short (optional, but can reduce load)
-    # if len(current) < 1:
-    #     return []
+    current_lower = current.lower() # For case-insensitive matching
+
+    # --- Use local cache if available and populated ---
+    if ingame_name_cache:
+        # print(f"IGN Autocomplete: Using cache with {len(ingame_name_cache)} items for '{current}'.") # Optional: for debugging
+        
+        matched_igns = [
+            ign for ign in ingame_name_cache
+            if current_lower in ign.lower() # Case-insensitive search within the cache
+        ]
+        
+        for ign_str in matched_igns[:limit]: # Apply limit after filtering
+            # Ensure name and value are strings
+            # Truncate suggestion name if too long for Discord UI
+            display_name = (ign_str[:97] + '...') if len(ign_str) > 100 else ign_str
+            choices.append(app_commands.Choice(name=display_name, value=ign_str))
+        
+        # print(f"IGN Autocomplete (Cache): Found {len(choices)} choices for '{current}'") # Optional: for debugging
+        return choices
+
+    # --- Fallback to Supabase if cache is empty or not loaded ---
+    print("IGN Autocomplete: Cache empty or not loaded, falling back to Supabase query.")
+    if not supabase:
+        print("IGN Autocomplete (Fallback): Supabase unavailable.")
+        return [] # Return empty list if DB is down and cache is empty
 
     try:
         # Use ilike for case-insensitive matching, % for wildcard
@@ -1544,16 +1600,15 @@ async def ign_autocomplete(interaction: discord.Interaction, current: str) -> Li
                     display_name = (ign_str[:97] + '...') if len(ign_str) > 100 else ign_str
                     choices.append(app_commands.Choice(name=display_name, value=ign_str))
                     seen_igns.add(ign)
+        # print(f"IGN Autocomplete (Supabase Fallback): Found {len(choices)} choices for '{current}'") # Optional: for debugging
+        return choices
 
     except (ConnectionError, APIError) as e:
-        print(f"IGN Autocomplete Error: Failed to fetch IGNs matching '{current}'. Error: {e}")
-        # Optionally return a choice indicating an error
-        # choices = [app_commands.Choice(name="Error fetching suggestions...", value="ERROR")]
+        print(f"IGN Autocomplete Error (Supabase Fallback): Failed to fetch IGNs matching '{current}'. Error: {e}")
     except Exception as e:
-         print(f"IGN Autocomplete Unexpected Error: {e}")
+         print(f"IGN Autocomplete Unexpected Error (Supabase Fallback): {e}")
 
-    # print(f"IGN Autocomplete: Found {len(choices)} choices for '{current}'") # Debugging
-    return choices
+    return [] # Return empty list on error during fallback
 
 async def remove_activity_log(guild: discord.Guild, ign: str, activity_date: datetime.date, remover_id: int) -> Tuple[bool, str]:
     """Removes an activity record. Returns (success, message). Handles case-insensitivity."""
@@ -2727,6 +2782,7 @@ async def on_ready():
 
     print("--- Loading initial data ---")
     await load_keyword_data(log_guild) # Load keywords
+    await load_ign_cache(log_guild) # Load IGN cache
 
     # --- START: Staff Channel Identification ---
     print("Identifying staff channels in target guild...")
