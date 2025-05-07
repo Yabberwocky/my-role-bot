@@ -4724,7 +4724,7 @@ async def on_message(message: discord.Message):
             final_message_content = ""
             if trigger_type == "Discovery" and discovery_congrats_user and discovered_phrase_identifier:
                 final_message_content = (
-                    f"🎉 woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: **'{discovered_phrase_identifier}'**! 🎉\n\n"
+                    f"# 🎉 \n woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: **'{discovered_phrase_identifier}'**! 🎉\n\n"
                     f"{ai_response_processed}"
                 )
             else:
@@ -4796,8 +4796,6 @@ async def on_message(message: discord.Message):
 
     # --- 2. Random Interjection Logic (Unchanged from your previous version) ---
     allow_interjection = True
-    if is_catercord or is_private_server: # Disable in Catercord and Private Server
-         allow_interjection = False
     # HC_MEMBER_LIST_CHANNEL_ID is a BOT_COMMANDS_ALLOWED_CHANNEL_ID, so interjections would be disabled by the above.
     # If you needed a more specific check for interjection in HC_MEMBER_LIST_CHANNEL_ID, it would go here.
     # For now, the general disable in Catercord covers it.
