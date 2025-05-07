@@ -4441,61 +4441,95 @@ async def refresh(interaction: discord.Interaction):
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass # Ignore if editing final response fails
 
-# --- Discovery Command (Revised for Contextual Info) ---
+# --- Discovery Command (Revised for Contextual Info & True Guild Membership Check) ---
 @tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!")
 async def discoveries(interaction: discord.Interaction):
-    if not keyword_data_cache:
+    # Ensure bot object and user ID are available
+    if not bot or not bot.user or not bot.user.id:
         await interaction.response.send_message(
-            "🔍 Keyword data is still loading. Please try again shortly!",
+            "🔍 Bot is not fully initialized. Please try again in a moment.",
+            ephemeral=True
+        )
+        return
+
+    # Keyword data check (remains the same)
+    if not keyword_data_cache: # Assuming keyword_data_cache is populated globally
+        await interaction.response.send_message(
+            "🔍 Keyword data is still loading or not available. Please try again shortly!",
             ephemeral=True
         )
         return
 
     guild = interaction.guild
-    channel = interaction.channel
-    now = discord.utils.utcnow()
-    catercord_invite_link = "https://discord.gg/5gMRbeWNKw" # User provided link
-    bot_invite_link = "https://discord.com/oauth2/authorize?client_id=1365572437185400893&permissions=68608&integration_type=0&scope=applications.commands+bot"
+    # channel = interaction.channel # Not strictly needed for this revised logic, but good to have if perms were checked
+    # now = discord.utils.utcnow() # Not used in this version of the embed's visible content
+
+    catercord_invite_link = "https://discord.gg/5gMRbeWNKw"
+    bot_invite_link = f"https://discord.com/oauth2/authorize?client_id={bot.user.id}&permissions=68608&integration_type=0&scope=applications.commands+bot"
 
     description_lines = []
-    is_catercord = guild and guild.id == CATERCORD_GUILD_ID
+    is_catercord = False
+    bot_is_guild_member = False # Flag to check if bot is a "real" member of the current guild
 
-    if is_catercord:
-        catercord_name = f"this server (**{guild.name}**)" if guild else "Catercord"
+    if guild:
+        is_catercord = guild.id == CATERCORD_GUILD_ID
+        # Check if the bot is a real member of this guild
+        bot_member_object = guild.get_member(bot.user.id)
+        if bot_member_object is not None:
+            bot_is_guild_member = True
+            # print(f"/discoveries: Bot IS a member of guild '{guild.name}' ({guild.id}). Joined at: {bot_member_object.joined_at}") # Debug
+        # else:
+            # print(f"/discoveries: Bot is NOT a member of guild '{guild.name}' ({guild.id}). Likely user-app context.") # Debug
+
+
+    if is_catercord: # This implies bot_is_guild_member is also true
+        catercord_name = f"this server (**{guild.name}**)"
         description_lines.extend([
             f"🕵️‍♂️ I'll respond to any known secret phrases you type here in {catercord_name}.",
             f"🎉 Be the first to find a new one, and I'll announce your grand discovery!"
         ])
-    else: # Not in Catercord
-        bot_can_send_in_channel = False
-        if guild and channel and isinstance(channel, discord.TextChannel):
-            bot_member = guild.me
-            if bot_member:
-                bot_can_send_in_channel = channel.permissions_for(bot_member).send_messages
-        
-        if bot_can_send_in_channel: # In another server, bot has send perms (likely guild-installed)
-            description_lines.extend([
-                f"🕵️‍♂️ I'll respond to any *already discovered* secret phrases you type in this server.",
-                f"➡️ To discover **new** secret phrases, you'll need to join [**Catercord**]({catercord_invite_link})!"
-            ])
-        else: # In another server, bot lacks send perms (likely not fully installed) or in DMs
-            description_lines.extend([
-                f"👋 Thanks for checking out my keyword feature!",
-                f"🔗 To enable my AI responses in this server, please [**re-invite me with the correct permissions**]({bot_invite_link}).",
-                f"➡️ To discover **new** secret phrases, head over to [**Catercord**]({catercord_invite_link})!"
-            ])
+    elif guild and bot_is_guild_member: # In another server, AND bot is a true member
+        description_lines.extend([
+            f"🕵️‍♂️ I'll respond to any *already discovered* secret phrases you type in this server.",
+            f"➡️ To discover **new** secret phrases, you'll need to join [**Catercord**]({catercord_invite_link})!"
+        ])
+    else: # Not in Catercord, AND bot is NOT a true member (or in DMs)
+        server_name_text = f"in '{guild.name}' " if guild else ""
+        description_lines.extend([
+            f"👋 Thanks for checking out my keyword feature!",
+            f"🔗 To allow me to respond to keywords {server_name_text}if they're discovered, an admin needs to [**add me to this server properly**]({bot_invite_link}).",
+            f"➡️ To discover **new** secret phrases, the adventure continues in [**Catercord**]({catercord_invite_link})!"
+        ])
 
     # --- Keyword Progress and Discovered List (Existing Logic) ---
+    description_lines.append("\n---") # Separator
+
+    # Global total_keywords and discovered_keywords_count are used here
+    if total_keywords > 0:
+        description_lines.append(f"**Overall Progress:** {discovered_keywords_count} / {total_keywords} phrases revealed globally.")
+    else:
+        description_lines.append("\n*No keyword phrases are currently configured.*")
+
+    embed_title = "🔮 AI Keyword Mysteries 🔮"
+    embed = discord.Embed(
+        title=embed_title,
+        description="\n".join(description_lines),
+        color=NERDY_YELLOW # Assuming NERDY_YELLOW is defined
+    )
+
     discovered_list_formatted = []
     undiscovered_count = 0
-
-    valid_rules = [rule for rule_id, rule in keyword_data_cache.items() if all(k in rule for k in ['phrase_identifier', 'discovered_by', 'discovered_at'])]
-    sorted_rules = sorted(valid_rules, key=lambda r: r.get('phrase_identifier', '').lower()) # Sort case-insensitively
+    # Assuming keyword_data_cache is a dict: {id: rule_dict}
+    # And rule_dict contains 'phrase_identifier', 'discovered_by', 'discovered_at'
+    valid_rules = [rule for rule_id, rule in keyword_data_cache.items()
+                   if isinstance(rule, dict) and all(k in rule for k in ['phrase_identifier'])] # Simpler check for valid rule structure
+    
+    sorted_rules = sorted(valid_rules, key=lambda r: r.get('phrase_identifier', '').lower())
 
     for rule in sorted_rules:
-        if rule.get('discovered_by'):
+        if rule.get('discovered_by'): # Check if 'discovered_by' key exists and is truthy
             user_id_str = rule['discovered_by']
-            timestamp_dt = rule.get('discovered_at')
+            timestamp_dt = rule.get('discovered_at') # Get 'discovered_at', can be None
             user_mention = f"<@{user_id_str}>"
             time_display = ""
             if timestamp_dt and isinstance(timestamp_dt, datetime.datetime):
@@ -4505,41 +4539,27 @@ async def discoveries(interaction: discord.Interaction):
                 f"🔹 `{rule['phrase_identifier']}` by {user_mention}{time_display}"
             )
         else:
-            undiscovered_count += 1
-    
-    description_lines.append("\n---") # Separator
-
-    if total_keywords > 0:
-        description_lines.append(f"**Overall Progress:** {discovered_keywords_count} / {total_keywords} phrases revealed globally.")
-    else:
-        description_lines.append("\n*No keyword phrases are currently configured.*")
-
-
-    embed_title = "🔮 AI Keyword Mysteries 🔮"
-    embed = discord.Embed(
-        title=embed_title,
-        description="\n".join(description_lines),
-        color=NERDY_YELLOW
-    )
+            undiscovered_count += 1 # This counts rules in cache that haven't been discovered
 
     if discovered_list_formatted:
         discovered_text_joined = "\n".join(discovered_list_formatted)
-        if len(discovered_text_joined) > 1020:
+        if len(discovered_text_joined) > 1020: # Max field value length
             discovered_text_joined = discovered_text_joined[:1015] + "\n... (more)"
-        embed.add_field(name="📜 Known Phrases", value=discovered_text_joined, inline=False)
-    elif total_keywords > 0:
-        embed.add_field(name="📜 Known Phrases", value="The scroll is blank... No phrases discovered yet!", inline=False)
+        embed.add_field(name="📜 Known Phrases (Discovered Globally)", value=discovered_text_joined, inline=False)
+    elif total_keywords > 0: # Only show if keywords exist but none found
+        embed.add_field(name="📜 Known Phrases (Discovered Globally)", value="The scroll is blank... No phrases discovered yet!", inline=False)
 
+    # This undiscovered_count is based on the cache, which should reflect global total undiscovered
     if total_keywords > 0 and undiscovered_count > 0:
         embed.add_field(
             name=f"❓ {undiscovered_count} Secret Phrase{'s' if undiscovered_count != 1 else ''} Still Hidden Globally",
             value=f"*Keep exploring to find them!*",
             inline=False
         )
-    elif total_keywords > 0 and undiscovered_count == 0:
+    elif total_keywords > 0 and undiscovered_count == 0: # All configured keywords are discovered
          embed.add_field(name="🎉 All Mysteries Solved Globally! 🎉", value="*You are true Keyword Masters!*", inline=False)
 
-    bot_name_display = bot.user.name if bot.user else "TheNerd's Pingslave"
+    bot_name_display = bot.user.name if bot.user else "TheNerd's Pingslave" # Fallback
     embed.set_footer(text=f"Bot by TheNerd (sweet_honey) | {bot_name_display}")
     if bot.user and bot.user.display_avatar:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
