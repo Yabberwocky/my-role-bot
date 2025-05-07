@@ -127,7 +127,7 @@ UNRESTRICTED_AI_CHANNEL_ID = 1330664430148780102 # Channel for unrestricted AI u
 keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
 user_reply_mention_cooldowns: Dict[int, datetime.datetime] = {} # user_id (int) -> timestamp when cooldown ends for reply/mention AI
 ingame_name_cache: List[str] = [] # Cache for In-Game Names from hc_members
-IMAGE_PROCESSING_CHANNEL_ID = 1248710731407560835 # Channel for image processing
+SCREENSHOTS_DROPBOX_CHANNEL_ID = 1359782718426316840 # Channel for image processing
 FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE = """Analyze the provided image(s), which are screenshots from the game Florr.io, potentially showing a guild member list.
 Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
 
@@ -183,6 +183,226 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+# --- Utility Functions (Helper for static timestamp) ---
+def get_formatted_utc_now() -> str:
+    """Returns the current UTC date and time in DD/MM/YYYY HH:MM UTC format."""
+    return discord.utils.utcnow().strftime("%d/%m/%Y %H:%M UTC")
+
+# --- Screenshot Activity Confirmation View & Buttons ---
+
+class ScreenshotActionButton(discord.ui.Button):
+    def __init__(self, ign: str, is_undo: bool, row: int, original_uploader_id: int, activity_date: datetime.date):
+        self.ign = ign
+        self.is_undo_action = is_undo # True if this button performs an "Undo", False if "Re-activate"
+        self.original_uploader_id = original_uploader_id
+        self.activity_date = activity_date
+
+        label_prefix = "Undo" if self.is_undo_action else "Re-Activate"
+        style = discord.ButtonStyle.danger if self.is_undo_action else discord.ButtonStyle.success
+        emoji = "↩️" if self.is_undo_action else "✅"
+        
+        # Ensure custom_id is unique enough if many buttons
+        # Truncate IGN if too long for custom_id (max 100 chars for custom_id)
+        safe_ign_for_id = self.ign.replace(" ", "_")[:50] # Basic sanitization
+        custom_id_action = "undo" if self.is_undo_action else "reactivate"
+        custom_id = f"ss_act_{custom_id_action}_{safe_ign_for_id}_{original_uploader_id}"
+
+
+        super().__init__(label=f"{label_prefix}: {self.ign}", style=style, emoji=emoji, custom_id=custom_id, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ScreenshotConfirmView = self.view # Type hint for clarity
+        if not view:
+            await interaction.response.send_message("Error: View context lost.", ephemeral=True)
+            return
+
+        # Security Check: Only the original uploader can use these buttons
+        if interaction.user.id != self.original_uploader_id:
+            await interaction.response.send_message("❌ You are not authorized to use this button.", ephemeral=True)
+            return
+
+        await interaction.response.defer() # Acknowledge the interaction
+
+        guild = interaction.guild
+        if not guild: # Should not happen if command is guild-only
+            await interaction.followup.send("Error: Guild context lost.", ephemeral=True)
+            return
+
+        action_performed_successfully = False
+        action_message = ""
+        log_action_description = ""
+
+        if self.is_undo_action:
+            # --- Perform UNDO Action ---
+            # This implies the user was marked active by THIS batch.
+            # We need to ensure `remove_activity_log` is safe if the record somehow vanished.
+            success, msg = await remove_activity_log(guild, self.ign, self.activity_date, interaction.user.id)
+            if success:
+                action_performed_successfully = True
+                view.update_ign_status(self.ign, 'undone_by_view')
+                action_message = f"↩️ Activity UNDONE for `{self.ign}` for {format_date_dmy(self.activity_date)}."
+                log_action_description = f"undid activity for IGN {self.ign}"
+            elif "No activity record found" in msg: # Successfully "undone" as it was already gone or never properly added
+                action_performed_successfully = True # Treat as success for UI update
+                view.update_ign_status(self.ign, 'undone_by_view')
+                action_message = f"↩️ Activity for `{self.ign}` was already not present for {format_date_dmy(self.activity_date)}. Marked as undone."
+                log_action_description = f"attempted to undo activity for IGN {self.ign}, but no record was found"
+            else:
+                action_message = f"⚠️ Failed to undo activity for `{self.ign}`: {msg}"
+                log_action_description = f"failed to undo activity for IGN {self.ign} ({msg})"
+
+        else:
+            # --- Perform RE-ACTIVATE Action ---
+            success, msg = await upsert_activity_log(guild, self.ign, self.activity_date, interaction.user.id)
+            if success:
+                action_performed_successfully = True
+                view.update_ign_status(self.ign, 'active_by_view') # Mark as active by this view's action
+                action_message = f"✅ Activity RE-ACTIVATED for `{self.ign}` for {format_date_dmy(self.activity_date)}."
+                log_action_description = f"re-activated activity for IGN {self.ign}"
+            else:
+                action_message = f"⚠️ Failed to re-activate activity for `{self.ign}`: {msg}"
+                log_action_description = f"failed to re-activate activity for IGN {self.ign} ({msg})"
+
+        # Log the button action
+        await log_info(guild, f"Screenshot Action: User `{interaction.user}` {log_action_description} via button (Original uploader: {self.original_uploader_id}).")
+
+        # Update the original confirmation message with new embed and buttons
+        if action_performed_successfully:
+            await view.refresh_message(interaction.message) # Pass the message to edit
+            # Trigger static list update if an activity status actually changed
+            asyncio.create_task(update_static_list_message(guild))
+
+        # Send an ephemeral follow-up to the user who clicked the button
+        await interaction.followup.send(action_message, ephemeral=True)
+
+
+class ScreenshotConfirmView(View):
+    # Max 5 buttons per row. Max 5 rows. Total 25 components.
+    # If newly_added_igns_details has more than ~23 items, we can't show all buttons.
+    MAX_BUTTONS_DISPLAY = 23 
+
+    def __init__(self, original_author_id: int, activity_date: datetime.date,
+                 newly_added_igns_details: List[Dict[str, Any]], # [{'ign': str, 'status': 'active_by_view' | 'undone_by_view'}]
+                 already_active_igns: List[str],
+                 failed_to_add_igns: List[str], # IGNs that AI found but failed DB ops
+                 guild_for_log: discord.Guild,
+                 original_message_id: int,
+                 timeout: float = 900.0): # 15 minutes timeout
+        super().__init__(timeout=timeout)
+        self.original_author_id = original_author_id
+        self.activity_date = activity_date
+        self.newly_added_igns_details = newly_added_igns_details # This list will be modified by buttons
+        self.already_active_igns = already_active_igns
+        self.failed_to_add_igns = failed_to_add_igns
+        self.guild_for_log = guild_for_log # For logging within the view if needed
+        self.message_id_to_reply_to = original_message_id # ID of the message we replied to (the one with screenshot)
+        
+        self._update_ui_elements()
+
+    def _update_ui_elements(self):
+        self.clear_items() # Remove previous buttons
+
+        current_row = 0
+        buttons_in_row = 0
+        buttons_added_count = 0
+
+        for ign_detail in self.newly_added_igns_details:
+            if buttons_added_count >= self.MAX_BUTTONS_DISPLAY:
+                # Add a placeholder if we exceed max buttons
+                # For simplicity, we'll just stop adding more buttons.
+                # A "more actions..." button could lead to a modal if needed.
+                print(f"Warning: Max buttons ({self.MAX_BUTTONS_DISPLAY}) reached for ScreenshotConfirmView. Not all actions displayed.")
+                break
+
+            ign = ign_detail['ign']
+            status = ign_detail['status'] # 'active_by_view' or 'undone_by_view'
+
+            is_undo_button = (status == 'active_by_view')
+            
+            button = ScreenshotActionButton(
+                ign=ign,
+                is_undo=is_undo_button,
+                row=current_row,
+                original_uploader_id=self.original_author_id,
+                activity_date=self.activity_date
+            )
+            self.add_item(button)
+            buttons_added_count += 1
+            buttons_in_row += 1
+            if buttons_in_row >= 5: # Max 5 components per row
+                buttons_in_row = 0
+                current_row += 1
+                if current_row >= 5: # Max 5 rows
+                    print(f"Warning: Max rows reached for ScreenshotConfirmView buttons.")
+                    break
+        
+    def update_ign_status(self, ign_to_update: str, new_status: str):
+        """Updates the status of an IGN in newly_added_igns_details."""
+        for detail in self.newly_added_igns_details:
+            if detail['ign'] == ign_to_update:
+                detail['status'] = new_status
+                break
+        self._update_ui_elements() # Re-render buttons based on new state
+
+    def create_embed(self) -> discord.Embed:
+        title = "📸 Screenshot Activity Update"
+        embed_color = NERDY_YELLOW
+        description_parts = [f"Activity for **{format_date_dmy(self.activity_date)}** based on your screenshot:"]
+
+        if not self.newly_added_igns_details and not self.already_active_igns and not self.failed_to_add_igns:
+            description_parts.append("\nNo players were processed from the screenshot.")
+            embed_color = discord.Color.orange()
+        else:
+            if self.newly_added_igns_details:
+                description_parts.append("\n**Newly Marked Active (or status changed via buttons):**")
+                for detail in self.newly_added_igns_details:
+                    ign = detail['ign']
+                    status_icon = "✅" if detail['status'] == 'active_by_view' else "↩️"
+                    status_text = "(Active)" if detail['status'] == 'active_by_view' else "(Undo Applied)"
+                    description_parts.append(f"- {status_icon} `{discord.utils.escape_markdown(ign)}` {status_text}")
+                if len(self.newly_added_igns_details) > self.MAX_BUTTONS_DISPLAY:
+                    description_parts.append(f"*(...and {len(self.newly_added_igns_details) - self.MAX_BUTTONS_DISPLAY} more not shown with buttons)*")
+
+
+            if self.already_active_igns:
+                description_parts.append("\n**Already Marked Active Today:**")
+                description_parts.extend([f"- 👍 `{discord.utils.escape_markdown(ign)}`" for ign in self.already_active_igns])
+            
+            if self.failed_to_add_igns:
+                description_parts.append("\n**Failed to Process (e.g. DB Error):**")
+                description_parts.extend([f"- ❌ `{discord.utils.escape_markdown(ign)}`" for ign in self.failed_to_add_igns])
+
+        embed = discord.Embed(title=title, description="\n".join(description_parts), color=embed_color)
+        embed.set_footer(text="Click buttons below to undo/re-activate new entries. (View active for 15 mins)")
+        embed.timestamp = discord.utils.utcnow()
+        return embed
+
+    async def refresh_message(self, message_obj_to_edit: discord.Message):
+        """Edits the message with the current view state."""
+        embed = self.create_embed()
+        try:
+            await message_obj_to_edit.edit(embed=embed, view=self)
+        except discord.HTTPException as e:
+            await log_error(self.guild_for_log, "Failed to refresh ScreenshotConfirmView message", error=e)
+
+    async def on_timeout(self):
+        # Try to edit the message to remove/disable buttons
+        # Fetch the message object it's attached to first.
+        # This assumes the view was attached to a message sent by the bot.
+        if self.message: # self.message should be set when the view is sent
+            try:
+                self.clear_items() # Remove all buttons
+                timeout_embed = self.create_embed() # Get current data
+                timeout_embed.description += "\n\n**Button interaction period has ended.**"
+                timeout_embed.color = discord.Color.light_grey()
+                await self.message.edit(embed=timeout_embed, view=self) # Send view with no items
+            except discord.NotFound:
+                await log_info(self.guild_for_log, f"ScreenshotConfirmView: Original message {self.message.id} not found on timeout.")
+            except discord.HTTPException as e:
+                await log_error(self.guild_for_log, f"ScreenshotConfirmView: Failed to edit message on timeout for {self.message.id}", error=e)
+        await log_info(self.guild_for_log, f"ScreenshotConfirmView for message {self.message_id_to_reply_to} by user {self.original_author_id} timed out.")
+        self.stop()
 
 async def get_ai_response_with_image(
     prompt: str,
@@ -934,8 +1154,7 @@ class StaticHCPagesView(View):
                   description=info_description, # Use the variable here
                   color=NERDY_YELLOW # Use bot's standard color
              )
-             current_unix_ts = int(discord.utils.utcnow().timestamp())
-             embed.set_footer(text=f"Info Mode | Updated: <t:{current_unix_ts}:R>")
+             embed.set_footer(text=f"Info Mode | Updated: {get_formatted_utc_now()}")
              return embed
 
         # --- Standard Page Embed Logic ---
@@ -1044,14 +1263,13 @@ class StaticHCPagesView(View):
             VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
         }
         view_text = view_text_map.get(self.view_mode, "Unknown View")
-        current_unix_ts = int(discord.utils.utcnow().timestamp())
         footer_text = (
             f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
             f"View: {view_text} | Sort: {sort_text}"
         )
         if hasattr(self, 'is_fetching_activity') and self.is_fetching_activity:
              footer_text += " | Fetching data..."
-        footer_text += f" | Updated: <t:{current_unix_ts}:R>"
+        footer_text += f" | Updated: {get_formatted_utc_now()}"
         embed.set_footer(text=footer_text)
         return embed
 
@@ -2117,88 +2335,103 @@ class HCPagesView(View):
         """Creates embed based on current view_mode, sort_mode, and context."""
         start = self.current_page * MEMBERS_PER_PAGE
         page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
-
-        IDX_WIDTH = 3
-        if self.view_mode == VIEW_MODE_DISCORD:
-             # Use a slightly wider name column to accommodate potentially longer stored names
-             NAME_WIDTH = 18
-             IGN_WIDTH = 15
-             ACT_WIDTH = 0 # No activity column
-             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'Discord (Stored)':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}") # Indicate stored name might be shown
-        # All activity views use the same layout now
-        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-             IGN_WIDTH = 20
-             ACT_WIDTH = ACTIVITY_COLUMN_WIDTH # Use constant
-             TOTAL_WIDTH = IDX_WIDTH + IGN_WIDTH + ACT_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'In-Game':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}")
-        else: # Fallback (shouldn't happen)
-             NAME_WIDTH = 15; IGN_WIDTH = 15; ACT_WIDTH = 0
-             TOTAL_WIDTH = IDX_WIDTH + NAME_WIDTH + IGN_WIDTH
-             header = (f"{'#':<{IDX_WIDTH}}{'Discord':<{NAME_WIDTH}}{'In-Game':<{IGN_WIDTH}}")
-
-        separator = "-" * TOTAL_WIDTH
-
-        desc_lines = [f"```", header, separator]
+        desc_lines = []
         idx = start + 1
 
+        # Define a shared IGN display width
+        IGN_DISPLAY_WIDTH = 18 # Consistent with static list
+        IDX_WIDTH = 3 # Consistent with static list
+
         if not page_data:
+            # Keep code block for "No members" for all views to maintain similar look for empty state
             desc_lines = ["```\nNo members found matching criteria.\n```"]
-        else:
+        elif self.view_mode == VIEW_MODE_DISCORD:
+            # Format: #. `IGN` DiscordMention (Mention is OUTSIDE code block)
+            # No header, no overall code block for this view mode's content lines
             for item_dict in page_data:
-                ign = item_dict.get('ign', 'Unknown')
+                ign = item_dict.get('ign', 'Unknown IGN')
+                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} "
 
-                if self.view_mode == VIEW_MODE_DISCORD:
-                    # Check if live discord.Member object exists (only available in Catercord context)
-                    member = item_dict.get('member')
-                    if member: # If we have the live member object (Catercord context)
-                        user_display = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
-                    else: # Use the stored name from Supabase (Outside Catercord or member left/no longer has role)
-                        user_display = item_dict.get('discord_name') or "[No Discord]" # Use DB name or fallback placeholder
+                member_obj = item_dict.get('member') # discord.Member object or None
+                user_id_for_mention: Optional[str] = None
+                display_name_for_fallback: Optional[str] = None
 
-                    ign_display = ign
-                    # Truncate display names if necessary
-                    if len(user_display) > NAME_WIDTH: user_display = user_display[:NAME_WIDTH-1] + "…"
-                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
-                    # Format line
-                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
-                            f"{user_display:<{NAME_WIDTH}}"
-                            f"{ign_display:<{IGN_WIDTH}}")
+                if member_obj:
+                    user_id_for_mention = str(member_obj.id)
+                elif item_dict.get('discord_id'):
+                    user_id_for_mention = str(item_dict['discord_id'])
+                    display_name_for_fallback = item_dict.get('discord_name') # Stored name if user not in server
 
-                elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-                    # Activity view logic remains the same, using data present in item_dict
-                    activity_count = item_dict.get('activity_count', 0)
-                    last_seen_date = item_dict.get('last_seen') # date object or None
-                    ign_display = ign
-                    # Format activity: Count (Last Seen DD/MM/YY)
-                    activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
+                # Construct mention or fallback text
+                if user_id_for_mention:
+                    mention_display = f"<@!{user_id_for_mention}>"
+                elif display_name_for_fallback: # User ID was linked, but member object not found
+                    mention_display = f"`{discord.utils.escape_markdown(display_name_for_fallback)} (Not in server)`"
+                else: # No Discord ID linked at all (e.g., hconly entry)
+                    mention_display = "`[No Discord Link]`"
 
-                    # Truncate display names if necessary
-                    if len(ign_display) > IGN_WIDTH: ign_display = ign_display[:IGN_WIDTH-1] + "…"
-                    if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
-                    # Format line
-                    line = (f"{str(idx)+'.':<{IDX_WIDTH}}"
-                            f"{ign_display:<{IGN_WIDTH}}"
-                            f"{activity_display:<{ACT_WIDTH}}")
-                else: # Fallback
-                     line = f"{str(idx)+'.':<{IDX_WIDTH}} Error: Invalid View Mode"
+                # Truncate IGN
+                ign_display = ign
+                if len(ign_display) > IGN_DISPLAY_WIDTH:
+                     ign_display = ign_display[:IGN_DISPLAY_WIDTH-1] + "…"
 
+                line = f"{index_str}`{ign_display:<{IGN_DISPLAY_WIDTH}}` {mention_display}"
                 desc_lines.append(line)
                 idx += 1
-            desc_lines.append("```")
 
-        # Use context flag to potentially adjust title
-        # If in Catercord, use standard title. Otherwise, indicate it's DB-only.
+        # All activity views use the same layout now (within a code block)
+        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
+             # Format: ``` #. IGN Activity ``` (Uses fixed-width code block)
+             # Re-use widths from static list for consistency if desired, or keep HCPagesView specific
+             # Static list uses: IGN_WIDTH = 16, ACT_WIDTH = 18 (ACTIVITY_COLUMN_WIDTH)
+             # HCPagesView currently uses: IGN_WIDTH = 20, ACT_WIDTH = ACTIVITY_COLUMN_WIDTH
+             # Let's align them for better consistency if possible. Static list's total width is tighter.
+             # Sticking to HCPagesView's current widths for activity for now unless specified.
+             IGN_WIDTH_ACTIVITY = 20 # Keep as is for HCPagesView
+             ACT_WIDTH = ACTIVITY_COLUMN_WIDTH
+             TOTAL_WIDTH = IDX_WIDTH + 1 + IGN_WIDTH_ACTIVITY + ACT_WIDTH # +1 for space after index
+             header = (f"{'#':<{IDX_WIDTH}} {'IGN':<{IGN_WIDTH_ACTIVITY}}{'Activity':<{ACT_WIDTH}}")
+             separator = "-" * (TOTAL_WIDTH -1) # Adjust separator to match content width
+
+             desc_lines.append("```")
+             desc_lines.append(header)
+             desc_lines.append(separator)
+
+             for item_dict in page_data:
+                ign = item_dict.get('ign', 'Unknown')
+                activity_count = item_dict.get('activity_count', 0)
+                last_seen_date = item_dict.get('last_seen') # date object or None
+                activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
+
+                index_str_activity = f"{str(idx)+'.':<{IDX_WIDTH}} " # Pad index and add space
+
+                ign_display_activity = ign
+                if len(ign_display_activity) > IGN_WIDTH_ACTIVITY: ign_display_activity = ign_display_activity[:IGN_WIDTH_ACTIVITY-1] + "…"
+                if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
+
+                line = (f"{index_str_activity}{ign_display_activity:<{IGN_WIDTH_ACTIVITY}}{activity_display:<{ACT_WIDTH}}")
+                desc_lines.append(line)
+                idx += 1
+             desc_lines.append("```")
+        else: # Fallback
+             desc_lines = ["```Error: Invalid View Mode```"]
+
+
         title = HC_LIST_EMBED_TITLE if self.is_catercord_context else "HC Database Members (All)"
-
         embed = discord.Embed(
             title=title,
-            description="\n".join(desc_lines),
+            description="\n".join(desc_lines), # Join the constructed lines
             color=NERDY_YELLOW
         )
 
-        # --- Footer Update (Remains the same) ---
+        # Footer Update (Remains the same logic)
         sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
+        # For Discord View, sort button is disabled, so text doesn't matter as much
+        # but if it were enabled, sort_mode could be 'discord_name' vs 'ign'
+        if self.view_mode == VIEW_MODE_DISCORD:
+            # If you implement sorting for Discord view later, this text might change
+            sort_text = "IGN" # Default assumption for this view if sort button was active
+
         view_text_map = {
             VIEW_MODE_DISCORD: "Discord+IGN",
             VIEW_MODE_ACTIVITY_ALL: "Activity (All)",
@@ -2207,14 +2440,13 @@ class HCPagesView(View):
             VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
         }
         view_text = view_text_map.get(self.view_mode, "Unknown View")
-        current_unix_ts = int(discord.utils.utcnow().timestamp())
         footer_text = (
             f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
             f"View: {view_text} | Sort: {sort_text}"
         )
         if self.is_fetching_activity:
              footer_text += " | Fetching data..."
-        footer_text += f" | <t:{current_unix_ts}:R>" # Dynamic timestamp
+        footer_text += f" | {get_formatted_utc_now()}"
         embed.set_footer(text=footer_text)
         return embed
 
@@ -2431,7 +2663,7 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
     """
     Fetches HC members from Discord and Supabase, including all-time activity counts.
     Logs warnings for mismatches (Role w/o DB, DB w/o Role/Member).
-    Returns a list of dicts: [{'member': discord.Member | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
+    Returns a list of dicts: [{'member': discord.Member | None, 'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
     and the total count.
     Data is sorted by Discord name (if available), then IGN (case-insensitive).
     """
@@ -2442,15 +2674,16 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         return [], 0
 
     # 1. Fetch ALL entries from Supabase hc_members table
-    all_db_members: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'processed': False}
+    all_db_members: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'discord_name': discord_name, 'processed': False}
     ign_only_members: Dict[str, Dict] = {} # ign_lower -> {'ign_original': ign, 'processed': False}
     all_igns_in_db: List[str] = [] # List of all original-case IGNs for activity fetching
 
     try:
         if not supabase: raise ConnectionError("Supabase client unavailable.")
         print(f"Fetch HC Data ({guild.name}): Fetching all from Supabase hc_members table...")
+        # MODIFIED: Select discord_name as well
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members").select("discord_id, ingame_name").execute()
+            lambda: supabase.table("hc_members").select("discord_id, ingame_name, discord_name").execute()
         )
         if resp and hasattr(resp, 'data') and resp.data:
             for entry in resp.data:
@@ -2458,9 +2691,10 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
                 if not ign: continue # Skip entries without an IGN
                 all_igns_in_db.append(ign) # Add original case IGN
                 d_id = entry.get("discord_id")
+                d_name = entry.get("discord_name") # Get discord_name
                 if d_id:
                     # Store discord_id as string consistently
-                    all_db_members[str(d_id)] = {"ign": ign, "processed": False}
+                    all_db_members[str(d_id)] = {"ign": ign, "discord_name": d_name, "processed": False}
                 else:
                     ign_only_members[ign.lower()] = {"ign_original": ign, "processed": False}
             print(f"Fetch HC Data ({guild.name}): Found {len(all_db_members)} DB entries with Discord ID, {len(ign_only_members)} without.")
@@ -2479,15 +2713,12 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
 
     # 2. Fetch ALL activity data for the IGNs found
     print(f"Fetch HC Data ({guild.name}): Fetching all-time activity for {len(all_igns_in_db)} IGNs...")
-    # Fetch activity counts using the helper function (pass original case IGNs)
-    # The helper will handle lowercase matching internally for the query
     activity_counts = await fetch_activity_data(guild, all_igns_in_db) # Fetches count and last_seen
     print(f"Fetch HC Data ({guild.name}): Fetched activity data for {len(activity_counts)} IGNs.")
 
     # 3. Get Discord members with the HC role
     discord_hc_members: List[discord.Member] = []
     try:
-        # Ensure guild is chunked if needed
         if not guild.chunked and guild.member_count is not None and guild.member_count > 1000:
              try:
                  print(f"Fetch HC Data ({guild.name}): Chunking guild..."); await guild.chunk(cache=True)
@@ -2496,8 +2727,7 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         discord_hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
         print(f"Fetch HC Data ({guild.name}): Found {len(discord_hc_members)} Discord members with HC role.")
     except Exception as e:
-        # Log as error but continue if possible, Supabase entries might still be processed
-        await log_error(guild, "Guild chunking/member fetch failed during data fetch. List might be incomplete.", error=e, ping_owner=False) # Don't necessarily ping for this unless severe
+        await log_error(guild, "Guild chunking/member fetch failed during data fetch. List might be incomplete.", error=e, ping_owner=False)
 
     # 4. Correlate and Build Final Data Structure
     final_data: List[Dict[str, Any]] = []
@@ -2508,84 +2738,75 @@ async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any
         db_entry = all_db_members.get(member_id_str)
         ign = "Unknown"
         activity = {'count': 0, 'last_seen': None} # Default activity
+        # Get member's current name for storage consistency if updating
+        current_discord_name = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
+
 
         if db_entry:
             ign = db_entry["ign"]
             db_entry["processed"] = True
-            # Get activity for this member's IGN (use lowercase for lookup)
             activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
         else:
-            # *** SCENARIO 1 LOG ***
-            # Member has role but no DB entry? Log it.
             await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
 
         final_data.append({
             "member": member,
+            "discord_id": member_id_str, # Add discord_id directly
+            "discord_name": current_discord_name, # Add current discord_name
             "ign": ign,
             "activity_count": activity['count'],
-            "last_seen": activity['last_seen'] # Store the date object or None
+            "last_seen": activity['last_seen']
         })
 
     # Process remaining DB entries (Discord member lost role/left or IGN-only)
-    # Add Discord-linked entries first
     for d_id, entry_data in all_db_members.items():
         if not entry_data["processed"]:
             ign = entry_data["ign"]
+            stored_discord_name = entry_data.get("discord_name") # Get stored name
             activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
 
-            # *** SCENARIO 2 LOGGING ***
+            # Logging for Scenario 2 (DB entry exists, but member not found/no role)
             try:
-                member_in_guild = guild.get_member(int(d_id)) # Check cache first
-                if not member_in_guild and not guild.chunked: # If not found and not chunked, maybe try fetching? Risky performance-wise.
-                     # Optional: try fetch member, but be careful with performance impact
-                     # try: member_in_guild = await guild.fetch_member(int(d_id))
-                     # except discord.NotFound: member_in_guild = None
-                     # except Exception: member_in_guild = None # Ignore other fetch errors
-                     pass
-
+                member_in_guild = guild.get_member(int(d_id))
                 if member_in_guild:
-                    # User is IN the guild, check if they have the HC role
                     if hc_role not in member_in_guild.roles:
-                        await log_info(guild, f"Fetch HC Data Warning: DB entry exists for {member_in_guild.mention} (`{d_id}`), but they do **not** currently have the HC role.")
-                    # else: # User exists and HAS the role, but wasn't processed in loop 1? This is odd.
-                    #     await log_warning(guild, f"Fetch HC Data Anomaly: DB entry for {member_in_guild.mention} (`{d_id}`) has HC role but wasn't processed initially.")
+                        await log_info(guild, f"Fetch HC Data Warning: DB entry exists for {member_in_guild.mention} (`{d_id}`), but they do **not** currently have the HC role. IGN: `{ign}`")
                 else:
-                    # User is NOT in the guild (or couldn't be found)
-                    # Fetch discord name from DB if available, fallback to ID
-                    db_name = entry_data.get("discord_name", f"ID {d_id}")
-                    await log_info(guild, f"Fetch HC Data Info: DB entry exists for user `{db_name}` (`{d_id}`), but they are not currently in this server (or couldn't be found). IGN: `{ign}`")
-
-            except ValueError: # Handle if d_id is somehow not a valid integer string
+                    name_to_log = stored_discord_name or f"ID {d_id}"
+                    await log_info(guild, f"Fetch HC Data Info: DB entry exists for user `{name_to_log}` (`{d_id}`), but they are not currently in this server (or couldn't be found). IGN: `{ign}`")
+            except ValueError:
                  await log_error(guild, f"Fetch HC Data Error: Invalid Discord ID '{d_id}' found in database for IGN '{ign}'.", ping_owner=True)
-            except Exception as e_log: # Catch errors during the logging check itself
-                 await log_error(guild, f"Fetch HC Data Error: Failed during Scenario 2 check for ID '{d_id}'", error=e_log, ping_owner=False) # Don't ping for logging errors
+            except Exception as e_log:
+                 await log_error(guild, f"Fetch HC Data Error: Failed during Scenario 2 check for ID '{d_id}'", error=e_log, ping_owner=False)
 
-            # Add to final data regardless of log status
+            # Add to final data with member: None
             final_data.append({
-                "member": None, # Display as [No Discord]
+                "member": None,
+                "discord_id": d_id, # Stored discord_id
+                "discord_name": stored_discord_name, # Stored discord_name
                 "ign": ign,
                 "activity_count": activity['count'],
                 "last_seen": activity['last_seen']
             })
-            # *** END SCENARIO 2 LOGGING ***
 
     # Add IGN-only entries (no discord_id)
     for ign_lower, entry_data in ign_only_members.items():
-         # No need to check 'processed' here as they weren't handled by Discord member loop
          ign = entry_data["ign_original"]
          activity = activity_counts.get(ign_lower, {'count': 0, 'last_seen': None})
          final_data.append({
              "member": None,
+             "discord_id": None, # Explicitly None
+             "discord_name": None, # Explicitly None
              "ign": ign,
              "activity_count": activity['count'],
              "last_seen": activity['last_seen']
          })
 
 
-    # 5. Sort the final list (Default: Discord name if available, then IGN case-insensitive)
+    # 5. Sort the final list
     final_data.sort(key=lambda item: (
-        item['member'].name.lower() if item.get('member') else 'zzz', # Sort None members last initially
-        item['member'].discriminator if item.get('member') else 'zzz',
+        item['member'].name.lower() if item.get('member') else (item.get('discord_name', 'zzz') or 'zzz').lower(),
+        item['member'].discriminator if item.get('member') else 'zzz', # Fallback for sorting
         item['ign'].lower()
     ))
 
@@ -2657,149 +2878,162 @@ async def on_close():
 # --- REVISED update_static_list_message Function ---
 
 async def update_static_list_message(guild: discord.Guild):
-    """ Creates or updates the SINGLE interactive HC list message."""
+    """ Creates or updates the SINGLE interactive HC list message, cleaning up old ones."""
     list_channel_id = HC_MEMBER_LIST_CHANNEL_ID
     chan = guild.get_channel(list_channel_id)
 
-    # --- Initial Checks (Unchanged) ---
+    # --- Initial Checks (Permissions, Bot Ready) ---
     if not isinstance(chan, discord.TextChannel):
         await log_error(guild, f"Static list update failed: Channel {list_channel_id} invalid.")
         return
-    if not bot or not bot.user:
-        await log_error(guild, "Static list update failed: Bot not ready.")
+    if not bot or not bot.user: # Added check for bot.user
+        await log_error(guild, "Static list update failed: Bot not ready or bot.user not available.")
         return
     bot_perms = chan.permissions_for(guild.me)
-    if not bot_perms.send_messages or not bot_perms.embed_links or not bot_perms.read_message_history:
-        await log_error(guild, f"Static list update failed: Bot missing Send/Embed/History permissions in {chan.mention}.")
+    if not bot_perms.send_messages or not bot_perms.embed_links or not bot_perms.read_message_history or not bot_perms.manage_messages: # Added manage_messages for cleanup
+        await log_error(guild, f"Static list update failed: Bot missing Send/Embed/History/ManageMessages permissions in {chan.mention}.")
         return
 
     await log_info(guild, f"Updating interactive static list in {chan.mention}...")
 
-    # --- Fetch Fresh Base Data (Unchanged) ---
-    member_data = []
-    total_count = 0
+    # --- Fetch Fresh Base Data and Initial Display Data (Unchanged logic) ---
+    member_data, total_count = [], 0
     try:
         member_data, total_count = await fetch_hc_member_data(guild)
-        if not member_data:
-            await log_info(guild, "Static list update: No HC members found. Will show empty state.")
-    except Exception as e_fetch:
-        await log_error(guild, "Static list update failed: Error fetching base member data.", error=e_fetch)
+    except Exception as e_fetch_base:
+        await log_error(guild, "Static list update failed: Error fetching base member data.", error=e_fetch_base)
         return
 
-    # --- Fetch Initial Display Data (Unchanged) ---
     initial_display_data = list(member_data) # Default to base data
     try:
         today_utc = datetime.datetime.now(pytz.utc).date()
         end_date_monthly = today_utc
         start_date_monthly = today_utc - datetime.timedelta(days=29)
         all_igns = [item['ign'] for item in member_data if item.get('ign')]
-
         if all_igns:
-            print(f"[Static Update] Fetching initial monthly activity for {len(all_igns)} IGNs...")
             monthly_activity_data = await fetch_activity_data(guild, all_igns, start_date_monthly, end_date_monthly)
-            print(f"[Static Update] Fetched initial monthly activity.")
             temp_data = []
-            for item in member_data: # Iterate base data
+            for item in member_data:
                 ign_lower = item.get('ign', '').lower()
                 activity_info = monthly_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                updated_item = item.copy() # Create copy from base data
-                updated_item['activity_count'] = activity_info['count']
-                updated_item['last_seen'] = activity_info['last_seen']
+                updated_item = item.copy(); updated_item['activity_count'] = activity_info['count']; updated_item['last_seen'] = activity_info['last_seen']
                 temp_data.append(updated_item)
-            initial_display_data = temp_data # Set the prepared data
-        else:
-            print("[Static Update] No IGNs found in base data, skipping initial monthly fetch.")
+            initial_display_data = temp_data
     except Exception as fetch_err:
          await log_error(guild, "[Static Update] Failed to fetch initial monthly activity", error=fetch_err)
+    # --- End Data Fetching ---
 
-    # --- Try to Get Existing View and Message (Unchanged) ---
-    existing_view_instance: Optional[StaticHCPagesView] = None
-    existing_message: Optional[discord.Message] = None
-    tracked_data = active_static_list_views.get(list_channel_id)
-    # ... (rest of existing message/view fetching logic is fine) ...
-    if tracked_data:
-        view = tracked_data.get('view')
-        msg_id = tracked_data.get('message_id')
-        # Check if view is the correct type and not stopped
-        if msg_id and isinstance(view, StaticHCPagesView) and not view.is_finished():
+    # --- Message and View Management ---
+    active_view_data = active_static_list_views.get(list_channel_id)
+    tracked_message_obj: Optional[discord.Message] = None
+    tracked_view_instance: Optional[StaticHCPagesView] = None
+
+    if active_view_data:
+        msg_id = active_view_data.get('message_id')
+        view_instance = active_view_data.get('view')
+        if msg_id and isinstance(view_instance, StaticHCPagesView) and not view_instance.is_finished():
             try:
-                existing_message = await chan.fetch_message(msg_id)
-                if existing_message:
-                    # Minimal check: does it have components? A more robust check is complex.
-                    if existing_message.components:
-                        existing_view_instance = view
-                        # Link message object to existing view instance if missing
-                        if not existing_view_instance.message:
-                            existing_view_instance.message = existing_message
-                        print(f"[Static Update] Found existing tracked message {msg_id} and running view instance.")
-                    else:
-                        print(f"[Static Update] Tracked message {msg_id} has no components. Will send new.")
-                        existing_message = None # Treat as non-existent for view update
+                fetched_msg = await chan.fetch_message(msg_id)
+                if fetched_msg.components: # Check if message still has view components
+                    tracked_message_obj = fetched_msg
+                    tracked_view_instance = view_instance
+                    if not tracked_view_instance.message: # Link if missing
+                        tracked_view_instance.message = fetched_msg
+                    print(f"[Static Update] Valid tracked message {msg_id} and view instance found.")
+                else:
+                    print(f"[Static Update] Tracked message {msg_id} found but has no components. Invalidating.")
+                    if not view_instance.is_finished(): view_instance.stop() # Stop the orphaned view
             except discord.NotFound:
-                print(f"[Static Update] Tracked message {msg_id} not found. Cleaning up tracker.")
-                if list_channel_id in active_static_list_views: del active_static_list_views[list_channel_id]
+                print(f"[Static Update] Tracked message {msg_id} not found. Invalidating.")
+                if not view_instance.is_finished(): view_instance.stop()
             except Exception as e_fetch_tracked:
-                 print(f"[Static Update] Error fetching/validating tracked message {msg_id}: {e_fetch_tracked}. Will send new.")
-                 # Clear potentially bad references
-                 existing_message = None
-                 existing_view_instance = None
+                print(f"[Static Update] Error validating tracked message {msg_id}: {e_fetch_tracked}. Invalidating.")
+                if not view_instance.is_finished(): view_instance.stop()
+        if not tracked_message_obj: # If validation failed
+            del active_static_list_views[list_channel_id] # Clear invalid entry
 
+    # Scan history for the most recent list message if no valid tracked one
+    message_from_history: Optional[discord.Message] = None
+    if not tracked_message_obj:
+        print("[Static Update] No valid tracked message. Scanning history for a reusable list...")
+        async for historical_msg in chan.history(limit=20): # Check last 20 messages
+            if historical_msg.author.id == bot.user.id and \
+               historical_msg.embeds and historical_msg.embeds[0].title == HC_LIST_EMBED_TITLE and \
+               historical_msg.components:
+                message_from_history = historical_msg
+                print(f"[Static Update] Found potential list message in history: {message_from_history.id}")
+                break # Found the newest one
 
-    # --- Update Existing View or Send New Message ---
+    # --- Determine Action: Update, Edit-with-New-View, or Send-New ---
+    final_updated_message: Optional[discord.Message] = None
+
     try:
-        if existing_view_instance and existing_message:
-            print(f"[Static Update] Updating data within existing view for message {existing_message.id}")
-            # Call the new method to update data and refresh
-            await existing_view_instance.update_data_and_refresh(
+        if tracked_message_obj and tracked_view_instance:
+            # Scenario 1: Valid tracked message and view instance exist. Update it.
+            print(f"[Static Update] Action: Updating existing tracked view for message {tracked_message_obj.id}")
+            await tracked_view_instance.update_data_and_refresh(
                 new_original_data=member_data,
                 new_initial_display_data=initial_display_data,
                 new_total_members=total_count
             )
-            await log_info(guild, f"Interactive static list updated (existing view) successfully in {chan.mention}.")
-        else:
-            print("[Static Update] No valid existing view found/reusable. Creating and sending new message.")
+            final_updated_message = tracked_message_obj
+            await log_info(guild, f"Interactive static list updated (reused active view) in {chan.mention}.")
 
-            # --- Prepare View (but don't pass message yet) ---
-            new_view_prep = StaticHCPagesView(
-                original_data=member_data,
-                initial_display_data=initial_display_data,
-                total_members=total_count,
-                guild=guild,
-                message=None # Pass None initially
+        elif message_from_history:
+            # Scenario 2: No valid tracked view, but found a reusable message in history.
+            # Edit this message with a brand new view.
+            print(f"[Static Update] Action: Reusing message {message_from_history.id} from history with a new view.")
+            new_view = StaticHCPagesView(
+                original_data=member_data, initial_display_data=initial_display_data,
+                total_members=total_count, guild=guild, message=message_from_history # Link message now
             )
-            initial_embed = new_view_prep.create_page_embed()
-            sent_message: Optional[discord.Message] = None
+            initial_embed = new_view.create_page_embed()
+            await message_from_history.edit(embed=initial_embed, view=new_view)
+            # Update tracker
+            active_static_list_views[list_channel_id] = {'view': new_view, 'message_id': message_from_history.id}
+            final_updated_message = message_from_history
+            await log_info(guild, f"Interactive static list updated (reused historical message, new view) in {chan.mention}.")
 
-            # --- Send Message with the prepared view ---
-            sent_message = await chan.send(embed=initial_embed, view=new_view_prep) # Send the prepared view
-            print(f"[Static Update] New message sent: {sent_message.id}")
+        else:
+            # Scenario 3: No message to reuse. Send a new one.
+            print("[Static Update] Action: Sending a new list message.")
+            new_view = StaticHCPagesView(
+                original_data=member_data, initial_display_data=initial_display_data,
+                total_members=total_count, guild=guild, message=None # Message linked after send
+            )
+            initial_embed = new_view.create_page_embed()
+            sent_message = await chan.send(embed=initial_embed, view=new_view)
+            new_view.message = sent_message # Link the sent message object
+            new_view.message_id = sent_message.id
+            # Update tracker
+            active_static_list_views[list_channel_id] = {'view': new_view, 'message_id': sent_message.id}
+            final_updated_message = sent_message
+            await log_info(guild, f"Interactive static list created (new message) in {chan.mention}.")
 
-            # --- Update Tracking and link message to view ---
-            if sent_message:
-                 # Stop previous view if accidentally tracked but not reused
-                 if list_channel_id in active_static_list_views:
-                      old_view_data = active_static_list_views[list_channel_id]
-                      if old_view_data.get('view') and not old_view_data['view'].is_finished():
-                           old_view_data['view'].stop()
-                      print(f"[Static Update] Stopped previous tracked view instance (if any).")
-
-                 # Link the sent message object to the view instance
-                 new_view_prep.message = sent_message
-                 new_view_prep.message_id = sent_message.id
-
-                 # Track the new message and view
-                 active_static_list_views[list_channel_id] = {
-                      'view': new_view_prep, # Store the view instance that now has the message linked
-                      'message_id': sent_message.id
-                 }
-                 print(f"[Static Update] Updated tracking for channel {list_channel_id} with NEW message {sent_message.id}")
-
-                 # Ensure background task is running
-                 if not check_static_view_timeout.is_running():
-                      print("[Static Update] Background task wasn't running. Starting it.")
-                      try: check_static_view_timeout.start()
-                      except RuntimeError: print("[Static Update] Background task already started (RuntimeError).")
-            await log_info(guild, f"Interactive static list updated (new message) successfully in {chan.mention}.")
+        # --- Cleanup Phase: Delete other old list messages by the bot ---
+        if final_updated_message:
+            print(f"[Static Update] Starting cleanup phase, protecting message {final_updated_message.id}.")
+            cleaned_count = 0
+            async for old_msg in chan.history(limit=30): # Check a bit more history for cleanup
+                if old_msg.author.id == bot.user.id and \
+                   old_msg.id != final_updated_message.id and \
+                   old_msg.embeds and old_msg.embeds[0].title == HC_LIST_EMBED_TITLE:
+                    try:
+                        await old_msg.delete()
+                        cleaned_count += 1
+                        print(f"[Static Update Cleanup] Deleted old list message {old_msg.id}")
+                        # If this deleted message was previously tracked, stop its view (if any)
+                        # This is more complex to manage safely without iterating active_static_list_views.
+                        # For now, relying on the primary logic to manage the single active view.
+                    except discord.Forbidden:
+                        await log_error(guild, f"Static list cleanup failed: Bot lacks delete permissions in {chan.mention}.")
+                        break # Stop trying if permissions are missing
+                    except discord.HTTPException as e_del:
+                        await log_error(guild, f"Static list cleanup failed: HTTP error deleting message {old_msg.id}.", error=e_del)
+            if cleaned_count > 0:
+                await log_info(guild, f"Static list cleanup: Deleted {cleaned_count} old/duplicate list message(s) from {chan.mention}.")
+        else:
+            print("[Static Update] Cleanup skipped as no final message was established.")
 
     except discord.Forbidden as e:
         await log_error(guild, f"Static list update failed: Bot lacks permissions in {chan.mention}.", error=e)
@@ -2807,6 +3041,12 @@ async def update_static_list_message(guild: discord.Guild):
         await log_error(guild, "Static list update failed: Discord API error.", error=e)
     except Exception as e:
         await log_error(guild, "Static list update failed: Unexpected error during send/edit/update.", error=e)
+
+    # Ensure background task is running
+    if not check_static_view_timeout.is_running():
+        print("[Static Update] Background task for view timeout wasn't running. Starting it.")
+        try: check_static_view_timeout.start()
+        except RuntimeError: print("[Static Update] Background task already started (RuntimeError).")
 
 # --- Discord Events ---
 @bot.event
@@ -4453,9 +4693,7 @@ async def syncnicknames(interaction: discord.Interaction):
     summary_embed.description = "\n".join(summary_lines)
 
     # --- MODIFIED FOOTER ---
-    # Add the dynamic timestamp to the footer
-    summary_embed.set_footer(text=f"Completed: <t:{end_unix_ts}:R>")
-    # REMOVED: summary_embed.timestamp = end_time
+    summary_embed.set_footer(text=f"Completed: {get_formatted_utc_now()}")
     # --- END MODIFIED FOOTER ---
 
     # ... (keep the final sending logic) ...
@@ -4476,8 +4714,7 @@ async def syncnicknames(interaction: discord.Interaction):
 
     # Log detailed summary internally
     log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
-    # Add dynamic timestamp to log embed footer as well
-    log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: <t:{end_unix_ts}:R>")
+    log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: {get_formatted_utc_now()}")
     await log_info(guild, "", embed=log_embed)
 
 
@@ -4808,40 +5045,36 @@ async def on_message(message: discord.Message):
             except (discord.Forbidden, discord.HTTPException) as reply_err:
                  await log_error(guild, f"Failed to send processed AI '{trigger_type}' response for msg {message.id}", error=reply_err)
 
-    # --- Image Processing for Name Extraction (MODIFIED for multiple images & green dot, and discarded name logging) ---
-    if message.channel.id == IMAGE_PROCESSING_CHANNEL_ID and message.attachments:
-
-        valid_image_attachments = []
-        for att in message.attachments:
-            if att.content_type and att.content_type.startswith("image/"):
-                valid_image_attachments.append(att)
+    # --- Image Processing for Name Extraction & Activity Update ---
+    if message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
+        valid_image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
 
         if valid_image_attachments:
             num_images = len(valid_image_attachments)
-            print(f"{num_images} image(s) received in #{channel.name} from {author.name}. Processing with AI (context-aware, green dot rule)...")
+            print(f"{num_images} image(s) received in #{channel.name} from {author.name}. Processing for activity...")
             
-            processing_reply_message_content = f"⏳ Analyzing {num_images} image(s) for online player names (using known name list & green dot rule)..."
-            if num_images == 0:
-                processing_reply_message_content = "No valid images found to process." # Should not happen if valid_image_attachments is populated
-
-            processing_reply = await message.reply(processing_reply_message_content, mention_author=False)
-            
-            if num_images == 0:
-                return
+            # Send initial processing message, PINGING the author
+            processing_reply_content = f"{author.mention} ⏳ Analyzing {num_images} image(s) for online player names and activity updates..."
+            processing_reply = await message.reply(processing_reply_content, allowed_mentions=discord.AllowedMentions(users=[author]))
 
             all_matched_igns_from_all_images: List[str] = []
-            all_ai_suggested_raw_names_global: Set[str] = set() # Use a set to store unique raw suggestions globally
+            all_ai_suggested_raw_names_global: Set[str] = set()
             ai_reported_no_names_at_least_once = False
             ai_extracted_some_text_globally = False
 
+            # Get today's date for activity logging
+            activity_date, date_error = get_utc_date()
+            if date_error or not activity_date:
+                await processing_reply.edit(content=f"{author.mention} ❌ Error: Could not determine today's date for activity logging.")
+                await log_error(guild, f"Screenshot activity error: Failed to get today's date ({date_error})", interaction=message)
+                return
+
             try:
+                # --- AI Image Analysis Loop (Identical to your provided code) ---
                 known_igns_str_for_prompt = "\n".join(ingame_name_cache) if ingame_name_cache else "No known names provided."
                 current_extraction_prompt = FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE.format(
                     known_igns_list_str=known_igns_str_for_prompt
                 )
-                # print(f"DEBUG IMAGE PROMPT (first 500 chars):\n{current_extraction_prompt[:500]}...")
-
-
                 for idx, image_att in enumerate(valid_image_attachments):
                     print(f"Processing image {idx + 1}/{num_images} (Filename: {image_att.filename}, ID: {image_att.id})...")
                     try:
@@ -4850,7 +5083,6 @@ async def on_message(message: discord.Message):
                             prompt=current_extraction_prompt,
                             image_bytes=image_data
                         )
-
                         if ai_extracted_text_for_this_image:
                             stripped_ai_text = ai_extracted_text_for_this_image.strip()
                             if stripped_ai_text.upper() == "NO_NAMES_FOUND":
@@ -4860,9 +5092,8 @@ async def on_message(message: discord.Message):
                                 ai_extracted_some_text_globally = True
                                 potential_names_from_ai_this_image = [name.strip() for name in stripped_ai_text.split('\n') if name.strip()]
                                 print(f"[Image {idx+1}] AI extracted potential names: {potential_names_from_ai_this_image}")
-                                for raw_name in potential_names_from_ai_this_image: # Add all raw AI suggestions
+                                for raw_name in potential_names_from_ai_this_image:
                                     all_ai_suggested_raw_names_global.add(raw_name)
-
                                 if ingame_name_cache and potential_names_from_ai_this_image:
                                     for ai_name in potential_names_from_ai_this_image:
                                         ai_name_lower = ai_name.lower()
@@ -4873,21 +5104,19 @@ async def on_message(message: discord.Message):
                                                 break
                         else:
                             print(f"[Image {idx+1}] AI returned no usable text for this image.")
-                    
                     except Exception as e_single_img_proc:
                         print(f"Error processing image {idx + 1} (Filename: {image_att.filename}, ID: {image_att.id}): {e_single_img_proc}")
                         await log_error(guild, f"Error during single image processing (message {message.id}, attachment {image_att.filename})", error=e_single_img_proc)
+                # --- End AI Image Analysis Loop ---
 
-                # --- After processing all images ---
 
-                # Log discarded names to extraordinary_logs_channel_id
+                # --- Log Discarded Names (Identical to your provided code) ---
                 discarded_by_cache_check: List[str] = []
                 if ai_extracted_some_text_globally:
                     matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
                     for raw_ai_name in all_ai_suggested_raw_names_global:
                         if raw_ai_name.lower() not in matched_igns_lower:
                             discarded_by_cache_check.append(raw_ai_name)
-                
                 if discarded_by_cache_check:
                     discarded_names_str = "\n- ".join(discord.utils.escape_markdown(d_name) for d_name in discarded_by_cache_check)
                     log_message_discarded = (
@@ -4899,11 +5128,8 @@ async def on_message(message: discord.Message):
                         f"```\n- {chr(10).join(discord.utils.escape_markdown(s_name) for s_name in sorted(list(all_ai_suggested_raw_names_global))) or 'None'}\n```"
                         f"\n**Final Matched Names:** {all_matched_igns_from_all_images if all_matched_igns_from_all_images else 'None'}"
                     )
-                    
-                    # Truncate description if too long for embed
-                    if len(log_message_discarded) > 4000: # Embed description limit is 4096
+                    if len(log_message_discarded) > 4000:
                         log_message_discarded = log_message_discarded[:4000] + "\n... (log truncated)"
-
                     error_embed_discarded = discord.Embed(
                         title="📝 AI Image Processing: Discarded Name Suggestions",
                         description=log_message_discarded,
@@ -4913,34 +5139,75 @@ async def on_message(message: discord.Message):
                     error_embed_discarded.set_footer(text=f"Message ID: {message.id} | User: {message.author.name}")
                     await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=error_embed_discarded)
                     print(f"Logged discarded AI names to extraordinary logs: {discarded_by_cache_check}")
+                # --- End Log Discarded Names ---
 
+                # --- Process Activity Updates ---
+                newly_added_details_for_view: List[Dict[str, Any]] = [] # For view: {'ign': str, 'status': 'active_by_view'}
+                already_active_today_for_view: List[str] = []
+                failed_to_add_for_view: List[str] = []
+                activity_changed = False
 
-                # Compile the final response to the user
-                if all_matched_igns_from_all_images:
-                    reply_msg_content = (
-                        f"✅ AI analysis of {num_images} image(s) complete. Identified and matched these ONLINE In-Game Names (green dot criteria) from our database:\n"
-                        f"```\n- " + '\n- '.join(discord.utils.escape_markdown(ign) for ign in all_matched_igns_from_all_images) + "\n```"
-                    )
-                    if len(reply_msg_content) > 1900:
-                        reply_msg_content = reply_msg_content[:1890] + "... (list truncated)"
-                    await processing_reply.edit(content=reply_msg_content)
-                else:
+                if not all_matched_igns_from_all_images:
+                    # Handle no names matched from AI
                     if ai_reported_no_names_at_least_once and not ai_extracted_some_text_globally:
-                        await processing_reply.edit(content=f"AI analysis of {num_images} image(s) complete: No online player names (from our known list, with green dots) were clearly identified in any of the images.")
+                        final_user_message = f"{author.mention} AI analysis of {num_images} image(s) complete: No online player names (from our known list, with green dots) were clearly identified in any of the images."
                     elif not ai_extracted_some_text_globally and not ai_reported_no_names_at_least_once:
-                         await processing_reply.edit(content=f"AI analysis ran into an issue or returned no usable data from any of the {num_images} image(s).")
+                        final_user_message = f"{author.mention} AI analysis ran into an issue or returned no usable data from any of the {num_images} image(s)."
+                    else: # Some text found, but no matches after filtering
+                        final_user_message = f"{author.mention} AI analysis of {num_images} image(s) complete. Some text may have been identified, but it didn't match our known online In-Game Names list or meet all specified criteria (e.g., green dot for online status)."
+                    await processing_reply.edit(content=final_user_message, allowed_mentions=discord.AllowedMentions(users=[author]))
+                else:
+                    # Iterate through matched IGNs to update activity
+                    for ign_str in all_matched_igns_from_all_images:
+                        ign_lower = ign_str.lower()
+                        exists = await check_activity_exists(guild, ign_lower, activity_date)
+
+                        if exists is True:
+                            already_active_today_for_view.append(ign_str)
+                        elif exists is False:
+                            # Not active yet today, so try to upsert
+                            success, upsert_msg = await upsert_activity_log(guild, ign_str, activity_date, author.id)
+                            if success:
+                                newly_added_details_for_view.append({'ign': ign_str, 'status': 'active_by_view'})
+                                activity_changed = True
+                            else:
+                                failed_to_add_for_view.append(ign_str)
+                                await log_error(guild, f"Screenshot activity: Failed to upsert activity for IGN '{ign_str}' from screenshot by {author.name}. DB Msg: {upsert_msg}")
+                        else: # exists is None (DB check failed)
+                            failed_to_add_for_view.append(ign_str)
+                            await log_error(guild, f"Screenshot activity: DB check failed for IGN '{ign_str}' from screenshot by {author.name}.")
+                    
+                    # --- Create View and Final Embed ---
+                    confirm_view = ScreenshotConfirmView(
+                        original_author_id=author.id,
+                        activity_date=activity_date,
+                        newly_added_igns_details=newly_added_details_for_view,
+                        already_active_igns=already_active_today_for_view,
+                        failed_to_add_igns=failed_to_add_for_view,
+                        guild_for_log=guild,
+                        original_message_id=message.id
+                    )
+                    final_embed = confirm_view.create_embed()
+                    
+                    # Edit the processing_reply to show the final embed and view
+                    # The content still pings the author.
+                    edited_message = await processing_reply.edit(content=f"{author.mention}", embed=final_embed, view=confirm_view, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    confirm_view.message = edited_message # Link the message to the view for on_timeout edits
+
+                    if activity_changed:
+                        await log_info(guild, f"Screenshot by {author.name} processed. Newly active: {len(newly_added_details_for_view)}, Already active: {len(already_active_today_for_view)}. Triggering list update.")
+                        asyncio.create_task(update_static_list_message(guild))
                     else:
-                        await processing_reply.edit(content=f"AI analysis of {num_images} image(s) complete. Some text may have been identified, but it didn't match our known online In-Game Names list or meet all specified criteria (e.g., green dot for online status).")
+                        await log_info(guild, f"Screenshot by {author.name} processed. No new activity recorded. Already active: {len(already_active_today_for_view)}.")
 
             except Exception as e_img_pipeline:
-                # ... (keep existing pipeline exception handling) ...
-                print(f"Critical error during multi-image processing pipeline for message {message.id}: {e_img_pipeline}")
-                await log_error(guild, "Critical error during multi-image processing in on_message", error=e_img_pipeline, ping_owner=True)
+                print(f"Critical error during screenshot activity processing pipeline for message {message.id}: {e_img_pipeline}")
+                await log_error(guild, "Critical error during screenshot activity processing", error=e_img_pipeline, ping_owner=True)
                 try:
-                    await processing_reply.edit(content=f"Sorry, a critical unexpected error occurred while processing the {num_images} image(s). Admins have been notified.")
+                    await processing_reply.edit(content=f"{author.mention} Sorry, a critical unexpected error occurred while processing the {num_images} image(s). Admins have been notified.", allowed_mentions=discord.AllowedMentions(users=[author]))
                 except Exception: pass
             
-            return # Image processing handled
+            return # Image processing handled, no further message processing needed.
 
     # --- 1. Reply/Mention Trigger ---
     should_trigger_reply_mention = False
