@@ -190,6 +190,11 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def can_manage_guild_or_is_bypass_user(interaction: discord.Interaction) -> bool:
+    if interaction.user.id == OWNER_USER_ID:
+        return True  # Bypass user, allow command
+    return interaction.permissions.manage_guild
+
 # --- Utility Functions (Helper for static timestamp) ---
 def get_formatted_utc_now() -> str:
     """Returns the current UTC date and time in DD/MM/YYYY HH:MM UTC format."""
@@ -5585,7 +5590,7 @@ async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Option
     app_commands.Choice(name="No", value="no"),
     app_commands.Choice(name="Yes", value="yes"),
 ])
-@app_commands.checks.has_permissions(manage_guild=True) # <--- ADDED MANAGE_GUILD PERMISSION CHECK
+@app_commands.check(can_manage_guild_or_is_bypass_user)
 @app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
 async def message_as(
     interaction: discord.Interaction,
