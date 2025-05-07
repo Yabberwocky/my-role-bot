@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from postgrest import APIError
 import traceback
 import math
-from typing import Optional, Tuple, List, Dict, Any # Keep this one, it's used more broadly
+from typing import Optional, Tuple, List, Dict, Any, Set # Keep this one, it's used more broadly
 from dotenv import load_dotenv
 import datetime
 import pytz
@@ -28,6 +28,8 @@ from collections import namedtuple
 import discord.utils
 import random
 from collections import defaultdict # Helpful for the interjection data
+import io # <--- ADD THIS IMPORT
+from PIL import Image
 
 # --- CONTEXT FOR FUTURE LLMS ---
 # (Please do not remove this comment block)
@@ -125,6 +127,33 @@ UNRESTRICTED_AI_CHANNEL_ID = 1330664430148780102 # Channel for unrestricted AI u
 keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
 user_reply_mention_cooldowns: Dict[int, datetime.datetime] = {} # user_id (int) -> timestamp when cooldown ends for reply/mention AI
 ingame_name_cache: List[str] = [] # Cache for In-Game Names from hc_members
+IMAGE_PROCESSING_CHANNEL_ID = 1248710731407560835 # Channel for image processing
+FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE = """Analyze the provided image(s), which are screenshots from the game Florr.io, potentially showing a guild member list.
+Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
+
+Known Valid In-Game Names (use this as your reference):
+--- BEGIN KNOWN NAMES LIST ---
+{known_igns_list_str}
+--- END KNOWN NAMES LIST ---
+
+**Instructions for Guild Member Lists (if present in the image):**
+- Focus on identifying players who are displayed in a way that suggests they are currently online or active in the guild. Games often distinguish online members from offline ones in these lists (e.g., brighter names, different icons, or placement).
+- Use your general knowledge of game UIs to infer this online/active status from the visual presentation in the guild list.
+- If a name is visible in a guild list but appears to be offline or inactive, DO NOT extract it.
+- If the image is definitively NOT a guild member list (e.g., general gameplay, chat messages without a structured list), you may identify any names from the "Known Valid In-Game Names" list if they are clearly visible. Prioritize guild list rules if a guild list is clearly present.
+
+General Output Instructions:
+1. List each clearly identifiable player name that meets ALL criteria above on a NEW LINE.
+2. These names must, as accurately as possible, match one of the names from the "Known Valid In-Game Names" list provided.
+3. If a name from the list appears to be partially visible or has minor OCR inaccuracies but you are confident it's a match to a name in the provided list AND meets the online/active criteria for guild lists, output the name *from the list*.
+4. Output ONLY the names. Do NOT include any other text, commentary, numbering, or formatting.
+5. If the same name (meeting all criteria) appears multiple times, list it only once in the final output.
+6. If, after applying all rules, no player names (from the provided list, meeting all criteria including appearing online/active in guild lists) are clearly identifiable in any of the image(s), output the exact phrase: NO_NAMES_FOUND
+
+Example of expected output if "PlayerName1" and "PlayerName2" (both appearing online in a guild list) were in the known list and found:
+PlayerName1
+PlayerName2
+"""
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -154,6 +183,48 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def get_ai_response_with_image(
+    prompt: str,
+    image_bytes: bytes,
+    # image_mime_type is not strictly needed by Gemini SDK if passing PIL Image,
+    # but good to have if direct byte submission was used.
+    # For PIL Image objects, Gemini infers the type.
+) -> Optional[str]:
+    if not ai_model:
+        print("AI Error (Image): AI model not initialized.")
+        return None
+
+    try:
+        # Convert image bytes to a PIL Image object
+        # This is often preferred by the Gemini SDK for easier handling
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Construct the request for Gemini with text and image
+        # The SDK allows sending a list: [text_prompt, image_object]
+        # Ensure your specific Gemini model version (e.g., gemini-1.5-flash-latest)
+        # supports this direct list input with PIL Images.
+        response = await ai_model.generate_content_async(
+            [prompt, img], # Send prompt first, then image
+             # Optional: Add safety settings if needed here, similar to get_ai_response
+             # safety_settings=[...]
+        )
+
+        # Check for blocked prompt/response
+        if not response.candidates:
+             print(f"AI Warning (Image): Response blocked. Prompt safety ratings: {response.prompt_feedback.safety_ratings if response.prompt_feedback else 'N/A'}")
+             # Consider logging this to your Discord log channel
+             await log_info(None, "AI image response blocked, likely due to safety filters.")
+             return "..." # Or some other indicator of blockage
+
+        ai_reply = response.text
+        return ai_reply
+
+    except Exception as e:
+        print(f"AI Error (Image): Exception during AI generation with image: {e}")
+        # Consider logging this to your Discord log channel
+        await log_error(None, "Error during AI generation in get_ai_response_with_image", error=e)
+        return None
 
 async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
     """Loads all In-Game Names from Supabase into an in-memory cache."""
@@ -2816,8 +2887,6 @@ async def on_ready():
                         # print(f"  -> Identified Staff Channel: #{channel.name} ({channel.id})") # Debug print
 
             print(f"Staff Channel Identification Complete: Found {actually_staff_channels} staff channel(s) out of {potentially_staff_channels} potentially restricted channels.")
-            if STAFF_CHANNELS:
-                print(f"  Staff Channel IDs: {STAFF_CHANNELS}")
         else:
             print("WARN: Could not find Florrist or HC1 roles in target guild. Cannot identify staff channels.")
             await log_error(target_guild, "Failed to identify staff channels: One or both required roles not found.", ping_owner=True)
@@ -4738,6 +4807,140 @@ async def on_message(message: discord.Message):
                      await message.reply(f"{final_message_content}", mention_author=mention_author_flag)
             except (discord.Forbidden, discord.HTTPException) as reply_err:
                  await log_error(guild, f"Failed to send processed AI '{trigger_type}' response for msg {message.id}", error=reply_err)
+
+    # --- Image Processing for Name Extraction (MODIFIED for multiple images & green dot, and discarded name logging) ---
+    if message.channel.id == IMAGE_PROCESSING_CHANNEL_ID and message.attachments:
+
+        valid_image_attachments = []
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("image/"):
+                valid_image_attachments.append(att)
+
+        if valid_image_attachments:
+            num_images = len(valid_image_attachments)
+            print(f"{num_images} image(s) received in #{channel.name} from {author.name}. Processing with AI (context-aware, green dot rule)...")
+            
+            processing_reply_message_content = f"⏳ Analyzing {num_images} image(s) for online player names (using known name list & green dot rule)..."
+            if num_images == 0:
+                processing_reply_message_content = "No valid images found to process." # Should not happen if valid_image_attachments is populated
+
+            processing_reply = await message.reply(processing_reply_message_content, mention_author=False)
+            
+            if num_images == 0:
+                return
+
+            all_matched_igns_from_all_images: List[str] = []
+            all_ai_suggested_raw_names_global: Set[str] = set() # Use a set to store unique raw suggestions globally
+            ai_reported_no_names_at_least_once = False
+            ai_extracted_some_text_globally = False
+
+            try:
+                known_igns_str_for_prompt = "\n".join(ingame_name_cache) if ingame_name_cache else "No known names provided."
+                current_extraction_prompt = FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE.format(
+                    known_igns_list_str=known_igns_str_for_prompt
+                )
+                # print(f"DEBUG IMAGE PROMPT (first 500 chars):\n{current_extraction_prompt[:500]}...")
+
+
+                for idx, image_att in enumerate(valid_image_attachments):
+                    print(f"Processing image {idx + 1}/{num_images} (Filename: {image_att.filename}, ID: {image_att.id})...")
+                    try:
+                        image_data = await image_att.read()
+                        ai_extracted_text_for_this_image = await get_ai_response_with_image(
+                            prompt=current_extraction_prompt,
+                            image_bytes=image_data
+                        )
+
+                        if ai_extracted_text_for_this_image:
+                            stripped_ai_text = ai_extracted_text_for_this_image.strip()
+                            if stripped_ai_text.upper() == "NO_NAMES_FOUND":
+                                print(f"[Image {idx+1}] AI explicitly reported NO_NAMES_FOUND.")
+                                ai_reported_no_names_at_least_once = True
+                            else:
+                                ai_extracted_some_text_globally = True
+                                potential_names_from_ai_this_image = [name.strip() for name in stripped_ai_text.split('\n') if name.strip()]
+                                print(f"[Image {idx+1}] AI extracted potential names: {potential_names_from_ai_this_image}")
+                                for raw_name in potential_names_from_ai_this_image: # Add all raw AI suggestions
+                                    all_ai_suggested_raw_names_global.add(raw_name)
+
+                                if ingame_name_cache and potential_names_from_ai_this_image:
+                                    for ai_name in potential_names_from_ai_this_image:
+                                        ai_name_lower = ai_name.lower()
+                                        for cached_ign in ingame_name_cache:
+                                            if cached_ign.lower() == ai_name_lower:
+                                                if cached_ign not in all_matched_igns_from_all_images:
+                                                    all_matched_igns_from_all_images.append(cached_ign)
+                                                break
+                        else:
+                            print(f"[Image {idx+1}] AI returned no usable text for this image.")
+                    
+                    except Exception as e_single_img_proc:
+                        print(f"Error processing image {idx + 1} (Filename: {image_att.filename}, ID: {image_att.id}): {e_single_img_proc}")
+                        await log_error(guild, f"Error during single image processing (message {message.id}, attachment {image_att.filename})", error=e_single_img_proc)
+
+                # --- After processing all images ---
+
+                # Log discarded names to extraordinary_logs_channel_id
+                discarded_by_cache_check: List[str] = []
+                if ai_extracted_some_text_globally:
+                    matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
+                    for raw_ai_name in all_ai_suggested_raw_names_global:
+                        if raw_ai_name.lower() not in matched_igns_lower:
+                            discarded_by_cache_check.append(raw_ai_name)
+                
+                if discarded_by_cache_check:
+                    discarded_names_str = "\n- ".join(discord.utils.escape_markdown(d_name) for d_name in discarded_by_cache_check)
+                    log_message_discarded = (
+                        f"AI suggested names for message by {message.author.mention} (`{message.author.id}`) in {message.channel.mention} "
+                        f"(Image(s): {', '.join([att.filename for att in valid_image_attachments]) or 'N/A'}) "
+                        f"that were discarded after cache check (not in known IGN list or did not meet criteria):\n"
+                        f"```\n- {discarded_names_str}\n```"
+                        f"\n**AI's Raw Unique Suggestions (before any filtering):**\n"
+                        f"```\n- {chr(10).join(discord.utils.escape_markdown(s_name) for s_name in sorted(list(all_ai_suggested_raw_names_global))) or 'None'}\n```"
+                        f"\n**Final Matched Names:** {all_matched_igns_from_all_images if all_matched_igns_from_all_images else 'None'}"
+                    )
+                    
+                    # Truncate description if too long for embed
+                    if len(log_message_discarded) > 4000: # Embed description limit is 4096
+                        log_message_discarded = log_message_discarded[:4000] + "\n... (log truncated)"
+
+                    error_embed_discarded = discord.Embed(
+                        title="📝 AI Image Processing: Discarded Name Suggestions",
+                        description=log_message_discarded,
+                        color=discord.Color.orange() 
+                    )
+                    error_embed_discarded.timestamp = discord.utils.utcnow()
+                    error_embed_discarded.set_footer(text=f"Message ID: {message.id} | User: {message.author.name}")
+                    await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=error_embed_discarded)
+                    print(f"Logged discarded AI names to extraordinary logs: {discarded_by_cache_check}")
+
+
+                # Compile the final response to the user
+                if all_matched_igns_from_all_images:
+                    reply_msg_content = (
+                        f"✅ AI analysis of {num_images} image(s) complete. Identified and matched these ONLINE In-Game Names (green dot criteria) from our database:\n"
+                        f"```\n- " + '\n- '.join(discord.utils.escape_markdown(ign) for ign in all_matched_igns_from_all_images) + "\n```"
+                    )
+                    if len(reply_msg_content) > 1900:
+                        reply_msg_content = reply_msg_content[:1890] + "... (list truncated)"
+                    await processing_reply.edit(content=reply_msg_content)
+                else:
+                    if ai_reported_no_names_at_least_once and not ai_extracted_some_text_globally:
+                        await processing_reply.edit(content=f"AI analysis of {num_images} image(s) complete: No online player names (from our known list, with green dots) were clearly identified in any of the images.")
+                    elif not ai_extracted_some_text_globally and not ai_reported_no_names_at_least_once:
+                         await processing_reply.edit(content=f"AI analysis ran into an issue or returned no usable data from any of the {num_images} image(s).")
+                    else:
+                        await processing_reply.edit(content=f"AI analysis of {num_images} image(s) complete. Some text may have been identified, but it didn't match our known online In-Game Names list or meet all specified criteria (e.g., green dot for online status).")
+
+            except Exception as e_img_pipeline:
+                # ... (keep existing pipeline exception handling) ...
+                print(f"Critical error during multi-image processing pipeline for message {message.id}: {e_img_pipeline}")
+                await log_error(guild, "Critical error during multi-image processing in on_message", error=e_img_pipeline, ping_owner=True)
+                try:
+                    await processing_reply.edit(content=f"Sorry, a critical unexpected error occurred while processing the {num_images} image(s). Admins have been notified.")
+                except Exception: pass
+            
+            return # Image processing handled
 
     # --- 1. Reply/Mention Trigger ---
     should_trigger_reply_mention = False
