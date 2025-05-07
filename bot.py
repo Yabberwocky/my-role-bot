@@ -159,6 +159,7 @@ EVIL_CATERPILLAR_NAME = "Evil Caterpillar"
 EVIL_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369656931089649794/861b3510338fa7ba0bb36baf12c36643.webp?size=160"
 GOOD_CATERPILLAR_NAME = "Good Caterpillar"
 GOOD_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369660290316111933/bf299249c71ee328dba5d821547fab56.webp?size=160"
+NERD_AVATAR_URL = "https://cdn.discordapp.com/app-icons/1365572437185400893/d10142d96592f7f79c5723177cd504a2.webp?size=128"
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -5544,11 +5545,13 @@ async def addkeyword(
         await log_error(guild, f"Keyword add failed: Unexpected Error for `{phrase_identifier}`.", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred while adding the keyword.")
 
-# Constants for personality choices (can remain the same)
+# Constants for personality choices
 PERSONALITY_NORMAL = "Normal Bot"
 PERSONALITY_EVIL = "Evil Caterpillar"
 PERSONALITY_GOOD = "Good Caterpillar"
+PERSONALITY_CUSTOM = "Custom" # Keep this simple, parameter handles the details
 
+# Helper function (fetch_avatar_bytes - remains the same)
 async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     """Fetches image bytes from a URL."""
     if not url:
@@ -5564,100 +5567,210 @@ async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Option
         print(f"Error fetching avatar from {url}: {e}")
         return None
 
+
 @tree.command(name="message", description="Send a message as a specified personality.")
 @app_commands.describe(
     personality="Choose the personality to send the message as.",
-    content="The message content to send."
+    content="The message content to send (or prompt for AI).",
+    custom_name="[Required for Custom] The name for the custom personality.", # Describe it as required for Custom
+    ai="[Optional] Have AI generate the message content? (Defaults to No)"
 )
 @app_commands.choices(personality=[
     app_commands.Choice(name=PERSONALITY_NORMAL, value=PERSONALITY_NORMAL),
     app_commands.Choice(name=PERSONALITY_EVIL, value=PERSONALITY_EVIL),
     app_commands.Choice(name=PERSONALITY_GOOD, value=PERSONALITY_GOOD),
+    app_commands.Choice(name=PERSONALITY_CUSTOM, value=PERSONALITY_CUSTOM), # "Custom" value
 ])
-@app_commands.checks.has_permissions(manage_messages=True) # User permission
-# Bot needs Manage Webhooks if creating them, or Send Messages if normal
+@app_commands.choices(ai=[
+    app_commands.Choice(name="No", value="no"),
+    app_commands.Choice(name="Yes", value="yes"),
+])
+@app_commands.checks.has_permissions(manage_guild=True) # <--- ADDED MANAGE_GUILD PERMISSION CHECK
 @app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
-async def message_as(interaction: discord.Interaction, personality: str, content: str):
+async def message_as(
+    interaction: discord.Interaction,
+    personality: str,
+    content: str,
+    custom_name: Optional[str] = None, # Optional parameter
+    ai: Optional[str] = "no"
+):
     if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+        # This check is redundant if command is only in guilds, but harmless defensive check
         await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
         return
-
-    await interaction.response.defer(ephemeral=True) # Defer acknowledgment
 
     target_channel: discord.TextChannel = interaction.channel
     guild = interaction.guild # For logging
 
+    # --- Parameter Validation for "Custom" ---
+    if personality == PERSONALITY_CUSTOM:
+        if not custom_name or not custom_name.strip():
+            # Send ephemeral error and stop execution
+            await interaction.response.send_message(
+                "❌ You selected the 'Custom' personality, but did not provide a `custom_name`.",
+                ephemeral=True
+            )
+            await log_info(guild, f"User `{interaction.user}` failed /message (Custom): No custom_name provided.")
+            return # Exit the command handler
+
+        # Basic validation for custom name length/content (optional, but good practice)
+        cleaned_custom_name = custom_name.strip()
+        if len(cleaned_custom_name) > 80:
+             await interaction.response.send_message("❌ Custom personality name must be 80 characters or less.", ephemeral=True)
+             return
+        # You might add checks for profanity or invalid characters if needed
+
+        # If custom, set the name and avatar URL to use later
+        personality_name_to_use = cleaned_custom_name
+        personality_avatar_url_to_use = NERD_AVATAR_URL # Use the configured Nerd avatar for custom
+
+    # --- Defer the response (after Custom validation if applicable) ---
+    # Defer publicly as the message will be public
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    use_ai_generation = ai.lower() == "yes" if ai else False
+    final_content_to_send = content # Start with original content
+
+    # --- AI Content Generation if requested ---
+    if use_ai_generation:
+        if not ai_model:
+            # Edit deferred response to show AI unavailable error
+            await interaction.followup.send("⚠️ AI model is not available. Sending original message content instead.")
+        else:
+            # Determine personality name for AI prompt
+            if personality == PERSONALITY_EVIL: ai_personality_name_for_prompt = EVIL_CATERPILLAR_NAME
+            elif personality == PERSONALITY_GOOD: ai_personality_name_for_prompt = GOOD_CATERPILLAR_NAME
+            elif personality == PERSONALITY_CUSTOM: ai_personality_name_for_prompt = personality_name_to_use # Use the determined custom name
+            else: ai_personality_name_for_prompt = PERSONALITY_NORMAL # Default for Normal Bot
+
+            # Generate system instruction
+            ai_system_instruction = HUMAN_SYSTEM_INSTRUCTION
+            if ai_personality_name_for_prompt:
+                ai_system_instruction = (
+                    f"You are a chat participant named '{ai_personality_name_for_prompt}'. "
+                    "Mimic human typing style: use lowercase, avoid excessive punctuation, keep messages short and conversational. "
+                    "Engage naturally based on the user's prompt."
+                )
+
+            ai_prompt = content # Use initial content as prompt
+            try:
+                async with target_channel.typing(): # Show typing in the channel where message will appear
+                    ai_response_raw = await get_ai_response(prompt=ai_prompt, system_instruction=ai_system_instruction)
+
+                if ai_response_raw:
+                    processed_response = ai_response_raw.lower().strip()
+                    if processed_response.endswith(('.', '!', '?')): processed_response = processed_response[:-1]
+                    if len(processed_response) > 1900: # Keep it under webhook limit minus some buffer
+                        processed_response = processed_response[:1897] + "..."
+                    final_content_to_send = processed_response # Update content to AI response
+                    await log_info(guild, f"AI generated content for '{personality}': '{final_content_to_send[:100]}...'")
+                else:
+                    # Edit deferred response to show AI couldn't generate
+                    await interaction.followup.send("⚠️ AI couldn't generate a response. Sending original message content instead.")
+                    # final_content_to_send remains the original content
+            except Exception as ai_err:
+                await log_error(guild, f"Error during AI generation for '{personality}'", error=ai_err, interaction=interaction)
+                # Edit deferred response to show AI error
+                await interaction.followup.send("⚠️ Error during AI generation. Sending original message content instead.")
+                # final_content_to_send remains the original content
+
+    # --- Send Message Logic ---
     if personality == PERSONALITY_NORMAL:
+        # Ensure bot has send_messages permission (already checked by decorator, but defensive check)
+        if not target_channel.permissions_for(guild.me).send_messages:
+             await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {target_channel.mention}.", ephemeral=True)
+             await log_error(guild, f"/message as Normal Bot failed: Bot missing Send Messages in {target_channel.mention}", interaction=interaction)
+             return
+
         try:
-            await target_channel.send(content)
-            await interaction.followup.send(f"✅ Message sent as '{PERSONALITY_NORMAL}'.", ephemeral=True)
+            sent_message = await target_channel.send(final_content_to_send)
+            # Use edit_original_response to update the thinking message
+            await interaction.edit_original_response(content=f"✅ Message sent as '{PERSONALITY_NORMAL}'.", embed=None, view=None) # Remove thinking, show success
+            # Send the AI Used info as a separate ephemeral followup
+            if use_ai_generation:
+                 try: await interaction.followup.send(f"(AI Used: {use_ai_generation})", ephemeral=True)
+                 except: pass # Ignore if followup fails again
+            await log_info(guild, f"User `{interaction.user}` sent as '{PERSONALITY_NORMAL}' in {target_channel.mention} (AI: {use_ai_generation}).")
         except discord.Forbidden:
-            await interaction.followup.send(f"❌ I don't have permission to send messages here as '{PERSONALITY_NORMAL}'.", ephemeral=True)
+             # Forbidden should be caught by decorator/initial check, but handle defensively
+            await interaction.edit_original_response(content=f"❌ I don't have permission to send messages here as '{PERSONALITY_NORMAL}'.", embed=None, view=None)
             await log_error(guild, f"/message as Normal Bot failed: Forbidden in {target_channel.mention}", interaction=interaction)
         except discord.HTTPException as e:
-            await interaction.followup.send(f"❌ Failed to send message as '{PERSONALITY_NORMAL}': {e}", ephemeral=True)
-            await log_error(guild, f"/message as Normal Bot failed: HTTP Error in {target_channel.mention}", error=e, interaction=interaction)
-        return
+             await interaction.edit_original_response(content=f"❌ Failed to send message as '{PERSONALITY_NORMAL}': {e}", embed=None, view=None)
+             await log_error(guild, f"/message as Normal Bot failed: HTTP Error in {target_channel.mention}", error=e, interaction=interaction)
+        return # Stop processing for normal bot
 
-    # --- Personality Webhook Logic (Dynamic Creation) ---
-    personality_name_to_use: Optional[str] = None
-    personality_avatar_url_to_use: Optional[str] = None
-
+    # --- Dynamic Webhook Logic (Evil, Good, Custom) ---
+    # Determine name and avatar URL based on personality
     if personality == PERSONALITY_EVIL:
         personality_name_to_use = EVIL_CATERPILLAR_NAME
         personality_avatar_url_to_use = EVIL_CATERPILLAR_AVATAR_URL
     elif personality == PERSONALITY_GOOD:
         personality_name_to_use = GOOD_CATERPILLAR_NAME
         personality_avatar_url_to_use = GOOD_CATERPILLAR_AVATAR_URL
+    # else: personality_name_to_use and personality_avatar_url_to_use were set for CUSTOM earlier
 
-    if not personality_name_to_use or not personality_avatar_url_to_use:
+    # --- Check if webhook configuration is missing for pre-defined personalities ---
+    if personality != PERSONALITY_CUSTOM and (not personality_name_to_use or not personality_avatar_url_to_use):
         error_msg = f"⚠️ Configuration error for '{personality}'. Name or Avatar URL missing. Contact bot owner."
-        await interaction.followup.send(error_msg, ephemeral=True)
+        await interaction.followup.send(error_msg) # Send as followup to the deferred interaction
         await log_error(guild, f"/message failed: Config missing for '{personality}' (Name: {personality_name_to_use}, Avatar: {personality_avatar_url_to_use})", interaction=interaction, ping_owner=True)
-        return
+        return # Exit command handler
+
+    # --- Check if Nerd Avatar URL is missing for Custom personality ---
+    if personality == PERSONALITY_CUSTOM and not NERD_AVATAR_URL:
+         await interaction.followup.send(f"⚠️ Configuration error: NERD_AVATAR_URL is not set for Custom personality. Contact bot owner.")
+         await log_error(guild, f"/message failed: NERD_AVATAR_URL missing for Custom personality.", interaction=interaction, ping_owner=True)
+         return # Exit command handler
+
 
     temp_webhook = None
     try:
         async with aiohttp.ClientSession() as session:
             avatar_bytes = await fetch_avatar_bytes(session, personality_avatar_url_to_use)
-            if not avatar_bytes:
-                await interaction.followup.send(f"⚠️ Could not fetch avatar for '{personality}'. Using default avatar.", ephemeral=True)
-                # Log this, but proceed with default avatar for the webhook
-                await log_info(guild, f"Could not fetch avatar for '{personality_name_to_use}' from {personality_avatar_url_to_use}. Webhook will use default avatar.")
+            # Log if avatar fetch failed, but proceed with default webhook avatar
+            if not avatar_bytes and personality_avatar_url_to_use:
+                 await log_info(guild, f"Could not fetch avatar for '{personality_name_to_use}' from {personality_avatar_url_to_use}. Webhook will use default avatar.")
 
-            # Create the webhook in the current channel
+            # Ensure bot has manage_webhooks permission (already checked by decorator, but defensive check)
+            if not target_channel.permissions_for(guild.me).manage_webhooks:
+                 await interaction.followup.send(f"❌ I need 'Manage Webhooks' permission in {target_channel.mention} to send as '{personality}'.", ephemeral=True)
+                 await log_error(guild, f"/message failed: Bot missing 'Manage Webhooks' in {target_channel.mention} for '{personality}'.", interaction=interaction)
+                 return # Exit handler if permission check fails late
+
             temp_webhook = await target_channel.create_webhook(
                 name=personality_name_to_use,
-                avatar=avatar_bytes, # Pass bytes, or None if fetch failed
-                reason=f"Temporary webhook for /message command by {interaction.user}"
+                avatar=avatar_bytes, # Pass fetched bytes or None
+                reason=f"Temp webhook for /message ({personality}) by {interaction.user}"
             )
-            
-            # Send the message using the temporary webhook
-            # discord.Webhook.from_url is not needed here as we have the Webhook object
-            await temp_webhook.send(
-                content=content,
-                # username=personality_name_to_use, # Already set on webhook creation
-                # avatar_url=personality_avatar_url_to_use # Already set on webhook creation
-                # allowed_mentions=discord.AllowedMentions.none() # Optional: disable pings
-            )
-        await interaction.followup.send(f"✅ Message sent as '{personality}'.", ephemeral=True)
-        await log_info(guild, f"User `{interaction.user}` sent message as '{personality}' in {target_channel.mention} via temp webhook.")
 
-    except discord.Forbidden: # Bot lacks Manage Webhooks permission
-        await interaction.followup.send(f"❌ I need the 'Manage Webhooks' permission in this channel to send as '{personality}'. Please ask an admin to grant it.", ephemeral=True)
-        await log_error(guild, f"/message failed: Bot missing 'Manage Webhooks' in {target_channel.mention} for '{personality}'.", interaction=interaction)
+            # Send the message
+            await temp_webhook.send(content=final_content_to_send)
+
+        # Success: Edit the deferred response
+        await interaction.edit_original_response(content=f"✅ Message sent as '{personality}'.", embed=None, view=None)
+        # Send AI Used info as separate ephemeral followup
+        if use_ai_generation:
+             try: await interaction.followup.send(f"(AI Used: {use_ai_generation})", ephemeral=True)
+             except: pass
+        await log_info(guild, f"User `{interaction.user}` sent as '{personality}' in {target_channel.mention} (AI: {use_ai_generation}).")
+
+    except discord.Forbidden: # Catch this again just in case, although decorator should handle it
+        await interaction.followup.send(f"❌ I don't have permission to manage webhooks in this channel.", ephemeral=True)
+        await log_error(guild, f"/message failed: Bot Forbidden managing webhooks in {target_channel.mention}.", interaction=interaction)
     except discord.HTTPException as e:
-        await interaction.followup.send(f"❌ Failed to send/create webhook for '{personality}': {e.text}", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed to send/create webhook: {e.text}", ephemeral=True)
         await log_error(guild, f"/message failed: HTTP error with temp webhook for '{personality}'.", error=e, interaction=interaction)
     except Exception as e:
-        await interaction.followup.send(f"❌ An unexpected error occurred with '{personality}'.", ephemeral=True)
+        await interaction.followup.send(f"❌ An unexpected error occurred.", ephemeral=True)
         await log_error(guild, f"/message failed: Unexpected error with temp webhook for '{personality}'.", error=e, interaction=interaction, ping_owner=True)
     finally:
+        # Clean up the temporary webhook if it was successfully created
         if temp_webhook:
             try:
-                await temp_webhook.delete(reason="Temporary webhook cleanup for /message command")
+                await temp_webhook.delete(reason="Temp webhook cleanup for /message command")
             except Exception as e_del:
-                # Log if deletion fails, but don't bother the user
+                # Log if deletion fails, but don't bother the user again
                 await log_error(guild, f"Failed to delete temporary webhook for '{personality}'. ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
