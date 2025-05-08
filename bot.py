@@ -5662,6 +5662,9 @@ async def addkeyword(
         await log_error(guild, f"Keyword add failed: Unexpected Error for `{phrase_identifier}`.", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred while adding the keyword.")
 
+# ... (Keep all existing imports and configurations) ...
+# ... (Keep fetch_avatar_bytes, can_manage_guild_or_is_bypass_user functions as they are) ...
+
 @tree.command(name="message", description="Send a message as a specified personality or by imitating a user.")
 @app_commands.describe(
     content="The message content. If AI is used, this becomes the prompt.",
@@ -5686,8 +5689,8 @@ async def addkeyword(
     app_commands.Choice(name="No", value="no"),
     app_commands.Choice(name="Yes", value="yes"),
 ])
-@app_commands.check(can_manage_guild_or_is_bypass_user)
-@app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
+@app_commands.check(can_manage_guild_or_is_bypass_user) # User permission check
+# REMOVED: @app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
 @app_commands.check(test_bot_owner_only_check)
 async def message_as(
     interaction: discord.Interaction,
@@ -5699,6 +5702,7 @@ async def message_as(
     custom_avatar: Optional[discord.Attachment] = None,
     ai: Optional[str] = "no"
 ):
+    print(f"DEBUG /message: Command invoked by {interaction.user} in channel {interaction.channel_id}")
     if not interaction.channel:
         await interaction.response.send_message("This command cannot be used without a channel context.", ephemeral=True)
         return
@@ -5707,24 +5711,22 @@ async def message_as(
         return
 
     target_channel: discord.abc.Messageable = interaction.channel
-    guild = interaction.guild # Will be None if in DMs
+    guild = interaction.guild
 
-    await interaction.response.defer(thinking=True, ephemeral=True) # Ephemeral defer
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # --- Determine effective identity for sending the message ---
     final_name_for_webhook: Optional[str] = None
     final_avatar_bytes_for_webhook: Optional[bytes] = None
-    use_webhook = False # Determines if webhook is needed (for custom name/avatar or specific personalities)
+    use_webhook = False
     effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL
 
-    # --- [LOGIC FOR DETERMINING final_name_for_webhook, final_avatar_bytes_for_webhook, use_webhook, effective_sender_name_for_context] ---
-    # This extensive block remains the same as your current correct version.
     async with aiohttp.ClientSession() as session:
         if imitate:
             use_webhook = True; final_name_for_webhook = imitate.display_name
             avatar_url_to_fetch = imitate.display_avatar.url if imitate.display_avatar else imitate.default_avatar.url
             final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, avatar_url_to_fetch)
             effective_sender_name_for_context = final_name_for_webhook
+            print(f"DEBUG /message: Mode: Imitate User '{final_name_for_webhook}'")
         elif custom_avatar:
             use_webhook = True
             try:
@@ -5740,6 +5742,7 @@ async def message_as(
             elif personality and personality.value == PERSONALITY_GOOD: final_name_for_webhook = GOOD_CATERPILLAR_NAME
             else: final_name_for_webhook = bot.user.name if bot.user else "Webhook User"
             effective_sender_name_for_context = final_name_for_webhook
+            print(f"DEBUG /message: Mode: Custom Avatar. Name: '{final_name_for_webhook}'")
         elif avatar:
             use_webhook = True; avatar_url_to_fetch = None; temp_name_from_avatar_choice = None
             if avatar.value == AVATAR_CHOICE_EVIL: avatar_url_to_fetch, temp_name_from_avatar_choice = EVIL_CATERPILLAR_AVATAR_URL, EVIL_CATERPILLAR_NAME
@@ -5755,12 +5758,14 @@ async def message_as(
             elif personality and personality.value == PERSONALITY_GOOD: final_name_for_webhook = GOOD_CATERPILLAR_NAME
             else: final_name_for_webhook = temp_name_from_avatar_choice
             effective_sender_name_for_context = final_name_for_webhook
+            print(f"DEBUG /message: Mode: Pre-defined Avatar '{avatar.value}'. Name: '{final_name_for_webhook}'")
         elif custom_name and custom_name.strip():
             use_webhook = True; cleaned_name = custom_name.strip()
             if not (1 <= len(cleaned_name) <= 80): await interaction.followup.send("❌ Custom name invalid length.", ephemeral=True); return
             final_name_for_webhook = cleaned_name; effective_sender_name_for_context = final_name_for_webhook
             if not NERD_AVATAR_URL: await interaction.followup.send(f"⚠️ Config error: NERD_AVATAR_URL not set.", ephemeral=True); await log_error(guild, f"/message: NERD_AVATAR_URL missing.", interaction=interaction, ping_owner=True); return
             final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, NERD_AVATAR_URL)
+            print(f"DEBUG /message: Mode: Custom Name '{final_name_for_webhook}' (with Nerd Avatar)")
         elif personality:
             if personality.value == PERSONALITY_EVIL:
                 use_webhook = True; final_name_for_webhook = EVIL_CATERPILLAR_NAME
@@ -5770,15 +5775,19 @@ async def message_as(
                 use_webhook = True; final_name_for_webhook = GOOD_CATERPILLAR_NAME
                 if not GOOD_CATERPILLAR_AVATAR_URL or not GOOD_CATERPILLAR_NAME: await interaction.followup.send(f"⚠️ Config error for '{PERSONALITY_GOOD}'.", ephemeral=True); return
                 final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, GOOD_CATERPILLAR_AVATAR_URL); effective_sender_name_for_context = final_name_for_webhook
-        if use_webhook and not final_name_for_webhook:
+            elif personality.value == PERSONALITY_NORMAL:
+                print(f"DEBUG /message: Mode: Personality Normal (no webhook triggered by personality itself)")
+        if use_webhook and not final_name_for_webhook: # Default webhook name if needed
             final_name_for_webhook = bot.user.name if bot.user else "Pingslave"; effective_sender_name_for_context = final_name_for_webhook
-    # --- [END OF IDENTITY DETERMINATION LOGIC] ---
+        if not use_webhook:
+             print(f"DEBUG /message: Mode: Defaulting to Normal Bot behavior (no webhook triggers from options).")
+
 
     use_ai_generation = ai.lower() == "yes" if ai else False
     final_content_to_send = content
 
-    # --- [AI Content Generation Logic - NO CHANGE HERE] ---
     if use_ai_generation:
+        print(f"DEBUG /message: AI generation requested.")
         if not ai_model: await interaction.followup.send("⚠️ AI model unavailable. Sending original content.", ephemeral=True)
         else:
             ai_system_instruction = (f"You are '{effective_sender_name_for_context}'. Mimic human typing. Base response on user prompt: '{content}'.")
@@ -5795,53 +5804,54 @@ async def message_as(
             except Exception as ai_err:
                 await log_error(guild, f"AI gen error for '{effective_sender_name_for_context}'", error=ai_err, interaction=interaction)
                 await interaction.followup.send("⚠️ AI gen error. Sending original content.", ephemeral=True)
-    # --- [END OF AI CONTENT GENERATION LOGIC] ---
 
     # --- Send Message ---
-    # Determine bot's membership status in the guild, using the reliable pattern
     bot_is_true_guild_member = False
-    if guild: # Only relevant if in a guild (interaction.guild is not None)
-        # interaction.guild.me should be the bot's Member object in this guild
+    if guild:
         if interaction.guild.me and interaction.guild.me.joined_at:
             bot_is_true_guild_member = True
-            # print(f"DEBUG /message: Bot IS a true member of '{guild.name}'. joined_at: {interaction.guild.me.joined_at}")
-        # else:
-            # print(f"DEBUG /message: Bot is in '{guild.name}' but NOT a true member (joined_at is None or guild.me is None).")
+            print(f"DEBUG /message: Bot IS a true member of '{guild.name}'. Guild ID: {guild.id}, Bot joined_at: {interaction.guild.me.joined_at}")
+        else:
+            print(f"DEBUG /message: Bot is in '{guild.name}' but NOT a true member (joined_at is None or guild.me is None). Guild ID: {guild.id}")
+    else:
+        print(f"DEBUG /message: Command used in DMs (guild is None).")
 
 
-    if not use_webhook: # "Normal Bot" personality chosen (or defaulted) AND no other webhook-triggering options.
+    if not use_webhook: # "Normal Bot" personality and no other webhook-triggering options.
+        print(f"DEBUG /message: Path decision: NOT using webhook.")
         if guild and not bot_is_true_guild_member:
-            # CASE 1: User-app scope in a guild for "Normal Bot" personality.
-            # Bot is present via application install, but not as a full member.
-            # Send message as part of the (already ephemeral) interaction response.
-            # print(f"DEBUG /message: Path: User-App Scope (Normal Bot) in guild '{guild.name}'")
+            print(f"DEBUG /message: Path selected: User-App Scope (Normal Bot) in guild '{guild.name}' -> Ephemeral edit.")
             try:
                 ai_note = " (AI Generated)" if use_ai_generation else ""
                 response_text = f"{final_content_to_send}{ai_note}"
-                if len(response_text) > 1990: # Max length for interaction response content
-                    response_text = response_text[:1987] + "..."
-
+                if len(response_text) > 1990: response_text = response_text[:1987] + "..."
                 await interaction.edit_original_response(content=response_text, embed=None, view=None)
                 await log_info(guild, f"User `{interaction.user}` sent (Normal Bot via User-App ephemeral) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'DM/Group'}. AI: {use_ai_generation}.")
             except Exception as e:
                 await log_error(guild, f"/message (User-App Normal) failed sending ephemeral response", error=e, interaction=interaction)
                 try: await interaction.edit_original_response(content="❌ Failed to deliver message.", embed=None, view=None)
-                except: pass # Ignore if even this fails
-            return # Exit after handling
+                except: pass
+            return
         else:
-            # CASE 2: "Normal Bot" personality AND (Bot is a Full Guild Member OR command is used in DMs).
-            # Send as a new, separate message to the channel/DM.
-            # print(f"DEBUG /message: Path: Full Member/DM Scope (Normal Bot). Guild: {guild.name if guild else 'DM'}")
+            print(f"DEBUG /message: Path selected: Full Member/DM Scope (Normal Bot) -> New message. Guild: {guild.name if guild else 'DM'}")
             permission_issue_location = target_channel.mention if isinstance(target_channel, discord.TextChannel) else "this DM/Group"
             can_send_regular_message = False
 
             if guild and interaction.guild.me: # Full guild member context
-                can_send_regular_message = target_channel.permissions_for(interaction.guild.me).send_messages
+                bot_perms_in_channel = target_channel.permissions_for(interaction.guild.me)
+                can_send_regular_message = bot_perms_in_channel.send_messages
+                print(f"DEBUG /message: Bot perms in {target_channel.mention}: send_messages={can_send_regular_message}")
+                if not can_send_regular_message:
+                    await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {permission_issue_location} to send a new message.", ephemeral=True)
+                    return
             elif not guild: # DM context
-                can_send_regular_message = True
+                can_send_regular_message = True # Assumed
+                print(f"DEBUG /message: DM context, assuming can send.")
 
-            if not can_send_regular_message:
-                await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {permission_issue_location}.", ephemeral=True)
+            # This 'else' for can_send_regular_message should not be reachable if the above logic is correct
+            # but it's here as a safeguard.
+            if not can_send_regular_message: # Should have been caught above for guild case
+                await interaction.followup.send(f"❌ Lacking permission to send new message in {permission_issue_location}.", ephemeral=True)
                 return
 
             try:
@@ -5857,20 +5867,28 @@ async def message_as(
             except Exception as e:
                 await interaction.edit_original_response(content=f"❌ Failed to send message: {e}", embed=None, view=None)
                 await log_error(guild, f"/message (Normal Full/DM) failed sending", error=e, interaction=interaction)
-            return # Exit after handling
+            return
 
-    # --- Webhook Logic (This path is taken if `use_webhook` is True) ---
-    # Webhooks always send a new, public message.
-    # print(f"DEBUG /message: Path: Webhook. Name: {final_name_for_webhook}")
-    if not isinstance(target_channel, discord.TextChannel): # Webhooks require a TextChannel
+    # --- Webhook Logic ---
+    print(f"DEBUG /message: Path selected: Webhook. Effective Name: '{effective_sender_name_for_context}', Webhook Name: '{final_name_for_webhook}'")
+    if not isinstance(target_channel, discord.TextChannel):
         await interaction.followup.send("❌ Webhook messages can only be sent to server text channels.", ephemeral=True)
         return
 
     temp_webhook: Optional[discord.Webhook] = None
     try:
-        if guild and not target_channel.permissions_for(interaction.guild.me).manage_webhooks:
-             await interaction.followup.send(f"❌ I need 'Manage Webhooks' permission in {target_channel.mention} to send as '{effective_sender_name_for_context}'.", ephemeral=True)
+        if guild and interaction.guild.me: # Full guild member check
+            bot_perms_in_channel = target_channel.permissions_for(interaction.guild.me)
+            can_manage_webhooks = bot_perms_in_channel.manage_webhooks
+            print(f"DEBUG /message: Bot perms in {target_channel.mention} for webhook: manage_webhooks={can_manage_webhooks}")
+            if not can_manage_webhooks:
+                 await interaction.followup.send(f"❌ I need 'Manage Webhooks' permission in {target_channel.mention} to send as '{effective_sender_name_for_context}'.", ephemeral=True)
+                 return
+        elif not guild: # Should have been caught by isinstance check, but defensive
+             await interaction.followup.send("❌ Webhooks cannot be used in DMs.", ephemeral=True)
              return
+        # If guild.me is None for some reason, this path might error later or Discord API might reject.
+
         if not final_name_for_webhook: final_name_for_webhook = bot.user.name if bot.user else "Pingslave Bot"
 
         temp_webhook = await target_channel.create_webhook(
@@ -5883,6 +5901,9 @@ async def message_as(
             try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
             except: pass
         await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' (webhook) in {target_channel.mention} (AI: {use_ai_generation}).")
+    except discord.Forbidden: # Catch Forbidden specifically for webhook creation/send
+        await interaction.followup.send(f"❌ Failed to send as '{effective_sender_name_for_context}' via webhook due to missing permissions (likely Manage Webhooks or Send Messages via Webhook).", ephemeral=True)
+        await log_error(guild, f"/message webhook failed for '{effective_sender_name_for_context}': Forbidden", interaction=interaction)
     except Exception as e:
         try: await interaction.edit_original_response(content=f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", embed=None, view=None)
         except: await interaction.followup.send(f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", ephemeral=True)
