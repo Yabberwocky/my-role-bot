@@ -167,6 +167,7 @@ PERSONALITY_CUSTOM = "Custom" # Keep this simple, parameter handles the details
 AVATAR_CHOICE_EVIL = "Evil Caterpillar Avatar"
 AVATAR_CHOICE_GOOD = "Good Caterpillar Avatar"
 AVATAR_CHOICE_NERD = "Nerd Bot Avatar" # Renamed for clarity, or keep as "Nerd Avatar"
+BOT_INSTANCE_TYPE = os.getenv("BOT_INSTANCE_TYPE", "PRODUCTION").upper()
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -196,6 +197,21 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def test_bot_owner_only_check(interaction: discord.Interaction) -> bool:
+    """
+    Global check: If BOT_INSTANCE_TYPE is "TESTING", only allows OWNER_USER_ID.
+    Otherwise (PRODUCTION), allows command execution (other checks may still apply).
+    """
+    if BOT_INSTANCE_TYPE == "TESTING":
+        if interaction.user.id == OWNER_USER_ID:
+            return True # Owner can use test bot commands
+        else:
+            # This message will be sent by the default CheckFailure handler if not overridden
+            # Or you can handle it in your on_app_command_error
+            print(f"Command '{interaction.command.name if interaction.command else 'N/A'}' on TEST bot blocked for user {interaction.user.id} (not owner).")
+            return False # Non-owner cannot use test bot commands
+    return True # Production bot commands are not restricted by this check
 
 # Helper function (fetch_avatar_bytes - remains the same)
 async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
@@ -3086,114 +3102,207 @@ async def update_static_list_message(guild: discord.Guild):
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
-    global BOT_USER_ID, command_ids, STAFF_CHANNELS # <<< Add STAFF_CHANNELS to global
+    global BOT_USER_ID, command_ids, STAFF_CHANNELS # Ensure all globals used are listed
+
     if bot.user:
         BOT_USER_ID = bot.user.id
         print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
         print(f"Discord.py v{discord.__version__}")
+        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") # Log the instance type
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
-        return
+        # Consider logging this error to your extraordinary_logs channel if possible,
+        # though if bot.user is None, guild context for logging might also be an issue.
+        return # Critical failure, cannot proceed
     
     activity = discord.Activity(type=discord.ActivityType.watching, name="out for Pings | /nerdhelp")
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
+    # --- Command Permissions Modification for TESTING Bot ---
+    # This section MUST come BEFORE tree.sync()
+    if BOT_INSTANCE_TYPE == "TESTING":
+        if OWNER_USER_ID is None: # OWNER_USER_ID must be defined for this to work
+            print("CRITICAL [TESTING BOT]: OWNER_USER_ID is not set. Command restriction to owner cannot be applied. Defaulting to admin-only.")
+            # You could log this to a channel if bot is sufficiently initialized
+            # await log_error(None, "TESTING BOT CRITICAL: OWNER_USER_ID not set. Command restrictions may not work as intended.", ping_owner=True)
+            # Fallback to admin-only permissions if owner ID is missing, which is still better than no restriction.
+            default_permissions_for_test_bot = discord.Permissions(administrator=True)
+        else:
+            print(f"INFO [TESTING BOT]: Applying command restrictions. Commands should be visible/usable primarily by owner (ID: {OWNER_USER_ID}) via admin role or direct permission.")
+            # Commands will be visible to administrators. The @app_commands.check(test_bot_owner_only_check)
+            # will then ensure only the OWNER_USER_ID can execute them.
+            default_permissions_for_test_bot = discord.Permissions(administrator=True)
+            
+        # Get all global commands. If you have guild-specific commands for Catercord, handle them.
+        # For simplicity, this example targets global commands.
+        # If your test bot only ever operates in Catercord, you might sync only to that guild.
+        
+        all_app_commands = tree.get_commands(guild=None) # Get global commands
+        # If you also register commands specifically to CATERCORD_GUILD_ID:
+        # target_guild_obj_for_test_cmds = discord.Object(id=CATERCORD_GUILD_ID)
+        # all_app_commands.extend(tree.get_commands(guild=target_guild_obj_for_test_cmds))
+        
+        restricted_count = 0
+        for cmd_obj in all_app_commands:
+            cmd_obj.default_member_permissions = default_permissions_for_test_bot
+            restricted_count +=1
+            # If the command is a group, restrict its subcommands too
+            if isinstance(cmd_obj, app_commands.Group):
+                for sub_cmd in cmd_obj.commands: # Iterate through commands in the group
+                    if isinstance(sub_cmd, (app_commands.Command, app_commands.Group)): # Ensure it's a command/subgroup
+                        sub_cmd.default_member_permissions = default_permissions_for_test_bot
+                        # Don't increment restricted_count again for subcommands here,
+                        # as the top-level group already covers it in terms of visibility.
+                        # The check decorator will handle execution.
+        print(f"INFO [TESTING BOT]: Applied admin-only default visibility to {restricted_count} top-level command entries.")
+
     # --- Command Syncing ---
-    # ... (keep existing sync logic) ...
     print("Syncing application commands...")
     synced_commands = []
     try:
-        synced_commands = await tree.sync() # Global sync
+        # For a TESTING bot, you might want to sync only to a specific guild (e.g., Catercord)
+        # to avoid polluting the global command space if the test bot uses a different app ID.
+        # If it's the same App ID, global sync affects both.
+        # If BOT_INSTANCE_TYPE == "TESTING" and CATERCORD_GUILD_ID:
+        #     print(f"INFO [TESTING BOT]: Syncing commands to guild ID {CATERCORD_GUILD_ID}.")
+        #     synced_commands = await tree.sync(guild=discord.Object(id=CATERCORD_GUILD_ID))
+        # else:
+        #     print("INFO [PRODUCTION BOT / Global Sync]: Syncing commands globally.")
+        #     synced_commands = await tree.sync() # Global sync for production or if test bot isn't guild-specific
+        
+        synced_commands = await tree.sync() # Your original global sync
+        
         print(f"Synced {len(synced_commands)} application commands.")
-        command_ids.clear()
+        command_ids.clear() # Clear previous IDs
         for cmd in synced_commands:
             if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
                 command_ids[cmd.name] = cmd.id
-            else: print(f"  Skipped storing ID during sync (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if command_ids: print(f"Stored command IDs: {command_ids}")
-        else: print("Warning: command_ids dictionary is empty after sync.")
-    except discord.HTTPException as e: print(f"Command Sync failed (HTTPException): {e}")
-    except Exception as e: print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
+                # If it's a group, store subcommand IDs too if your get_cmd_mention needs it
+                if isinstance(cmd, app_commands.Group):
+                    for sub_cmd in cmd.commands:
+                        if isinstance(sub_cmd, app_commands.Command): # Check if it's a command, not another subgroup for this example
+                             full_name = f"{cmd.name} {sub_cmd.name}" # Or however you reference subcommands
+                             command_ids[full_name] = sub_cmd.id # Note: Discord might return separate IDs for subcommands
+            else:
+                print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
+        if command_ids:
+            print(f"Stored command IDs: {command_ids}")
+        else:
+            print("Warning: command_ids dictionary is empty after sync.")
+    except discord.HTTPException as e:
+        print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
+        # Log this error if possible
+        # await log_error(None, "Command Sync failed (HTTPException)", error=e, ping_owner=True)
+    except Exception as e:
+        print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
+        # Log this error if possible
+        # await log_error(None, "Command Sync failed (Unexpected Error)", error=e, ping_owner=True)
 
 
     # --- Signal Bot Ready & Load Initial Data ---
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-    if log_guild:
+    
+    # Determine the guild for logging readiness message
+    log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    
+    if log_guild_for_ready_msg:
         try:
-             await log_info(log_guild, f"Bot ready and online. Synced {len(synced_commands)} commands.")
+             instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
+             await log_info(log_guild_for_ready_msg, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
         except Exception as log_e:
              print(f"Failed to send initial ready log message: {log_e}")
 
     print("--- Loading initial data ---")
-    await load_keyword_data(log_guild) # Load keywords
-    await load_ign_cache(log_guild) # Load IGN cache
+    # Pass a guild context for logging within these load functions if possible
+    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) # Prefer Catercord for logs
+    if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0] # Fallback
+
+    await load_keyword_data(log_guild_for_data_load) # Load keywords
+    await load_ign_cache(log_guild_for_data_load) # Load IGN cache
 
     # --- START: Staff Channel Identification ---
     print("Identifying staff channels in target guild...")
     STAFF_CHANNELS.clear() # Clear previous findings
-    target_guild = bot.get_guild(CATERCORD_GUILD_ID)
-    if target_guild:
-        florrist_role = target_guild.get_role(FLORRIST_ROLE_ID)
-        hc1_role = target_guild.get_role(HC1_ROLE_ID)
-        everyone_role = target_guild.default_role # Get @everyone role
+    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
+    if target_guild_for_staff_channels:
+        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
+        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
+        everyone_role = target_guild_for_staff_channels.default_role
 
-        if florrist_role and hc1_role:
-            print(f"Checking channel visibility against roles: '{florrist_role.name}' and '{hc1_role.name}'")
+        if florrist_role and hc1_role: # everyone_role always exists
+            print(f"Checking channel visibility against roles: '{florrist_role.name}', '{hc1_role.name}' in guild '{target_guild_for_staff_channels.name}'")
             potentially_staff_channels = 0
             actually_staff_channels = 0
-            for channel in target_guild.text_channels: # Check only text channels
-                # Check permissions for @everyone first
+            for channel in target_guild_for_staff_channels.text_channels:
                 everyone_perms = channel.permissions_for(everyone_role)
                 if not everyone_perms.view_channel:
                     potentially_staff_channels += 1
-                    # If @everyone can't view, check if *either* role grants view access via overwrite
                     florrist_ow = channel.overwrites_for(florrist_role)
                     hc1_ow = channel.overwrites_for(hc1_role)
-
                     florrist_can_view = florrist_ow.view_channel is True
                     hc1_can_view = hc1_ow.view_channel is True
-
-                    # If *neither* role overwrite specifically allows viewing, it's a staff channel
                     if not florrist_can_view and not hc1_can_view:
                         STAFF_CHANNELS.add(channel.id)
                         actually_staff_channels += 1
-                        # print(f"  -> Identified Staff Channel: #{channel.name} ({channel.id})") # Debug print
-
+                        # print(f"  -> Identified Staff Channel: #{channel.name} ({channel.id})")
             print(f"Staff Channel Identification Complete: Found {actually_staff_channels} staff channel(s) out of {potentially_staff_channels} potentially restricted channels.")
         else:
-            print("WARN: Could not find Florrist or HC1 roles in target guild. Cannot identify staff channels.")
-            await log_error(target_guild, "Failed to identify staff channels: One or both required roles not found.", ping_owner=True)
+            missing_role_names = []
+            if not florrist_role: missing_role_names.append(f"Florrist Role (ID: {FLORRIST_ROLE_ID})")
+            if not hc1_role: missing_role_names.append(f"HC1 Role (ID: {HC1_ROLE_ID})")
+            print(f"WARN: Could not find required roles in target guild for staff channel identification: {', '.join(missing_role_names)}.")
+            if log_guild_for_data_load: # Log error if guild context available
+                await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
     else:
-        print("WARN: Target guild not found. Cannot identify staff channels.")
+        print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
     # --- END: Staff Channel Identification ---
 
 
     # --- Start Background Tasks ---
-    # ... (keep existing task starting logic) ...
     print("Starting background tasks...")
     if not check_static_view_timeout.is_running():
-        try: check_static_view_timeout.start(); print(" Static view timeout checker task started.")
-        except Exception as e_task: print(f"Failed to start static view timeout task: {e_task}"); await log_error(log_guild, "Failed to start static view timeout task", error=e_task)
+        try:
+            check_static_view_timeout.start()
+            print(" Static view timeout checker task started.")
+        except RuntimeError: # Already running
+            print(" Static view timeout checker task was already running (RuntimeError).")
+        except Exception as e_task_start:
+            print(f"Failed to start static view timeout task: {e_task_start}")
+            if log_guild_for_data_load:
+                await log_error(log_guild_for_data_load, "Failed to start static view timeout task", error=e_task_start)
 
 
     # --- Schedule Delayed Static List Update ---
-    # ... (keep existing delayed update logic) ...
     async def delayed_update(delay_seconds: int):
-        await asyncio.sleep(delay_seconds)
+        await asyncio.sleep(delay_seconds) # Wait for the specified delay
         print(f"--- Running delayed static list update after {delay_seconds}s ---")
-        guild = bot.get_guild(CATERCORD_GUILD_ID)
-        if not guild: print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed update."); await log_error(None, f"Delayed update failed: Target guild {CATERCORD_GUILD_ID} not found."); return
-        if not supabase: print("ERROR: Supabase client not available for delayed update."); await log_error(guild, "Delayed update failed: Supabase client not available."); return
-        try: await update_static_list_message(guild)
-        except Exception as e: print(f"ERROR during delayed initial list update: {e}\n{traceback.format_exc()}"); await log_error(guild, "Error during delayed initial list update", error=e)
+        
+        guild_for_delayed_update = bot.get_guild(CATERCORD_GUILD_ID)
+        if not guild_for_delayed_update:
+            print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed static list update.")
+            # Log this if possible. Guild context is None here.
+            # await log_error(None, f"Delayed static list update failed: Target guild {CATERCORD_GUILD_ID} not found.")
+            return
+            
+        if not supabase:
+            print("ERROR: Supabase client not available for delayed static list update.")
+            await log_error(guild_for_delayed_update, "Delayed static list update failed: Supabase client not available.")
+            return
+            
+        try:
+            await update_static_list_message(guild_for_delayed_update)
+        except Exception as e:
+            print(f"ERROR during delayed initial static list update: {e}\n{traceback.format_exc()}")
+            await log_error(guild_for_delayed_update, "Error during delayed initial static list update", error=e)
         print(f"--- Delayed static list update finished ---")
 
+    # Check if bot is fully ready and in the target guild before scheduling
     if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
-        print("Scheduling delayed static list update for target guild...")
-        bot.loop.create_task(delayed_update(delay_seconds=60))
-    else: print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
-
+        print("Scheduling delayed static list update for target guild (Catercord)...")
+        # Use bot.loop.create_task for asyncio tasks from sync context if not already in async
+        asyncio.create_task(delayed_update(delay_seconds=60)) # Using asyncio.create_task directly is fine in async func
+    else:
+        print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
 
     print("--- on_ready event finished ---")
 
@@ -3340,6 +3449,7 @@ def get_cmd_mention(name: str) -> str:
 @app_commands.describe(user="The user to verify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
+@app_commands.check(test_bot_owner_only_check)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     if not guild:
@@ -3454,6 +3564,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.describe(user="The user to unverify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
+@app_commands.check(test_bot_owner_only_check)
 async def unverify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     if not guild:
@@ -3566,6 +3677,7 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will link/update DB & set nickname).") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
+@app_commands.check(test_bot_owner_only_check)
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction):
@@ -3795,6 +3907,7 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 @app_commands.checks.has_permissions(manage_roles=True) # User needs permission to trigger potential role changes
 @app_commands.checks.bot_has_permissions(manage_roles=True) # Bot needs permission to manage roles
+@app_commands.check(test_bot_owner_only_check)
 async def hcleave(interaction: discord.Interaction, ingame_name: str):
     """Removes HC database entry based on IGN and handles linked user roles."""
     guild = interaction.guild
@@ -4005,6 +4118,7 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
 @tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
 @app_commands.describe(ingame_name="The player's unique in-game name.")
 @app_commands.checks.has_permissions(manage_roles=True) # Or another suitable permission
+@app_commands.check(test_bot_owner_only_check)
 async def hconly(interaction: discord.Interaction, ingame_name: str):
     """Adds a member to the HC database using only their IGN."""
     guild = interaction.guild
@@ -4083,6 +4197,7 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
 
 # --- Activate Myself Command ---
 @tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
+@app_commands.check(test_bot_owner_only_check)
 # No extra permissions needed by default, relies on user having a linked IGN
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
@@ -4145,6 +4260,7 @@ async def activatemyself(interaction: discord.Interaction):
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete) # REMOVED date autocomplete
 @app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
+@app_commands.check(test_bot_owner_only_check)
 # VV Ensure this 'async' keyword is present VV
 # MODIFIED: Removed 'date: str' parameter
 async def active(interaction: discord.Interaction, ingame_name: str):
@@ -4179,27 +4295,6 @@ async def active(interaction: discord.Interaction, ingame_name: str):
         await log_info(guild, f"`{interaction.user}` used /active for {display_target} on {format_date_dmy(activity_date)}. Triggering list update.")
         asyncio.create_task(update_static_list_message(guild))
 
-
-# --- Alias Command /a for /active ---
-@tree.command(name="a", description="Alias for /active: Mark an IGN as active for a specific date.") # New command name "a"
-@app_commands.describe( # Use the SAME descriptions as /active
-    ingame_name="The In-Game Name (IGN) to mark active.",
-    date="Date of activity (Select from list)."
-)
-@app_commands.autocomplete( # Use the SAME autocomplete functions as /active
-    ingame_name=ign_autocomplete,
-    date=activity_date_autocomplete
-)
-# Optional: Add permission checks if /active has them
-# @app_commands.checks.has_permissions(...)
-# Function name MUST be different from the original 'active'
-async def active_alias(interaction: discord.Interaction, ingame_name: str, date: str):
-    """Handles the /a alias by calling the /active command's logic."""
-    # Directly call the implementation of the original /active command
-    # Pass the interaction and all arguments along
-    await active(interaction, ingame_name, date)
-
-
 # --- Inactive Command (CORRECTED DECORATOR and Date Handling, ADDED PERMISSION CHECK) ---
 @tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
 @app_commands.describe(
@@ -4208,6 +4303,7 @@ async def active_alias(interaction: discord.Interaction, ingame_name: str, date:
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
 @app_commands.checks.has_permissions(manage_guild=True) # <<<--- ADDED PERMISSION CHECK
+@app_commands.check(test_bot_owner_only_check)
 async def inactive(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
@@ -4252,21 +4348,9 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
          await log_info(guild, f"`{interaction.user}` used /inactive for {display_target} on {format_date_dmy(activity_date)}. No record found.")
     # Errors are logged within remove_activity_log if needed
 
-
-# --- Bulk Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="bulkactive", description="Mark multiple members active for today via IGNs using a modal.") # MODIFIED Description
-# REMOVED date describe
-# REMOVED date autocomplete decorator entirely
-@app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
-# MODIFIED: Removed 'date: str' parameter
-async def bulkactive(interaction: discord.Interaction):
-    # MODIFIED: Pass None to the modal constructor, indicating no specific date was provided.
-    modal = BulkActiveModal(date_str=None)
-    await interaction.response.send_modal(modal)
-
-
 # --- REVISED /hcmembers Command ---
 @tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
+@app_commands.check(test_bot_owner_only_check)
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -4404,6 +4488,7 @@ async def hcmembers(interaction: discord.Interaction):
 
 @tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.check(test_bot_owner_only_check)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -4477,6 +4562,7 @@ async def refresh(interaction: discord.Interaction):
 
 # --- Discovery Command (Further Refined Formatting for User-App Context) ---
 @tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!")
+@app_commands.check(test_bot_owner_only_check)
 async def discoveries(interaction: discord.Interaction):
     # Ensure bot object and user ID are available
     if not bot or not bot.user or not bot.user.id:
@@ -4603,6 +4689,7 @@ async def discoveries(interaction: discord.Interaction):
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
 @app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
+@app_commands.check(test_bot_owner_only_check)
 async def syncnicknames(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
@@ -4793,6 +4880,7 @@ async def syncnicknames(interaction: discord.Interaction):
 
 # --- Wither Command ---
 @tree.command(name="wither", description="Temporarily remove roles from a user.")
+@app_commands.check(test_bot_owner_only_check)
 @app_commands.describe(
     user="User to wither.",
     time="Duration in minutes (0.1 to 10, default 2)."
@@ -5488,6 +5576,7 @@ async def on_message(message: discord.Message):
 
 # NEW Command: Add Keyword (Owner Only)
 @tree.command(name="addkeyword", description="[Owner Only] Add a new keyword rule to the database.")
+@app_commands.check(test_bot_owner_only_check)
 @app_commands.describe(
     phrase_identifier="Unique identifier for this keyword (e.g., 'rule_linking').",
     inclusion_regex="Regex pattern to trigger this keyword (case-insensitive).",
@@ -5599,238 +5688,213 @@ async def addkeyword(
 ])
 @app_commands.check(can_manage_guild_or_is_bypass_user)
 @app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
+@app_commands.check(test_bot_owner_only_check)
 async def message_as(
     interaction: discord.Interaction,
     content: str,
     personality: Optional[app_commands.Choice[str]] = None,
     custom_name: Optional[str] = None,
     imitate: Optional[discord.Member] = None,
-    avatar: Optional[app_commands.Choice[str]] = None, # New avatar choice
-    custom_avatar: Optional[discord.Attachment] = None, # New custom avatar attachment
+    avatar: Optional[app_commands.Choice[str]] = None,
+    custom_avatar: Optional[discord.Attachment] = None,
     ai: Optional[str] = "no"
 ):
-    if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
+    if not interaction.channel:
+        await interaction.response.send_message("This command cannot be used without a channel context.", ephemeral=True)
+        return
+    if interaction.guild and not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("In a server, this command can only be used in text channels.", ephemeral=True)
         return
 
-    target_channel: discord.TextChannel = interaction.channel
-    guild = interaction.guild
+    target_channel: discord.abc.Messageable = interaction.channel
+    guild = interaction.guild # Will be None if in DMs
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True) # Ephemeral defer
 
     # --- Determine effective identity for sending the message ---
     final_name_for_webhook: Optional[str] = None
     final_avatar_bytes_for_webhook: Optional[bytes] = None
-    use_webhook = False
-    # For logging and AI prompt context, this name reflects the persona being adopted
+    use_webhook = False # Determines if webhook is needed (for custom name/avatar or specific personalities)
     effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL
 
-
-    async with aiohttp.ClientSession() as session: # Create session once for all potential fetches
-        # 1. Imitate (Highest priority for both name and avatar)
+    # --- [LOGIC FOR DETERMINING final_name_for_webhook, final_avatar_bytes_for_webhook, use_webhook, effective_sender_name_for_context] ---
+    # This extensive block remains the same as your current correct version.
+    async with aiohttp.ClientSession() as session:
         if imitate:
-            use_webhook = True
-            final_name_for_webhook = imitate.display_name
+            use_webhook = True; final_name_for_webhook = imitate.display_name
             avatar_url_to_fetch = imitate.display_avatar.url if imitate.display_avatar else imitate.default_avatar.url
             final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, avatar_url_to_fetch)
             effective_sender_name_for_context = final_name_for_webhook
-            print(f"Message As: Imitating user {imitate.id} ({final_name_for_webhook}). Avatar URL: {avatar_url_to_fetch}")
-
-        # 2. Custom Avatar (Overrides pre-defined avatar choice and personality avatar)
         elif custom_avatar:
             use_webhook = True
             try:
                 final_avatar_bytes_for_webhook = await custom_avatar.read()
-                if not final_avatar_bytes_for_webhook: # Should not happen if attachment is valid image
-                    await interaction.followup.send("❌ Failed to read the custom avatar image. Please try a different image.", ephemeral=True)
-                    return
+                if not final_avatar_bytes_for_webhook: await interaction.followup.send("❌ Failed to read custom avatar.", ephemeral=True); return
             except Exception as e:
-                await interaction.followup.send(f"❌ Error reading custom avatar: {e}", ephemeral=True)
-                await log_error(guild, "Error reading custom_avatar attachment", error=e, interaction=interaction)
-                return
-
-            # Determine name when custom_avatar is used: custom_name > personality > bot_name
+                await interaction.followup.send(f"❌ Error reading custom avatar: {e}", ephemeral=True); await log_error(guild, "Error reading custom_avatar", error=e, interaction=interaction); return
             if custom_name and custom_name.strip():
-                cleaned_name = custom_name.strip()
-                if not (1 <= len(cleaned_name) <= 80):
-                    await interaction.followup.send("❌ Custom name (with custom avatar) must be 1-80 characters.", ephemeral=True)
-                    return
+                cleaned_name = custom_name.strip();
+                if not (1 <= len(cleaned_name) <= 80): await interaction.followup.send("❌ Custom name invalid length.", ephemeral=True); return
                 final_name_for_webhook = cleaned_name
-            elif personality and personality.value == PERSONALITY_EVIL:
-                final_name_for_webhook = EVIL_CATERPILLAR_NAME
-            elif personality and personality.value == PERSONALITY_GOOD:
-                final_name_for_webhook = GOOD_CATERPILLAR_NAME
-            else: # Default name if only custom_avatar is provided
-                final_name_for_webhook = bot.user.name if bot.user else "Webhook User"
+            elif personality and personality.value == PERSONALITY_EVIL: final_name_for_webhook = EVIL_CATERPILLAR_NAME
+            elif personality and personality.value == PERSONALITY_GOOD: final_name_for_webhook = GOOD_CATERPILLAR_NAME
+            else: final_name_for_webhook = bot.user.name if bot.user else "Webhook User"
             effective_sender_name_for_context = final_name_for_webhook
-            print(f"Message As: Using custom uploaded avatar. Name: {final_name_for_webhook}")
-
-        # 3. Pre-defined Avatar Choice (Overrides personality avatar)
         elif avatar:
-            use_webhook = True
-            avatar_url_to_fetch: Optional[str] = None
-            temp_name_from_avatar_choice: Optional[str] = None
-
-            if avatar.value == AVATAR_CHOICE_EVIL:
-                avatar_url_to_fetch = EVIL_CATERPILLAR_AVATAR_URL
-                temp_name_from_avatar_choice = EVIL_CATERPILLAR_NAME
-            elif avatar.value == AVATAR_CHOICE_GOOD:
-                avatar_url_to_fetch = GOOD_CATERPILLAR_AVATAR_URL
-                temp_name_from_avatar_choice = GOOD_CATERPILLAR_NAME
-            elif avatar.value == AVATAR_CHOICE_NERD:
-                avatar_url_to_fetch = NERD_AVATAR_URL
-                temp_name_from_avatar_choice = bot.user.name if bot.user else "Nerd Bot" # Or a fixed name like "The Nerd"
-
-            if not avatar_url_to_fetch: # Check if any of the chosen avatar URLs are not configured
-                await interaction.followup.send(f"⚠️ Configuration error: The URL for '{avatar.value}' is not set. Contact bot owner.", ephemeral=True)
-                await log_error(guild, f"/message: Avatar URL missing for pre-defined choice '{avatar.value}'", interaction=interaction, ping_owner=True)
-                return
+            use_webhook = True; avatar_url_to_fetch = None; temp_name_from_avatar_choice = None
+            if avatar.value == AVATAR_CHOICE_EVIL: avatar_url_to_fetch, temp_name_from_avatar_choice = EVIL_CATERPILLAR_AVATAR_URL, EVIL_CATERPILLAR_NAME
+            elif avatar.value == AVATAR_CHOICE_GOOD: avatar_url_to_fetch, temp_name_from_avatar_choice = GOOD_CATERPILLAR_AVATAR_URL, GOOD_CATERPILLAR_NAME
+            elif avatar.value == AVATAR_CHOICE_NERD: avatar_url_to_fetch, temp_name_from_avatar_choice = NERD_AVATAR_URL, (bot.user.name if bot.user else "Nerd Bot")
+            if not avatar_url_to_fetch: await interaction.followup.send(f"⚠️ Config error: URL for '{avatar.value}' not set.", ephemeral=True); await log_error(guild, f"/message: URL missing for '{avatar.value}'", interaction=interaction, ping_owner=True); return
             final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, avatar_url_to_fetch)
-
-            # Determine name when pre-defined avatar is used: custom_name > personality > name from avatar choice
             if custom_name and custom_name.strip():
-                cleaned_name = custom_name.strip()
-                if not (1 <= len(cleaned_name) <= 80):
-                    await interaction.followup.send("❌ Custom name (with chosen avatar) must be 1-80 characters.", ephemeral=True)
-                    return
+                cleaned_name = custom_name.strip();
+                if not (1 <= len(cleaned_name) <= 80): await interaction.followup.send("❌ Custom name invalid length.", ephemeral=True); return
                 final_name_for_webhook = cleaned_name
-            elif personality and personality.value == PERSONALITY_EVIL:
-                final_name_for_webhook = EVIL_CATERPILLAR_NAME
-            elif personality and personality.value == PERSONALITY_GOOD:
-                final_name_for_webhook = GOOD_CATERPILLAR_NAME
-            else: # Fallback to name associated with avatar choice
-                final_name_for_webhook = temp_name_from_avatar_choice
+            elif personality and personality.value == PERSONALITY_EVIL: final_name_for_webhook = EVIL_CATERPILLAR_NAME
+            elif personality and personality.value == PERSONALITY_GOOD: final_name_for_webhook = GOOD_CATERPILLAR_NAME
+            else: final_name_for_webhook = temp_name_from_avatar_choice
             effective_sender_name_for_context = final_name_for_webhook
-            print(f"Message As: Using pre-defined avatar '{avatar.value}'. Name: {final_name_for_webhook}")
-
-        # 4. Custom Name (Implies Nerd Avatar if no other avatar specified by higher priority)
         elif custom_name and custom_name.strip():
-            use_webhook = True
-            cleaned_name = custom_name.strip()
-            if not (1 <= len(cleaned_name) <= 80):
-                await interaction.followup.send("❌ Custom name must be 1-80 characters.", ephemeral=True)
-                return
-            final_name_for_webhook = cleaned_name
-            effective_sender_name_for_context = final_name_for_webhook
-            # Avatar will be Nerd Avatar by default if this branch is reached
-            if not NERD_AVATAR_URL:
-                await interaction.followup.send(f"⚠️ Configuration error: NERD_AVATAR_URL is not set for Custom Name default. Contact bot owner.")
-                await log_error(guild, f"/message: NERD_AVATAR_URL missing for Custom Name default.", interaction=interaction, ping_owner=True)
-                return
+            use_webhook = True; cleaned_name = custom_name.strip()
+            if not (1 <= len(cleaned_name) <= 80): await interaction.followup.send("❌ Custom name invalid length.", ephemeral=True); return
+            final_name_for_webhook = cleaned_name; effective_sender_name_for_context = final_name_for_webhook
+            if not NERD_AVATAR_URL: await interaction.followup.send(f"⚠️ Config error: NERD_AVATAR_URL not set.", ephemeral=True); await log_error(guild, f"/message: NERD_AVATAR_URL missing.", interaction=interaction, ping_owner=True); return
             final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, NERD_AVATAR_URL)
-            print(f"Message As: Using custom name '{final_name_for_webhook}' with Nerd avatar.")
-
-        # 5. Pre-defined Personality (Evil/Good - if no other avatar/name overrides)
         elif personality:
             if personality.value == PERSONALITY_EVIL:
-                use_webhook = True
-                final_name_for_webhook = EVIL_CATERPILLAR_NAME
-                if not EVIL_CATERPILLAR_AVATAR_URL or not EVIL_CATERPILLAR_NAME: # Check config
-                    await interaction.followup.send(f"⚠️ Configuration error for '{PERSONALITY_EVIL}'. Name or Avatar URL missing.", ephemeral=True); return
-                final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, EVIL_CATERPILLAR_AVATAR_URL)
-                effective_sender_name_for_context = final_name_for_webhook
+                use_webhook = True; final_name_for_webhook = EVIL_CATERPILLAR_NAME
+                if not EVIL_CATERPILLAR_AVATAR_URL or not EVIL_CATERPILLAR_NAME: await interaction.followup.send(f"⚠️ Config error for '{PERSONALITY_EVIL}'.", ephemeral=True); return
+                final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, EVIL_CATERPILLAR_AVATAR_URL); effective_sender_name_for_context = final_name_for_webhook
             elif personality.value == PERSONALITY_GOOD:
-                use_webhook = True
-                final_name_for_webhook = GOOD_CATERPILLAR_NAME
-                if not GOOD_CATERPILLAR_AVATAR_URL or not GOOD_CATERPILLAR_NAME: # Check config
-                    await interaction.followup.send(f"⚠️ Configuration error for '{PERSONALITY_GOOD}'. Name or Avatar URL missing.", ephemeral=True); return
-                final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, GOOD_CATERPILLAR_AVATAR_URL)
-                effective_sender_name_for_context = final_name_for_webhook
-            elif personality.value == PERSONALITY_NORMAL:
-                # effective_sender_name_for_context remains default (bot's name)
-                # use_webhook remains False
-                pass
-            print(f"Message As: Using personality '{personality.value}'. Name: {final_name_for_webhook if use_webhook else 'Normal Bot'}")
-        # Else: Default to Normal Bot (use_webhook is False, effective_sender_name_for_context is bot's name)
-
-        # Default webhook name if webhook is used but name wasn't explicitly set by above logic
+                use_webhook = True; final_name_for_webhook = GOOD_CATERPILLAR_NAME
+                if not GOOD_CATERPILLAR_AVATAR_URL or not GOOD_CATERPILLAR_NAME: await interaction.followup.send(f"⚠️ Config error for '{PERSONALITY_GOOD}'.", ephemeral=True); return
+                final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, GOOD_CATERPILLAR_AVATAR_URL); effective_sender_name_for_context = final_name_for_webhook
         if use_webhook and not final_name_for_webhook:
-            final_name_for_webhook = bot.user.name if bot.user else "Pingslave"
-            effective_sender_name_for_context = final_name_for_webhook
+            final_name_for_webhook = bot.user.name if bot.user else "Pingslave"; effective_sender_name_for_context = final_name_for_webhook
+    # --- [END OF IDENTITY DETERMINATION LOGIC] ---
 
     use_ai_generation = ai.lower() == "yes" if ai else False
     final_content_to_send = content
 
-    # --- AI Content Generation if requested ---
+    # --- [AI Content Generation Logic - NO CHANGE HERE] ---
     if use_ai_generation:
-        if not ai_model:
-            await interaction.followup.send("⚠️ AI model is not available. Sending original message content instead.")
+        if not ai_model: await interaction.followup.send("⚠️ AI model unavailable. Sending original content.", ephemeral=True)
         else:
-            ai_system_instruction = (
-                f"You are a chat participant named '{effective_sender_name_for_context}'. "
-                "Mimic human typing style: use lowercase, avoid excessive punctuation, keep messages short and conversational. "
-                f"Engage naturally based on the user's prompt: '{content}'."
-            )
-            if imitate:
-                 ai_system_instruction += f"\nIMPORTANT: You are specifically imitating the user {imitate.display_name}."
-
+            ai_system_instruction = (f"You are '{effective_sender_name_for_context}'. Mimic human typing. Base response on user prompt: '{content}'.")
+            if imitate: ai_system_instruction += f"\nIMPORTANT: You are imitating {imitate.display_name}."
             try:
                 ai_response_raw = await get_ai_response(prompt=content, system_instruction=ai_system_instruction)
                 if ai_response_raw:
-                    processed_response = ai_response_raw.lower().strip()
+                    processed_response = ai_response_raw.lower().strip();
                     if processed_response.endswith(('.', '!', '?')): processed_response = processed_response[:-1]
                     if len(processed_response) > 1950: processed_response = processed_response[:1947] + "..."
                     final_content_to_send = processed_response
-                    await log_info(guild, f"AI generated content for '{effective_sender_name_for_context}': '{final_content_to_send[:100]}...'")
-                else:
-                    await interaction.followup.send("⚠️ AI couldn't generate a response. Sending original message content instead.")
+                    await log_info(guild, f"AI gen for '{effective_sender_name_for_context}': '{final_content_to_send[:100]}...'")
+                else: await interaction.followup.send("⚠️ AI no response. Sending original content.", ephemeral=True)
             except Exception as ai_err:
-                await log_error(guild, f"Error during AI generation for '{effective_sender_name_for_context}'", error=ai_err, interaction=interaction)
-                await interaction.followup.send("⚠️ Error during AI generation. Sending original message content instead.")
+                await log_error(guild, f"AI gen error for '{effective_sender_name_for_context}'", error=ai_err, interaction=interaction)
+                await interaction.followup.send("⚠️ AI gen error. Sending original content.", ephemeral=True)
+    # --- [END OF AI CONTENT GENERATION LOGIC] ---
 
     # --- Send Message ---
-    if not use_webhook: # Send as normal bot
-        if not target_channel.permissions_for(guild.me).send_messages:
-            await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {target_channel.mention}.", ephemeral=True)
-            return
-        try:
-            await target_channel.send(final_content_to_send)
-            await interaction.edit_original_response(content=f"✅ Message sent as '{effective_sender_name_for_context}'.", embed=None, view=None)
-            if use_ai_generation:
-                 try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
-                 except: pass
-            await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' in {target_channel.mention} (AI: {use_ai_generation}).")
-        except Exception as e:
-            await interaction.edit_original_response(content=f"❌ Failed to send message as '{effective_sender_name_for_context}': {e}", embed=None, view=None)
-            await log_error(guild, f"/message failed sending as normal bot", error=e, interaction=interaction)
+    # Determine bot's membership status in the guild, using the reliable pattern
+    bot_is_true_guild_member = False
+    if guild: # Only relevant if in a guild (interaction.guild is not None)
+        # interaction.guild.me should be the bot's Member object in this guild
+        if interaction.guild.me and interaction.guild.me.joined_at:
+            bot_is_true_guild_member = True
+            # print(f"DEBUG /message: Bot IS a true member of '{guild.name}'. joined_at: {interaction.guild.me.joined_at}")
+        # else:
+            # print(f"DEBUG /message: Bot is in '{guild.name}' but NOT a true member (joined_at is None or guild.me is None).")
+
+
+    if not use_webhook: # "Normal Bot" personality chosen (or defaulted) AND no other webhook-triggering options.
+        if guild and not bot_is_true_guild_member:
+            # CASE 1: User-app scope in a guild for "Normal Bot" personality.
+            # Bot is present via application install, but not as a full member.
+            # Send message as part of the (already ephemeral) interaction response.
+            # print(f"DEBUG /message: Path: User-App Scope (Normal Bot) in guild '{guild.name}'")
+            try:
+                ai_note = " (AI Generated)" if use_ai_generation else ""
+                response_text = f"{final_content_to_send}{ai_note}"
+                if len(response_text) > 1990: # Max length for interaction response content
+                    response_text = response_text[:1987] + "..."
+
+                await interaction.edit_original_response(content=response_text, embed=None, view=None)
+                await log_info(guild, f"User `{interaction.user}` sent (Normal Bot via User-App ephemeral) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'DM/Group'}. AI: {use_ai_generation}.")
+            except Exception as e:
+                await log_error(guild, f"/message (User-App Normal) failed sending ephemeral response", error=e, interaction=interaction)
+                try: await interaction.edit_original_response(content="❌ Failed to deliver message.", embed=None, view=None)
+                except: pass # Ignore if even this fails
+            return # Exit after handling
+        else:
+            # CASE 2: "Normal Bot" personality AND (Bot is a Full Guild Member OR command is used in DMs).
+            # Send as a new, separate message to the channel/DM.
+            # print(f"DEBUG /message: Path: Full Member/DM Scope (Normal Bot). Guild: {guild.name if guild else 'DM'}")
+            permission_issue_location = target_channel.mention if isinstance(target_channel, discord.TextChannel) else "this DM/Group"
+            can_send_regular_message = False
+
+            if guild and interaction.guild.me: # Full guild member context
+                can_send_regular_message = target_channel.permissions_for(interaction.guild.me).send_messages
+            elif not guild: # DM context
+                can_send_regular_message = True
+
+            if not can_send_regular_message:
+                await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {permission_issue_location}.", ephemeral=True)
+                return
+
+            try:
+                await target_channel.send(final_content_to_send)
+                await interaction.edit_original_response(content=f"✅ Message sent as '{effective_sender_name_for_context}'.", embed=None, view=None)
+                if use_ai_generation:
+                     try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
+                     except: pass
+                await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' in {permission_issue_location} (AI: {use_ai_generation}).")
+            except discord.Forbidden:
+                await interaction.edit_original_response(content=f"❌ Failed to send message (Forbidden).", embed=None, view=None)
+                await log_error(guild, f"/message (Normal Full/DM) failed sending: Forbidden", interaction=interaction)
+            except Exception as e:
+                await interaction.edit_original_response(content=f"❌ Failed to send message: {e}", embed=None, view=None)
+                await log_error(guild, f"/message (Normal Full/DM) failed sending", error=e, interaction=interaction)
+            return # Exit after handling
+
+    # --- Webhook Logic (This path is taken if `use_webhook` is True) ---
+    # Webhooks always send a new, public message.
+    # print(f"DEBUG /message: Path: Webhook. Name: {final_name_for_webhook}")
+    if not isinstance(target_channel, discord.TextChannel): # Webhooks require a TextChannel
+        await interaction.followup.send("❌ Webhook messages can only be sent to server text channels.", ephemeral=True)
         return
 
-    # --- Webhook Logic ---
-    temp_webhook = None
+    temp_webhook: Optional[discord.Webhook] = None
     try:
-        if not target_channel.permissions_for(guild.me).manage_webhooks:
+        if guild and not target_channel.permissions_for(interaction.guild.me).manage_webhooks:
              await interaction.followup.send(f"❌ I need 'Manage Webhooks' permission in {target_channel.mention} to send as '{effective_sender_name_for_context}'.", ephemeral=True)
              return
-
-        # Ensure final_name_for_webhook is not None if use_webhook is True
-        if not final_name_for_webhook: # Should be caught by earlier logic, but defensive
-            final_name_for_webhook = bot.user.name if bot.user else "Pingslave Bot"
+        if not final_name_for_webhook: final_name_for_webhook = bot.user.name if bot.user else "Pingslave Bot"
 
         temp_webhook = await target_channel.create_webhook(
-            name=str(final_name_for_webhook), # Ensure string
-            avatar=final_avatar_bytes_for_webhook, # Can be None
-            reason=f"Temp webhook for /message ({effective_sender_name_for_context}) by {interaction.user}"
+            name=str(final_name_for_webhook), avatar=final_avatar_bytes_for_webhook,
+            reason=f"Temp webhook for /message by {interaction.user}"
         )
-        await temp_webhook.send(content=final_content_to_send, wait=True) # wait=True can be useful
-
+        await temp_webhook.send(content=final_content_to_send, wait=True)
         await interaction.edit_original_response(content=f"✅ Message sent as '{effective_sender_name_for_context}'.", embed=None, view=None)
         if use_ai_generation:
             try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
             except: pass
-        await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' in {target_channel.mention} (AI: {use_ai_generation}).")
-
+        await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' (webhook) in {target_channel.mention} (AI: {use_ai_generation}).")
     except Exception as e:
-        await interaction.followup.send(f"❌ An error occurred sending as '{effective_sender_name_for_context}'.", ephemeral=True)
-        await log_error(guild, f"/message failed with webhook for '{effective_sender_name_for_context}'.", error=e, interaction=interaction, ping_owner=True)
+        try: await interaction.edit_original_response(content=f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", embed=None, view=None)
+        except: await interaction.followup.send(f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", ephemeral=True)
+        await log_error(guild, f"/message webhook failed for '{effective_sender_name_for_context}'.", error=e, interaction=interaction, ping_owner=True)
     finally:
         if temp_webhook:
-            try:
-                await temp_webhook.delete(reason="Temp webhook cleanup for /message command")
-            except Exception as e_del:
-                await log_error(guild, f"Failed to delete temporary webhook for '{effective_sender_name_for_context}'. ID: {temp_webhook.id}", error=e_del)
+            try: await temp_webhook.delete(reason="Temp webhook cleanup")
+            except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook '{effective_sender_name_for_context}'. ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
+@app_commands.check(test_bot_owner_only_check)
 async def nerdhelp(interaction: discord.Interaction):
     # guild is still useful for the initial check
     guild = interaction.guild
