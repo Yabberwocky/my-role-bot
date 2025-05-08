@@ -5689,8 +5689,7 @@ async def addkeyword(
     app_commands.Choice(name="No", value="no"),
     app_commands.Choice(name="Yes", value="yes"),
 ])
-@app_commands.check(can_manage_guild_or_is_bypass_user) # User permission check
-# REMOVED: @app_commands.checks.bot_has_permissions(send_messages=True, manage_webhooks=True)
+@app_commands.check(can_manage_guild_or_is_bypass_user)
 @app_commands.check(test_bot_owner_only_check)
 async def message_as(
     interaction: discord.Interaction,
@@ -5713,11 +5712,46 @@ async def message_as(
     target_channel: discord.abc.Messageable = interaction.channel
     guild = interaction.guild
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    # --- Determine bot's guild membership status and preliminary webhook use ---
+    bot_is_true_guild_member = False
+    if guild:
+        if interaction.guild.me and interaction.guild.me.joined_at:
+            bot_is_true_guild_member = True
+            print(f"DEBUG /message (pre-defer): Bot IS a true member of '{guild.name}'.")
+        else:
+            print(f"DEBUG /message (pre-defer): Bot is in '{guild.name}' but NOT a true member.")
+    else:
+        print(f"DEBUG /message (pre-defer): Command used in DMs (guild is None).")
+
+    # Preliminary check if a webhook will be used based on options
+    # This mirrors the logic that sets `use_webhook = True` later
+    preliminary_webhook_intent = False
+    if imitate: preliminary_webhook_intent = True
+    elif custom_avatar: preliminary_webhook_intent = True
+    elif avatar: preliminary_webhook_intent = True # Any pre-defined avatar choice implies webhook
+    elif custom_name and custom_name.strip(): preliminary_webhook_intent = True # Custom name implies webhook (with default avatar)
+    elif personality and personality.value in [PERSONALITY_EVIL, PERSONALITY_GOOD]:
+        preliminary_webhook_intent = True # Specific personalities imply webhook
+    # PERSONALITY_NORMAL does not, by itself, imply webhook
+
+    print(f"DEBUG /message (pre-defer): Preliminary webhook intent: {preliminary_webhook_intent}")
+
+    # --- Conditional Deferral ---
+    defer_ephemeral = True # Default to ephemeral
+    if guild and not bot_is_true_guild_member and not preliminary_webhook_intent:
+        # This is the specific case: in a guild, bot is not a "true member" (user-installed app),
+        # AND we are NOT planning to use a webhook (so it will be a simple message edit).
+        defer_ephemeral = False
+        print(f"DEBUG /message: Deferring PUBLICLY (non-ephemeral) for user-app, non-webhook path.")
+    else:
+        print(f"DEBUG /message: Deferring PRIVATELY (ephemeral).")
+
+    await interaction.response.defer(thinking=True, ephemeral=defer_ephemeral)
+    # --- End of Deferral Logic ---
 
     final_name_for_webhook: Optional[str] = None
     final_avatar_bytes_for_webhook: Optional[bytes] = None
-    use_webhook = False
+    use_webhook = False # This will be the definitive flag
     effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL
 
     async with aiohttp.ClientSession() as session:
@@ -5776,11 +5810,22 @@ async def message_as(
                 if not GOOD_CATERPILLAR_AVATAR_URL or not GOOD_CATERPILLAR_NAME: await interaction.followup.send(f"⚠️ Config error for '{PERSONALITY_GOOD}'.", ephemeral=True); return
                 final_avatar_bytes_for_webhook = await fetch_avatar_bytes(session, GOOD_CATERPILLAR_AVATAR_URL); effective_sender_name_for_context = final_name_for_webhook
             elif personality.value == PERSONALITY_NORMAL:
+                # This case does NOT set use_webhook = True on its own
+                effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL # or just use default
                 print(f"DEBUG /message: Mode: Personality Normal (no webhook triggered by personality itself)")
-        if use_webhook and not final_name_for_webhook: # Default webhook name if needed
+        
+        if use_webhook and not final_name_for_webhook: # Default webhook name if needed and webhook is active
             final_name_for_webhook = bot.user.name if bot.user else "Pingslave"; effective_sender_name_for_context = final_name_for_webhook
-        if not use_webhook:
-             print(f"DEBUG /message: Mode: Defaulting to Normal Bot behavior (no webhook triggers from options).")
+        
+        # Final check on effective_sender_name if no webhook path modified it
+        if not use_webhook and personality and personality.value == PERSONALITY_NORMAL :
+             effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL
+        elif not use_webhook and not personality: # No personality, no other webhook triggers
+             effective_sender_name_for_context = bot.user.name if bot.user else PERSONALITY_NORMAL
+
+
+    if not use_webhook:
+        print(f"DEBUG /message: Mode: Defaulting to Normal Bot behavior (no webhook triggers from options). Effective sender: {effective_sender_name_for_context}")
 
 
     use_ai_generation = ai.lower() == "yes" if ai else False
@@ -5788,51 +5833,49 @@ async def message_as(
 
     if use_ai_generation:
         print(f"DEBUG /message: AI generation requested.")
-        if not ai_model: await interaction.followup.send("⚠️ AI model unavailable. Sending original content.", ephemeral=True)
+        if not ai_model: await interaction.followup.send("⚠️ AI model unavailable. Sending original content.", ephemeral=True) # Followup if defer was public
         else:
             ai_system_instruction = (f"You are '{effective_sender_name_for_context}'. Mimic human typing. Base response on user prompt: '{content}'.")
             if imitate: ai_system_instruction += f"\nIMPORTANT: You are imitating {imitate.display_name}."
             try:
                 ai_response_raw = await get_ai_response(prompt=content, system_instruction=ai_system_instruction)
                 if ai_response_raw:
-                    processed_response = ai_response_raw.lower().strip();
-                    if processed_response.endswith(('.', '!', '?')): processed_response = processed_response[:-1]
+                    processed_response = ai_response_raw #.lower().strip(); # Keep original casing from AI
+                    # if processed_response.endswith(('.', '!', '?')): processed_response = processed_response[:-1] # Consider if this is always desired
                     if len(processed_response) > 1950: processed_response = processed_response[:1947] + "..."
                     final_content_to_send = processed_response
                     await log_info(guild, f"AI gen for '{effective_sender_name_for_context}': '{final_content_to_send[:100]}...'")
-                else: await interaction.followup.send("⚠️ AI no response. Sending original content.", ephemeral=True)
+                else: # Followup if defer was public
+                    await interaction.followup.send("⚠️ AI no response. Sending original content.", ephemeral=True)
             except Exception as ai_err:
                 await log_error(guild, f"AI gen error for '{effective_sender_name_for_context}'", error=ai_err, interaction=interaction)
+                # Followup if defer was public
                 await interaction.followup.send("⚠️ AI gen error. Sending original content.", ephemeral=True)
 
     # --- Send Message ---
-    bot_is_true_guild_member = False
-    if guild:
-        if interaction.guild.me and interaction.guild.me.joined_at:
-            bot_is_true_guild_member = True
-            print(f"DEBUG /message: Bot IS a true member of '{guild.name}'. Guild ID: {guild.id}, Bot joined_at: {interaction.guild.me.joined_at}")
-        else:
-            print(f"DEBUG /message: Bot is in '{guild.name}' but NOT a true member (joined_at is None or guild.me is None). Guild ID: {guild.id}")
-    else:
-        print(f"DEBUG /message: Command used in DMs (guild is None).")
-
+    # bot_is_true_guild_member is already calculated before defer
 
     if not use_webhook: # "Normal Bot" personality and no other webhook-triggering options.
         print(f"DEBUG /message: Path decision: NOT using webhook.")
+        # The 'bot_is_true_guild_member' variable was calculated before the deferral.
         if guild and not bot_is_true_guild_member:
-            print(f"DEBUG /message: Path selected: User-App Scope (Normal Bot) in guild '{guild.name}' -> Ephemeral edit.")
+            print(f"DEBUG /message: Path selected: User-App Scope (Normal Bot) in guild '{guild.name}' -> Ephemeral edit (of potentially public defer).")
+            # If defer_ephemeral was False, this edit_original_response will edit the public "Thinking..." message.
+            # If defer_ephemeral was True, this edit_original_response will edit the private "Thinking..." message.
             try:
                 ai_note = " (AI Generated)" if use_ai_generation else ""
                 response_text = f"{final_content_to_send}{ai_note}"
                 if len(response_text) > 1990: response_text = response_text[:1987] + "..."
+                # The original response (deferred message) will be edited.
+                # Its visibility (public/ephemeral) was determined by `defer_ephemeral`.
                 await interaction.edit_original_response(content=response_text, embed=None, view=None)
-                await log_info(guild, f"User `{interaction.user}` sent (Normal Bot via User-App ephemeral) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'DM/Group'}. AI: {use_ai_generation}.")
+                await log_info(guild, f"User `{interaction.user}` sent (Normal Bot via User-App {'public' if not defer_ephemeral else 'ephemeral'}) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'DM/Group'}. AI: {use_ai_generation}.")
             except Exception as e:
-                await log_error(guild, f"/message (User-App Normal) failed sending ephemeral response", error=e, interaction=interaction)
+                await log_error(guild, f"/message (User-App Normal) failed sending {'public' if not defer_ephemeral else 'ephemeral'} response", error=e, interaction=interaction)
                 try: await interaction.edit_original_response(content="❌ Failed to deliver message.", embed=None, view=None)
-                except: pass
+                except: pass # If original response edit fails, not much to do
             return
-        else:
+        else: # Bot is a true guild member OR it's a DM
             print(f"DEBUG /message: Path selected: Full Member/DM Scope (Normal Bot) -> New message. Guild: {guild.name if guild else 'DM'}")
             permission_issue_location = target_channel.mention if isinstance(target_channel, discord.TextChannel) else "this DM/Group"
             can_send_regular_message = False
@@ -5842,20 +5885,20 @@ async def message_as(
                 can_send_regular_message = bot_perms_in_channel.send_messages
                 print(f"DEBUG /message: Bot perms in {target_channel.mention}: send_messages={can_send_regular_message}")
                 if not can_send_regular_message:
+                    # Original response was deferred (likely ephemeral), so followup is fine.
                     await interaction.followup.send(f"❌ I don't have 'Send Messages' permission in {permission_issue_location} to send a new message.", ephemeral=True)
                     return
             elif not guild: # DM context
                 can_send_regular_message = True # Assumed
                 print(f"DEBUG /message: DM context, assuming can send.")
 
-            # This 'else' for can_send_regular_message should not be reachable if the above logic is correct
-            # but it's here as a safeguard.
-            if not can_send_regular_message: # Should have been caught above for guild case
+            if not can_send_regular_message:
                 await interaction.followup.send(f"❌ Lacking permission to send new message in {permission_issue_location}.", ephemeral=True)
                 return
 
             try:
                 await target_channel.send(final_content_to_send)
+                # Edit the original (deferred) response to confirm. It was likely ephemeral here.
                 await interaction.edit_original_response(content=f"✅ Message sent as '{effective_sender_name_for_context}'.", embed=None, view=None)
                 if use_ai_generation:
                      try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
@@ -5870,6 +5913,7 @@ async def message_as(
             return
 
     # --- Webhook Logic ---
+    # If we reach here, use_webhook is True. The deferral was likely ephemeral.
     print(f"DEBUG /message: Path selected: Webhook. Effective Name: '{effective_sender_name_for_context}', Webhook Name: '{final_name_for_webhook}'")
     if not isinstance(target_channel, discord.TextChannel):
         await interaction.followup.send("❌ Webhook messages can only be sent to server text channels.", ephemeral=True)
@@ -5887,24 +5931,28 @@ async def message_as(
         elif not guild: # Should have been caught by isinstance check, but defensive
              await interaction.followup.send("❌ Webhooks cannot be used in DMs.", ephemeral=True)
              return
-        # If guild.me is None for some reason, this path might error later or Discord API might reject.
+        # If guild.me is None (user-installed app context), webhook creation might fail if the app lacks webhook perms.
+        # This is an implicit check by the API call itself.
 
         if not final_name_for_webhook: final_name_for_webhook = bot.user.name if bot.user else "Pingslave Bot"
 
         temp_webhook = await target_channel.create_webhook(
-            name=str(final_name_for_webhook), avatar=final_avatar_bytes_for_webhook,
+            name=str(final_name_for_webhook)[:80], # Ensure name is within Discord limits for webhooks
+            avatar=final_avatar_bytes_for_webhook,
             reason=f"Temp webhook for /message by {interaction.user}"
         )
         await temp_webhook.send(content=final_content_to_send, wait=True)
+        # Edit the original (deferred) response to confirm. It was likely ephemeral here.
         await interaction.edit_original_response(content=f"✅ Message sent as '{effective_sender_name_for_context}'.", embed=None, view=None)
         if use_ai_generation:
             try: await interaction.followup.send(f"(AI Used)", ephemeral=True)
             except: pass
         await log_info(guild, f"User `{interaction.user}` sent as '{effective_sender_name_for_context}' (webhook) in {target_channel.mention} (AI: {use_ai_generation}).")
     except discord.Forbidden: # Catch Forbidden specifically for webhook creation/send
-        await interaction.followup.send(f"❌ Failed to send as '{effective_sender_name_for_context}' via webhook due to missing permissions (likely Manage Webhooks or Send Messages via Webhook).", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed to send as '{effective_sender_name_for_context}' via webhook due to missing permissions (likely Manage Webhooks or Send Messages via Webhook). This can happen if the app was installed by a user without granting these server-wide.", ephemeral=True)
         await log_error(guild, f"/message webhook failed for '{effective_sender_name_for_context}': Forbidden", interaction=interaction)
     except Exception as e:
+        # Try to edit original response first, then followup as fallback
         try: await interaction.edit_original_response(content=f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", embed=None, view=None)
         except: await interaction.followup.send(f"❌ Error sending as '{effective_sender_name_for_context}' via webhook.", ephemeral=True)
         await log_error(guild, f"/message webhook failed for '{effective_sender_name_for_context}'.", error=e, interaction=interaction, ping_owner=True)
