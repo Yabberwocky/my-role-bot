@@ -5918,7 +5918,7 @@ async def message(
     user="The user to imitate (name and avatar).",
     message_content="The content of the message to send."
 )
-@app_commands.checks.has_permissions(manage_guild=True) # User needs Manage Guild # Owner bypass and test bot restriction
+@app_commands.checks.has_permissions(can_manage_guild_or_is_bypass_user) # User needs Manage Guild # Owner bypass and test bot restriction
 async def imitate(
     interaction: discord.Interaction,
     user: discord.Member,
