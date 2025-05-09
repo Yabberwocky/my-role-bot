@@ -211,17 +211,31 @@ class HelpPagesView(discord.ui.View):
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
 
-        # Only add the toggle button if the user is allowed to see staff commands
-        if self.is_staff_view_allowed:
-            self.add_item(self.create_toggle_button())
-        # If not is_staff_view_allowed, no button is added, so it's a static general help.
+        # --- We will let the @discord.ui.button decorator handle the button ---
+        # --- So, NO self.toggle_button = ... or self.add_item(...) here for it ---
+        
+        # Update the appearance of the decorated button if it's going to be active.
+        # The button itself is only "active" (visible/added to children) if is_staff_view_allowed.
+        # We need to find the button instance created by the decorator to modify it.
+        # The children are populated after __init__ completes based on decorators.
+        # So, we can't modify it here directly in __init__ before it's added.
+        # Instead, the button's initial appearance can be set in its callback logic or before sending.
+        
+        # If not staff view allowed, we will remove the button before sending the view.
+        # This is done in the /nerdhelp command now.
+        pass
 
-    def create_toggle_button(self) -> discord.ui.Button:
-        # This method now correctly assumes it's only called if is_staff_view_allowed is True
+
+    def _update_decorated_button_appearance(self, button_to_update: discord.ui.Button):
+        """Updates the label, emoji, and style of the button passed to it."""
         if self.current_page == "general":
-            return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_actual") # Ensure unique custom_id
+            button_to_update.label = "View Staff Commands"
+            button_to_update.emoji = "🛡️"
+            button_to_update.style = discord.ButtonStyle.secondary
         else: # current_page == "staff"
-            return discord.ui.Button(label="Back to General", emoji="⬅️", style=discord.ButtonStyle.primary, custom_id="help_toggle_page_actual") # Ensure unique custom_id
+            button_to_update.label = "Back to General"
+            button_to_update.emoji = "⬅️"
+            button_to_update.style = discord.ButtonStyle.primary
 
     def _create_general_embed(self) -> discord.Embed:
         embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
@@ -264,55 +278,41 @@ class HelpPagesView(discord.ui.View):
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
-    def get_current_embed(self) -> discord.Embed: # Renamed from get_current_embed_and_button
+    def get_current_embed(self) -> discord.Embed:
         if self.current_page == "staff":
             return self._create_staff_embed()
         return self._create_general_embed()
 
-    async def _update_message_view(self, interaction: Optional[discord.Interaction] = None):
-        embed = self.get_current_embed()
-        self.clear_items() # Remove old button(s)
-        
-        # Re-add the button only if staff view is allowed (this ensures no button if it's static general help)
-        if self.is_staff_view_allowed:
-            self.add_item(self.create_toggle_button())
-            
-        if interaction:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(embed=embed, view=self)
-            elif self.message: # Should not happen if interaction is passed from button click
-                await self.message.edit(embed=embed, view=self)
-        elif self.message: # Called internally (e.g. on_timeout)
-            # For timeout, we want to remove the view entirely or disable buttons
-            # Let on_timeout handle final edit explicitly
-            pass
-
-
-    # REMOVE the old @discord.ui.button decorators for general_commands_button and staff_commands_button
-    # Add the single toggle button callback directly:
-    
-    @discord.ui.button(label="Toggle Page", custom_id="help_toggle_page_actual") # Label updated dynamically
+    # The button defined by the decorator is the one and only toggle button.
+    # Its initial label/style will be as defined in the decorator. We update it before sending the view.
+    @discord.ui.button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
     async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # This callback is only active if the button was added (i.e., is_staff_view_allowed was True)
+        if not self.is_staff_view_allowed:
+            await interaction.response.send_message("This action is not available.", ephemeral=True, delete_after=5)
+            return
+
         if self.current_page == "general":
             self.current_page = "staff"
         else:
             self.current_page = "general"
         
-        # Update the button's look and then edit the message
-        new_button_instance = self.create_toggle_button() # Get the correctly styled button
-        self.clear_items()
-        self.add_item(new_button_instance)
-        
+        self._update_decorated_button_appearance(button) # Pass the button instance from the callback
         current_embed = self.get_current_embed()
+        
         await interaction.response.edit_message(embed=current_embed, view=self)
 
     async def on_timeout(self):
-        if self.message:
+        if self.message and self.is_staff_view_allowed: # Only if there was an interactive element
             try:
                 current_embed_on_timeout = self.get_current_embed()
                 current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
-                await self.message.edit(embed=current_embed_on_timeout, view=None) # Remove view
+                
+                # Find the button and disable it
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button) and item.custom_id == "help_toggle_page_decorator_final":
+                        item.disabled = True
+                        break
+                await self.message.edit(embed=current_embed_on_timeout, view=self) # Send view with disabled button
             except discord.HTTPException:
                 pass
         self.stop()
@@ -6053,6 +6053,7 @@ async def florr( # RENAME function, and parameters
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
+# REMOVED @app_commands.check(test_bot_owner_only_check)
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
@@ -6066,25 +6067,34 @@ async def nerdhelp(interaction: discord.Interaction):
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
 
     can_see_staff_commands = False
-    if isinstance(interaction.user, discord.Member): # Check if Member for permissions
-        # Use your global check function here
+    if isinstance(interaction.user, discord.Member):
         can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
 
+    # Create the view instance
+    view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
+    
+    # If the user cannot see staff commands, we effectively want no buttons.
+    # We achieve this by clearing items from the view instance if it's not allowed.
+    # The HelpPagesView's button is defined by a decorator, so it's always part of its potential children.
+    if not can_see_staff_commands:
+        view_instance.clear_items() # Remove the decorated button if not allowed to use it
 
-    # Create the view; it will internally decide if the button is added based on is_staff_view_allowed
-    view_to_send = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
-    initial_embed = view_to_send.get_current_embed() # Gets general embed by default
+    # The button's initial appearance is set by the decorator (View Staff Commands)
+    # This is correct as the initial page is 'general'.
+    initial_embed = view_instance.get_current_embed()
+
 
     try:
-        # If user cannot see staff commands, the view will have no buttons, effectively static.
-        await interaction.response.send_message(embed=initial_embed, view=view_to_send, ephemeral=False)
-        view_to_send.message = await interaction.original_response()
+        # Send the view. If view_instance.children is empty, Discord handles it as no components.
+        await interaction.response.send_message(embed=initial_embed, view=view_instance, ephemeral=False)
+        view_instance.message = await interaction.original_response()
             
     except Exception as e:
         print(f"Error sending nerdhelp response: {e}")
-        # Log full traceback if it's an HTTPException with code 50035 for components
         if isinstance(e, discord.HTTPException) and e.code == 50035:
+            print("--- TRACEBACK FOR NERDHELP 50035 ---")
             print(traceback.format_exc())
+            print("--- END TRACEBACK ---")
         await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
         try:
             if interaction.response.is_done():
