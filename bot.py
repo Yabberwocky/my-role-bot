@@ -211,67 +211,33 @@ class HelpPagesView(discord.ui.View):
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
 
-        # The single toggle button will be managed by the callback
-        self.add_item(self.create_toggle_button())
+        # Only add the toggle button if the user is allowed to see staff commands
+        if self.is_staff_view_allowed:
+            self.add_item(self.create_toggle_button())
+        # If not is_staff_view_allowed, no button is added, so it's a static general help.
 
     def create_toggle_button(self) -> discord.ui.Button:
+        # This method now correctly assumes it's only called if is_staff_view_allowed is True
         if self.current_page == "general":
-            if self.is_staff_view_allowed:
-                return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page")
-            else:
-                # If staff view not allowed, don't show a button to go there (or show a disabled one)
-                # For simplicity, we'll just not add it if they can't see staff.
-                # Or, you could add a disabled button or no button.
-                # Let's create a dummy invisible button if no toggle is needed.
-                # Or simply return None and handle in add_item.
-                # A cleaner way is to simply not add the button if not needed.
-                # The __init__ will call this, so it's fine.
-                # For now, if no staff view allowed, no button. The calling command should handle this.
-                # OR - if staff view is not allowed, the view itself shouldn't be paginated.
-                # For this specific request (single toggle button), if they can't see staff,
-                # then there's nothing to toggle TO.
-                #
-                # Let's assume if is_staff_view_allowed is false, the calling /nerdhelp
-                # will just send the general embed without this view.
-                # For now, this button creation assumes is_staff_view_allowed is TRUE.
-                # If it's false, the view probably shouldn't even be used or the button shouldn't exist.
-                #
-                # Re-evaluating: The button SHOULD exist if is_staff_view_allowed, otherwise no button.
-                # The /nerdhelp command will decide whether to attach this view.
-                # This button's existence implies toggling IS possible.
-                return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page")
+            return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_actual") # Ensure unique custom_id
         else: # current_page == "staff"
-            return discord.ui.Button(label="Back to General", emoji="⬅️", style=discord.ButtonStyle.primary, custom_id="help_toggle_page")
+            return discord.ui.Button(label="Back to General", emoji="⬅️", style=discord.ButtonStyle.primary, custom_id="help_toggle_page_actual") # Ensure unique custom_id
 
     def _create_general_embed(self) -> discord.Embed:
         embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        
-        # ADDED Newline after description for spacing
-        embed.description = "Here are commands generally available to users:\n\u200B" # \u200B is a zero-width space for a blank line
-        
-        # Removed the initial spacer field as the description now has a blank line
-        # embed.add_field(name="\u200B", value="\u200B", inline=False) 
-
-        # [HC1] Member List & Activity
+        embed.description = "Here are commands generally available to users:\n\u200B"
         embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
-
-        # Secret Phrase Discovery
         embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
-        
-        # Messaging Utilities (General)
         embed.add_field(name="\u200B\n💬 Messaging", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
-
-        # Other
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-        
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
@@ -279,81 +245,74 @@ class HelpPagesView(discord.ui.View):
         embed = discord.Embed(title="🛡️ Pingslave Bot - Staff Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        
-        # ADDED Newline after description for spacing
         embed.description = "These commands typically require server management permissions:\n\u200B"
-        
-        # Removed the initial spacer field
-        # embed.add_field(name="\u200B", value="\u200B", inline=False)
-
-        # Verification & HC Management
         embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('unverify')}  · Unverify user. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify into HC. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hconly')} · Register IGN only. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False)
-        
-        # Activity Tracking (Staff)
         embed.add_field(name="\u200B\n⏱️ Activity Tracking (Staff)", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active. `[Manage Server]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity. `[Manage Server]`", value="\u200B", inline=False)
-        # REMOVED /bulkactive from staff help as requested
-        # embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Bulk mark active. `[Manage Server]`", value="\u200B", inline=False)
-
-
-        # Utilities (Staff & Owner)
         embed.add_field(name="\u200B\n⚙️ Utilities (Staff & Owner)", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Manage Server]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list & data. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync all HC nicks. `[Manage Nicks]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
-        
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
-    def get_current_embed_and_button(self) -> Tuple[discord.Embed, Optional[discord.ui.Button]]:
-        button = None
-        if self.is_staff_view_allowed: # Only create a toggle button if they can actually view staff commands
-            button = self.create_toggle_button()
-
+    def get_current_embed(self) -> discord.Embed: # Renamed from get_current_embed_and_button
         if self.current_page == "staff":
-            return self._create_staff_embed(), button
-        return self._create_general_embed(), button
+            return self._create_staff_embed()
+        return self._create_general_embed()
 
-    async def edit_message_with_current_page(self, interaction: discord.Interaction):
-        embed, new_button = self.get_current_embed_and_button()
+    async def _update_message_view(self, interaction: Optional[discord.Interaction] = None):
+        embed = self.get_current_embed()
+        self.clear_items() # Remove old button(s)
         
-        self.clear_items() # Remove old button
-        if new_button: # Add the new button if one was created
-            self.add_item(new_button)
+        # Re-add the button only if staff view is allowed (this ensures no button if it's static general help)
+        if self.is_staff_view_allowed:
+            self.add_item(self.create_toggle_button())
             
-        await interaction.response.edit_message(embed=embed, view=self)
+        if interaction:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=embed, view=self)
+            elif self.message: # Should not happen if interaction is passed from button click
+                await self.message.edit(embed=embed, view=self)
+        elif self.message: # Called internally (e.g. on_timeout)
+            # For timeout, we want to remove the view entirely or disable buttons
+            # Let on_timeout handle final edit explicitly
+            pass
 
-    @discord.ui.button(label="Toggle", custom_id="help_toggle_page") # Label and style will be set dynamically
-    async def toggle_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_staff_view_allowed: # Defensive check
-            await interaction.response.send_message("This action is not available.", ephemeral=True)
-            return
 
+    # REMOVE the old @discord.ui.button decorators for general_commands_button and staff_commands_button
+    # Add the single toggle button callback directly:
+    
+    @discord.ui.button(label="Toggle Page", custom_id="help_toggle_page_actual") # Label updated dynamically
+    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # This callback is only active if the button was added (i.e., is_staff_view_allowed was True)
         if self.current_page == "general":
             self.current_page = "staff"
         else:
             self.current_page = "general"
         
-        await self.edit_message_with_current_page(interaction)
-    
+        # Update the button's look and then edit the message
+        new_button_instance = self.create_toggle_button() # Get the correctly styled button
+        self.clear_items()
+        self.add_item(new_button_instance)
+        
+        current_embed = self.get_current_embed()
+        await interaction.response.edit_message(embed=current_embed, view=self)
+
     async def on_timeout(self):
         if self.message:
             try:
-                self.clear_items() # Remove button on timeout
-                # Optionally, you could add a disabled "Timed Out" button or just send view=None
-                # For simplicity, let's just remove the button.
-                # Get the last displayed embed to keep the content.
-                current_embed_on_timeout = self._create_general_embed() if self.current_page == "general" else self._create_staff_embed()
+                current_embed_on_timeout = self.get_current_embed()
                 current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
-                await self.message.edit(embed=current_embed_on_timeout, view=None) # Remove view by passing None
+                await self.message.edit(embed=current_embed_on_timeout, view=None) # Remove view
             except discord.HTTPException:
                 pass
         self.stop()
@@ -5918,7 +5877,7 @@ async def message(
     user="The user to imitate (name and avatar).",
     message_content="The content of the message to send."
 )
-@app_commands.check(can_manage_guild_or_is_bypass_user) # User needs Manage Guild # Owner bypass and test bot restriction
+@app_commands.check(can_manage_guild_or_is_bypass_user)
 async def imitate(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -6107,49 +6066,25 @@ async def nerdhelp(interaction: discord.Interaction):
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
 
     can_see_staff_commands = False
-    if isinstance(interaction.user, discord.Member):
-        can_see_staff_commands = interaction.user.guild_permissions.manage_guild or interaction.user.id == OWNER_USER_ID
+    if isinstance(interaction.user, discord.Member): # Check if Member for permissions
+        # Use your global check function here
+        can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
 
-    # --- Create view and initial embed ---
-    # The view will decide if a button is needed based on can_see_staff_commands.
-    # If can_see_staff_commands is false, the view will initially have no button (or a disabled one).
-    view_to_send: Optional[HelpPagesView] = None
-    
-    # Only attach the view (and thus the button) if staff commands can be viewed by this user.
-    # Otherwise, just send the general embed.
-    if can_see_staff_commands:
-        view_to_send = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=True) # Pass True here
-        initial_embed, _ = view_to_send.get_current_embed_and_button() # Gets general embed
-    else:
-        # If user cannot see staff commands, create the general embed directly without a view
-        # (or create a view instance that knows not to add the toggle button)
-        # For simplicity here, let's just send the general embed without a view if no toggle needed.
-        # To use the view consistently, the view's __init__ or create_toggle_button
-        # should correctly handle is_staff_view_allowed=False by not adding a functional button.
-        #
-        # Let's stick to using the view, and the view will correctly not add a button if not allowed.
-        # This means HelpPagesView must correctly handle `is_staff_view_allowed=False` in its `__init__`
-        # by not adding the button if it's the only page.
-        #
-        # Corrected approach:
-        # The view's __init__ creates the button. The button callback itself is always present.
-        # The decision to show staff commands or not is handled.
-        # The button itself will only be *added* if `is_staff_view_allowed` is True.
-        
-        # If can_see_staff_commands is False, we just show the general help page without interaction.
-        temp_view_for_general_embed = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=False)
-        initial_embed = temp_view_for_general_embed._create_general_embed() # Directly get general embed
-        # view_to_send remains None in this case
+
+    # Create the view; it will internally decide if the button is added based on is_staff_view_allowed
+    view_to_send = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
+    initial_embed = view_to_send.get_current_embed() # Gets general embed by default
 
     try:
-        if view_to_send: # Only pass the view if it's created (i.e., if staff commands are possible)
-            await interaction.response.send_message(embed=initial_embed, view=view_to_send, ephemeral=False)
-            view_to_send.message = await interaction.original_response()
-        else: # User cannot see staff commands, send static general help
-            await interaction.response.send_message(embed=initial_embed, ephemeral=False)
+        # If user cannot see staff commands, the view will have no buttons, effectively static.
+        await interaction.response.send_message(embed=initial_embed, view=view_to_send, ephemeral=False)
+        view_to_send.message = await interaction.original_response()
             
     except Exception as e:
         print(f"Error sending nerdhelp response: {e}")
+        # Log full traceback if it's an HTTPException with code 50035 for components
+        if isinstance(e, discord.HTTPException) and e.code == 50035:
+            print(traceback.format_exc())
         await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
         try:
             if interaction.response.is_done():
