@@ -168,8 +168,6 @@ AVATAR_CHOICE_EVIL = "Evil Caterpillar Avatar"
 AVATAR_CHOICE_GOOD = "Good Caterpillar Avatar"
 AVATAR_CHOICE_NERD = "Nerd Bot Avatar" # Renamed for clarity, or keep as "Nerd Avatar"
 BOT_INSTANCE_TYPE = os.getenv("BOT_INSTANCE_TYPE", "PRODUCTION").upper()
-AVATAR_CHOICES_FOLDER_NAME = "Petals and mobs" # Folder for /say avatars
-available_avatar_filenames: List[str] = []     # Populated in on_ready
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -199,75 +197,6 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
-
-async def load_avatar_filenames(guild_for_log: Optional[discord.Guild]):
-    """Scans the AVATAR_CHOICES_FOLDER_NAME for .png files and populates available_avatar_filenames."""
-    global available_avatar_filenames
-    available_avatar_filenames = [] # Reset list
-
-    # --- DEBUGGING PATHS ---
-    script_location = os.path.dirname(os.path.abspath(__file__))
-    potential_folder_path = os.path.join(script_location, AVATAR_CHOICES_FOLDER_NAME)
-    
-    print(f"[AVATAR DEBUG] Script location: {script_location}")
-    print(f"[AVATAR DEBUG] AVATAR_CHOICES_FOLDER_NAME: {AVATAR_CHOICES_FOLDER_NAME}")
-    print(f"[AVATAR DEBUG] Attempting to find folder at: {potential_folder_path}")
-    # --- END DEBUGGING ---
-
-    folder_to_scan = potential_folder_path # Use the path relative to the script
-
-    try:
-        if not os.path.exists(folder_to_scan):
-            # Also check CWD as a fallback, though script-relative is usually better
-            cwd_path = os.path.join(os.getcwd(), AVATAR_CHOICES_FOLDER_NAME)
-            print(f"[AVATAR DEBUG] Folder not found at script-relative path. Checking CWD path: {cwd_path}")
-            if os.path.exists(cwd_path):
-                folder_to_scan = cwd_path
-                print(f"[AVATAR DEBUG] Found folder at CWD path: {folder_to_scan}")
-            else:
-                await log_error(guild_for_log, f"Avatar choices folder '{AVATAR_CHOICES_FOLDER_NAME}' (tried '{potential_folder_path}' and '{cwd_path}') not found. /say avatar selection will be empty.", ping_owner=True)
-                print(f"CRITICAL: Avatar choices folder '{AVATAR_CHOICES_FOLDER_NAME}' not found at expected locations.")
-                return
-
-        count = 0
-        print(f"[AVATAR INFO] Scanning for avatars in: {folder_to_scan}")
-        for filename in os.listdir(folder_to_scan):
-            if filename.lower().endswith(".png"):
-                available_avatar_filenames.append(os.path.splitext(filename)[0])
-                count += 1
-        
-        available_avatar_filenames.sort(key=str.lower) 
-        
-        if count > 0:
-            await log_info(guild_for_log, f"Successfully loaded {count} avatar filenames from '{folder_to_scan}' for /say command.")
-            print(f"Loaded {count} avatar filenames. First few: {available_avatar_filenames[:5] if count > 5 else available_avatar_filenames}")
-        else:
-            await log_info(guild_for_log, f"No .png avatar files found in '{folder_to_scan}'.")
-            print(f"INFO: No .png files found in '{folder_to_scan}'.")
-
-    except FileNotFoundError: # Specifically catch if os.listdir fails because the path is still wrong
-        await log_error(guild_for_log, f"Avatar folder path '{folder_to_scan}' reported as existing, but FileNotFoundError on listdir. Check permissions or if it's a symlink issue.", ping_owner=True)
-        print(f"CRITICAL: FileNotFoundError when trying to list contents of '{folder_to_scan}'.")
-        available_avatar_filenames = []
-    except Exception as e:
-        await log_error(guild_for_log, f"Error loading avatar filenames from '{folder_to_scan}'", error=e, ping_owner=True)
-        print(f"CRITICAL: Exception loading avatar filenames from '{folder_to_scan}': {e}")
-        available_avatar_filenames = []
-
-async def avatar_filename_autocomplete(
-    interaction: discord.Interaction,
-    current: str
-) -> List[app_commands.Choice[str]]:
-    """Autocompletes avatar filenames from the local 'Petals and mobs' cache."""
-    if not available_avatar_filenames:
-        return [app_commands.Choice(name="No avatars loaded or folder not found.", value="error_no_avatars_loaded")]
-
-    choices = [
-        app_commands.Choice(name=filename, value=filename)
-        for filename in available_avatar_filenames
-        if current.lower() in filename.lower() # Case-insensitive search
-    ]
-    return choices[:25] # Discord's limit for autocomplete choices
 
 async def test_bot_owner_only_check(interaction: discord.Interaction) -> bool:
     """
@@ -3173,159 +3102,59 @@ async def update_static_list_message(guild: discord.Guild):
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
-    global BOT_USER_ID, command_ids, STAFF_CHANNELS, available_avatar_filenames # Add available_avatar_filenames
+    global BOT_USER_ID, command_ids, STAFF_CHANNELS # Ensure all globals used are listed
 
     if bot.user:
         BOT_USER_ID = bot.user.id
         print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
         print(f"Discord.py v{discord.__version__}")
-        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") 
+        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") # Log the instance type
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
-        return 
+        # Consider logging this error to your extraordinary_logs channel if possible,
+        # though if bot.user is None, guild context for logging might also be an issue.
+        return # Critical failure, cannot proceed
     
     activity = discord.Activity(type=discord.ActivityType.watching, name="out for Pings | /nerdhelp")
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
+    # --- Command Permissions Modification for TESTING Bot ---
+    # This section MUST come BEFORE tree.sync()
     if BOT_INSTANCE_TYPE == "TESTING":
-        if OWNER_USER_ID is None: 
+        if OWNER_USER_ID is None: # OWNER_USER_ID must be defined for this to work
             print("CRITICAL [TESTING BOT]: OWNER_USER_ID is not set. Command restriction to owner cannot be applied. Defaulting to admin-only.")
+            # You could log this to a channel if bot is sufficiently initialized
+            # await log_error(None, "TESTING BOT CRITICAL: OWNER_USER_ID not set. Command restrictions may not work as intended.", ping_owner=True)
+            # Fallback to admin-only permissions if owner ID is missing, which is still better than no restriction.
             default_permissions_for_test_bot = discord.Permissions(administrator=True)
         else:
             print(f"INFO [TESTING BOT]: Applying command restrictions. Commands should be visible/usable primarily by owner (ID: {OWNER_USER_ID}) via admin role or direct permission.")
+            # Commands will be visible to administrators. The @app_commands.check(test_bot_owner_only_check)
+            # will then ensure only the OWNER_USER_ID can execute them.
             default_permissions_for_test_bot = discord.Permissions(administrator=True)
             
-        all_app_commands = tree.get_commands(guild=None) 
+        # Get all global commands. If you have guild-specific commands for Catercord, handle them.
+        # For simplicity, this example targets global commands.
+        # If your test bot only ever operates in Catercord, you might sync only to that guild.
+        
+        all_app_commands = tree.get_commands(guild=None) # Get global commands
+        # If you also register commands specifically to CATERCORD_GUILD_ID:
+        # target_guild_obj_for_test_cmds = discord.Object(id=CATERCORD_GUILD_ID)
+        # all_app_commands.extend(tree.get_commands(guild=target_guild_obj_for_test_cmds))
         
         restricted_count = 0
         for cmd_obj in all_app_commands:
             cmd_obj.default_member_permissions = default_permissions_for_test_bot
             restricted_count +=1
+            # If the command is a group, restrict its subcommands too
             if isinstance(cmd_obj, app_commands.Group):
-                for sub_cmd in cmd_obj.commands: 
-                    if isinstance(sub_cmd, (app_commands.Command, app_commands.Group)): 
+                for sub_cmd in cmd_obj.commands: # Iterate through commands in the group
+                    if isinstance(sub_cmd, (app_commands.Command, app_commands.Group)): # Ensure it's a command/subgroup
                         sub_cmd.default_member_permissions = default_permissions_for_test_bot
+                        # Don't increment restricted_count again for subcommands here,
+                        # as the top-level group already covers it in terms of visibility.
+                        # The check decorator will handle execution.
         print(f"INFO [TESTING BOT]: Applied admin-only default visibility to {restricted_count} top-level command entries.")
-
-    print("Syncing application commands...")
-    synced_commands = []
-    try:
-        synced_commands = await tree.sync() 
-        
-        print(f"Synced {len(synced_commands)} application commands.")
-        command_ids.clear() 
-        for cmd in synced_commands:
-            if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
-                command_ids[cmd.name] = cmd.id
-                if isinstance(cmd, app_commands.Group):
-                    for sub_cmd in cmd.commands:
-                        if isinstance(sub_cmd, app_commands.Command): 
-                             full_name = f"{cmd.name} {sub_cmd.name}" 
-                             command_ids[full_name] = sub_cmd.id 
-            else:
-                print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if command_ids:
-            print(f"Stored command IDs: {command_ids}")
-        else:
-            print("Warning: command_ids dictionary is empty after sync.")
-    except discord.HTTPException as e:
-        print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
-    except Exception as e:
-        print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
-
-    print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    
-    log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-    
-    if log_guild_for_ready_msg:
-        try:
-             instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
-             await log_info(log_guild_for_ready_msg, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
-        except Exception as log_e:
-             print(f"Failed to send initial ready log message: {log_e}")
-
-    print("--- Loading initial data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) 
-    if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0] 
-
-    await load_keyword_data(log_guild_for_data_load) 
-    await load_ign_cache(log_guild_for_data_load)
-    await load_avatar_filenames(log_guild_for_data_load) # <<< --- ADD THIS LINE
-
-    print("Identifying staff channels in target guild...")
-    STAFF_CHANNELS.clear() 
-    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
-    if target_guild_for_staff_channels:
-        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
-        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
-        everyone_role = target_guild_for_staff_channels.default_role
-
-        if florrist_role and hc1_role: 
-            print(f"Checking channel visibility against roles: '{florrist_role.name}', '{hc1_role.name}' in guild '{target_guild_for_staff_channels.name}'")
-            potentially_staff_channels = 0
-            actually_staff_channels = 0
-            for channel in target_guild_for_staff_channels.text_channels:
-                everyone_perms = channel.permissions_for(everyone_role)
-                if not everyone_perms.view_channel:
-                    potentially_staff_channels += 1
-                    florrist_ow = channel.overwrites_for(florrist_role)
-                    hc1_ow = channel.overwrites_for(hc1_role)
-                    florrist_can_view = florrist_ow.view_channel is True
-                    hc1_can_view = hc1_ow.view_channel is True
-                    if not florrist_can_view and not hc1_can_view:
-                        STAFF_CHANNELS.add(channel.id)
-                        actually_staff_channels += 1
-            print(f"Staff Channel Identification Complete: Found {actually_staff_channels} staff channel(s) out of {potentially_staff_channels} potentially restricted channels.")
-        else:
-            missing_role_names = []
-            if not florrist_role: missing_role_names.append(f"Florrist Role (ID: {FLORRIST_ROLE_ID})")
-            if not hc1_role: missing_role_names.append(f"HC1 Role (ID: {HC1_ROLE_ID})")
-            print(f"WARN: Could not find required roles in target guild for staff channel identification: {', '.join(missing_role_names)}.")
-            if log_guild_for_data_load: 
-                await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
-    else:
-        print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
-
-    print("Starting background tasks...")
-    if not check_static_view_timeout.is_running():
-        try:
-            check_static_view_timeout.start()
-            print(" Static view timeout checker task started.")
-        except RuntimeError: 
-            print(" Static view timeout checker task was already running (RuntimeError).")
-        except Exception as e_task_start:
-            print(f"Failed to start static view timeout task: {e_task_start}")
-            if log_guild_for_data_load:
-                await log_error(log_guild_for_data_load, "Failed to start static view timeout task", error=e_task_start)
-
-    async def delayed_update(delay_seconds: int):
-        await asyncio.sleep(delay_seconds) 
-        print(f"--- Running delayed static list update after {delay_seconds}s ---")
-        
-        guild_for_delayed_update = bot.get_guild(CATERCORD_GUILD_ID)
-        if not guild_for_delayed_update:
-            print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed static list update.")
-            return
-            
-        if not supabase:
-            print("ERROR: Supabase client not available for delayed static list update.")
-            await log_error(guild_for_delayed_update, "Delayed static list update failed: Supabase client not available.")
-            return
-            
-        try:
-            await update_static_list_message(guild_for_delayed_update)
-        except Exception as e:
-            print(f"ERROR during delayed initial static list update: {e}\n{traceback.format_exc()}")
-            await log_error(guild_for_delayed_update, "Error during delayed initial static list update", error=e)
-        print(f"--- Delayed static list update finished ---")
-
-    if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
-        print("Scheduling delayed static list update for target guild (Catercord)...")
-        asyncio.create_task(delayed_update(delay_seconds=60)) 
-    else:
-        print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
-
-    print("--- on_ready event finished ---")
 
     # --- Command Syncing ---
     print("Syncing application commands...")
@@ -6132,108 +5961,87 @@ async def message_as(
             try: await temp_webhook.delete(reason="Temp webhook cleanup")
             except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook '{effective_sender_name_for_context}'. ID: {temp_webhook.id}", error=e_del)
 
-@tree.command(name="say", description="Send a message with a custom name and a chosen avatar.") # Updated description
+@tree.command(name="say", description="Send a message with a custom name and the bot's default avatar.")
 @app_commands.describe(
     custom_name="The name to display for the message (1-80 characters).",
-    avatar_filename="Choose an avatar from the 'Petals and mobs' collection.", # Updated description
     message_content="The content of the message to send."
 )
-@app_commands.autocomplete(avatar_filename=avatar_filename_autocomplete) # Added autocomplete
-@app_commands.check(test_bot_owner_only_check)
-@app_commands.checks.bot_has_permissions(manage_webhooks=True) # Bot needs to create/manage webhooks
+@app_commands.check(test_bot_owner_only_check) # Keep for testing consistency
+@app_commands.checks.bot_has_permissions(manage_webhooks=True) # Bot needs to create webhooks
 async def say(
     interaction: discord.Interaction,
     custom_name: str,
-    avatar_filename: str, # New parameter for the chosen avatar filename (without extension)
     message_content: str
 ):
     if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("This command can only be used in server text channels.", ephemeral=True)
+        await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
         return
 
     target_channel: discord.TextChannel = interaction.channel
-    guild = interaction.guild # For logging context
+    guild = interaction.guild # Will be None if in DMs, but command restricted to text channels in guilds
 
-    # Defer ephemerally, as the primary action is sending a message, and confirmation is short.
+    # Defer ephemerally as the command result is just a confirmation
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # --- Validate Custom Name (same as before) ---
+    # --- Validate Custom Name ---
     cleaned_name = custom_name.strip()
     if not (1 <= len(cleaned_name) <= 80):
         await interaction.followup.send("❌ Custom name must be 1-80 characters long.", ephemeral=True)
         return
+    # Basic check for Discord disallowed characters/strings in webhook names
     disallowed_in_names = ["@", "#", ":", "```", "discord"]
-    if any(disallowed in cleaned_name.lower() for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
-        await interaction.followup.send(f"❌ The custom name '{discord.utils.escape_markdown(cleaned_name)}' contains disallowed characters or is a reserved name.", ephemeral=True)
+    if any(disallowed in cleaned_name for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
+        await interaction.followup.send(f"❌ The custom name '{cleaned_name}' contains disallowed characters or is a reserved name.", ephemeral=True)
         return
 
-    # --- Handle Chosen Avatar Filename ---
-    if avatar_filename == "error_no_avatars_loaded": # Check for the error value from autocomplete
-        await interaction.followup.send("❌ Avatars are not currently available. Please try again later or contact an admin.", ephemeral=True)
-        return
-    
-    # Validate if the chosen filename is in our loaded list (important safety check)
-    if not avatar_filename in available_avatar_filenames:
-        await interaction.followup.send(f"❌ Invalid avatar choice: '{discord.utils.escape_markdown(avatar_filename)}'. Please select a valid avatar from the suggestions.", ephemeral=True)
+    # --- Fetch Fixed Avatar ---
+    fixed_avatar_bytes: Optional[bytes] = None
+    if not NERD_AVATAR_URL:
+        await interaction.followup.send("⚠️ Configuration error: The bot's default avatar URL is not set. Cannot send with custom avatar. Contact bot owner.", ephemeral=True)
+        await log_error(guild, "/say command failed: NERD_AVATAR_URL is not configured.", interaction=interaction, ping_owner=True)
         return
 
-    # Construct the full path to the avatar image
-    # (Assumes AVATAR_CHOICES_FOLDER_NAME is relative to where bot.py runs)
-    chosen_avatar_path = os.path.join(AVATAR_CHOICES_FOLDER_NAME, f"{avatar_filename}.png")
-    chosen_avatar_bytes: Optional[bytes] = None
+    async with aiohttp.ClientSession() as session:
+        fixed_avatar_bytes = await fetch_avatar_bytes(session, NERD_AVATAR_URL)
+        if not fixed_avatar_bytes:
+            await interaction.followup.send("⚠️ Failed to fetch the bot's default avatar. Message will be sent without it if possible, or may fail.", ephemeral=True)
+            # Log this as a warning, but allow proceeding without avatar if fetch fails
+            await log_info(guild, f"/say command warning: Failed to fetch NERD_AVATAR_URL ({NERD_AVATAR_URL}). Avatar might be missing.")
 
-    if not os.path.exists(chosen_avatar_path):
-        await interaction.followup.send(f"⚠️ Avatar file '{discord.utils.escape_markdown(avatar_filename)}.png' not found on the server. Please contact an admin.", ephemeral=True)
-        await log_error(guild, f"/say command error: Avatar file not found at '{chosen_avatar_path}' for choice '{avatar_filename}'", interaction=interaction, ping_owner=True)
-        return
-    
-    try:
-        with open(chosen_avatar_path, "rb") as f:
-            chosen_avatar_bytes = f.read()
-        if not chosen_avatar_bytes: # File is empty or unreadable
-            await interaction.followup.send(f"⚠️ Could not read avatar file '{discord.utils.escape_markdown(avatar_filename)}.png'. The file might be empty or corrupted. Please contact an admin.", ephemeral=True)
-            await log_error(guild, f"/say command error: Could not read data from avatar file '{chosen_avatar_path}' for choice '{avatar_filename}'", interaction=interaction, ping_owner=True)
-            return
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ An error occurred while trying to access the avatar file '{discord.utils.escape_markdown(avatar_filename)}.png'. Please contact an admin.", ephemeral=True)
-        await log_error(guild, f"/say command error: Exception reading avatar file '{chosen_avatar_path}' for choice '{avatar_filename}'", error=e, interaction=interaction, ping_owner=True)
-        return
 
-    # --- Webhook Logic (Uses the loaded avatar bytes) ---
+    # --- Webhook Logic ---
     temp_webhook: Optional[discord.Webhook] = None
     try:
+        # Create the webhook
         temp_webhook = await target_channel.create_webhook(
             name=cleaned_name,
-            avatar=chosen_avatar_bytes, # Use the bytes of the chosen local PNG
-            reason=f"Temp webhook for /say command by {interaction.user} (Avatar: {avatar_filename})"
+            avatar=fixed_avatar_bytes, # This can be None if fetch_avatar_bytes failed
+            reason=f"Temp webhook for /say command by {interaction.user}"
         )
 
+        # Send the message using the webhook
         # Discord API handles message content length for webhooks (max 2000 chars)
-        # Ensure message_content is not excessively long if you want to pre-check, but API will error otherwise.
         await temp_webhook.send(content=message_content, wait=True)
 
-        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}' with avatar '{avatar_filename}'.")
-        await log_info(guild, f"User `{interaction.user}` used /say as '{cleaned_name}' with avatar '{avatar_filename}' in {target_channel.mention}. Message: '{message_content[:100].strip()}...'")
+        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}'.")
+        await log_info(guild, f"User `{interaction.user}` used /say as '{cleaned_name}' in {target_channel.mention}. Message: '{message_content[:100].strip()}...'")
 
     except discord.Forbidden:
-        await interaction.edit_original_response(content=f"❌ I lack 'Manage Webhooks' permission in {target_channel.mention} or other permissions needed to send this message as '{cleaned_name}'.")
-        await log_error(guild, f"/say command failed for '{cleaned_name}' with avatar '{avatar_filename}': Forbidden (likely manage_webhooks or send_messages via webhook).", interaction=interaction)
+        await interaction.edit_original_response(content=f"❌ I lack 'Manage Webhooks' permission in {target_channel.mention} or other permissions to send this message.")
+        await log_error(guild, f"/say command failed: Forbidden (likely manage_webhooks or send_messages via webhook).", interaction=interaction)
     except discord.HTTPException as e:
-        # Provide more specific error if possible (e.g. invalid form body for avatar)
-        error_text = f"❌ Discord API Error: Failed to send message as '{cleaned_name}'. {e.text}"
-        if e.code == 50035 and 'avatar' in str(e.text).lower(): # Discord error for invalid avatar
-            error_text = f"❌ Discord API Error: The avatar '{avatar_filename}.png' is invalid or could not be processed by Discord. It might be too large, corrupted, or an unsupported format (must be PNG for this command)."
-        await interaction.edit_original_response(content=error_text)
-        await log_error(guild, f"/say command failed for '{cleaned_name}' with avatar '{avatar_filename}': HTTP Exception creating/sending webhook.", error=e, interaction=interaction)
+        await interaction.edit_original_response(content=f"❌ Discord API Error: Failed to send message as '{cleaned_name}'. {e.text}")
+        await log_error(guild, f"/say command failed: HTTP Exception creating/sending webhook.", error=e, interaction=interaction)
     except Exception as e:
         await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to send the message as '{cleaned_name}'.")
-        await log_error(guild, f"/say command failed for '{cleaned_name}' with avatar '{avatar_filename}': Unexpected error.", error=e, interaction=interaction, ping_owner=True)
+        await log_error(guild, f"/say command failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
     finally:
         if temp_webhook:
             try:
-                await temp_webhook.delete(reason=f"Temporary webhook cleanup for /say command. Avatar: {avatar_filename}")
+                await temp_webhook.delete(reason="Temporary webhook cleanup for /say command")
             except Exception as e_del:
-                await log_error(guild, f"Failed to delete temporary webhook for /say. Webhook ID: {temp_webhook.id}, Avatar: {avatar_filename}", error=e_del)
+                # Log if webhook deletion fails, but don't bother the user
+                await log_error(guild, f"Failed to delete temporary webhook for /say command. Webhook ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
