@@ -204,29 +204,55 @@ async def load_avatar_filenames(guild_for_log: Optional[discord.Guild]):
     """Scans the AVATAR_CHOICES_FOLDER_NAME for .png files and populates available_avatar_filenames."""
     global available_avatar_filenames
     available_avatar_filenames = [] # Reset list
+
+    # --- DEBUGGING PATHS ---
+    script_location = os.path.dirname(os.path.abspath(__file__))
+    potential_folder_path = os.path.join(script_location, AVATAR_CHOICES_FOLDER_NAME)
+    
+    print(f"[AVATAR DEBUG] Script location: {script_location}")
+    print(f"[AVATAR DEBUG] AVATAR_CHOICES_FOLDER_NAME: {AVATAR_CHOICES_FOLDER_NAME}")
+    print(f"[AVATAR DEBUG] Attempting to find folder at: {potential_folder_path}")
+    # --- END DEBUGGING ---
+
+    folder_to_scan = potential_folder_path # Use the path relative to the script
+
     try:
-        if not os.path.exists(AVATAR_CHOICES_FOLDER_NAME):
-            await log_error(guild_for_log, f"Avatar choices folder '{AVATAR_CHOICES_FOLDER_NAME}' not found. /say avatar selection will be empty.", ping_owner=True)
-            return
+        if not os.path.exists(folder_to_scan):
+            # Also check CWD as a fallback, though script-relative is usually better
+            cwd_path = os.path.join(os.getcwd(), AVATAR_CHOICES_FOLDER_NAME)
+            print(f"[AVATAR DEBUG] Folder not found at script-relative path. Checking CWD path: {cwd_path}")
+            if os.path.exists(cwd_path):
+                folder_to_scan = cwd_path
+                print(f"[AVATAR DEBUG] Found folder at CWD path: {folder_to_scan}")
+            else:
+                await log_error(guild_for_log, f"Avatar choices folder '{AVATAR_CHOICES_FOLDER_NAME}' (tried '{potential_folder_path}' and '{cwd_path}') not found. /say avatar selection will be empty.", ping_owner=True)
+                print(f"CRITICAL: Avatar choices folder '{AVATAR_CHOICES_FOLDER_NAME}' not found at expected locations.")
+                return
 
         count = 0
-        for filename in os.listdir(AVATAR_CHOICES_FOLDER_NAME):
+        print(f"[AVATAR INFO] Scanning for avatars in: {folder_to_scan}")
+        for filename in os.listdir(folder_to_scan):
             if filename.lower().endswith(".png"):
-                # Store filename without the .png extension
                 available_avatar_filenames.append(os.path.splitext(filename)[0])
                 count += 1
         
-        available_avatar_filenames.sort(key=str.lower) # Sort for consistent autocomplete results
+        available_avatar_filenames.sort(key=str.lower) 
         
         if count > 0:
-            await log_info(guild_for_log, f"Successfully loaded {count} avatar filenames from '{AVATAR_CHOICES_FOLDER_NAME}' for /say command.")
+            await log_info(guild_for_log, f"Successfully loaded {count} avatar filenames from '{folder_to_scan}' for /say command.")
             print(f"Loaded {count} avatar filenames. First few: {available_avatar_filenames[:5] if count > 5 else available_avatar_filenames}")
         else:
-            await log_info(guild_for_log, f"No .png avatar files found in '{AVATAR_CHOICES_FOLDER_NAME}'.")
+            await log_info(guild_for_log, f"No .png avatar files found in '{folder_to_scan}'.")
+            print(f"INFO: No .png files found in '{folder_to_scan}'.")
 
+    except FileNotFoundError: # Specifically catch if os.listdir fails because the path is still wrong
+        await log_error(guild_for_log, f"Avatar folder path '{folder_to_scan}' reported as existing, but FileNotFoundError on listdir. Check permissions or if it's a symlink issue.", ping_owner=True)
+        print(f"CRITICAL: FileNotFoundError when trying to list contents of '{folder_to_scan}'.")
+        available_avatar_filenames = []
     except Exception as e:
-        await log_error(guild_for_log, f"Error loading avatar filenames from '{AVATAR_CHOICES_FOLDER_NAME}'", error=e, ping_owner=True)
-        available_avatar_filenames = [] # Ensure it's empty on error
+        await log_error(guild_for_log, f"Error loading avatar filenames from '{folder_to_scan}'", error=e, ping_owner=True)
+        print(f"CRITICAL: Exception loading avatar filenames from '{folder_to_scan}': {e}")
+        available_avatar_filenames = []
 
 async def avatar_filename_autocomplete(
     interaction: discord.Interaction,
