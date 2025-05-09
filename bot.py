@@ -203,6 +203,161 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+class HelpPagesView(discord.ui.View):
+    def __init__(self, bot_user: discord.User, is_staff_view_allowed: bool, timeout=180.0):
+        super().__init__(timeout=timeout)
+        self.bot_user = bot_user
+        self.current_page = "general" # "general" or "staff"
+        self.is_staff_view_allowed = is_staff_view_allowed
+        self.message: Optional[discord.Message] = None
+
+        # The single toggle button will be managed by the callback
+        self.add_item(self.create_toggle_button())
+
+    def create_toggle_button(self) -> discord.ui.Button:
+        if self.current_page == "general":
+            if self.is_staff_view_allowed:
+                return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page")
+            else:
+                # If staff view not allowed, don't show a button to go there (or show a disabled one)
+                # For simplicity, we'll just not add it if they can't see staff.
+                # Or, you could add a disabled button or no button.
+                # Let's create a dummy invisible button if no toggle is needed.
+                # Or simply return None and handle in add_item.
+                # A cleaner way is to simply not add the button if not needed.
+                # The __init__ will call this, so it's fine.
+                # For now, if no staff view allowed, no button. The calling command should handle this.
+                # OR - if staff view is not allowed, the view itself shouldn't be paginated.
+                # For this specific request (single toggle button), if they can't see staff,
+                # then there's nothing to toggle TO.
+                #
+                # Let's assume if is_staff_view_allowed is false, the calling /nerdhelp
+                # will just send the general embed without this view.
+                # For now, this button creation assumes is_staff_view_allowed is TRUE.
+                # If it's false, the view probably shouldn't even be used or the button shouldn't exist.
+                #
+                # Re-evaluating: The button SHOULD exist if is_staff_view_allowed, otherwise no button.
+                # The /nerdhelp command will decide whether to attach this view.
+                # This button's existence implies toggling IS possible.
+                return discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page")
+        else: # current_page == "staff"
+            return discord.ui.Button(label="Back to General", emoji="⬅️", style=discord.ButtonStyle.primary, custom_id="help_toggle_page")
+
+    def _create_general_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
+        if self.bot_user and self.bot_user.display_avatar:
+            embed.set_thumbnail(url=self.bot_user.display_avatar.url)
+        
+        # ADDED Newline after description for spacing
+        embed.description = "Here are commands generally available to users:\n\u200B" # \u200B is a zero-width space for a blank line
+        
+        # Removed the initial spacer field as the description now has a blank line
+        # embed.add_field(name="\u200B", value="\u200B", inline=False) 
+
+        # [HC1] Member List & Activity
+        embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
+
+        # Secret Phrase Discovery
+        embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
+        
+        # Messaging Utilities (General)
+        embed.add_field(name="\u200B\n💬 Messaging", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
+
+        # Other
+        embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
+        
+        embed.set_footer(text="Bot by TheNerd | sweet_honey")
+        return embed
+
+    def _create_staff_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="🛡️ Pingslave Bot - Staff Commands", color=NERDY_YELLOW)
+        if self.bot_user and self.bot_user.display_avatar:
+            embed.set_thumbnail(url=self.bot_user.display_avatar.url)
+        
+        # ADDED Newline after description for spacing
+        embed.description = "These commands typically require server management permissions:\n\u200B"
+        
+        # Removed the initial spacer field
+        # embed.add_field(name="\u200B", value="\u200B", inline=False)
+
+        # Verification & HC Management
+        embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('unverify')}  · Unverify user. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify into HC. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hconly')} · Register IGN only. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False)
+        
+        # Activity Tracking (Staff)
+        embed.add_field(name="\u200B\n⏱️ Activity Tracking (Staff)", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active. `[Manage Server]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity. `[Manage Server]`", value="\u200B", inline=False)
+        # REMOVED /bulkactive from staff help as requested
+        # embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Bulk mark active. `[Manage Server]`", value="\u200B", inline=False)
+
+
+        # Utilities (Staff & Owner)
+        embed.add_field(name="\u200B\n⚙️ Utilities (Staff & Owner)", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Manage Server]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list & data. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync all HC nicks. `[Manage Nicks]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
+        
+        embed.set_footer(text="Bot by TheNerd | sweet_honey")
+        return embed
+
+    def get_current_embed_and_button(self) -> Tuple[discord.Embed, Optional[discord.ui.Button]]:
+        button = None
+        if self.is_staff_view_allowed: # Only create a toggle button if they can actually view staff commands
+            button = self.create_toggle_button()
+
+        if self.current_page == "staff":
+            return self._create_staff_embed(), button
+        return self._create_general_embed(), button
+
+    async def edit_message_with_current_page(self, interaction: discord.Interaction):
+        embed, new_button = self.get_current_embed_and_button()
+        
+        self.clear_items() # Remove old button
+        if new_button: # Add the new button if one was created
+            self.add_item(new_button)
+            
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Toggle", custom_id="help_toggle_page") # Label and style will be set dynamically
+    async def toggle_page_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.is_staff_view_allowed: # Defensive check
+            await interaction.response.send_message("This action is not available.", ephemeral=True)
+            return
+
+        if self.current_page == "general":
+            self.current_page = "staff"
+        else:
+            self.current_page = "general"
+        
+        await self.edit_message_with_current_page(interaction)
+    
+    async def on_timeout(self):
+        if self.message:
+            try:
+                self.clear_items() # Remove button on timeout
+                # Optionally, you could add a disabled "Timed Out" button or just send view=None
+                # For simplicity, let's just remove the button.
+                # Get the last displayed embed to keep the content.
+                current_embed_on_timeout = self._create_general_embed() if self.current_page == "general" else self._create_staff_embed()
+                current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
+                await self.message.edit(embed=current_embed_on_timeout, view=None) # Remove view by passing None
+            except discord.HTTPException:
+                pass
+        self.stop()
+
 async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices = []
     current_lower = current.lower()
@@ -272,21 +427,6 @@ async def load_profile_picture_choices(guild_for_log: Optional[discord.Guild]):
         print("No profile picture choices loaded. Folders might be empty or missing.")
         if guild_for_log:
              await log_info(guild_for_log, "No profile picture choices were loaded (folders empty or not found).")
-
-async def test_bot_owner_only_check(interaction: discord.Interaction) -> bool:
-    """
-    Global check: If BOT_INSTANCE_TYPE is "TESTING", only allows OWNER_USER_ID.
-    Otherwise (PRODUCTION), allows command execution (other checks may still apply).
-    """
-    if BOT_INSTANCE_TYPE == "TESTING":
-        if interaction.user.id == OWNER_USER_ID:
-            return True # Owner can use test bot commands
-        else:
-            # This message will be sent by the default CheckFailure handler if not overridden
-            # Or you can handle it in your on_app_command_error
-            print(f"Command '{interaction.command.name if interaction.command else 'N/A'}' on TEST bot blocked for user {interaction.user.id} (not owner).")
-            return False # Non-owner cannot use test bot commands
-    return True # Production bot commands are not restricted by this check
 
 # Helper function (fetch_avatar_bytes - remains the same)
 async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
@@ -3193,57 +3333,10 @@ async def on_ready():
     activity = discord.Activity(type=discord.ActivityType.watching, name="out for Pings | /nerdhelp")
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
-    # --- Command Permissions Modification for TESTING Bot ---
-    # This section MUST come BEFORE tree.sync()
-    if BOT_INSTANCE_TYPE == "TESTING":
-        if OWNER_USER_ID is None: # OWNER_USER_ID must be defined for this to work
-            print("CRITICAL [TESTING BOT]: OWNER_USER_ID is not set. Command restriction to owner cannot be applied. Defaulting to admin-only.")
-            # You could log this to a channel if bot is sufficiently initialized
-            # await log_error(None, "TESTING BOT CRITICAL: OWNER_USER_ID not set. Command restrictions may not work as intended.", ping_owner=True)
-            # Fallback to admin-only permissions if owner ID is missing, which is still better than no restriction.
-            default_permissions_for_test_bot = discord.Permissions(administrator=True)
-        else:
-            print(f"INFO [TESTING BOT]: Applying command restrictions. Commands should be visible/usable primarily by owner (ID: {OWNER_USER_ID}) via admin role or direct permission.")
-            # Commands will be visible to administrators. The @app_commands.check(test_bot_owner_only_check)
-            # will then ensure only the OWNER_USER_ID can execute them.
-            default_permissions_for_test_bot = discord.Permissions(administrator=True)
-            
-        # Get all global commands. If you have guild-specific commands for Catercord, handle them.
-        # For simplicity, this example targets global commands.
-        # If your test bot only ever operates in Catercord, you might sync only to that guild.
-        
-        all_app_commands = tree.get_commands(guild=None) # Get global commands
-        # If you also register commands specifically to CATERCORD_GUILD_ID:
-        # target_guild_obj_for_test_cmds = discord.Object(id=CATERCORD_GUILD_ID)
-        # all_app_commands.extend(tree.get_commands(guild=target_guild_obj_for_test_cmds))
-        
-        restricted_count = 0
-        for cmd_obj in all_app_commands:
-            cmd_obj.default_member_permissions = default_permissions_for_test_bot
-            restricted_count +=1
-            # If the command is a group, restrict its subcommands too
-            if isinstance(cmd_obj, app_commands.Group):
-                for sub_cmd in cmd_obj.commands: # Iterate through commands in the group
-                    if isinstance(sub_cmd, (app_commands.Command, app_commands.Group)): # Ensure it's a command/subgroup
-                        sub_cmd.default_member_permissions = default_permissions_for_test_bot
-                        # Don't increment restricted_count again for subcommands here,
-                        # as the top-level group already covers it in terms of visibility.
-                        # The check decorator will handle execution.
-        print(f"INFO [TESTING BOT]: Applied admin-only default visibility to {restricted_count} top-level command entries.")
-
     # --- Command Syncing ---
     print("Syncing application commands...")
     synced_commands = []
     try:
-        # For a TESTING bot, you might want to sync only to a specific guild (e.g., Catercord)
-        # to avoid polluting the global command space if the test bot uses a different app ID.
-        # If it's the same App ID, global sync affects both.
-        # If BOT_INSTANCE_TYPE == "TESTING" and CATERCORD_GUILD_ID:
-        #     print(f"INFO [TESTING BOT]: Syncing commands to guild ID {CATERCORD_GUILD_ID}.")
-        #     synced_commands = await tree.sync(guild=discord.Object(id=CATERCORD_GUILD_ID))
-        # else:
-        #     print("INFO [PRODUCTION BOT / Global Sync]: Syncing commands globally.")
-        #     synced_commands = await tree.sync() # Global sync for production or if test bot isn't guild-specific
         
         synced_commands = await tree.sync() # Your original global sync
         
@@ -3527,7 +3620,6 @@ def get_cmd_mention(name: str) -> str:
 @app_commands.describe(user="The user to verify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
-@app_commands.check(test_bot_owner_only_check)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     if not guild:
@@ -3642,7 +3734,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.describe(user="The user to unverify.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
-@app_commands.check(test_bot_owner_only_check)
 async def unverify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
     if not guild:
@@ -3755,7 +3846,6 @@ async def unverify(interaction: discord.Interaction, user: discord.Member):
 @app_commands.describe(user="User to HC verify.", ingame_name="User's Florr IGN (will link/update DB & set nickname).") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True, manage_nicknames=True)
-@app_commands.check(test_bot_owner_only_check)
 async def hcverify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction):
@@ -3985,7 +4075,6 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 @app_commands.checks.has_permissions(manage_roles=True) # User needs permission to trigger potential role changes
 @app_commands.checks.bot_has_permissions(manage_roles=True) # Bot needs permission to manage roles
-@app_commands.check(test_bot_owner_only_check)
 async def hcleave(interaction: discord.Interaction, ingame_name: str):
     """Removes HC database entry based on IGN and handles linked user roles."""
     guild = interaction.guild
@@ -4196,7 +4285,6 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
 @tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
 @app_commands.describe(ingame_name="The player's unique in-game name.")
 @app_commands.checks.has_permissions(manage_roles=True) # Or another suitable permission
-@app_commands.check(test_bot_owner_only_check)
 async def hconly(interaction: discord.Interaction, ingame_name: str):
     """Adds a member to the HC database using only their IGN."""
     guild = interaction.guild
@@ -4275,7 +4363,6 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
 
 # --- Activate Myself Command ---
 @tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
-@app_commands.check(test_bot_owner_only_check)
 # No extra permissions needed by default, relies on user having a linked IGN
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
@@ -4338,7 +4425,6 @@ async def activatemyself(interaction: discord.Interaction):
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete) # REMOVED date autocomplete
 @app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
-@app_commands.check(test_bot_owner_only_check)
 # VV Ensure this 'async' keyword is present VV
 # MODIFIED: Removed 'date: str' parameter
 async def active(interaction: discord.Interaction, ingame_name: str):
@@ -4381,7 +4467,6 @@ async def active(interaction: discord.Interaction, ingame_name: str):
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
 @app_commands.checks.has_permissions(manage_guild=True) # <<<--- ADDED PERMISSION CHECK
-@app_commands.check(test_bot_owner_only_check)
 async def inactive(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
@@ -4428,7 +4513,6 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
 
 # --- REVISED /hcmembers Command ---
 @tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
-@app_commands.check(test_bot_owner_only_check)
 async def hcmembers(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -4566,7 +4650,6 @@ async def hcmembers(interaction: discord.Interaction):
 
 @tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.") # Updated description
 @app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.check(test_bot_owner_only_check)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     # --- Initial Checks ---
@@ -4640,7 +4723,6 @@ async def refresh(interaction: discord.Interaction):
 
 # --- Discovery Command (Further Refined Formatting for User-App Context) ---
 @tree.command(name="discoveries", description="Explore the world of AI-powered secret keyword phrases!")
-@app_commands.check(test_bot_owner_only_check)
 async def discoveries(interaction: discord.Interaction):
     # Ensure bot object and user ID are available
     if not bot or not bot.user or not bot.user.id:
@@ -4767,7 +4849,6 @@ async def discoveries(interaction: discord.Interaction):
 @tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
 @app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
 @app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
-@app_commands.check(test_bot_owner_only_check)
 async def syncnicknames(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
@@ -4958,7 +5039,6 @@ async def syncnicknames(interaction: discord.Interaction):
 
 # --- Wither Command ---
 @tree.command(name="wither", description="Temporarily remove roles from a user.")
-@app_commands.check(test_bot_owner_only_check)
 @app_commands.describe(
     user="User to wither.",
     time="Duration in minutes (0.1 to 10, default 2)."
@@ -5654,7 +5734,6 @@ async def on_message(message: discord.Message):
 
 # NEW Command: Add Keyword (Owner Only)
 @tree.command(name="addkeyword", description="[Owner Only] Add a new keyword rule to the database.")
-@app_commands.check(test_bot_owner_only_check)
 @app_commands.describe(
     phrase_identifier="Unique identifier for this keyword (e.g., 'rule_linking').",
     inclusion_regex="Regex pattern to trigger this keyword (case-insensitive).",
@@ -5748,8 +5827,7 @@ async def addkeyword(
 @app_commands.choices(ai=[
     app_commands.Choice(name="No", value="no"),
     app_commands.Choice(name="Yes", value="yes"),
-])
-@app_commands.check(test_bot_owner_only_check) # Keep for testing consistency
+]) # Keep for testing consistency
 async def message(
     interaction: discord.Interaction,
     message_content: str,
@@ -5840,8 +5918,7 @@ async def message(
     user="The user to imitate (name and avatar).",
     message_content="The content of the message to send."
 )
-@app_commands.checks.has_permissions(manage_guild=True) # User needs Manage Guild
-@app_commands.check(test_bot_owner_only_check) # Owner bypass and test bot restriction
+@app_commands.checks.has_permissions(manage_guild=True) # User needs Manage Guild # Owner bypass and test bot restriction
 async def imitate(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -5913,7 +5990,6 @@ async def imitate(
     message_content="The content of the message to send."
 )
 @app_commands.autocomplete(profile=profile_pic_autocomplete) # Ensure 'profile' matches param name
-@app_commands.check(test_bot_owner_only_check)
 # @app_commands.checks.bot_has_permissions(manage_webhooks=True) # REMOVE - Bot needs it implicitly, user doesn't grant it
 async def florr( # RENAME function, and parameters
     interaction: discord.Interaction,
@@ -6018,70 +6094,60 @@ async def florr( # RENAME function, and parameters
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
-@app_commands.check(test_bot_owner_only_check)
 async def nerdhelp(interaction: discord.Interaction):
     guild = interaction.guild
-    if not guild: # Still good to keep this initial check
+    if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
 
     if not bot or not bot.user:
-        print("Error: Bot object not available in nerdhelp command.")
         await interaction.response.send_message("Bot is not fully ready, cannot generate help.", ephemeral=False)
         return
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
 
-    embed = discord.Embed(
-        title="🤓 Pingslave Bot Commands",
-        color=NERDY_YELLOW
-    )
-    # Top spacer
-    embed.add_field(name="\u200B", value="\u200B", inline=False)
+    can_see_staff_commands = False
+    if isinstance(interaction.user, discord.Member):
+        can_see_staff_commands = interaction.user.guild_permissions.manage_guild or interaction.user.id == OWNER_USER_ID
 
-    # Verification & HC Management (No changes here)
-    embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify a standard user.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('unverify')}  · Revert a user to unverified.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify a user into HC.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('hconly')} · Register member by IGN only.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove member from HC.", value="\u200B", inline=False)
-
-    # [HC1] Member List (No changes here)
-    embed.add_field(name="\u200B\n📊 [HC1] Member List", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list & keyword data.", value="\u200B", inline=False) # Slightly updated desc
-
-    # Activity Tracking (No changes here)
-    embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('active')}  · Mark *any* member as active for a date.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove an activity record for a date.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('bulkactive')}  · Mark multiple members active via modal.", value="\u200B", inline=False)
-
-    # Secret Phrase Discovery (No changes here)
-    embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('addkeyword')} · [Owner] Add a new keyword rule.", value="\u200B", inline=False) # Assuming addkeyword exists
-
-    # Messaging Utilities (NEW/MODIFIED SECTION)
-    embed.add_field(name="\u200B\n💬 Messaging Utilities", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('imitate')} · [Staff] Send msg as another user.", value="\u200B", inline=False)
+    # --- Create view and initial embed ---
+    # The view will decide if a button is needed based on can_see_staff_commands.
+    # If can_see_staff_commands is false, the view will initially have no button (or a disabled one).
+    view_to_send: Optional[HelpPagesView] = None
     
-    # Other Utilities
-    embed.add_field(name="\u200B\n⚙️ Other Utilities", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicknames to stored IGNs.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('wither')}  · Temporarily remove user roles.", value="\u200B", inline=False)
-    embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-    
-    embed.set_footer(text="Bot by TheNerd | sweet_honey")
-    if bot.user and bot.user.display_avatar:
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    # Only attach the view (and thus the button) if staff commands can be viewed by this user.
+    # Otherwise, just send the general embed.
+    if can_see_staff_commands:
+        view_to_send = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=True) # Pass True here
+        initial_embed, _ = view_to_send.get_current_embed_and_button() # Gets general embed
+    else:
+        # If user cannot see staff commands, create the general embed directly without a view
+        # (or create a view instance that knows not to add the toggle button)
+        # For simplicity here, let's just send the general embed without a view if no toggle needed.
+        # To use the view consistently, the view's __init__ or create_toggle_button
+        # should correctly handle is_staff_view_allowed=False by not adding a functional button.
+        #
+        # Let's stick to using the view, and the view will correctly not add a button if not allowed.
+        # This means HelpPagesView must correctly handle `is_staff_view_allowed=False` in its `__init__`
+        # by not adding the button if it's the only page.
+        #
+        # Corrected approach:
+        # The view's __init__ creates the button. The button callback itself is always present.
+        # The decision to show staff commands or not is handled.
+        # The button itself will only be *added* if `is_staff_view_allowed` is True.
+        
+        # If can_see_staff_commands is False, we just show the general help page without interaction.
+        temp_view_for_general_embed = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=False)
+        initial_embed = temp_view_for_general_embed._create_general_embed() # Directly get general embed
+        # view_to_send remains None in this case
 
     try:
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+        if view_to_send: # Only pass the view if it's created (i.e., if staff commands are possible)
+            await interaction.response.send_message(embed=initial_embed, view=view_to_send, ephemeral=False)
+            view_to_send.message = await interaction.original_response()
+        else: # User cannot see staff commands, send static general help
+            await interaction.response.send_message(embed=initial_embed, ephemeral=False)
+            
     except Exception as e:
         print(f"Error sending nerdhelp response: {e}")
         await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
