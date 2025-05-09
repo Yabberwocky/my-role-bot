@@ -96,6 +96,8 @@ ACTIVITY_COLUMN_WIDTH = 18 # Increase width for "Count (Last Seen)"
 COMMAND_PREFIX = "." # Define the prefix
 AUTODELETE_DELAY_SECONDS = 5.0
 CATERCORD_GUILD_ID = 1200476681803137024 # Catercord server ID
+RANDOM_SERVER_ID = 1318657897550577776 # New server ID for special wither logic
+WITHERED_ROLE_ID_RANDOM_SERVER = 1370374993287975024 # Special role for wither in RANDOM_SERVER_ID
 active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view': StaticHCPagesView, 'message_id': int, 'task': tasks.Loop}
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
 SORT_MODE_DISCORD_NAME = "sort_discord_name"
@@ -5006,7 +5008,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     guild = interaction.guild
     invoker = interaction.user # Member object of the user running the command
 
-    # Pre-checks (must be done before deferring potentially)
+    # Pre-checks
     if not guild:
         await interaction.response.send_message("This command cannot be used outside a server.", ephemeral=False)
         return
@@ -5014,100 +5016,114 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     bot_member = guild.me # Bot's member object in the guild
 
     async def fail_check(log_reason: str, user_message: str):
-        """Helper to send ephemeral failure message and log error."""
-        # Ensure response is only sent once
+        """Helper to send failure message and log error."""
         send_method = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         try:
-            # Use create_embed helper
             await send_method(embed=create_embed(user_message, discord.Color.red()), ephemeral=False)
         except (discord.NotFound, discord.InteractionResponded, discord.HTTPException) as e:
-             # Catch common errors if sending fails
             print(f"Wither Check Fail Send Error: {type(e).__name__} - {e}")
         except Exception as e:
-             print(f"Wither Check Fail Send Error (Unknown): {e}")
-        # Log the failure reason
+            print(f"Wither Check Fail Send Error (Unknown): {e}")
         await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
 
-    # 1. Permission Check (Invoker)
-    if invoker.id not in ALLOWED_WITHERER_IDS:
-        # Defer ephemerally *before* sending fail message if not already done
+    # 1. Permission Check (Invoker) - MODIFIED
+    invoker_can_wither = False
+    permission_denied_message = "❌ You do not have permission to use this command." # Default
+
+    if guild.id == CATERCORD_GUILD_ID:
+        if invoker.id in ALLOWED_WITHERER_IDS:
+            invoker_can_wither = True
+    elif guild.id == RANDOM_SERVER_ID:
+        if invoker.id in ALLOWED_WITHERER_IDS or (isinstance(invoker, discord.Member) and invoker.guild_permissions.administrator):
+            invoker_can_wither = True
+        else:
+            permission_denied_message = "❌ In this server, only whitelisted users or Administrators can use this command."
+    else: # Any other server
+        if isinstance(invoker, discord.Member) and invoker.guild_permissions.administrator:
+            invoker_can_wither = True
+        else:
+            permission_denied_message = "❌ In this server, only Administrators can use this command."
+
+    if not invoker_can_wither:
         if not interaction.response.is_done():
             try: await interaction.response.defer(ephemeral=False)
-            except discord.InteractionResponded: pass # Race condition handled
-        await fail_check("Invoker permission denied.", "❌ You do not have permission to use this command.")
+            except discord.InteractionResponded: pass
+        await fail_check("Invoker permission denied.", permission_denied_message)
         return
 
-    # 2. Defer Publicly (thinking state visible) - DO THIS *AFTER* invoker check
-    # If the invoker check passed, we intend to proceed publicly.
+    # 2. Defer Publicly (thinking state visible)
     if not interaction.response.is_done():
         try:
             await interaction.response.defer(thinking=True, ephemeral=False)
         except discord.InteractionResponded:
-             # If it was already responded to (e.g., by the failed ephemeral defer above somehow)
-             # This shouldn't normally happen if logic flow is correct, but handle defensively.
-             print(f"Warning: Interaction {interaction.id} was already responded to before public defer in wither.")
-             pass
+            print(f"Warning: Interaction {interaction.id} was already responded to before public defer in wither.")
+            pass
 
     # 3. Target Checks (Self, Protected, Bot, Hierarchy)
     if user.id == invoker.id: await fail_check("Target self.", "🤨 You cannot wither yourself."); return
-    # Check protected ID, allow if invoker IS the protected ID
     if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>)."); return
     if user.id == BOT_USER_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
     if user.bot: await fail_check("Target other bot.", "🤖 You cannot wither other bots."); return
-    # Check guild owner, allow if invoker IS the owner
     if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target guild owner.", f"👑 You cannot wither the server owner (<@{guild.owner_id}>)."); return
-    # Bot hierarchy check
     if bot_member.top_role.position <= user.top_role.position: await fail_check("Bot hierarchy low.", f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles."); return
-    # Invoker hierarchy check (unless invoker is owner)
-    if invoker.id != guild.owner_id and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", f"❌ Your highest role ('{invoker.top_role.name}') is not high enough to wither {user.mention}."); return
-    # Bot permissions check
+    if invoker.id != guild.owner_id and isinstance(invoker, discord.Member) and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", f"❌ Your highest role ('{invoker.top_role.name}') is not high enough to wither {user.mention}."); return
     if not bot_member.guild_permissions.manage_roles: await fail_check("Bot missing manage_roles perm.", "❌ I lack the `Manage Roles` permission needed for this command."); return
-
 
     # 4. Get Original Roles (excluding @everyone)
     original_roles = [r for r in user.roles if r.id != guild.default_role.id]
-    if not original_roles:
-        # Use followup since we deferred publicly
+    if not original_roles and guild.id != RANDOM_SERVER_ID: # If no roles AND not random server (where we might just add the special role)
         await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles (other than @everyone) to remove.", discord.Color.orange()), ephemeral=False)
         return
 
     # --- Start of Main Wither Logic (Outer Try Block) ---
     try:
-        # Calculate duration
-        wither_seconds = min(max(1, int(time * 60)), int(MAX_WITHER_SECONDS or 600)) # Ensure bounds, convert minutes to seconds
+        wither_seconds = min(max(1, int(time * 60)), int(MAX_WITHER_SECONDS or 600))
         actual_minutes = wither_seconds / 60.0
         reason_wither = f"Withered by {invoker.name} ({invoker.id}) for {actual_minutes:.1f}m."
 
         # --- Role Removal ---
-        # Filter roles the bot can actually manage based on hierarchy
         roles_to_remove_actually = [r for r in original_roles if bot_member.top_role.position > r.position]
         skipped_roles_remove = [r for r in original_roles if r not in roles_to_remove_actually]
 
-        if not roles_to_remove_actually:
+        if not roles_to_remove_actually and guild.id != RANDOM_SERVER_ID: # If no manageable roles AND not random server
              await interaction.followup.send(embed=create_embed(f"ℹ️ Cannot wither {user.display_name}: None of their roles are below my highest role.", color=discord.Color.orange()), ephemeral=False)
              await log_info(guild, f"Wither attempt on {user.name} by {invoker.name} failed: No manageable roles.")
              return
 
-        # Perform role removal using edit (replace roles with only @everyone)
-        # Ensure @everyone role exists (should always be true)
         everyone_role = guild.default_role
-        await user.edit(roles=[everyone_role], reason=reason_wither)
+        roles_to_set_during_wither = [everyone_role]
+        special_wither_role_added_msg_part = ""
+
+        if guild.id == RANDOM_SERVER_ID:
+            withered_role_random_obj = guild.get_role(WITHERED_ROLE_ID_RANDOM_SERVER)
+            if withered_role_random_obj:
+                if bot_member.top_role.position > withered_role_random_obj.position:
+                    roles_to_set_during_wither.append(withered_role_random_obj)
+                    special_wither_role_added_msg_part = f"\n**Special Role Added:** `{withered_role_random_obj.name}`"
+                else:
+                    special_wither_role_added_msg_part = f"\n*(Note: Could not add special withered role '{withered_role_random_obj.name}' due to hierarchy.)*"
+            else:
+                special_wither_role_added_msg_part = f"\n*(Note: Special withered role (ID: {WITHERED_ROLE_ID_RANDOM_SERVER}) for this server not found/configured.)*"
+                await log_error(guild, f"Wither: Special role {WITHERED_ROLE_ID_RANDOM_SERVER} not found in guild {guild.id} ({RANDOM_SERVER_ID})")
+
+        await user.edit(roles=roles_to_set_during_wither, reason=reason_wither)
 
         # --- Send Confirmation ---
-        roles_removed_names = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually) or 'None Manageable')
-        # Truncate if too long for embed description field part
-        if len(roles_removed_names) > 900: roles_removed_names = roles_removed_names[:897] + "..."
+        roles_removed_names = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually) or ('None' if not roles_to_remove_actually and guild.id != RANDOM_SERVER_ID else 'All existing manageable roles'))
+        if len(roles_removed_names) > 850: roles_removed_names = roles_removed_names[:847] + "..."
 
         wither_desc = f"{user.mention} has been withered by {invoker.mention} for **{actual_minutes:.1f} minutes**!\n\n**Roles Removed:** {roles_removed_names}"
+        wither_desc += special_wither_role_added_msg_part # Add info about the special role if applicable
         if skipped_roles_remove:
             skipped_names = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))
             if len(skipped_names) > 100: skipped_names = skipped_names[:97] + "..."
-            wither_desc += f"\n*(Skipped {len(skipped_roles_remove)} role(s) due to hierarchy: {skipped_names})*"
+            wither_desc += f"\n*(Skipped removing {len(skipped_roles_remove)} role(s) due to hierarchy: {skipped_names})*"
 
         await interaction.followup.send(embed=create_embed(title="🌪️ Wither Cast! 🌪️", description=wither_desc, color=discord.Color.dark_purple()), ephemeral=False)
 
-        # --- Log Action ---
         log_msg = f"`{user.name}` ({user.id}) withered by `{invoker.name}` ({invoker.id}) for {actual_minutes:.1f}m. Roles removed: {', '.join(r.name for r in roles_to_remove_actually) or 'N/A'}."
+        if guild.id == RANDOM_SERVER_ID and any(role.id == WITHERED_ROLE_ID_RANDOM_SERVER for role in roles_to_set_during_wither):
+            log_msg += f" Special role {WITHERED_ROLE_ID_RANDOM_SERVER} added."
         if skipped_roles_remove: log_msg += f" Skipped (hierarchy): {', '.join(r.name for r in skipped_roles_remove)}."
         await log_info(guild, log_msg)
 
@@ -5116,89 +5132,87 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
         # --- Role Restore (Inner Try Block) ---
         try:
-            # Refetch member and bot objects to ensure data/perms are current
-            # Use fetch_member as user might have rejoined/roles changed externally
             member_after = await guild.fetch_member(user.id)
-            # Fetch bot member too in case its roles changed
             bot_member_after = await guild.fetch_member(bot.user.id) if bot.user else await guild.fetch_me()
             reason_restore = f"Wither expired after {actual_minutes:.1f}m. Restoring roles."
 
-            # --- Pre-Restore Checks ---
-            # Check bot permissions again before restore attempt
             if not bot_member_after.guild_permissions.manage_roles:
                 await log_error(guild, f"Wither restore fail for {member_after.mention}: Bot lost `Manage Roles` permission.")
-                # Attempt to notify in channel
                 if interaction.channel: await interaction.channel.send(f"⚠️ Failed to restore roles for {member_after.mention}: Bot permissions missing.")
                 return
-
-            # Check bot hierarchy again (user might have gotten higher roles)
             if bot_member_after.top_role.position <= member_after.top_role.position:
                 await log_error(guild, f"Wither restore fail: Bot hierarchy now too low for {member_after.mention}.")
                 if interaction.channel: await interaction.channel.send(f"⚠️ Failed to restore roles for {member_after.mention}: Hierarchy issue.")
                 return
 
-            # --- Determine Roles to Restore ---
-            # Check existence and hierarchy for each original role again
-            valid_restore_roles = [] # Roles that still exist and bot can assign
-            skipped_deleted_names = [] # Names of roles that were deleted
-            skipped_hierarchy_names = [] # Names of roles now above bot
-
-            original_role_ids = {r.id for r in original_roles} # Set for efficient lookup
-            current_valid_roles = {r.id: r for r in guild.roles} # Map of current roles in guild
+            valid_restore_roles = []
+            skipped_deleted_names = []
+            skipped_hierarchy_names = []
+            original_role_ids = {r.id for r in original_roles}
+            current_valid_roles = {r.id: r for r in guild.roles}
 
             for role_id in original_role_ids:
                 role_obj = current_valid_roles.get(role_id)
                 if not role_obj:
-                    # Find original name if possible (might be inaccurate if ID reused)
                     original_name = next((r.name for r in original_roles if r.id == role_id), f"ID {role_id}")
                     skipped_deleted_names.append(original_name)
                 elif bot_member_after.top_role.position > role_obj.position:
-                    valid_restore_roles.append(role_obj) # Add the valid Role object
+                    valid_restore_roles.append(role_obj)
                 else:
                     skipped_hierarchy_names.append(role_obj.name)
 
             if skipped_deleted_names: await log_info(guild, f"Wither restore notice for {member_after.name}: Roles seem deleted: {', '.join(skipped_deleted_names)}.")
             if skipped_hierarchy_names: await log_info(guild, f"Wither restore notice for {member_after.name}: Roles skipped (hierarchy): {', '.join(skipped_hierarchy_names)}.")
 
-            if not valid_restore_roles:
+            if not valid_restore_roles and guild.id != RANDOM_SERVER_ID: # If no roles to restore AND not random server (where we only need to remove the special role)
                 await log_info(guild, f"Wither restore: No valid roles left to restore for {member_after.name}.")
                 if interaction.channel: await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, but no valid roles could be restored (deleted or hierarchy issues).")
-                return
+                # Still proceed to remove special role if in RANDOM_SERVER_ID
+                if guild.id != RANDOM_SERVER_ID: return
 
-            # --- Attempt Role Restore ---
-            # Combine valid roles to restore with the @everyone role
             final_roles_to_set = valid_restore_roles + [guild.default_role]
+            special_wither_role_removed_msg_part = ""
+
+            if guild.id == RANDOM_SERVER_ID:
+                withered_role_random_obj = guild.get_role(WITHERED_ROLE_ID_RANDOM_SERVER)
+                if withered_role_random_obj and withered_role_random_obj in member_after.roles:
+                    # The role `withered_role_random_obj` will be removed because it's not in `final_roles_to_set`
+                    # (unless it was one of the original_roles, which is unlikely for a wither role)
+                    if bot_member_after.top_role.position > withered_role_random_obj.position:
+                         special_wither_role_removed_msg_part = f"\n*(Special withered role `{withered_role_random_obj.name}` removed.)*"
+                         await log_info(guild, f"Wither Restore: Removing special role {withered_role_random_obj.name} from {member_after.name} in {RANDOM_SERVER_ID}.")
+                    else:
+                         special_wither_role_removed_msg_part = f"\n*(Could not remove special withered role `{withered_role_random_obj.name}` due to hierarchy.)*"
+                         await log_error(guild, f"Wither Restore: Could not remove special role {withered_role_random_obj.name} from {member_after.name} in {RANDOM_SERVER_ID} due to hierarchy.")
+
+
             await member_after.edit(roles=final_roles_to_set, reason=reason_restore)
 
-            # --- Send Restore Confirmation ---
-            restored_names = (', '.join(f"`{r.name}`" for r in valid_restore_roles))
+            restored_names = (', '.join(f"`{r.name}`" for r in valid_restore_roles) or 'None')
             restore_msg = f"✨ {member_after.mention}'s roles have been restored!"
-            # Add details about skipped roles if any
+            restore_msg += special_wither_role_removed_msg_part # Add info about special role removal
             if skipped_deleted_names or skipped_hierarchy_names:
                 restore_msg += "\n*(Some original roles were not restored due to being deleted or hierarchy issues.)*"
 
-            # Use followup for restore message if original interaction is still valid
-            # otherwise send to channel directly.
             try:
                  await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
             except (discord.NotFound, discord.HTTPException) as e_followup:
                 print(f"Wither restore followup failed ({e_followup}), attempting to send to channel.")
-                # Fallback to sending in the original channel if followup fails
                 if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
                     try: await interaction.channel.send(embed=create_embed(restore_msg, color=NERDY_YELLOW))
                     except Exception as e_chan_send: await log_error(guild, "Wither failed channel send after followup fail", error=e_chan_send)
                 else: await log_info(guild, f"Wither restore OK for {member_after.mention}, but couldn't send followup or channel message.")
 
-            await log_info(guild, f"Restored roles for `{member_after.name}` ({member_after.id}). Roles: {', '.join(r.name for r in valid_restore_roles)}")
+            log_restore_details = f"Restored roles for `{member_after.name}` ({member_after.id}). Roles: {', '.join(r.name for r in valid_restore_roles)}"
+            if guild.id == RANDOM_SERVER_ID and "removed" in special_wither_role_removed_msg_part.lower():
+                log_restore_details += f". Special role {WITHERED_ROLE_ID_RANDOM_SERVER} also handled."
+            await log_info(guild, log_restore_details)
 
-        # --- Inner Except Blocks (Handling Restore Errors) ---
         except discord.NotFound:
-            # User left the server during the wither period
             await log_info(guild, f"Wither restore skipped: User `{user.name}` ({user.id}) left the server.")
-            # Attempt to notify channel
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
                 try: await interaction.channel.send(f"ℹ️ Wither ended for {user.display_name}, but they have left the server.")
-                except Exception: pass # Ignore failure to notify
+                except Exception: pass
         except discord.Forbidden:
             await log_error(guild, f"Wither restore failed: Forbidden error for {user.name} ({user.id}).")
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
@@ -5210,25 +5224,20 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
                 try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name}: Discord API error.")
                 except Exception: pass
         except Exception as e:
-            # Catch any other unexpected errors during restore
             await log_error(guild, f"Wither restore failed: Unexpected error for {user.name} ({user.id}).", error=e)
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
                 try: await interaction.channel.send(f"⚠️ An unexpected error occurred trying to restore roles for {user.display_name}.")
                 except Exception: pass
 
-    # --- Outer Except Blocks (Handling Role Removal Errors) ---
     except discord.Forbidden:
-        # This implies the initial role removal failed
         await log_error(guild, f"Wither initial remove failed: Forbidden for {user.name} ({user.id}).", interaction=interaction)
-        # Try to edit the deferred response to show failure
         try: await interaction.edit_original_response(content=f"❌ Failed to remove roles for {user.display_name}: Permissions error.", embed=None, view=None)
-        except Exception: pass # Ignore if editing fails
+        except Exception: pass
     except discord.HTTPException as e:
         await log_error(guild, f"Wither initial remove failed: API error for {user.name} ({user.id}).", error=e, interaction=interaction)
         try: await interaction.edit_original_response(content=f"❌ Failed to remove roles for {user.display_name}: Discord API error.", embed=None, view=None)
         except Exception: pass
     except Exception as e:
-        # Catch any other unexpected errors during the initial removal phase
         await log_error(guild, f"Wither initial remove failed: Unexpected error for {user.name} ({user.id}).", error=e, interaction=interaction)
         try: await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to wither {user.display_name}.", embed=None, view=None)
         except Exception: pass
