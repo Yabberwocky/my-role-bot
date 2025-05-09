@@ -175,6 +175,7 @@ PETALS_FOLDER_NAME = "Petals"
 MOBS_FOLDER_NAME = "Mobs"
 available_profile_pics_cache: List[Tuple[str, str, str]] = []
 PROFILE_PIC_BASE_PATH = "" # Will be set in on_ready to the script's directory
+ALWAYS_ON_AI_CHANNELS = {1330664430148780102, 1364657218175107162} # Channels for AI to respond to every message
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -204,6 +205,116 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def send_ai_chat_response(
+    trigger_type: str,
+    prompt_for_ai: str,
+    history: List[discord.Message], # history should include the triggering message as the last item if AI is responding TO it.
+    system_instruction_override: Optional[str] = None,
+    discovery_congrats_user: Optional[discord.User] = None,
+    discovered_phrase_identifier: Optional[str] = None,
+    keyword_triggered_identifier: Optional[str] = None 
+):
+    if not ai_model: return
+
+    # Determine context for sending/logging
+    # The 'history' list should contain the relevant messages.
+    # If AI is responding TO a specific message (e.g., Reply, Keyword, AlwaysOn), that message is in history.
+    # For "Discovery", the triggering message is also in history.
+    
+    # Try to get the channel from the most recent message in history.
+    # This assumes history is always populated if this function is called.
+    channel_to_send_in: Optional[discord.abc.Messageable] = None
+    guild_for_log: Optional[discord.Guild] = None
+    message_to_reply_to: Optional[discord.Message] = None # The message object the AI is directly responding to
+
+    if history:
+        # The last message in history is typically the one that triggered the AI
+        # or the most recent context for an "AlwaysOn" trigger.
+        triggering_message_context = history[-1] 
+        channel_to_send_in = triggering_message_context.channel
+        guild_for_log = triggering_message_context.guild
+        if trigger_type not in ["Interject", "AlwaysOn"]: # Interject was removed, AlwaysOn sends to channel not reply
+             message_to_reply_to = triggering_message_context
+    else:
+        print(f"AI Error (send_ai_chat_response): History was empty for trigger '{trigger_type}'. Cannot determine channel.")
+        # Potentially log this error to your bot's error log
+        # await log_error(None, f"AI send_ai_chat_response error: History empty for trigger '{trigger_type}'.")
+        return
+
+    if not channel_to_send_in:
+        print(f"AI Error (send_ai_chat_response): Could not determine channel to send response for trigger '{trigger_type}'.")
+        return 
+
+    final_system_instruction = system_instruction_override or HUMAN_SYSTEM_INSTRUCTION
+    ai_response_processed = None
+
+    try:
+        # Typing indicator
+        typing_context = contextlib.nullcontext()
+        if isinstance(channel_to_send_in, discord.TextChannel): 
+            typing_context = channel_to_send_in.typing()
+
+        async with typing_context:
+             # For history, ensure it's formatted correctly if get_ai_response expects discord.Message objects
+             # The current get_ai_response formats it internally.
+             ai_response_raw = await get_ai_response(
+                 prompt=prompt_for_ai,
+                 history=history, 
+                 system_instruction=final_system_instruction
+             )
+
+        if not ai_response_raw:
+            await log_info(guild_for_log, f"AI for '{trigger_type}' (triggered by msg {history[-1].id if history else 'N/A'}) returned None or empty response.")
+            fail_msg = "... (couldn't think of a response right now)"
+            if trigger_type in ["AlwaysOn"]: await channel_to_send_in.send(fail_msg)
+            elif message_to_reply_to: await message_to_reply_to.reply(fail_msg, mention_author=False)
+            return
+
+        ai_response_processed = ai_response_raw.strip() 
+        if ai_response_processed.endswith(('.', '!', '?')):
+            ai_response_processed = ai_response_processed[:-1]
+        
+        bot_name_prefix_lower = "thenerd's pingslave:"
+        if ai_response_processed.lower().startswith(bot_name_prefix_lower):
+            ai_response_processed = ai_response_processed[len(bot_name_prefix_lower):].lstrip()
+
+        if len(ai_response_processed) > 1800: 
+             ai_response_processed = ai_response_processed[:1797] + "..."
+
+    except Exception as ai_call_err:
+        await log_error(guild_for_log, f"Error during get_ai_response for '{trigger_type}' (triggered by msg {history[-1].id if history else 'N/A'})", error=ai_call_err)
+        fail_msg = "... (ran into a snag trying to respond)"
+        if trigger_type in ["AlwaysOn"]: await channel_to_send_in.send(fail_msg)
+        elif message_to_reply_to: await message_to_reply_to.reply(fail_msg, mention_author=False)
+        return
+
+    if ai_response_processed:
+        final_message_content = ""
+        if trigger_type == "Discovery" and discovery_congrats_user and discovered_phrase_identifier:
+            final_message_content = (
+                f"# 🎉 \n woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: **'{discord.utils.escape_markdown(discovered_phrase_identifier)}'**! 🎉\n\n"
+                f"{ai_response_processed}"
+            )
+        else:
+            final_message_content = ai_response_processed
+        
+        if keyword_triggered_identifier and trigger_type == "Keyword":
+            final_message_content += f"\n*(You triggered the keyword: `{discord.utils.escape_markdown(keyword_triggered_identifier)}`)*"
+
+        try:
+            mention_author_flag = trigger_type in ["Reply", "Keyword", "Discovery"]
+            
+            if trigger_type in ["AlwaysOn"]: # "Interject" was removed
+                 await channel_to_send_in.send(f"{final_message_content}")
+            elif message_to_reply_to: 
+                 await message_to_reply_to.reply(f"{final_message_content}", mention_author=mention_author_flag)
+            else: 
+                 await channel_to_send_in.send(f"{final_message_content}")
+                 await log_info(guild_for_log, f"AI response for '{trigger_type}' sent to channel directly as message_to_reply_to was None (Msg ID: {history[-1].id if history else 'N/A'}).")
+
+        except (discord.Forbidden, discord.HTTPException) as reply_err:
+             await log_error(guild_for_log, f"Failed to send processed AI '{trigger_type}' response for msg {history[-1].id if history else 'N/A'}", error=reply_err)
 
 class HelpPagesView(discord.ui.View):
     def __init__(self, bot_user: discord.User, is_staff_view_allowed: bool, timeout=180.0):
@@ -5246,105 +5357,42 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         try: await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to wither {user.display_name}.", embed=None, view=None)
         except Exception: pass
 
-# --- Discord Events ---
 @bot.event
 async def on_message(message: discord.Message):
-    # --- Initial Checks: Ignore DMs, self, other bots ---
+    # --- Initial Checks: Ignore DMs (unless specifically handled later), self, other bots, no content ---
     if not message.guild or not bot.is_ready() or not bot.user or message.author.id == bot.user.id or message.author.bot:
+        return
+    if not message.content and not message.attachments: # Ignore messages with no text and no attachments
         return
 
     guild = message.guild
     channel = message.channel
     author = message.author
-    now = discord.utils.utcnow()
+    # now = discord.utils.utcnow() # Not used in this refactored version directly
 
     # --- Context Flags ---
     is_catercord = guild.id == CATERCORD_GUILD_ID
-    is_private_server = guild.id == PRIVATE_SERVER_ID
-    is_other_server = not is_catercord and not is_private_server
+    is_private_server = guild.id == PRIVATE_SERVER_ID 
     is_owner = author.id == OWNER_USER_ID
 
-    # Catercord specific channel checks
+    # Catercord specific channel checks for keyword discovery restrictions
     is_staff_channel_catercord = False
-    is_bot_commands_channel_catercord = False # Used for reply/mention AI cooldown bypass
+    is_bot_commands_channel_catercord = False # Used for keyword discovery restrictions
     if is_catercord:
         is_staff_channel_catercord = channel.id in STAFF_CHANNELS
-        is_bot_commands_channel_catercord = channel.id in BOT_COMMANDS_ALLOWED_CHANNEL_IDS # Check if current channel allows bot commands
+        is_bot_commands_channel_catercord = channel.id in BOT_COMMANDS_ALLOWED_CHANNEL_IDS
 
     # This flag is specifically for keyword discovery restrictions in Catercord
     is_restricted_keyword_discovery_channel_catercord = is_staff_channel_catercord or is_bot_commands_channel_catercord
 
 
-    # --- Shared AI Helper (send_ai_chat_response - same as your last version) ---
-    async def send_ai_chat_response(
-        trigger_type: str,
-        prompt_for_ai: str,
-        history: List[discord.Message],
-        system_instruction_override: Optional[str] = None,
-        discovery_congrats_user: Optional[discord.User] = None,
-        discovered_phrase_identifier: Optional[str] = None
-    ):
-        if not ai_model: return
-
-        final_system_instruction = system_instruction_override or HUMAN_SYSTEM_INSTRUCTION
-        ai_response_processed = None
-
-        try:
-            async with channel.typing():
-                 ai_response_raw = await get_ai_response(
-                     prompt=prompt_for_ai,
-                     history=history,
-                     system_instruction=final_system_instruction
-                 )
-
-            if not ai_response_raw:
-                await log_info(guild, f"AI for '{trigger_type}' trigger ({message.id}) returned None or empty response.")
-                fail_msg = "... (couldn't think of a response right now)"
-                if trigger_type == "Interject": await channel.send(fail_msg)
-                else: await message.reply(fail_msg, mention_author=False)
-                return
-
-            ai_response_processed = ai_response_raw.lower().strip()
-            if ai_response_processed.endswith(('.', '!', '?')):
-                ai_response_processed = ai_response_processed[:-1]
-            if len(ai_response_processed) > 400:
-                 ai_response_processed = ai_response_processed[:397] + "..."
-
-        except Exception as ai_call_err:
-            await log_error(guild, f"Error during get_ai_response for '{trigger_type}' ({message.id})", error=ai_call_err)
-            fail_msg = "... (ran into a snag trying to respond)"
-            if trigger_type == "Interject": await channel.send(fail_msg)
-            else: await message.reply(fail_msg, mention_author=False)
-            return
-
-        if ai_response_processed:
-            final_message_content = ""
-            if trigger_type == "Discovery" and discovery_congrats_user and discovered_phrase_identifier:
-                final_message_content = (
-                    f"# 🎉 \n woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: **'{discovered_phrase_identifier}'**! 🎉\n\n"
-                    f"{ai_response_processed}"
-                )
-            else:
-                final_message_content = ai_response_processed
-
-            try:
-                mention_author_flag = trigger_type in ["Reply", "Keyword", "Discovery"]
-                if trigger_type == "Interject":
-                     await channel.send(f"{final_message_content}")
-                else:
-                     await message.reply(f"{final_message_content}", mention_author=mention_author_flag)
-            except (discord.Forbidden, discord.HTTPException) as reply_err:
-                 await log_error(guild, f"Failed to send processed AI '{trigger_type}' response for msg {message.id}", error=reply_err)
-
-    # --- Image Processing for Name Extraction & Activity Update ---
+    # --- 1. Image Processing for Name Extraction & Activity Update ---
     if message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
         valid_image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
-
         if valid_image_attachments:
             num_images = len(valid_image_attachments)
             print(f"{num_images} image(s) received in #{channel.name} from {author.name}. Processing for activity...")
             
-            # Send initial processing message, PINGING the author
             processing_reply_content = f"{author.mention} ⏳ Analyzing {num_images} image(s) for online player names and activity updates..."
             processing_reply = await message.reply(processing_reply_content, allowed_mentions=discord.AllowedMentions(users=[author]))
 
@@ -5353,15 +5401,13 @@ async def on_message(message: discord.Message):
             ai_reported_no_names_at_least_once = False
             ai_extracted_some_text_globally = False
 
-            # Get today's date for activity logging
             activity_date, date_error = get_utc_date()
             if date_error or not activity_date:
                 await processing_reply.edit(content=f"{author.mention} ❌ Error: Could not determine today's date for activity logging.")
-                await log_error(guild, f"Screenshot activity error: Failed to get today's date ({date_error})", interaction=message)
+                await log_error(guild, f"Screenshot activity error: Failed to get today's date ({date_error})", interaction=message) # interaction should be message
                 return
 
             try:
-                # --- AI Image Analysis Loop (Identical to your provided code) ---
                 known_igns_str_for_prompt = "\n".join(ingame_name_cache) if ingame_name_cache else "No known names provided."
                 current_extraction_prompt = FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE.format(
                     known_igns_list_str=known_igns_str_for_prompt
@@ -5398,10 +5444,7 @@ async def on_message(message: discord.Message):
                     except Exception as e_single_img_proc:
                         print(f"Error processing image {idx + 1} (Filename: {image_att.filename}, ID: {image_att.id}): {e_single_img_proc}")
                         await log_error(guild, f"Error during single image processing (message {message.id}, attachment {image_att.filename})", error=e_single_img_proc)
-                # --- End AI Image Analysis Loop ---
-
-
-                # --- Log Discarded Names (Identical to your provided code) ---
+                
                 discarded_by_cache_check: List[str] = []
                 if ai_extracted_some_text_globally:
                     matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
@@ -5430,10 +5473,9 @@ async def on_message(message: discord.Message):
                     error_embed_discarded.set_footer(text=f"Message ID: {message.id} | User: {message.author.name}")
                     await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=error_embed_discarded)
                     print(f"Logged discarded AI names to extraordinary logs: {discarded_by_cache_check}")
-                # --- End Log Discarded Names ---
 
                 # --- Process Activity Updates ---
-                newly_added_details_for_view: List[Dict[str, Any]] = [] # For view: {'ign': str, 'status': 'active_by_view'}
+                newly_added_details_for_view: List[Dict[str, Any]] = [] 
                 already_active_today_for_view: List[str] = []
                 failed_to_add_for_view: List[str] = []
                 activity_changed = False
@@ -5444,9 +5486,22 @@ async def on_message(message: discord.Message):
                         final_user_message = f"{author.mention} AI analysis of {num_images} image(s) complete: No online player names (from our known list, with green dots) were clearly identified in any of the images."
                     elif not ai_extracted_some_text_globally and not ai_reported_no_names_at_least_once:
                         final_user_message = f"{author.mention} AI analysis ran into an issue or returned no usable data from any of the {num_images} image(s)."
-                    else: # Some text found, but no matches after filtering
+                    else: 
                         final_user_message = f"{author.mention} AI analysis of {num_images} image(s) complete. Some text may have been identified, but it didn't match our known online In-Game Names list or meet all specified criteria (e.g., green dot for online status)."
-                    await processing_reply.edit(content=final_user_message, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    
+                    # --- MODIFICATION FOR EDITING processing_reply ---
+                    try:
+                        await processing_reply.edit(content=final_user_message, allowed_mentions=discord.AllowedMentions(users=[author]), embed=None, view=None)
+                    except discord.NotFound: # Specifically catch NotFound (Unknown Message)
+                        print(f"Screenshot processing: 'processing_reply' (ID: {processing_reply.id}) not found for edit. Sending new followup to original message.")
+                        # Send a new message replying to the original user's message
+                        await message.reply(final_user_message, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    except discord.HTTPException as e_edit_http:
+                        await log_error(guild, f"Screenshot processing: HTTP error editing 'processing_reply' for no matched names.", error=e_edit_http, interaction=message)
+                        # Fallback to sending new message if edit failed for other HTTP reasons
+                        await message.reply(final_user_message, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    # --- END MODIFICATION ---
+
                 else:
                     # Iterate through matched IGNs to update activity
                     for ign_str in all_matched_igns_from_all_images:
@@ -5480,10 +5535,22 @@ async def on_message(message: discord.Message):
                     )
                     final_embed = confirm_view.create_embed()
                     
-                    # Edit the processing_reply to show the final embed and view
-                    # The content still pings the author.
-                    edited_message = await processing_reply.edit(content=f"{author.mention}", embed=final_embed, view=confirm_view, allowed_mentions=discord.AllowedMentions(users=[author]))
-                    confirm_view.message = edited_message # Link the message to the view for on_timeout edits
+                    # --- MODIFICATION FOR EDITING processing_reply ---
+                    edited_message: Optional[discord.Message] = None
+                    try:
+                        edited_message = await processing_reply.edit(content=f"{author.mention}", embed=final_embed, view=confirm_view, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    except discord.NotFound: # Specifically catch NotFound (Unknown Message)
+                        print(f"Screenshot processing: 'processing_reply' (ID: {processing_reply.id}) not found for edit. Sending new followup to original message.")
+                        # Send a new message replying to the original user's message, with the view and embed
+                        edited_message = await message.reply(content=f"{author.mention}", embed=final_embed, view=confirm_view, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    except discord.HTTPException as e_edit_http:
+                        await log_error(guild, f"Screenshot processing: HTTP error editing 'processing_reply' with results.", error=e_edit_http, interaction=message)
+                        # Fallback to sending new message if edit failed for other HTTP reasons
+                        edited_message = await message.reply(content=f"{author.mention}", embed=final_embed, view=confirm_view, allowed_mentions=discord.AllowedMentions(users=[author]))
+                    # --- END MODIFICATION ---
+                    
+                    if edited_message: # Ensure we got a message object back
+                        confirm_view.message = edited_message # Link the message to the view for on_timeout edits
 
                     if activity_changed:
                         await log_info(guild, f"Screenshot by {author.name} processed. Newly active: {len(newly_added_details_for_view)}, Already active: {len(already_active_today_for_view)}. Triggering list update.")
@@ -5493,103 +5560,131 @@ async def on_message(message: discord.Message):
 
             except Exception as e_img_pipeline:
                 print(f"Critical error during screenshot activity processing pipeline for message {message.id}: {e_img_pipeline}")
+                traceback.print_exc() # Print full traceback for this specific error
                 await log_error(guild, "Critical error during screenshot activity processing", error=e_img_pipeline, ping_owner=True)
+                # --- MODIFICATION FOR EDITING processing_reply (Error Case) ---
+                critical_error_message_content = f"{author.mention} Sorry, a critical unexpected error occurred while processing the {num_images} image(s). Admins have been notified."
                 try:
-                    await processing_reply.edit(content=f"{author.mention} Sorry, a critical unexpected error occurred while processing the {num_images} image(s). Admins have been notified.", allowed_mentions=discord.AllowedMentions(users=[author]))
-                except Exception: pass
-            
-            return # Image processing handled, no further message processing needed.
+                    await processing_reply.edit(content=critical_error_message_content, allowed_mentions=discord.AllowedMentions(users=[author]), embed=None, view=None)
+                except discord.NotFound:
+                    print(f"Screenshot processing: 'processing_reply' (ID: {processing_reply.id}) not found for critical error edit. Sending new followup.")
+                    await message.reply(critical_error_message_content, allowed_mentions=discord.AllowedMentions(users=[author]))
+                except discord.HTTPException as e_edit_crit_http:
+                    await log_error(guild, f"Screenshot processing: HTTP error editing 'processing_reply' for critical error.", error=e_edit_crit_http, interaction=message)
+                    await message.reply(critical_error_message_content, allowed_mentions=discord.AllowedMentions(users=[author]))
+                except Exception as e_final_send_crit:
+                     print(f"Failed to send critical error message to user after pipeline failure: {e_final_send_crit}")
+                # --- END MODIFICATION ---
+            return # Image processing handled.
 
-    # --- 1. Reply/Mention Trigger ---
+    # --- 2. Always-On AI Channels (Responds to every message) ---
+    if ai_model and channel.id in ALWAYS_ON_AI_CHANNELS and not message.content.startswith(COMMAND_PREFIX):
+        print(f"AI Trigger: Always-On Channel Message by {author.name} in #{channel.name}")
+        history = []
+        try:
+            async for msg_hist in channel.history(limit=10, before=message):
+                history.append(msg_hist)
+            history.reverse() # Oldest to newest
+            history.append(message) # Add current message to history for AI context
+        except Exception as e:
+            print(f"Error fetching history for AI AlwaysOn: {e}")
+            history.append(message) # At least have the current message
+
+        cleaned_prompt = message.content
+        if not cleaned_prompt.strip() and message.stickers:
+            cleaned_prompt = f"(User sent a sticker: {message.stickers[0].name})"
+        elif not cleaned_prompt.strip():
+             cleaned_prompt = "(User sent an empty or attachment-only message that wasn't an image)"
+
+        await send_ai_chat_response(
+            trigger_type="AlwaysOn",
+            prompt_for_ai=cleaned_prompt, # The AI will see the full message via history
+            history=history
+        )
+        return # Message handled by AlwaysOn AI
+
+    # --- 3. Reply/Mention Trigger ---
     should_trigger_reply_mention = False
     is_reply_to_bot = False
     bot_mention_formats = [f'<@{bot.user.id}>', f'<@!{bot.user.id}>']
 
     if message.reference and message.reference.message_id:
         try:
-            ref_msg = message.reference.resolved or await channel.fetch_message(message.reference.message_id)
+            ref_msg = message.reference.resolved
+            if not ref_msg and message.reference.channel_id == channel.id :
+                ref_msg = await channel.fetch_message(message.reference.message_id)
+            
             if ref_msg and ref_msg.author.id == bot.user.id:
                 should_trigger_reply_mention = True
                 is_reply_to_bot = True
-        except Exception: pass # Ignore errors fetching reference
+        except Exception as e_ref:
+            print(f"Minor error fetching referenced message for reply check: {e_ref}")
 
     if not should_trigger_reply_mention and any(mention in message.content for mention in bot_mention_formats):
         should_trigger_reply_mention = True
 
-    if should_trigger_reply_mention:
-        # --- Cooldown Check for Reply/Mention in Catercord ---
-        # Apply cooldown if in Catercord AND NOT in one of the allowed bot command channels
-        apply_reply_mention_cooldown = is_catercord and not is_bot_commands_channel_catercord
+    if ai_model and should_trigger_reply_mention:
+        # If in Catercord AND not an always-on channel, show the "psst" message.
+        if is_catercord and channel.id not in ALWAYS_ON_AI_CHANNELS:
+            clickable_channel = f"<#{UNRESTRICTED_AI_CHANNEL_ID}>" # This is an always-on channel
+            info_message_text = (
+                f"ℹ️ Psst! You can chat with me freely in {clickable_channel} "
+                f"for AI-powered conversations! This message will disappear shortly."
+            )
+            try:
+                await message.reply(info_message_text, mention_author=False, delete_after=7.0)
+            except (discord.Forbidden, discord.HTTPException) as info_reply_err:
+                print(f"Error sending AI channel info message: {info_reply_err}")
+            return # Do not proceed with AI response in this restricted context
 
-        if apply_reply_mention_cooldown:
-            cooldown_end_time = user_reply_mention_cooldowns.get(author.id)
-            if cooldown_end_time and now < cooldown_end_time:
-                # User is on cooldown
-                cooldown_message_text = f"⏳ AI responses via reply/ping in this channel are on a cooldown. Please use <#{UNRESTRICTED_AI_CHANNEL_ID}> for unrestricted access."
-                try:
-                    await message.reply(cooldown_message_text, mention_author=False, delete_after=4.0)
-                except (discord.Forbidden, discord.HTTPException) as cd_reply_err:
-                    print(f"Error sending reply/mention AI cooldown message: {cd_reply_err}")
-                return # Stop processing for AI reply/mention
+        # Proceed with AI response if:
+        # 1. In an ALWAYS_ON_AI_CHANNELS (Catercord or otherwise if you expand that set).
+        # 2. In any other server (not Catercord) where the bot is a full guild member.
+        #    (Full guild member check: guild.me and guild.me.joined_at)
+        can_respond_here = False
+        if channel.id in ALWAYS_ON_AI_CHANNELS: # This covers the main AI channel in Catercord
+            can_respond_here = True
+        elif not is_catercord and guild.me and guild.me.joined_at: # Other servers, if bot is full member
+            can_respond_here = True
+        
+        if can_respond_here:
+            print(f"AI Trigger: Reply/Mention by {author.name} in #{channel.name}")
+            history = []
+            try:
+                async for msg_hist in channel.history(limit=10, before=message):
+                    history.append(msg_hist)
+                history.reverse()
+                history.append(message) # Add current message to history
+            except Exception as e:
+                print(f"Error fetching history for AI reply/mention: {e}")
+                history.append(message)
 
-            # If not on cooldown, set it now for this user for the specified duration
-            user_reply_mention_cooldowns[author.id] = now + datetime.timedelta(minutes=REPLY_MENTION_COOLDOWN_MINUTES)
-            print(f"AI Reply/Mention Cooldown set for user {author.id} ({author.name}) in Catercord channel {channel.id} until {user_reply_mention_cooldowns[author.id].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            cleaned_prompt = message.content
+            for mention in bot_mention_formats:
+                cleaned_prompt = cleaned_prompt.replace(mention, "").strip()
+            if not cleaned_prompt.strip() and message.stickers:
+                 cleaned_prompt = f"(User replied/mentioned with a sticker: {message.stickers[0].name})"
+            elif not cleaned_prompt.strip():
+                cleaned_prompt = "(just replied/mentioned, no extra text)"
 
-        # --- Proceed with AI response logic ---
-        print(f"AI Trigger: Reply/Mention by {author} in #{channel.name}")
-        history = []
-        try:
-            async for msg_hist in channel.history(limit=10, before=message): history.append(msg_hist)
-            history.reverse()
-        except Exception as e: print(f"Error fetching history for AI reply/mention: {e}")
+            await send_ai_chat_response(
+                trigger_type="Reply" if is_reply_to_bot else "Mention",
+                prompt_for_ai=cleaned_prompt, # The AI will see the full message via history
+                history=history
+            )
+            return # Handled by AI reply/mention
+        # else: If not can_respond_here (e.g. Catercord restricted channel, or user-app in other server), do nothing for reply/mention.
 
-        cleaned_prompt = message.content
-        for mention in bot_mention_formats: cleaned_prompt = cleaned_prompt.replace(mention, "").strip()
-        if not cleaned_prompt: cleaned_prompt = "(just replied/mentioned, no extra text)"
-
-        await send_ai_chat_response(
-            trigger_type="Reply" if is_reply_to_bot else "Mention",
-            prompt_for_ai=cleaned_prompt,
-            history=history
-        )
-        return # Handled by AI reply/mention
-
-    # --- 2. Random Interjection Logic (Unchanged from your previous version) ---
-    allow_interjection = True
-    # HC_MEMBER_LIST_CHANNEL_ID is a BOT_COMMANDS_ALLOWED_CHANNEL_ID, so interjections would be disabled by the above.
-    # If you needed a more specific check for interjection in HC_MEMBER_LIST_CHANNEL_ID, it would go here.
-    # For now, the general disable in Catercord covers it.
-
-    if allow_interjection and ai_model:
-        channel_id = channel.id
-        data = channel_interjection_data[channel_id]
-        data['count'] += 1
-        if data['count'] >= data['target']:
-            can_interject = data['last_interject_time'] is None or (now - data['last_interject_time']) >= RANDOM_INTERJECT_COOLDOWN
-            if can_interject:
-                print(f"AI Trigger: Random interjection in #{channel.name}")
-                data['count'] = 0
-                data['target'] = random.randint(RANDOM_INTERJECT_MIN_MSGS, RANDOM_INTERJECT_MAX_MSGS)
-                data['last_interject_time'] = now
-                history = []
-                try:
-                    async for msg_hist in channel.history(limit=6, before=message): history.append(msg_hist)
-                    history.reverse()
-                except Exception as e: print(f"Error fetching history for AI interject: {e}")
-                interject_prompt = "briefly chime in based on the last few messages"
-                await send_ai_chat_response(trigger_type="Interject", prompt_for_ai=interject_prompt, history=history)
-                # Allow keyword check to happen after interjection
-
-    # --- 3. Keyword Detection Logic (Unchanged from your previous correct version) ---
-    if keyword_data_cache:
+    # --- 4. Keyword Detection Logic ---
+    if ai_model and keyword_data_cache:
         message_content_lower = message.content.lower()
-        global discovered_keywords_count # Make sure this is accessible if you're modifying it
+        # global discovered_keywords_count # Already global
 
         for rule_id_str, rule_data in keyword_data_cache.items():
             try:
-                if not all(k in rule_data for k in ['inclusion_regex', 'phrase_identifier', 'speciality', 'instructions']):
+                if not isinstance(rule_data, dict) or not all(k in rule_data for k in ['inclusion_regex', 'phrase_identifier', 'speciality', 'instructions']):
                     continue
+
                 if rule_data.get('exclusion_regex') and rule_data['exclusion_regex'].search(message_content_lower):
                     continue
                 if not rule_data['inclusion_regex'].search(message_content_lower):
@@ -5601,27 +5696,33 @@ async def on_message(message: discord.Message):
                 if not rule_is_discovered:
                     can_discover_this_rule = False
                     discovery_context_server = ""
-                    # Use is_restricted_keyword_discovery_channel_catercord for discovery restriction
+                    
                     if is_catercord and not is_restricted_keyword_discovery_channel_catercord and not is_owner:
                         can_discover_this_rule = True
-                        discovery_context_server = "Catercord"
-                    elif is_private_server and is_owner: # Owner can discover in private server
+                        discovery_context_server = "Catercord (Public Channel)"
+                    elif is_private_server and is_owner:
                         can_discover_this_rule = True
-                        discovery_context_server = "Private Server"
+                        discovery_context_server = "Private Server (Owner Discovery)"
 
                     if can_discover_this_rule:
-                        print(f"Keyword DISCOVERY: '{phrase_identifier}' by {author} ({author.id}) in #{channel.name} ({guild.name} - {discovery_context_server} context)")
+                        print(f"Keyword DISCOVERY: '{phrase_identifier}' by {author.name} ({author.id}) in #{channel.name} ({guild.name} - {discovery_context_server})")
                         discovery_time = discord.utils.utcnow()
                         db_recorded = await record_discovery_in_db(guild, rule_id_str, author.id, discovery_time)
                         if db_recorded:
                             keyword_data_cache[rule_id_str]['discovered_by'] = str(author.id)
                             keyword_data_cache[rule_id_str]['discovered_at'] = discovery_time
                             discovered_keywords_count += 1
+                            
                             history = []
                             try:
-                                async for hist_msg in channel.history(limit=5, before=message): history.append(hist_msg)
+                                async for hist_msg in channel.history(limit=5, before=message):
+                                    history.append(hist_msg)
                                 history.reverse()
-                            except Exception as e: print(f"Error fetching history for keyword discovery AI: {e}")
+                                history.append(message) # Add current message
+                            except Exception as e: 
+                                print(f"Error fetching history for keyword discovery AI: {e}")
+                                history.append(message)
+                            
                             discovery_ai_prompt = f"user message: '{message.content}' (triggered first discovery of keyword: '{phrase_identifier}')"
                             discovery_system_instruction = (
                                 f"You are a helpful and slightly playful bot. A user just made the FIRST EVER discovery of your secret keyword phrase '{phrase_identifier}'.\n"
@@ -5629,7 +5730,7 @@ async def on_message(message: discord.Message):
                                 f"2. Then, seamlessly transition into a creative, human-like response related to their triggering message, keeping in mind the keyword's theme.\n"
                                 f"   - Keyword Theme/Speciality: {rule_data.get('speciality', 'General')}\n"
                                 f"   - Specific Instructions: {rule_data.get('instructions', 'Respond naturally and engagingly.')}\n"
-                                f"Keep the entire response concise and conversational, like a human."
+                                f"Keep the entire response concise and conversational, like a human. Do not refer to yourself in the third person."
                             )
                             await send_ai_chat_response(
                                 trigger_type="Discovery",
@@ -5639,70 +5740,70 @@ async def on_message(message: discord.Message):
                                 discovery_congrats_user=author,
                                 discovered_phrase_identifier=phrase_identifier
                             )
-                            keyword_cooldowns[rule_id_str] = now + datetime.timedelta(minutes=KEYWORD_COOLDOWN_MINUTES)
                             break 
                         else:
-                            await log_error(guild, f"Failed to record discovery in DB for '{phrase_identifier}' by {author}.", ping_owner=True)
+                            await log_error(guild, f"Failed to record discovery in DB for '{phrase_identifier}' by {author.name}.", ping_owner=True)
                         continue 
 
-                # Triggering logic (if rule IS discovered)
                 if keyword_data_cache[rule_id_str].get('discovered_by'):
                     can_trigger_this_rule = False
                     trigger_context_server = ""
-                    # Use is_restricted_keyword_discovery_channel_catercord for triggering restriction as well
+                    
                     if is_catercord and not is_restricted_keyword_discovery_channel_catercord:
                         can_trigger_this_rule = True
-                        trigger_context_server = "Catercord"
-                    elif is_private_server and is_owner: # Owner can trigger in private server
+                        trigger_context_server = "Catercord (Public Channel)"
+                    elif is_private_server and is_owner:
                         can_trigger_this_rule = True
-                        trigger_context_server = "Private Server (Owner)"
-                    elif is_other_server: # Unrestricted trigger in other servers
+                        trigger_context_server = "Private Server (Owner Trigger)"
+                    elif not is_catercord and not is_private_server and guild.me and guild.me.joined_at: # Other servers, full member
                         can_trigger_this_rule = True
-                        trigger_context_server = "Other Server"
-
+                        trigger_context_server = f"Other Server ({guild.name})"
+                    
                     if can_trigger_this_rule:
-                        cooldown_end_time = keyword_cooldowns.get(rule_id_str)
-                        if cooldown_end_time and now < cooldown_end_time:
-                            remaining_seconds = (cooldown_end_time - now).total_seconds()
-                            formatted_time = format_time_difference(remaining_seconds)
-                            cooldown_msg_content = f"⏳ Keyword '{phrase_identifier}' is on cooldown. Try again in {formatted_time}."
-                            try:
-                                await message.reply(cooldown_msg_content, mention_author=False, delete_after=4.0)
-                            except (discord.Forbidden, discord.HTTPException) as cd_reply_err:
-                                print(f"Error sending keyword cooldown reply: {cd_reply_err}")
-                            continue 
-
-                        print(f"Keyword TRIGGER: '{phrase_identifier}' by {author} in #{channel.name} ({guild.name} - {trigger_context_server} context)")
+                        # REMOVED COOLDOWN CHECK AND SETTING FOR KEYWORD TRIGGERS
+                        print(f"Keyword TRIGGER: '{phrase_identifier}' by {author.name} in #{channel.name} ({guild.name} - {trigger_context_server})")
                         history = []
                         try:
-                            async for hist_msg in channel.history(limit=5, before=message): history.append(hist_msg)
+                            async for hist_msg in channel.history(limit=5, before=message):
+                                history.append(hist_msg)
                             history.reverse()
-                        except Exception as e: print(f"Error fetching history for keyword AI: {e}")
+                            history.append(message) # Add current message
+                        except Exception as e: 
+                            print(f"Error fetching history for keyword AI: {e}")
+                            history.append(message)
+                        
                         keyword_ai_prompt = f"keyword '{phrase_identifier}' triggered by message: '{message.content}'"
                         keyword_system_instruction = (
                             f"{HUMAN_SYSTEM_INSTRUCTION}\n\n"
                             f"CONTEXT: Respond to a user message that triggered the keyword '{phrase_identifier}'.\n"
                             f"SPECIALITY: {rule_data.get('speciality', 'General')}\n"
                             f"INSTRUCTIONS: {rule_data.get('instructions', 'Respond naturally.')}\n"
-                            f"Focus on the user's triggering message, using history for context."
+                            f"Focus on the user's triggering message, using history for context. Do not refer to yourself in third person."
                         )
                         await send_ai_chat_response(
                             trigger_type="Keyword",
                             prompt_for_ai=keyword_ai_prompt,
                             history=history,
-                            system_instruction_override=keyword_system_instruction
+                            system_instruction_override=keyword_system_instruction,
+                            keyword_triggered_identifier=phrase_identifier
                         )
-                        keyword_cooldowns[rule_id_str] = now + datetime.timedelta(minutes=KEYWORD_COOLDOWN_MINUTES)
                         break 
             except Exception as e_rule:
-                 await log_error(guild, f"Error processing keyword rule '{rule_data.get('phrase_identifier', rule_id_str)}'", error=e_rule)
+                 await log_error(guild, f"Error processing keyword rule '{rule_data.get('phrase_identifier', rule_id_str if isinstance(rule_id_str, str) else 'UnknownID')}'", error=e_rule)
 
-    # --- 4. Auto-Delete Logic (Unchanged from your previous version) ---
+    # --- 5. Auto-Delete Logic for HC_MEMBER_LIST_CHANNEL_ID ---
     if channel.id == HC_MEMBER_LIST_CHANNEL_ID:
         if message.interaction is not None and author.id == bot.user.id:
-            try: await message.delete(delay=AUTODELETE_DELAY_SECONDS)
-            except Exception: pass
-            finally: return
+            try:
+                await message.delete(delay=AUTODELETE_DELAY_SECONDS)
+            except discord.Forbidden:
+                print(f"Failed to auto-delete message {message.id} in HC list channel: Missing Permissions.")
+            except discord.NotFound:
+                pass 
+            except Exception as e_del:
+                print(f"Error auto-deleting message {message.id} in HC list channel: {e_del}")
+            finally:
+                return
 
 # NEW Command: Add Keyword (Owner Only)
 @tree.command(name="addkeyword", description="[Owner Only] Add a new keyword rule to the database.")
