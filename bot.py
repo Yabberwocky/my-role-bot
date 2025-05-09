@@ -4999,6 +4999,7 @@ async def syncnicknames(interaction: discord.Interaction):
 
 
 # --- Wither Command ---
+# --- Wither Command (MODIFIED - Invoker Hierarchy Check Removed) ---
 @tree.command(name="wither", description="Temporarily remove roles from a user.")
 @app_commands.describe(
     user="User to wither.",
@@ -5026,7 +5027,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
             print(f"Wither Check Fail Send Error (Unknown): {e}")
         await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
 
-    # 1. Permission Check (Invoker) - MODIFIED
+    # 1. Permission Check (Invoker)
     invoker_can_wither = False
     permission_denied_message = "❌ You do not have permission to use this command." # Default
 
@@ -5059,15 +5060,20 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
             print(f"Warning: Interaction {interaction.id} was already responded to before public defer in wither.")
             pass
 
-    # 3. Target Checks (Self, Protected, Bot, Hierarchy)
+    # 3. Target Checks (Self, Protected, Bot, Bot Hierarchy)
     if user.id == invoker.id: await fail_check("Target self.", "🤨 You cannot wither yourself."); return
     if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>)."); return
     if user.id == BOT_USER_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
     if user.bot: await fail_check("Target other bot.", "🤖 You cannot wither other bots."); return
     if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target guild owner.", f"👑 You cannot wither the server owner (<@{guild.owner_id}>)."); return
+    # Bot hierarchy check (Bot must be able to manage target's roles)
     if bot_member.top_role.position <= user.top_role.position: await fail_check("Bot hierarchy low.", f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles."); return
-    if invoker.id != guild.owner_id and isinstance(invoker, discord.Member) and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", f"❌ Your highest role ('{invoker.top_role.name}') is not high enough to wither {user.mention}."); return
+    # --- Invoker hierarchy check REMOVED ---
+    # if invoker.id != guild.owner_id and isinstance(invoker, discord.Member) and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", f"❌ Your highest role ('{invoker.top_role.name}') is not high enough to wither {user.mention}."); return
+    
+    # Bot permissions check
     if not bot_member.guild_permissions.manage_roles: await fail_check("Bot missing manage_roles perm.", "❌ I lack the `Manage Roles` permission needed for this command."); return
+
 
     # 4. Get Original Roles (excluding @everyone)
     original_roles = [r for r in user.roles if r.id != guild.default_role.id]
@@ -5176,8 +5182,6 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
             if guild.id == RANDOM_SERVER_ID:
                 withered_role_random_obj = guild.get_role(WITHERED_ROLE_ID_RANDOM_SERVER)
                 if withered_role_random_obj and withered_role_random_obj in member_after.roles:
-                    # The role `withered_role_random_obj` will be removed because it's not in `final_roles_to_set`
-                    # (unless it was one of the original_roles, which is unlikely for a wither role)
                     if bot_member_after.top_role.position > withered_role_random_obj.position:
                          special_wither_role_removed_msg_part = f"\n*(Special withered role `{withered_role_random_obj.name}` removed.)*"
                          await log_info(guild, f"Wither Restore: Removing special role {withered_role_random_obj.name} from {member_after.name} in {RANDOM_SERVER_ID}.")
