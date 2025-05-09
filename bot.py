@@ -168,6 +168,10 @@ AVATAR_CHOICE_EVIL = "Evil Caterpillar Avatar"
 AVATAR_CHOICE_GOOD = "Good Caterpillar Avatar"
 AVATAR_CHOICE_NERD = "Nerd Bot Avatar" # Renamed for clarity, or keep as "Nerd Avatar"
 BOT_INSTANCE_TYPE = os.getenv("BOT_INSTANCE_TYPE", "PRODUCTION").upper()
+PETALS_FOLDER_NAME = "Petals"
+MOBS_FOLDER_NAME = "Mobs"
+available_profile_pics_cache: List[Tuple[str, str, str]] = []
+PROFILE_PIC_BASE_PATH = "" # Will be set in on_ready to the script's directory
 
 # --- Supabase Client ---
 supabase: Optional[Client] = None
@@ -197,6 +201,76 @@ def run_flask():
 def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True); flask_thread.start(); print("Keep alive thread initiated.")
 
 # --- Utility Functions ---
+
+async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    choices = []
+    current_lower = current.lower()
+    
+    if not available_profile_pics_cache:
+        return [app_commands.Choice(name="Error: No images loaded, try later or /refresh", value="error_no_images_loaded")]
+
+    for display_name, folder_id, filename_with_ext in available_profile_pics_cache:
+        if not current_lower or current_lower in display_name.lower(): # Show all if current is empty
+            # Value format: "FolderName:filename_with_ext.png"
+            choice_value = f"{folder_id}:{filename_with_ext}"
+            
+            # Ensure choice name and value are within Discord's limits (100 chars)
+            safe_display_name = (display_name[:97] + "...") if len(display_name) > 100 else display_name
+            safe_choice_value = (choice_value[:97] + "...") if len(choice_value) > 100 else choice_value
+            
+            choices.append(app_commands.Choice(name=safe_display_name, value=safe_choice_value))
+        
+        if len(choices) >= 25: # Discord's limit for autocomplete suggestions
+            break
+            
+    if not choices and current: # If user typed something but no matches
+        return [app_commands.Choice(name=f"No matches for '{current}'", value="error_no_matches_found")]
+        
+    return choices
+
+async def load_profile_picture_choices(guild_for_log: Optional[discord.Guild]):
+    global available_profile_pics_cache, PROFILE_PIC_BASE_PATH
+    available_profile_pics_cache.clear()
+    
+    # Determine the base path relative to this script file
+    # This ensures it works correctly on Render
+    PROFILE_PIC_BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+    
+    folders_to_scan = {
+        PETALS_FOLDER_NAME: os.path.join(PROFILE_PIC_BASE_PATH, PETALS_FOLDER_NAME),
+        MOBS_FOLDER_NAME: os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
+    }
+    
+    loaded_count = 0
+    for folder_id, folder_path in folders_to_scan.items():
+        if not os.path.isdir(folder_path):
+            print(f"Warning: Profile picture folder not found: {folder_path}")
+            if guild_for_log:
+                 await log_info(guild_for_log, f"Profile picture folder '{folder_id}' not found at '{folder_path}'. Choices from this folder will be unavailable.")
+            continue
+            
+        try:
+            for filename in os.listdir(folder_path):
+                if filename.lower().endswith(".png"):
+                    # Display name: filename without .png, spaces for underscores, title case
+                    display_name = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ").title()
+                    available_profile_pics_cache.append((display_name, folder_id, filename))
+                    loaded_count += 1
+        except OSError as e:
+            print(f"Error scanning folder {folder_path}: {e}")
+            if guild_for_log:
+                 await log_error(guild_for_log, f"Error scanning profile picture folder {folder_path}", error=e)
+
+    if available_profile_pics_cache:
+        # Sort by display name for consistent autocomplete
+        available_profile_pics_cache.sort(key=lambda x: x[0])
+        print(f"Loaded {loaded_count} profile picture choices from folders: {', '.join(folders_to_scan.keys())}.")
+        if guild_for_log:
+            await log_info(guild_for_log, f"Successfully loaded {loaded_count} profile picture choices.")
+    else:
+        print("No profile picture choices loaded. Folders might be empty or missing.")
+        if guild_for_log:
+             await log_info(guild_for_log, "No profile picture choices were loaded (folders empty or not found).")
 
 async def test_bot_owner_only_check(interaction: discord.Interaction) -> bool:
     """
@@ -3220,6 +3294,9 @@ async def on_ready():
     await load_keyword_data(log_guild_for_data_load) # Load keywords
     await load_ign_cache(log_guild_for_data_load) # Load IGN cache
 
+    print("Loading profile picture choices...")
+    await load_profile_picture_choices(log_guild_for_data_load)
+
     # --- START: Staff Channel Identification ---
     print("Identifying staff channels in target guild...")
     STAFF_CHANNELS.clear() # Clear previous findings
@@ -6042,6 +6119,114 @@ async def say(
             except Exception as e_del:
                 # Log if webhook deletion fails, but don't bother the user
                 await log_error(guild, f"Failed to delete temporary webhook for /say command. Webhook ID: {temp_webhook.id}", error=e_del)
+
+@tree.command(name="post_as", description="Send a message with a custom name and a chosen profile picture.")
+@app_commands.describe(
+    custom_name="The name to display for the message (1-80 characters).",
+    profile_picture="Choose a profile picture from the list.",
+    message_content="The content of the message to send."
+)
+@app_commands.autocomplete(profile_picture=profile_pic_autocomplete)
+@app_commands.check(test_bot_owner_only_check) # Keep for testing consistency
+@app_commands.checks.bot_has_permissions(manage_webhooks=True) # Bot needs to create webhooks
+async def post_as(
+    interaction: discord.Interaction,
+    custom_name: str,
+    profile_picture: str, # This will be "FolderName:filename.png"
+    message_content: str
+):
+    if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
+        return
+
+    target_channel: discord.TextChannel = interaction.channel
+    guild = interaction.guild
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Validate custom_name (same as existing /say)
+    cleaned_name = custom_name.strip()
+    if not (1 <= len(cleaned_name) <= 80):
+        await interaction.followup.send("❌ Custom name must be 1-80 characters long.", ephemeral=True)
+        return
+    disallowed_in_names = ["@", "#", ":", "```", "discord"] # Common disallowed characters
+    if any(disallowed in cleaned_name.lower() for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
+        await interaction.followup.send(f"❌ The custom name '{cleaned_name}' contains disallowed characters or is a reserved name.", ephemeral=True)
+        return
+
+    # Parse profile_picture value
+    if profile_picture in ["error_no_images_loaded", "error_no_matches_found"]:
+        # These are error values from autocomplete, handle them gracefully
+        await interaction.followup.send(f"❌ Profile picture selection error: {profile_picture.replace('_', ' ').title()}", ephemeral=True)
+        return
+        
+    try:
+        folder_id, filename_with_ext = profile_picture.split(":", 1)
+    except ValueError:
+        await interaction.followup.send("❌ Invalid profile picture selection format.", ephemeral=True)
+        await log_error(guild, f"/post_as: Invalid profile_picture value format received: '{profile_picture}'", interaction=interaction)
+        return
+
+    if folder_id not in [PETALS_FOLDER_NAME, MOBS_FOLDER_NAME]:
+        await interaction.followup.send("❌ Invalid folder specified in profile picture selection.", ephemeral=True)
+        await log_error(guild, f"/post_as: Unknown folder_id in profile_picture value: '{folder_id}'", interaction=interaction)
+        return
+
+    # Construct the full local path to the image
+    if not PROFILE_PIC_BASE_PATH: # Should be set in on_ready
+        await interaction.followup.send("⚠️ Configuration error: Profile picture base path not set. Contact bot owner.", ephemeral=True)
+        await log_error(guild, "/post_as command failed: PROFILE_PIC_BASE_PATH is not set (likely on_ready issue).", interaction=interaction, ping_owner=True)
+        return
+        
+    image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename_with_ext)
+
+    chosen_avatar_bytes: Optional[bytes] = None
+    try:
+        if not os.path.exists(image_path):
+            # This can happen if cache is stale or file was removed after bot start
+            await interaction.followup.send(f"❌ Error: Selected image file not found on server: `{filename_with_ext}`. Please try `/refresh` or contact an admin.", ephemeral=True)
+            await log_error(guild, f"/post_as: Image file not found at '{image_path}'. Cache might be stale.", interaction=interaction, ping_owner=True)
+            # Optionally, you could try to reload the cache here:
+            # await load_profile_picture_choices(guild)
+            return
+        with open(image_path, "rb") as f:
+            chosen_avatar_bytes = f.read()
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error reading selected image file: `{filename_with_ext}`.", ephemeral=True)
+        await log_error(guild, f"Error reading image file {image_path}", error=e, interaction=interaction)
+        return
+
+    if not chosen_avatar_bytes: # Should be caught by earlier checks, but defensive
+        await interaction.followup.send(f"❌ Failed to load bytes for image: `{filename_with_ext}`.", ephemeral=True)
+        return
+
+    # Webhook Logic
+    temp_webhook: Optional[discord.Webhook] = None
+    try:
+        temp_webhook = await target_channel.create_webhook(
+            name=cleaned_name,
+            avatar=chosen_avatar_bytes,
+            reason=f"Temp webhook for /post_as by {interaction.user}"
+        )
+        await temp_webhook.send(content=message_content, wait=True) # wait=True is good practice
+        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}' with picture '{folder_id}/{filename_with_ext}'.")
+        await log_info(guild, f"User `{interaction.user}` used /post_as as '{cleaned_name}' (Pic: {folder_id}/{filename_with_ext}) in {target_channel.mention}. Msg: '{message_content[:50].strip()}...'")
+
+    except discord.Forbidden:
+        await interaction.edit_original_response(content=f"❌ I lack 'Manage Webhooks' permission in {target_channel.mention} or other permissions to send this message.")
+        await log_error(guild, f"/post_as failed: Forbidden (likely manage_webhooks or send_messages via webhook).", interaction=interaction)
+    except discord.HTTPException as e:
+        # Provide more specific error if available (e.g., invalid form body for avatar if bytes are bad)
+        error_text = f"Discord API Error: Failed to send. Code: {e.code}, Text: {e.text}"
+        await interaction.edit_original_response(content=error_text[:1900]) # Keep it under limit
+        await log_error(guild, f"/post_as failed: HTTP Exception", error=e, interaction=interaction)
+    except Exception as e:
+        await interaction.edit_original_response(content=f"❌ An unexpected error occurred.")
+        await log_error(guild, f"/post_as failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
+    finally:
+        if temp_webhook:
+            try: await temp_webhook.delete(reason="Temp webhook cleanup for /post_as")
+            except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /post_as. ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
