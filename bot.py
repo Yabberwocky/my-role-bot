@@ -118,9 +118,9 @@ def default_channel_data():
         'last_interject_time': None
     }
 channel_interjection_data: Dict[int, Dict[str, Any]] = defaultdict(default_channel_data)
-RANDOM_INTERJECT_MIN_MSGS = 5 # Lower minimum
-RANDOM_INTERJECT_MAX_MSGS = 10 # Lower maximum
-RANDOM_INTERJECT_COOLDOWN = datetime.timedelta(minutes=2.0) # Shorter cooldown
+RANDOM_INTERJECT_MIN_MSGS = 20 # Lower minimum
+RANDOM_INTERJECT_MAX_MSGS = 30 # Lower maximum
+RANDOM_INTERJECT_COOLDOWN = datetime.timedelta(minutes=10.0) # Shorter cooldown
 PRIVATE_SERVER_ID = 1332980983003349012
 STAFF_CHANNELS = set() # Initialize as empty set, will be populated in on_ready
 REPLY_MENTION_COOLDOWN_MINUTES = 5.0
@@ -5960,6 +5960,88 @@ async def message_as(
         if temp_webhook:
             try: await temp_webhook.delete(reason="Temp webhook cleanup")
             except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook '{effective_sender_name_for_context}'. ID: {temp_webhook.id}", error=e_del)
+
+@tree.command(name="say", description="Send a message with a custom name and the bot's default avatar.")
+@app_commands.describe(
+    custom_name="The name to display for the message (1-80 characters).",
+    message_content="The content of the message to send."
+)
+@app_commands.check(test_bot_owner_only_check) # Keep for testing consistency
+@app_commands.checks.bot_has_permissions(manage_webhooks=True) # Bot needs to create webhooks
+async def say(
+    interaction: discord.Interaction,
+    custom_name: str,
+    message_content: str
+):
+    if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
+        return
+
+    target_channel: discord.TextChannel = interaction.channel
+    guild = interaction.guild # Will be None if in DMs, but command restricted to text channels in guilds
+
+    # Defer ephemerally as the command result is just a confirmation
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # --- Validate Custom Name ---
+    cleaned_name = custom_name.strip()
+    if not (1 <= len(cleaned_name) <= 80):
+        await interaction.followup.send("❌ Custom name must be 1-80 characters long.", ephemeral=True)
+        return
+    # Basic check for Discord disallowed characters/strings in webhook names
+    disallowed_in_names = ["@", "#", ":", "```", "discord"]
+    if any(disallowed in cleaned_name for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
+        await interaction.followup.send(f"❌ The custom name '{cleaned_name}' contains disallowed characters or is a reserved name.", ephemeral=True)
+        return
+
+    # --- Fetch Fixed Avatar ---
+    fixed_avatar_bytes: Optional[bytes] = None
+    if not NERD_AVATAR_URL:
+        await interaction.followup.send("⚠️ Configuration error: The bot's default avatar URL is not set. Cannot send with custom avatar. Contact bot owner.", ephemeral=True)
+        await log_error(guild, "/say command failed: NERD_AVATAR_URL is not configured.", interaction=interaction, ping_owner=True)
+        return
+
+    async with aiohttp.ClientSession() as session:
+        fixed_avatar_bytes = await fetch_avatar_bytes(session, NERD_AVATAR_URL)
+        if not fixed_avatar_bytes:
+            await interaction.followup.send("⚠️ Failed to fetch the bot's default avatar. Message will be sent without it if possible, or may fail.", ephemeral=True)
+            # Log this as a warning, but allow proceeding without avatar if fetch fails
+            await log_info(guild, f"/say command warning: Failed to fetch NERD_AVATAR_URL ({NERD_AVATAR_URL}). Avatar might be missing.")
+
+
+    # --- Webhook Logic ---
+    temp_webhook: Optional[discord.Webhook] = None
+    try:
+        # Create the webhook
+        temp_webhook = await target_channel.create_webhook(
+            name=cleaned_name,
+            avatar=fixed_avatar_bytes, # This can be None if fetch_avatar_bytes failed
+            reason=f"Temp webhook for /say command by {interaction.user}"
+        )
+
+        # Send the message using the webhook
+        # Discord API handles message content length for webhooks (max 2000 chars)
+        await temp_webhook.send(content=message_content, wait=True)
+
+        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}'.")
+        await log_info(guild, f"User `{interaction.user}` used /say as '{cleaned_name}' in {target_channel.mention}. Message: '{message_content[:100].strip()}...'")
+
+    except discord.Forbidden:
+        await interaction.edit_original_response(content=f"❌ I lack 'Manage Webhooks' permission in {target_channel.mention} or other permissions to send this message.")
+        await log_error(guild, f"/say command failed: Forbidden (likely manage_webhooks or send_messages via webhook).", interaction=interaction)
+    except discord.HTTPException as e:
+        await interaction.edit_original_response(content=f"❌ Discord API Error: Failed to send message as '{cleaned_name}'. {e.text}")
+        await log_error(guild, f"/say command failed: HTTP Exception creating/sending webhook.", error=e, interaction=interaction)
+    except Exception as e:
+        await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to send the message as '{cleaned_name}'.")
+        await log_error(guild, f"/say command failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
+    finally:
+        if temp_webhook:
+            try:
+                await temp_webhook.delete(reason="Temporary webhook cleanup for /say command")
+            except Exception as e_del:
+                # Log if webhook deletion fails, but don't bother the user
+                await log_error(guild, f"Failed to delete temporary webhook for /say command. Webhook ID: {temp_webhook.id}", error=e_del)
    
 # --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
