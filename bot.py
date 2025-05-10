@@ -830,7 +830,7 @@ if GEMINI_API_KEY:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         # Using a recent, efficient model suitable for free tier
-        ai_model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or 'gemini-pro' if flash isn't available/preferred
+        ai_model = genai.GenerativeModel('gemini-2.0-flash') # Or 'gemini-pro' if flash isn't available/preferred
         print("Google Gemini AI client configured successfully.")
     except ImportError:
         print("WARNING: 'google-generativeai' library not found. AI features disabled. Run 'pip install google-generativeai'")
