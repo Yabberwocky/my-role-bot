@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import discord # Keep your original discord import
-import sys     # <--- Ensure this import is present
 import os      # <--- Ensure this import is present
 import threading
 import asyncio
@@ -18,13 +17,9 @@ from dotenv import load_dotenv
 import datetime
 import pytz
 from dateutil.parser import parse as date_parse
-from dateutil.relativedelta import relativedelta
 from discord.ext import tasks
-import time # For timestamp comparison if needed, although discord.utils.utcnow() is better
 import re
-import uuid # For UUID handling
 import asyncio
-from collections import namedtuple
 import discord.utils
 import random
 from collections import defaultdict # Helpful for the interjection data
@@ -102,80 +97,21 @@ active_static_list_views: Dict[int, Dict[str, Any]] = {} # channel_id -> {'view'
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
 SORT_MODE_DISCORD_NAME = "sort_discord_name"
 KEYWORD_TABLE_NAME = "keyword_phrases" # Supabase table name
-KEYWORD_COOLDOWN_MINUTES = 5.0
 keyword_data_cache: Dict[str, Any] = {} # id (str) -> KeywordRule details
-keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
 total_keywords = 0
 discovered_keywords_count = 0
-HUMAN_SYSTEM_INSTRUCTION = ( # New instruction for human-like persona
-    "You are a chat participant in a Discord server. Mimic human typing style: use lowercase, avoid excessive punctuation (especially ending periods/exclamation marks), "
-    "keep messages relatively short and conversational. Engage naturally with the ongoing discussion based on the provided history and the user's last message. "
-    "Your goal is to blend in."
-)
-# Structure: {channel_id: {'count': int, 'target': int, 'last_interject_time': Optional[datetime.datetime]}}
-# Use defaultdict for easier initialization
-def default_channel_data():
-    return {
-        'count': 0,
-        'target': random.randint(15, 20), # Initial random target
-        'last_interject_time': None
-    }
-channel_interjection_data: Dict[int, Dict[str, Any]] = defaultdict(default_channel_data)
-RANDOM_INTERJECT_MIN_MSGS = 20 # Lower minimum
-RANDOM_INTERJECT_MAX_MSGS = 30 # Lower maximum
-RANDOM_INTERJECT_COOLDOWN = datetime.timedelta(minutes=10.0) # Shorter cooldown
 PRIVATE_SERVER_ID = 1332980983003349012
 STAFF_CHANNELS = set() # Initialize as empty set, will be populated in on_ready
-REPLY_MENTION_COOLDOWN_MINUTES = 5.0
 UNRESTRICTED_AI_CHANNEL_ID = 1330664430148780102 # Channel for unrestricted AI use in Catercord
-keyword_cooldowns: Dict[str, datetime.datetime] = {} # id (str) -> timestamp when cooldown ends
-user_reply_mention_cooldowns: Dict[int, datetime.datetime] = {} # user_id (int) -> timestamp when cooldown ends for reply/mention AI
 ingame_name_cache: List[str] = [] # Cache for In-Game Names from hc_members
 SCREENSHOTS_DROPBOX_CHANNEL_ID = 1359782718426316840 # Channel for image processing
-FLORR_IMAGE_NAME_EXTRACTION_PROMPT_TEMPLATE = """Analyze the provided image(s), which are screenshots from the game Florr.io, potentially showing a guild member list.
-Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
-
-Known Valid In-Game Names (use this as your reference):
---- BEGIN KNOWN NAMES LIST ---
-{known_igns_list_str}
---- END KNOWN NAMES LIST ---
-
-**Instructions for Guild Member Lists (if present in the image):**
-- Focus on identifying players who are displayed in a way that suggests they are currently online or active in the guild. Games often distinguish online members from offline ones in these lists (e.g., brighter names, different icons, or placement).
-- Use your general knowledge of game UIs to infer this online/active status from the visual presentation in the guild list.
-- If a name is visible in a guild list but appears to be offline or inactive, DO NOT extract it.
-- If the image is definitively NOT a guild member list (e.g., general gameplay, chat messages without a structured list), you may identify any names from the "Known Valid In-Game Names" list if they are clearly visible. Prioritize guild list rules if a guild list is clearly present.
-
-General Output Instructions:
-1. List each clearly identifiable player name that meets ALL criteria above on a NEW LINE.
-2. These names must, as accurately as possible, match one of the names from the "Known Valid In-Game Names" list provided.
-3. If a name from the list appears to be partially visible or has minor OCR inaccuracies but you are confident it's a match to a name in the provided list AND meets the online/active criteria for guild lists, output the name *from the list*.
-4. Output ONLY the names. Do NOT include any other text, commentary, numbering, or formatting.
-5. If the same name (meeting all criteria) appears multiple times, list it only once in the final output.
-6. If, after applying all rules, no player names (from the provided list, meeting all criteria including appearing online/active in guild lists) are clearly identifiable in any of the image(s), output the exact phrase: NO_NAMES_FOUND
-
-Example of expected output if "PlayerName1" and "PlayerName2" (both appearing online in a guild list) were in the known list and found:
-PlayerName1
-PlayerName2
-"""
-EVIL_CATERPILLAR_NAME = "Evil Caterpillar"
-EVIL_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369656931089649794/861b3510338fa7ba0bb36baf12c36643.webp?size=160"
-GOOD_CATERPILLAR_NAME = "Good Caterpillar"
-GOOD_CATERPILLAR_AVATAR_URL = "https://cdn.discordapp.com/avatars/1369660290316111933/bf299249c71ee328dba5d821547fab56.webp?size=160"
-NERD_AVATAR_URL = "https://cdn.discordapp.com/app-icons/1365572437185400893/d10142d96592f7f79c5723177cd504a2.webp?size=128"
-PERSONALITY_NORMAL = "Normal Bot"
-PERSONALITY_EVIL = "Evil Caterpillar"
-PERSONALITY_GOOD = "Good Caterpillar"
-PERSONALITY_CUSTOM = "Custom" # Keep this simple, parameter handles the details
-AVATAR_CHOICE_EVIL = "Evil Caterpillar Avatar"
-AVATAR_CHOICE_GOOD = "Good Caterpillar Avatar"
-AVATAR_CHOICE_NERD = "Nerd Bot Avatar" # Renamed for clarity, or keep as "Nerd Avatar"
 BOT_INSTANCE_TYPE = os.getenv("BOT_INSTANCE_TYPE", "PRODUCTION").upper()
 PETALS_FOLDER_NAME = "Petals"
 MOBS_FOLDER_NAME = "Mobs"
 available_profile_pics_cache: List[Tuple[str, str, str]] = []
 PROFILE_PIC_BASE_PATH = "" # Will be set in on_ready to the script's directory
 ALWAYS_ON_AI_CHANNELS = {1330664430148780102, 1364657218175107162} # Channels for AI to respond to every message
+
 
 AI_PROMPTS = {
     "HUMAN_SYSTEM_INSTRUCTION": (
@@ -369,7 +305,7 @@ def get_prompt(prompt_key: str, **kwargs) -> Optional[str]:
 def get_ai_model_priority_list():
     models = []
     if ai_model_2_5_flash: # Highest
-        models.append({'instance': ai_model_2_5_flash, 'name': 'Gemini 2.5 Flash (Preview)', 'id': 'premium_flash'})
+        models.append({'instance': ai_model_2_5_flash, 'name': 'Gemini 2.5 Flash (Preview)', 'id': 'gemini_2_5_flash'})
     if ai_model_2_0_flash: # Standard
         models.append({'instance': ai_model_2_0_flash, 'name': 'Gemini 2.0 Flash', 'id': 'gemini_2_0_flash'})
     if ai_model_2_0_flash_lite: # Lite
@@ -435,7 +371,7 @@ async def send_ai_chat_response(
              actual_prompt_for_ai = get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {})) or actual_prompt_for_ai
 
     elif trigger_type == "Discovery" and keyword_triggered_rule_data and discovery_congrats_user:
-        preferred_model_id_for_call = 'premium_flash'
+        preferred_model_id_for_call = 'gemini_2_5_flash'
         sys_instruct_key = "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION"
         final_system_instruction_str = get_prompt(
             sys_instruct_key,
@@ -447,7 +383,7 @@ async def send_ai_chat_response(
         actual_prompt_for_ai = f"user message: '{user_message_content}' (triggered first discovery of keyword: '{keyword_triggered_rule_data['phrase_identifier']}')"
 
     elif trigger_type == "Keyword" and keyword_triggered_rule_data:
-        preferred_model_id_for_call = 'premium_flash'
+        preferred_model_id_for_call = 'gemini_2_5_flash'
         sys_instruct_key = "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION"
         human_sys_instruct = get_prompt("HUMAN_SYSTEM_INSTRUCTION")
         final_system_instruction_str = get_prompt(
@@ -460,7 +396,7 @@ async def send_ai_chat_response(
         actual_prompt_for_ai = f"keyword '{keyword_triggered_rule_data['phrase_identifier']}' triggered by message: '{user_message_content}'"
     
     elif trigger_type in ["Reply", "Mention"]:
-        preferred_model_id_for_call = 'premium_flash'
+        preferred_model_id_for_call = 'gemini_2_5_flash'
         sys_instruct_key = system_instruction_key or "HUMAN_SYSTEM_INSTRUCTION"
         final_system_instruction_str = get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
         actual_prompt_for_ai = user_message_content or "(general interaction)"
@@ -468,7 +404,7 @@ async def send_ai_chat_response(
             actual_prompt_for_ai = get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {})) or actual_prompt_for_ai
 
     elif trigger_type.startswith("COMMAND_"): # For AI responses triggered by commands
-        preferred_model_id_for_call = 'premium_flash' # Default high quality for direct command output
+        preferred_model_id_for_call = 'gemini_2_5_flash' # Default high quality for direct command output
         # System instruction typically from prompt_key_for_ai or a general bot persona
         sys_instruct_key = system_instruction_key or "BOT_PURPOSE_GENERAL" # Default, can be overridden by command
         final_system_instruction_str = get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
@@ -1214,7 +1150,7 @@ async def get_ai_response_with_image(
     prompt_key: str,
     image_bytes: bytes,
     prompt_kwargs: Optional[Dict[str, Any]] = None,
-    preferred_model_id: str = 'premium_flash' # Default to highest for images
+    preferred_model_id: str = 'gemini_2_5_flash' # Default to highest for images
 ) -> Optional[str]:
     all_available_models = get_ai_model_priority_list()
     if not all_available_models:
@@ -1411,19 +1347,7 @@ async def record_discovery_in_db(guild_for_log: Optional[discord.Guild], keyword
         await log_error(guild_for_log, f"Failed to record discovery for keyword ID {keyword_id_str} in Supabase", error=e, ping_owner=True)
         return False # Indicate failure
 
-def format_time_difference(seconds: float) -> str:
-    """Formats remaining cooldown time."""
-    if seconds < 1:
-        return "less than a second"
-    elif seconds < 60:
-        return f"{int(seconds)} second{'s' if int(seconds) != 1 else ''}"
-    else:
-        minutes = int(seconds // 60)
-        remaining_seconds = int(seconds % 60)
-        if remaining_seconds == 0:
-            return f"{minutes} minute{'s' if minutes != 1 else ''}"
-        else:
-            return f"{minutes} minute{'s' if minutes != 1 else ''} and {remaining_seconds} second{'s' if remaining_seconds != 1 else ''}"
+
 
 class SelfActivateButton(discord.ui.Button):
     """Button for users to mark themselves active for today."""
@@ -2388,180 +2312,6 @@ async def check_activity_exists(guild: discord.Guild, ign_lower: str, activity_d
         # Log the error but return None to signal check failure
         await log_error(guild, f"Error checking activity existence for IGN '{ign_lower}' on {activity_date}", error=e)
         return None # Indicate error
-
-# --- Bulk Active Modal ---
-class BulkActiveModal(Modal, title="Bulk Mark Active"):
-    igns_input = TextInput(
-        label="In-Game Names (IGNs)",
-        style=discord.TextStyle.paragraph,
-        placeholder="Enter one IGN per line or separate by spaces/commas...",
-        required=True,
-        max_length=2000 # Adjust as needed
-    )
-
-    def __init__(self, date_str: Optional[str]):
-        super().__init__(timeout=300.0) # 5 minute timeout for modal
-        self.target_date_str = date_str # Store the date passed from the command
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Defer the modal's interaction response ephemerally
-        await interaction.response.defer(thinking=True, ephemeral=False)
-
-        guild = interaction.guild
-        if not guild or not supabase: # Ensure guild and supabase are available
-            await interaction.followup.send("❌ Error: Command context or database unavailable.", ephemeral=False)
-            return
-
-        # --- Get Date ---
-        activity_date, date_error = get_utc_date(self.target_date_str)
-        if date_error:
-            await interaction.followup.send(f"❌ {date_error}", ephemeral=False)
-            return
-        if not activity_date:
-            await interaction.followup.send("❌ Could not determine activity date.", ephemeral=False)
-            return
-
-        # --- Process IGNs ---
-        raw_text = self.igns_input.value
-        # Split by newline, space, comma, and filter out empty strings
-        potential_igns = [part.strip() for line in raw_text.split('\n') for part in line.replace(',', ' ').split(' ') if part.strip()]
-
-        if not potential_igns:
-            await interaction.followup.send("❌ No IGNs were entered.", ephemeral=False)
-            return
-
-        # --- NEW Counters and Lists ---
-        processed_count = 0
-        newly_added_count = 0
-        already_marked_count = 0
-        failed_count = 0
-        check_failed_count = 0 # Count how many existence checks failed
-
-        newly_added_igns = []
-        already_marked_igns = []
-        failed_igns = [] # Format: "`IGN` (Reason)"
-        check_failed_igns = [] # IGNs where the existence check itself failed
-
-        log_details = []
-        # --- END NEW ---
-
-        progress_msg = await interaction.followup.send(f"⏳ Processing {len(potential_igns)} IGNs for {format_date_dmy(activity_date)}...", ephemeral=False)
-
-        for current_ign in potential_igns:
-            processed_count += 1
-            if not current_ign: continue # Skip empty
-
-            ign_lower = current_ign.lower() # Use lowercase for checks and upsert
-
-            # --- Check if activity already exists ---
-            exists = await check_activity_exists(guild, ign_lower, activity_date)
-
-            if exists is True:
-                # Record already exists
-                already_marked_count += 1
-                already_marked_igns.append(f"`{current_ign}`")
-                log_details.append(f"Skip (Exists): {current_ign}")
-                continue # Skip the upsert call
-
-            elif exists is False:
-                # Record does not exist, proceed with upsert
-                success, msg = await upsert_activity_log(guild, current_ign, activity_date, interaction.user.id) # Pass original case to upsert if needed, though upsert likely lowercases too
-
-                if success:
-                    newly_added_count += 1
-                    newly_added_igns.append(f"`{current_ign}`")
-                    log_details.append(f"OK (Added): {current_ign}")
-                else:
-                    failed_count += 1
-                    # Extract reason more robustly if possible, fallback to full message
-                    reason = msg.split(':', 1)[-1].strip() if ':' in msg else msg
-                    failed_igns.append(f"`{current_ign}` ({reason})")
-                    log_details.append(f"Fail (Upsert): {current_ign} ({msg})")
-
-            else: # exists is None (check failed)
-                check_failed_count += 1
-                check_failed_igns.append(f"`{current_ign}`")
-                log_details.append(f"Fail (Check): {current_ign}")
-                # Treat check failure as an overall failure for this IGN
-                failed_count += 1 # Also increment failed count
-                failed_igns.append(f"`{current_ign}` (DB Check Error)")
-
-
-            # Optional: Update progress message periodically
-            # if processed_count % 10 == 0:
-            #     try: await progress_msg.edit(content=f"⏳ Processing... ({processed_count}/{len(potential_igns)})")
-            #     except discord.HTTPException: pass
-
-        # --- Final Feedback ---
-        total_failures = failed_count # Combines upsert failures and check failures
-
-        if total_failures == 0 and newly_added_count > 0:
-             summary_title = "✅ Bulk Activity Update Successful"
-             final_color = NERDY_YELLOW # Or Green
-        elif total_failures == 0 and newly_added_count == 0:
-             summary_title = "ℹ️ Bulk Activity Update: No Changes Needed"
-             final_color = discord.Color.blue()
-        else:
-             summary_title = "⚠️ Bulk Activity Update Partially Complete"
-             final_color = discord.Color.orange()
-
-        summary_desc = [
-            f"Date Processed: **{format_date_dmy(activity_date)}**",
-            f"Total Submitted: {len(potential_igns)}",
-            f"---", # Separator
-            f"✅ **Newly Added:** {newly_added_count}",
-            f"⏭️ **Already Marked (Skipped):** {already_marked_count}",
-            f"❌ **Failed / Check Error:** {total_failures}",
-            f"---" # Separator
-        ]
-
-        # Function to format list of IGNs for embed field
-        def format_ign_list(igns: List[str], max_display: int = 15) -> str:
-            if not igns: return "None"
-            display_str = ", ".join(igns[:max_display])
-            if len(igns) > max_display:
-                display_str += f", ... *(+{len(igns) - max_display} more)*"
-            # Ensure the field value doesn't exceed Discord limits
-            return (display_str[:1021] + '...') if len(display_str) > 1024 else display_str
-
-        summary_embed = discord.Embed(title=summary_title, description="\n".join(summary_desc), color=final_color)
-
-        # Add fields for details only if there are entries in that category
-        if newly_added_igns:
-            summary_embed.add_field(name="Newly Added IGNs", value=format_ign_list(newly_added_igns), inline=False)
-        if already_marked_igns:
-            summary_embed.add_field(name="Skipped IGNs (Already Marked)", value=format_ign_list(already_marked_igns), inline=False)
-        if failed_igns: # Includes check failures now
-             # Sort failed IGNs maybe? Optional.
-             summary_embed.add_field(name="Failed IGNs (Reason)", value=format_ign_list(failed_igns), inline=False)
-        # Optionally report check_failed_igns separately if needed for debugging
-        # if check_failed_igns:
-        #     summary_embed.add_field(name="DB Check Failed For", value=format_ign_list(check_failed_igns), inline=False)
-
-        try:
-            await progress_msg.edit(content=None, embed=summary_embed)
-        except discord.HTTPException: # Handle if original progress message gone
-             await interaction.followup.send(embed=summary_embed, ephemeral=False) # Send new message
-
-        # Update log message with new counts
-        log_msg = (f"`{interaction.user}` used /bulkactive for {format_date_dmy(activity_date)}. "
-                   f"Submitted: {len(potential_igns)}, Added: {newly_added_count}, "
-                   f"Skipped: {already_marked_count}, Failed: {total_failures}. "
-                   f"Details: {'; '.join(log_details)}")
-        # Truncate log message if needed before sending
-        await log_info(guild, (log_msg[:1950] + "...") if len(log_msg) > 1990 else log_msg)
-
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        # Keep this error handler as is
-        await log_error(interaction.guild, "Error in BulkActiveModal", error=error, interaction=interaction)
-        try:
-             if interaction.response.is_done():
-                 await interaction.followup.send("❌ An unexpected error occurred within the modal processing.", ephemeral=False)
-             else:
-                 await interaction.response.send_message("❌ An unexpected error occurred within the modal processing.", ephemeral=False)
-        except Exception:
-             pass
                 
 async def ign_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Autocompletes In-Game Names from the local cache or hc_members table."""
@@ -5804,7 +5554,7 @@ async def on_message(message: discord.Message):
                             prompt_key="FLORR_IMAGE_NAME_EXTRACTION", # New prompt key
                             image_bytes=image_data,
                             prompt_kwargs={'known_igns_list_str': known_igns_str}
-                            # preferred_model_id defaults to 'premium_flash' in get_ai_response_with_image
+                            # preferred_model_id defaults to 'gemini_2_5_flash' in get_ai_response_with_image
                         )
                         if ai_extracted_text_for_this_image:
                             stripped_ai_text = ai_extracted_text_for_this_image.strip()
@@ -6051,7 +5801,7 @@ async def on_message(message: discord.Message):
                 history=history,
                 user_message_content=cleaned_prompt,
                 system_instruction_key="HUMAN_SYSTEM_INSTRUCTION"
-                # preferred_model_id will be 'premium_flash' (highest) inside send_ai_chat_response
+                # preferred_model_id will be 'gemini_2_5_flash' (highest) inside send_ai_chat_response
             )
             return # Handled by AI reply/mention
 
@@ -6113,7 +5863,7 @@ async def on_message(message: discord.Message):
                                 user_message_content=message.content, # Pass raw user message
                                 discovery_congrats_user=author,
                                 keyword_triggered_rule_data=rule_data # Pass the specific rule's data
-                                # preferred_model_id will be 'premium_flash', system instruction handled by "Discovery" type
+                                # preferred_model_id will be 'gemini_2_5_flash', system instruction handled by "Discovery" type
                             )
                             break # Keyword handled by discovery
                         else:
@@ -6157,7 +5907,7 @@ async def on_message(message: discord.Message):
                             history=history,
                             user_message_content=message.content, # Pass raw user message
                             keyword_triggered_rule_data=rule_data # Pass the specific rule's data
-                            # preferred_model_id will be 'premium_flash', system instruction handled by "Keyword" type
+                            # preferred_model_id will be 'gemini_2_5_flash', system instruction handled by "Keyword" type
                         )
                         break # Keyword handled by trigger
             except Exception as e_rule:
@@ -6305,8 +6055,8 @@ async def message(
         else:
             try:
                 # For /message, user's input is the direct prompt. System instruction makes the bot sound human.
-                # Let's use 'premium_flash' for potentially better quality for a direct command.
-                preferred_model_for_message_cmd = 'premium_flash'
+                # Let's use 'gemini_2_5_flash' for potentially better quality for a direct command.
+                preferred_model_for_message_cmd = 'gemini_2_5_flash'
                 ai_system_instruction_str = get_prompt("HUMAN_SYSTEM_INSTRUCTION")
 
                 # Typing indicator only makes sense if sending to a TextChannel
