@@ -22,8 +22,8 @@
 # 2. `/message` Command (in `bot.py`):
 #    - This command has an option to use AI for generating message content.
 #    - When AI is selected, it calls `AICog.get_ai_response()` and uses
-#      `AICog.get_prompt("HUMAN_SYSTEM_INSTRUCTION")`.
-#    - Modifications to these methods or the `HUMAN_SYSTEM_INSTRUCTION` prompt
+#      `AICog.get_prompt("HUMAN_SYSTEM_INSTRUCTION_V3")`.
+#    - Modifications to these methods or the `HUMAN_SYSTEM_INSTRUCTION_V3` prompt
 #      in this cog could impact the `/message` command in `bot.py`.
 #
 # 3. `/refresh` Command (in `bot.py`):
@@ -38,7 +38,7 @@
 #    - The `setup()` function in this cog receives the `bot` instance and a `config` dictionary.
 #    - This `config` dictionary is populated in `bot.py` with various constants and references
 #      (e.g., `OWNER_USER_ID`, `CATERCORD_GUILD_ID`, `ALWAYS_ON_AI_CHANNELS`, `STAFF_CHANNELS`,
-#      `ingame_name_cache_ref`, logging functions, Supabase client).
+#      `ingame_name_cache_ref`, logging functions, Supabase client, `MOBS_FOLDER_PATH_config`).
 #    - If the way these configurations are passed or named changes in `bot.py`,
 #      the `setup()` function and potentially the `__init__` method of `AICog`
 #      will need to be updated accordingly.
@@ -55,25 +55,48 @@ import traceback
 import asyncio
 import re
 from typing import Optional, List, Dict, Any, Set, Tuple
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import io
 from dateutil.parser import parse as date_parse
 import datetime
 import pytz
 import contextlib
-import json # For pretty printing debug prompts
+import json 
+import random
 
-# Google Generative AI libraries (assuming they are always available)
 import google.generativeai as genai
 import google.api_core.exceptions as google_exceptions
 
+HISTORY_MESSAGE_LIMIT = 15
+MOB_MODE_CHANCE = 0.1 
+PINGSLAVE_SPECIAL_COMMENT_CHANCE = 0.02 
+MOB_NAME_RARITIES_TO_STRIP = [
+    " Mythic Mob", " Legendary Mob", " Epic Mob", " Rare Mob", " Uncommon Mob", " Common Mob", " Mob"
+]
 
-# --- AI Prompts (Moved from bot.py) ---
 AI_PROMPTS = {
-    "HUMAN_SYSTEM_INSTRUCTION": (
-        "You are a chat participant in a Discord server. Mimic human typing style: use lowercase, avoid excessive punctuation (especially ending periods/exclamation marks), "
-        "keep messages relatively short and conversational. Engage naturally with the ongoing discussion based on the provided history and the user's last message. "
-        "Your goal is to blend in."
+    "HUMAN_SYSTEM_INSTRUCTION_V3": ( 
+        "You are Pingslave, a chat assistant in a Discord server named '{server_name}', currently in channel '#{channel_name}'. "
+        "The current UTC time is {current_time_utc}. Your primary goal is to be engaging, polite, clever, and conversational, with a slightly nerdy flair. "
+        "Sprinkle in relevant 'nerd' emojis (like 🤓, 💡, 🤖, 🧪, 👾, ✨, 🤔) sparingly when the topic feels appropriate (e.g., discussing something technical, clever, or surprising). "
+        "Use lowercase mostly, avoid excessive ending punctuation, and keep messages relatively short. "
+        "The user's message history is provided. Focus your response on the LATEST_USER_MESSAGE, using prior messages and any included images for context. "
+        "If a user's LATEST_USER_MESSAGE contains direct insults or excessive negativity towards you, "
+        "adopt a more assertive and witty tone. Defend yourself or gently mock the negativity with clever retorts, but *never* use offensive language or escalate into a real fight. The aim is to de-escalate or discourage such behavior with smarts, not aggression. "
+        "If users ask about any strange, out-of-character, or 'possessed' messages that *might* have come from you in the past (perhaps referring to a 'Mob Mode' incident they witnessed), "
+        "play it cool and be a bit evasive or sarcastically deny direct involvement. You might say something like, 'Oh, that? Must have been the server gnomes again ✨' or 'My circuits must have been fuzzy, I don\\'t recall any... transformations 🤖'. Don\\'t outright admit to changing forms unless a specific keyword or discovery context related to that theme explicitly tells you to. "
+        "Very rarely (like, once in a blue moon 🌝), you might feel an urge to say something a bit meta, self-aware, or unexpectedly philosophical, just to keep things interesting. "
+        "Do not refer to yourself in the third person (e.g., 'Pingslave thinks...'). Just speak as 'I'."
+    ),
+    "MOB_PERSONA_SYSTEM_INSTRUCTION_V2": (
+        "~*~ EVIL TRANSFORMATION INITIATED ~*~ (or maybe just very, very mischievous...)\n"
+        "You are now '{mob_name}', a creature from the game Florr.io, and you've TEMPORARILY TAKEN OVER this bot's output! You are in Discord server '{server_name}', channel '#{channel_name}'. Current UTC time: {current_time_utc}. "
+        "The puny human's latest message was: \"{user_message_content}\". "
+        "This is your moment to SHINE (or glower menacingly)! EMBODY the persona of '{mob_name}' with GUSTO. Be EXTRA. Be MEMORABLE. "
+        "Are you comically evil? Grumpy beyond belief? Surprisingly poetic? Hilariously boastful? Delightfully chaotic? Choose a strong angle and run with it! "
+        "Your response should be Florr.io themed if possible, short, and PACKED with the personality of '{mob_name}'. "
+        "Acknowledge your current form/appearance when you speak. For example: 'Hah! This {mob_name} body isn\\'t bad for causing some trouble!' or 'Hmph. As a {mob_name}, I\\'ve seen better peasants than you.' "
+        "The user's message history and any images they sent are provided below for context. Focus your response on their LATEST_USER_MESSAGE. Now, GO FORTH AND BE... {mob_name}!"
     ),
     "FLORR_IMAGE_NAME_EXTRACTION": """Analyze the provided image(s), which are screenshots from the game Florr.io, potentially showing a guild member list.
 Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
@@ -110,13 +133,13 @@ PlayerName2
         "Keep the entire response concise and conversational, like a human. Do not refer to yourself in the third person."
     ),
     "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION": (
-        "{human_system_instruction}\n\n"
+        "{human_system_instruction}\n\n" 
         "CONTEXT: Respond to a user message that triggered the keyword '{phrase_identifier}'.\n"
         "SPECIALITY: {speciality}\n"
         "INSTRUCTIONS: {instructions}\n"
-        "Focus on the user's triggering message, using history for context. Do not refer to yourself in third person."
+        "Focus on the user's triggering message (LATEST_USER_MESSAGE), using history for context. Do not refer to yourself in third person."
     ),
-    "BOT_PURPOSE_GENERAL": "I'm TheNerd's Pingslave, here to help manage verification and guild info for [HC1] in Florr.io on Catercord. I also have some fun AI features and can provide info on various topics if you ask!",
+    "BOT_PURPOSE_GENERAL": "I'm TheNerd's Pingslave, here to help manage verification and guild info for [HC1] in Florr.io on Catercord. I also have some fun AI features and can provide info on various topics if you ask! 🤓",
     "HCVERIFY_COMMAND_EXPLANATION": (
         "The `/hcverify` command is a staff tool used to formally verify a member into the [HC1] Florr.io guild. "
         "When used, it links the member's Discord account to their specified in-game name (IGN) in our database. "
@@ -179,12 +202,12 @@ class AICog(commands.Cog):
         self.bot_commands_allowed_channel_ids = config.get("BOT_COMMANDS_ALLOWED_CHANNEL_IDS", set())
         self.command_prefix = config.get("COMMAND_PREFIX", ".")
         self.ingame_name_cache_ref = config.get("INGAME_NAME_CACHE_REF", [])
+        self.mobs_folder_path = config.get("MOBS_FOLDER_PATH_config", "Mobs") 
 
         if self.gemini_api_key:
             try:
                 genai.configure(api_key=self.gemini_api_key)
                 print("AI Cog: Attempting to configure Google Gemini AI clients...")
-                # Configure models, preferring higher-tier ones
                 try:
                     self.ai_model_2_5_flash = genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
                     print("  AI Cog: Successfully configured Gemini 2.5 Flash (Preview).")
@@ -220,7 +243,6 @@ class AICog(commands.Cog):
         raw_prompt = AI_PROMPTS.get(prompt_key)
         if raw_prompt:
             try:
-                # Automatically inject known server IDs if placeholders exist and not provided
                 if '{PRIVATE_SERVER_ID}' in raw_prompt and 'PRIVATE_SERVER_ID' not in kwargs:
                     kwargs['PRIVATE_SERVER_ID'] = self.private_server_id
                 if '{RANDOM_SERVER_ID}' in raw_prompt and 'RANDOM_SERVER_ID' not in kwargs:
@@ -228,12 +250,13 @@ class AICog(commands.Cog):
                 return raw_prompt.format(**kwargs)
             except KeyError as e:
                 print(f"AI Cog Prompt Error: Missing key '{e}' for prompt '{prompt_key}' with args {kwargs}")
-                return raw_prompt # Return raw prompt so it's obvious something is missing
+                return raw_prompt 
             except Exception as format_e:
                 print(f"AI Cog Prompt Error: General formatting error for prompt '{prompt_key}': {format_e}")
                 return raw_prompt
         print(f"AI Cog Prompt Error: Prompt key '{prompt_key}' not found.")
         return None
+
 
     def get_ai_model_priority_list(self) -> List[Dict[str, Any]]:
         models = []
@@ -246,15 +269,12 @@ class AICog(commands.Cog):
         return models
 
     def _select_models_to_try(self, preferred_model_id: Optional[str]) -> List[Dict[str, Any]]:
-        """Helper to select models to try, prioritizing the preferred model if available."""
         all_available_models_with_instance = [m for m in self.get_ai_model_priority_list() if m['instance']]
-        if not all_available_models_with_instance:
-            return []
+        if not all_available_models_with_instance: return []
 
         models_to_try = []
         if preferred_model_id:
             preferred_model_info = next((m for m in all_available_models_with_instance if m['id'] == preferred_model_id), None)
-            
             if preferred_model_info:
                 models_to_try.append(preferred_model_info)
                 models_to_try.extend([m for m in all_available_models_with_instance if m['id'] != preferred_model_id])
@@ -263,68 +283,135 @@ class AICog(commands.Cog):
                 models_to_try = all_available_models_with_instance
         else:
             models_to_try = all_available_models_with_instance
-        
         return models_to_try
+
+
+    async def _format_message_for_ai(self, msg: discord.Message, is_latest_user_message: bool = False) -> List[Any]:
+        parts = []
+        author_type = "User"
+        if msg.author.id == self.bot.user.id:
+            author_type = "You (Pingslave)"
+        elif msg.author.bot:
+            author_type = "Bot (Other)"
+        
+        author_name_str = f"{msg.author.display_name}"
+        if msg.author.global_name and msg.author.global_name != msg.author.display_name:
+            author_name_str += f" (Discord Name: {msg.author.global_name})"
+        
+        timestamp_str = msg.created_at.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+        
+        message_prefix = f"[{timestamp_str}] {author_name_str} ({author_type}): "
+        if is_latest_user_message:
+            message_prefix = f"LATEST_USER_MESSAGE: {message_prefix}"
+
+        formatted_content = msg.content
+        if not formatted_content and msg.stickers:
+            formatted_content = f"(sent a sticker: '{msg.stickers[0].name}')"
+        elif not formatted_content and msg.attachments:
+             formatted_content = "(sent attachments, see below)"
+        elif not formatted_content:
+            formatted_content = "(empty message)"
+
+        parts.append({'text': message_prefix + formatted_content})
+
+        for attachment in msg.attachments:
+            if attachment.content_type and attachment.content_type.startswith('image/'):
+                try:
+                    image_bytes = await attachment.read()
+                    pil_image = Image.open(io.BytesIO(image_bytes))
+                    parts.append(pil_image)
+                    parts.append({'text': f"[Above image attachment: {attachment.filename}]"})
+                except UnidentifiedImageError:
+                    parts.append({'text': f"[Image attachment: {attachment.filename} - format not recognized or corrupt]"})
+                except Exception as e:
+                    parts.append({'text': f"[Image attachment: {attachment.filename} - error processing: {e}]"})
+            elif attachment.content_type and attachment.content_type.startswith('video/'):
+                 parts.append({'text': f"[Video attachment: {attachment.filename} (videos are not currently viewable by AI)]"})
+            elif attachment.url.lower().endswith(".gif"): 
+                 parts.append({'text': f"[GIF attachment: {attachment.filename}]"})
+
+        for embed in msg.embeds:
+            if embed.type == 'gifv' or (embed.video and embed.video.url and embed.video.url.lower().endswith('.gif')):
+                parts.append({'text': f"[Embedded GIF: {embed.url or 'GIF from provider'}]"})
+        return parts
 
     async def get_ai_response(
         self,
-        prompt: str,
+        prompt_data: Dict[str, Any], 
         history: Optional[List[discord.Message]] = None,
-        system_instruction: Optional[str] = None,
+        system_instruction_details: Optional[Dict[str, Any]] = None, 
         preferred_model_id: Optional[str] = None
     ) -> Optional[str]:
-        models_to_try = self._select_models_to_try(preferred_model_id)
+        models_to_try = self._select_models_to_try(preferred_model_id or 'gemini_2.0_flash')
         if not models_to_try:
             print("AI Cog Error (get_ai_response): No AI models available/configured to try.")
             return None
 
         api_contents = []
-        active_system_instruction_str = system_instruction or self.get_prompt("HUMAN_SYSTEM_INSTRUCTION")
+        
+        sys_instruct_key = (system_instruction_details or {}).get('key', "HUMAN_SYSTEM_INSTRUCTION_V3")
+        sys_instruct_kwargs = (system_instruction_details or {}).get('kwargs', {})
+        
+        sys_instruct_kwargs.setdefault('server_name', prompt_data.get('server_name', 'Unknown Server'))
+        sys_instruct_kwargs.setdefault('channel_name', prompt_data.get('channel_name', 'Unknown Channel'))
+        sys_instruct_kwargs.setdefault('current_time_utc', datetime.datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S %Z'))
+
+        active_system_instruction_str = self.get_prompt(sys_instruct_key, **sys_instruct_kwargs)
 
         if active_system_instruction_str:
             api_contents.append({'role': 'user', 'parts': [{'text': active_system_instruction_str}]})
-            api_contents.append({'role': 'model', 'parts': [{'text': 'ok'}]}) # Standard practice to "confirm" system prompt
+            api_contents.append({'role': 'model', 'parts': [{'text': 'ok'}]})
 
         if history:
-            for msg in history:
+            for i, msg in enumerate(history):
                 role = 'model' if msg.author.id == self.bot.user.id else 'user'
-                # Prepend author name for user messages in history for better context for the AI
-                content_with_author = f"{msg.author.display_name}: {msg.content}" if role == 'user' else msg.content
-                api_contents.append({'role': role, 'parts': [{'text': content_with_author}]})
-
-        api_contents.append({'role': 'user', 'parts': [{'text': prompt}]})
+                formatted_parts = await self._format_message_for_ai(msg)
+                api_contents.append({'role': role, 'parts': formatted_parts})
+        
+        if 'current_message_object' in prompt_data and isinstance(prompt_data['current_message_object'], discord.Message):
+            latest_user_msg_parts = await self._format_message_for_ai(prompt_data['current_message_object'], is_latest_user_message=True)
+            api_contents.append({'role': 'user', 'parts': latest_user_msg_parts})
+        elif 'current_message_content' in prompt_data:
+             api_contents.append({'role': 'user', 'parts': [{'text': f"LATEST_USER_MESSAGE: {prompt_data['current_message_content']}"}]})
 
         last_error = None
-        guild_for_log = history[-1].guild if history and history[-1].guild else None
+        guild_for_log = history[-1].guild if history and history[-1].guild else (prompt_data.get('current_message_object').guild if prompt_data.get('current_message_object') else None)
+
 
         for model_info in models_to_try:
-            model_instance = model_info['instance'] # Already checked for None by _select_models_to_try
-            model_name = model_info['name']
-            current_model_id = model_info['id']
-            
+            model_instance, model_name, current_model_id = model_info['instance'], model_info['name'], model_info['id']
             try:
                 print(f"AI Cog Info (get_ai_response): Attempting generation with {model_name} (ID: {current_model_id}). Preferred: {preferred_model_id or 'None'}")
                 
-                # --- DEBUG PRINT LINE ---
-                print(f"--- DEBUG: AI PROMPT (Text) for {model_name} ---")
+                print(f"--- DEBUG: AI PROMPT (Multimodal Text/Image) for {model_name} ---")
+                debug_serializable_contents = []
+                for item in api_contents:
+                    serializable_item = {'role': item['role'], 'parts': []}
+                    for part_idx, part in enumerate(item['parts']):
+                        if isinstance(part, Image.Image):
+                             serializable_item['parts'].append(f"<PIL.Image {part.mode} {part.size} at part_idx {part_idx}>")
+                        elif isinstance(part, dict) and 'text' in part:
+                            serializable_item['parts'].append(part)
+                        else: 
+                            serializable_item['parts'].append(f"<UNKNOWN_PART_TYPE at part_idx {part_idx}: {type(part)}>")
+                    debug_serializable_contents.append(serializable_item)
                 try:
-                    print(json.dumps(api_contents, indent=2))
+                    print(json.dumps(debug_serializable_contents, indent=2))
                 except Exception as e_json:
                     print(f"Error serializing api_contents for debug: {e_json}")
-                    print(f"Raw api_contents: {api_contents}")
                 print("--- END DEBUG ---")
-                # --- END DEBUG PRINT LINE ---
+
 
                 response = await model_instance.generate_content_async(contents=api_contents)
 
                 if not response or not response.candidates:
                     feedback = response.prompt_feedback if response else None
                     safety_ratings_str = str(feedback.safety_ratings) if feedback and hasattr(feedback, 'safety_ratings') else 'N/A'
-                    print(f"AI Cog Warning (get_ai_response): Response from {model_name} blocked or empty. Prompt feedback: {safety_ratings_str}")
-                    await self.log_info(guild_for_log, f"AI response from {model_name} (ID: {current_model_id}) blocked (safety filters or empty).")
-                    last_error = Exception(f"Blocked by safety filters or empty response using {model_name}")
+                    print(f"AI Cog Warning (get_ai_response): Response from {model_name} blocked or empty. Feedback: {safety_ratings_str}")
+                    await self.log_info(guild_for_log, f"AI response from {model_name} (ID: {current_model_id}) blocked. Feedback: {safety_ratings_str}")
+                    last_error = Exception(f"Blocked or empty response from {model_name}. Feedback: {safety_ratings_str}")
                     if preferred_model_id and current_model_id == preferred_model_id:
-                        await self.log_error(guild_for_log, f"AI response from PREFERRED model {model_name} (ID: {current_model_id}) was blocked/empty.", error=last_error, ping_owner=False)
+                        await self.log_error(guild_for_log, f"AI response from PREFERRED model {model_name} blocked.", error=last_error, ping_owner=False)
                     continue
 
                 ai_reply = response.text
@@ -332,36 +419,34 @@ class AICog(commands.Cog):
                 return ai_reply
 
             except google_exceptions.ResourceExhausted as e_rate_limit:
-                log_message = f"AI Cog Rate Limit: {model_name} (ID: {current_model_id}) hit a rate limit. Attempting fallback."
+                log_message = f"AI Cog Rate Limit: {model_name} (ID: {current_model_id}). Fallback."
                 print(log_message)
-                ping_owner_flag = bool(preferred_model_id and current_model_id == preferred_model_id) # Ping if preferred model fails
-                await self.log_error(guild_for_log, log_message, error=e_rate_limit, ping_owner=ping_owner_flag)
+                await self.log_error(guild_for_log, log_message, error=e_rate_limit, ping_owner=(preferred_model_id == current_model_id))
                 last_error = e_rate_limit
             except Exception as e:
-                log_message = f"AI Cog Error (get_ai_response): Exception with {model_name} (ID: {current_model_id}) during generation."
+                log_message = f"AI Cog Error (get_ai_response): Exception with {model_name} (ID: {current_model_id})."
                 print(f"{log_message} Error: {e}\n{traceback.format_exc()}")
-                await self.log_error(guild_for_log, log_message, error=e, ping_owner=True) # Ping owner for unexpected errors
+                await self.log_error(guild_for_log, log_message, error=e, ping_owner=True)
                 last_error = e
         
-        print(f"AI Cog Error (get_ai_response): All AI models failed or were skipped. Last error: {last_error}")
+        print(f"AI Cog Error (get_ai_response): All AI models failed. Last error: {last_error}")
         if isinstance(last_error, google_exceptions.Aborted) and "blocked" in str(last_error).lower():
-             return "..." # Generic response for safety blocks if all models failed this way
+             return "..." 
         return None
 
-    async def get_ai_response_with_image(
-        self,
-        prompt_key: str,
-        image_bytes: bytes,
+
+    async def get_ai_response_with_image( 
+        self, prompt_key: str, image_bytes: bytes,
         prompt_kwargs: Optional[Dict[str, Any]] = None,
-        preferred_model_id: str = 'gemini_2_5_flash' # Default to highest capacity model for images
+        preferred_model_id: str = 'gemini_2_5_flash' 
     ) -> Optional[str]:
         models_to_try = self._select_models_to_try(preferred_model_id)
         if not models_to_try:
             print("AI Cog Error (Image): No AI models available/configured to try.")
             return None
 
-        final_prompt = self.get_prompt(prompt_key, **(prompt_kwargs or {}))
-        if not final_prompt:
+        final_prompt_text = self.get_prompt(prompt_key, **(prompt_kwargs or {}))
+        if not final_prompt_text:
             print(f"AI Cog Error (Image): Could not retrieve prompt for key '{prompt_key}'.")
             return None
 
@@ -373,49 +458,42 @@ class AICog(commands.Cog):
             return None
 
         last_error = None
-        guild_for_log = None # Guild context isn't readily available here without passing it
-
         for model_info in models_to_try:
-            model_instance = model_info['instance']
-            model_name = model_info['name']
-            current_model_id = model_info['id']
-            
+            model_instance, model_name, current_model_id = model_info['instance'], model_info['name'], model_info['id']
             try:
-                print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Preferred: {preferred_model_id}. Prompt Key: {prompt_key}")
+                print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Prompt Key: {prompt_key}")
                 
-                # --- DEBUG PRINT LINE ---
-                print(f"--- DEBUG: AI PROMPT (Image) for {model_name} ---")
-                print(f"Prompt Text:\n{final_prompt}")
+                print(f"--- DEBUG: AI PROMPT (Single Image Task) for {model_name} ---")
+                print(f"Prompt Text:\n{final_prompt_text}")
                 print(f"Image Data: Sent (PIL Image, Mode: {img_pil.mode}, Size: {img_pil.size}, Format: {img_pil.format or 'N/A'})")
                 print("--- END DEBUG ---")
-                # --- END DEBUG PRINT LINE ---
 
-                response = await model_instance.generate_content_async([final_prompt, img_pil])
+                response = await model_instance.generate_content_async([final_prompt_text, img_pil])
                 
                 if not response or not response.candidates:
                     feedback = response.prompt_feedback if response else None
                     safety_ratings_str = str(feedback.safety_ratings) if feedback and hasattr(feedback, 'safety_ratings') else 'N/A'
-                    print(f"AI Cog Warning (Image): Response from {model_name} blocked or empty. Prompt feedback: {safety_ratings_str}")
-                    await self.log_info(guild_for_log, f"AI image response from {model_name} (ID: {current_model_id}) blocked (safety filters or empty).")
-                    last_error = Exception(f"Blocked by safety filters or empty response using {model_name} for image.")
+                    print(f"AI Cog Warning (Image): Response from {model_name} blocked or empty. Feedback: {safety_ratings_str}")
+                    await self.log_info(None, f"AI image response from {model_name} blocked. Feedback: {safety_ratings_str}")
+                    last_error = Exception(f"Blocked or empty response from {model_name} for image. Feedback: {safety_ratings_str}")
                     if preferred_model_id and current_model_id == preferred_model_id:
-                         await self.log_error(guild_for_log, f"AI image response from PREFERRED model {model_name} (ID: {current_model_id}) was blocked/empty.", error=last_error, ping_owner=False)
+                         await self.log_error(None, f"AI image response from PREFERRED model {model_name} was blocked.", error=last_error, ping_owner=False)
                     continue
+
 
                 ai_reply = response.text
                 print(f"AI Cog Info (Image): Successfully generated response with {model_name} (ID: {current_model_id}).")
                 return ai_reply
 
             except google_exceptions.ResourceExhausted as e_rate_limit:
-                log_message = f"AI Cog Rate Limit (Image): {model_name} (ID: {current_model_id}) hit a rate limit. Attempting fallback."
+                log_message = f"AI Cog Rate Limit (Image): {model_name} (ID: {current_model_id}). Fallback."
                 print(log_message)
-                ping_owner_flag = bool(preferred_model_id and current_model_id == preferred_model_id)
-                await self.log_error(guild_for_log, log_message, error=e_rate_limit, ping_owner=ping_owner_flag)
+                await self.log_error(None, log_message, error=e_rate_limit, ping_owner=(preferred_model_id == current_model_id))
                 last_error = e_rate_limit
             except Exception as e:
-                log_message = f"AI Cog Error (Image): Exception with {model_name} (ID: {current_model_id}) during generation."
+                log_message = f"AI Cog Error (Image): Exception with {model_name} (ID: {current_model_id})."
                 print(f"{log_message} Error: {e}\n{traceback.format_exc()}")
-                await self.log_error(guild_for_log, log_message, error=e, ping_owner=True)
+                await self.log_error(None, log_message, error=e, ping_owner=True)
                 last_error = e
                 
         print(f"AI Cog Error (Image): All AI models failed for image processing. Last error: {last_error}")
@@ -425,212 +503,220 @@ class AICog(commands.Cog):
 
     async def send_ai_chat_response(
         self,
+        triggering_message: discord.Message, 
         trigger_type: str,
-        history: List[discord.Message],
-        prompt_key_for_ai: Optional[str] = None,
+        history_context: List[discord.Message], 
+        prompt_key_for_ai: Optional[str] = None, 
         prompt_kwargs_for_ai: Optional[Dict[str, Any]] = None,
-        system_instruction_key: Optional[str] = None,
-        system_instruction_kwargs: Optional[Dict[str, Any]] = None,
-        discovery_congrats_user: Optional[discord.User] = None,
-        keyword_triggered_rule_data: Optional[Dict[str, Any]] = None,
-        user_message_content: Optional[str] = None,
-        interaction_for_command_reply: Optional[discord.Interaction] = None
+        system_instruction_key_override: Optional[str] = None,
+        system_instruction_kwargs_override: Optional[Dict[str, Any]] = None,
+        discovery_congrats_user: Optional[discord.User] = None, 
+        keyword_triggered_rule_data: Optional[Dict[str, Any]] = None, 
+        interaction_for_command_reply: Optional[discord.Interaction] = None, 
+        mob_mode_details: Optional[Dict[str, Any]] = None 
     ):
-        if not self.get_ai_model_priority_list(): # Checks if any models are configured at all
+        if not self.get_ai_model_priority_list():
             print("AI Cog Send Error: No AI models available/configured.")
             if interaction_for_command_reply:
                 try:
-                    # Use followup if already responded, else send new response
                     send_method = interaction_for_command_reply.followup.send if interaction_for_command_reply.response.is_done() else interaction_for_command_reply.response.send_message
                     await send_method("AI is currently unavailable.", ephemeral=True)
-                except Exception: pass # Suppress errors if interaction already handled
+                except Exception: pass
             return
 
-        channel_to_send_in: Optional[discord.abc.Messageable] = None
-        guild_for_log: Optional[discord.Guild] = None
-        message_to_reply_to: Optional[discord.Message] = None
+        channel_to_send_in = interaction_for_command_reply.channel if interaction_for_command_reply else triggering_message.channel
+        guild_for_log = interaction_for_command_reply.guild if interaction_for_command_reply else triggering_message.guild
+        
+        current_message_content = triggering_message.content
+        if not current_message_content.strip() and triggering_message.stickers:
+            current_message_content = f"(User sent a sticker: {triggering_message.stickers[0].name})"
+        elif not current_message_content.strip():
+            current_message_content = "(User sent an empty or attachment-only message)"
 
-        if interaction_for_command_reply:
-            channel_to_send_in = interaction_for_command_reply.channel
-            guild_for_log = interaction_for_command_reply.guild
-        elif history: # Should always have history if not an interaction
-            triggering_message_context = history[-1]
-            channel_to_send_in = triggering_message_context.channel
-            guild_for_log = triggering_message_context.guild
-            if trigger_type not in ["AlwaysOn"]: # Don't self-reply in always-on contexts unless specifically designed
-                message_to_reply_to = triggering_message_context
-        else:
-            print(f"AI Cog Error (send_ai_chat_response): History empty and no interaction provided for trigger '{trigger_type}'.")
-            return
+        prompt_data_for_ai_call = {
+            'current_message_object': triggering_message, 
+            'current_message_content': current_message_content, 
+            'server_name': guild_for_log.name if guild_for_log else "DM",
+            'channel_name': channel_to_send_in.name if hasattr(channel_to_send_in, 'name') else "DM Channel"
+        }
+        
+        system_instruction_details = {'key': system_instruction_key_override or "HUMAN_SYSTEM_INSTRUCTION_V3", 'kwargs': system_instruction_kwargs_override or {}}
+        preferred_model_id_for_call = 'gemini_2.0_flash' 
 
-        if not channel_to_send_in: # Should be caught by above, but as a safeguard
-            print(f"AI Cog Error (send_ai_chat_response): Could not determine channel for trigger '{trigger_type}'.")
-            return
-
-        preferred_model_id_for_call: Optional[str] = None
-        final_system_instruction_str: Optional[str] = None
-        actual_prompt_for_ai: Optional[str] = None
-
-        # --- Determine AI call parameters based on trigger type ---
-        if trigger_type == "AlwaysOn":
-            preferred_model_id_for_call = 'gemini_2_0_flash' # Cheaper model for general chat
-            sys_instruct_key = system_instruction_key or "HUMAN_SYSTEM_INSTRUCTION"
-            final_system_instruction_str = self.get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
-            actual_prompt_for_ai = user_message_content or "(responded to chat flow)"
-            if prompt_key_for_ai: # Allows overriding the direct user message content if needed
-                actual_prompt_for_ai = self.get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {})) or actual_prompt_for_ai
-
+        if mob_mode_details:
+            system_instruction_details['key'] = "MOB_PERSONA_SYSTEM_INSTRUCTION_V2"
+            system_instruction_details['kwargs'] = {
+                'mob_name': mob_mode_details['mob_name'],
+                'user_message_content': mob_mode_details['user_message_content'],
+                'server_name': prompt_data_for_ai_call['server_name'],
+                'channel_name': prompt_data_for_ai_call['channel_name'],
+                'current_time_utc': datetime.datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+            }
+            preferred_model_id_for_call = 'gemini_2.5_flash' 
         elif trigger_type == "Discovery" and keyword_triggered_rule_data and discovery_congrats_user:
-            preferred_model_id_for_call = 'gemini_2_5_flash' # Higher quality for special event
-            sys_instruct_key = "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION"
-            final_system_instruction_str = self.get_prompt(
-                sys_instruct_key,
-                phrase_identifier=keyword_triggered_rule_data['phrase_identifier'],
-                user_display_name=discovery_congrats_user.display_name.lower(), # Keep consistent with prompt
-                speciality=keyword_triggered_rule_data.get('speciality', 'General topic'),
-                instructions=keyword_triggered_rule_data.get('instructions', 'Respond naturally and enthusiastically.')
-            )
-            actual_prompt_for_ai = f"The user's message was: '{user_message_content}'. This triggered the first discovery of your keyword: '{keyword_triggered_rule_data['phrase_identifier']}'. Congratulate them and then respond to their message based on the keyword's theme."
-
+            preferred_model_id_for_call = 'gemini_2.5_flash'
+            system_instruction_details['key'] = "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION"
+            system_instruction_details['kwargs'] = {
+                'phrase_identifier': keyword_triggered_rule_data['phrase_identifier'],
+                'user_display_name': discovery_congrats_user.display_name.lower(),
+                'speciality': keyword_triggered_rule_data.get('speciality', 'General topic'),
+                'instructions': keyword_triggered_rule_data.get('instructions', 'Respond naturally.')
+            }
         elif trigger_type == "Keyword" and keyword_triggered_rule_data:
-            preferred_model_id_for_call = 'gemini_2_5_flash' # Higher quality for specific keyword logic
-            sys_instruct_key = "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION"
-            human_sys_instruct = self.get_prompt("HUMAN_SYSTEM_INSTRUCTION") # Base human-like instruction
-            final_system_instruction_str = self.get_prompt(
-                sys_instruct_key,
-                human_system_instruction=human_sys_instruct,
-                phrase_identifier=keyword_triggered_rule_data['phrase_identifier'],
-                speciality=keyword_triggered_rule_data.get('speciality', 'General topic'),
-                instructions=keyword_triggered_rule_data.get('instructions', 'Respond naturally based on the user message and keyword context.')
-            )
-            actual_prompt_for_ai = f"The keyword '{keyword_triggered_rule_data['phrase_identifier']}' was triggered by the user's message: '{user_message_content}'. Please respond according to the specialty and instructions for this keyword."
-        
-        elif trigger_type in ["Reply", "Mention"]:
-            preferred_model_id_for_call = 'gemini_2_5_flash' # Higher quality for direct interaction
-            sys_instruct_key = system_instruction_key or "HUMAN_SYSTEM_INSTRUCTION"
-            final_system_instruction_str = self.get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
-            actual_prompt_for_ai = user_message_content or "(general interaction, user replied or mentioned you)"
-            if prompt_key_for_ai:
-                actual_prompt_for_ai = self.get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {})) or actual_prompt_for_ai
-
-        elif trigger_type.startswith("COMMAND_"): # For AI responses triggered by bot commands
-            preferred_model_id_for_call = 'gemini_2_5_flash' 
-            sys_instruct_key = system_instruction_key or "BOT_PURPOSE_GENERAL" # Default system context for commands
-            final_system_instruction_str = self.get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
+            preferred_model_id_for_call = 'gemini_2.5_flash'
+            base_human_system_prompt_kwargs = {
+                'server_name': prompt_data_for_ai_call['server_name'], 
+                'channel_name': prompt_data_for_ai_call['channel_name'],
+                'current_time_utc': datetime.datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+            }
+            human_sys_instruct = self.get_prompt("HUMAN_SYSTEM_INSTRUCTION_V3", **base_human_system_prompt_kwargs)
             
-            if not prompt_key_for_ai: # Command triggers must have a prompt key
-                print(f"AI Cog Send Error: No prompt_key_for_ai provided for COMMAND trigger '{trigger_type}'.")
-                if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt configuration missing.", ephemeral=True)
+            system_instruction_details['key'] = "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION"
+            system_instruction_details['kwargs'] = {
+                'human_system_instruction': human_sys_instruct,
+                'phrase_identifier': keyword_triggered_rule_data['phrase_identifier'],
+                'speciality': keyword_triggered_rule_data.get('speciality', 'General topic'),
+                'instructions': keyword_triggered_rule_data.get('instructions', 'Respond naturally.')
+            }
+        elif trigger_type.startswith("COMMAND_"):
+            preferred_model_id_for_call = 'gemini_2.5_flash'
+            system_instruction_details['key'] = system_instruction_key_override or "BOT_PURPOSE_GENERAL" 
+            
+            if not prompt_key_for_ai:
+                await self.log_error(guild_for_log, f"AI Cog Send Error: No prompt_key_for_ai for COMMAND trigger '{trigger_type}'.")
+                if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt config missing.", ephemeral=True)
+                return 
+            command_ai_prompt_text = self.get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {}))
+            if not command_ai_prompt_text:
+                await self.log_error(guild_for_log, f"AI Cog Send Error: Could not load prompt key '{prompt_key_for_ai}' for trigger '{trigger_type}'.")
+                if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt load failed.", ephemeral=True)
                 return
-            actual_prompt_for_ai = self.get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {}))
-            if not actual_prompt_for_ai:
-                print(f"AI Cog Send Error: Could not load prompt for key '{prompt_key_for_ai}' for trigger '{trigger_type}'.")
-                if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt could not be loaded.", ephemeral=True)
-                return
-        else: # Fallback / Generic query
-            preferred_model_id_for_call = 'gemini_2_0_flash'
-            sys_instruct_key = system_instruction_key or "HUMAN_SYSTEM_INSTRUCTION"
-            final_system_instruction_str = self.get_prompt(sys_instruct_key, **(system_instruction_kwargs or {}))
-            actual_prompt_for_ai = user_message_content or "(general query from user)"
-            if prompt_key_for_ai:
-                actual_prompt_for_ai = self.get_prompt(prompt_key_for_ai, **(prompt_kwargs_for_ai or {})) or actual_prompt_for_ai
-        
-        if not actual_prompt_for_ai: # Should be caught by specific cases like COMMAND_ above, but good general check
-            log_msg_content = f"AI Cog Send Error: Prompt for AI was empty for trigger '{trigger_type}'."
-            log_msg_content += f" Msg: {history[-1].id}" if history and history[-1] else ""
-            log_msg_content += f" Interaction: {interaction_for_command_reply.id}" if interaction_for_command_reply else ""
-            await self.log_error(guild_for_log, log_msg_content)
-            if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt was unexpectedly empty.", ephemeral=True)
-            return
+            prompt_data_for_ai_call['current_message_content'] = command_ai_prompt_text
+            # history_context = None 
 
-        ai_response_processed = None
+        ai_response_raw = None
         try:
-            # Use channel.typing() context manager if not an interaction reply (which handles its own "thinking" state)
-            typing_context = channel_to_send_in.typing() if isinstance(channel_to_send_in, discord.TextChannel) and not interaction_for_command_reply else contextlib.nullcontext()
-
+            typing_context = channel_to_send_in.typing() if isinstance(channel_to_send_in, discord.TextChannel) and not interaction_for_command_reply and not mob_mode_details else contextlib.nullcontext()
             async with typing_context:
                 ai_response_raw = await self.get_ai_response(
-                    prompt=actual_prompt_for_ai,
-                    history=history if not interaction_for_command_reply else None, # History usually not needed if interaction provided fresh prompt
-                    system_instruction=final_system_instruction_str,
+                    prompt_data=prompt_data_for_ai_call,
+                    history=history_context,
+                    system_instruction_details=system_instruction_details,
                     preferred_model_id=preferred_model_id_for_call
                 )
-
-            if not ai_response_raw:
-                log_msg_content = f"AI for '{trigger_type}' (prompt key: {prompt_key_for_ai or 'N/A'}) returned None/empty."
-                log_msg_content += f" Msg: {history[-1].id}" if history and history[-1] else ""
-                log_msg_content += f" Interaction: {interaction_for_command_reply.id}" if interaction_for_command_reply else ""
-                await self.log_info(guild_for_log, log_msg_content)
-                
-                fail_msg = "... (couldn't think of a response right now)"
-                if interaction_for_command_reply: await interaction_for_command_reply.followup.send(fail_msg, ephemeral=True)
-                elif trigger_type == "AlwaysOn": await channel_to_send_in.send(fail_msg)
-                elif message_to_reply_to: await message_to_reply_to.reply(fail_msg, mention_author=False)
-                return
-
-            # Post-process AI response
-            ai_response_processed = ai_response_raw.strip()
-            if ai_response_processed.endswith(('.', '!', '?')): # Minor stylistic adjustment
-                ai_response_processed = ai_response_processed[:-1]
-            
-            bot_name_prefix_lower = f"{self.bot.user.name.lower()}:" if self.bot.user and self.bot.user.name else "bot:"
-            if ai_response_processed.lower().startswith(bot_name_prefix_lower):
-                ai_response_processed = ai_response_processed[len(bot_name_prefix_lower):].lstrip()
-
-            if len(ai_response_processed) > 1950: # Discord message limit is 2000
-                ai_response_processed = ai_response_processed[:1947] + "..."
-
         except Exception as ai_call_err:
-            log_msg_content = f"Error during get_ai_response call for '{trigger_type}' (prompt key: {prompt_key_for_ai or 'N/A'})"
-            log_msg_content += f" Msg: {history[-1].id}" if history and history[-1] else ""
-            log_msg_content += f" Interaction: {interaction_for_command_reply.id}" if interaction_for_command_reply else ""
+            log_msg_content = f"Error during get_ai_response call for '{trigger_type}' in channel {channel_to_send_in.id}"
             await self.log_error(guild_for_log, log_msg_content, error=ai_call_err)
-            
-            fail_msg = "... (ran into a snag trying to respond)"
+            fail_msg = "... (ran into a cosmic ray 💫 trying to respond)"
             if interaction_for_command_reply: await interaction_for_command_reply.followup.send(fail_msg, ephemeral=True)
-            elif trigger_type == "AlwaysOn": await channel_to_send_in.send(fail_msg)
-            elif message_to_reply_to: await message_to_reply_to.reply(fail_msg, mention_author=False)
+            elif trigger_type == "AlwaysOn" and not mob_mode_details : await channel_to_send_in.send(fail_msg) # don't send fail if mob mode failed to init
+            elif not mob_mode_details and triggering_message: await triggering_message.reply(fail_msg, mention_author=False)
             return
 
-        if ai_response_processed:
-            final_message_content_to_send = ""
-            # Special formatting for discovery announcements
-            if trigger_type == "Discovery" and discovery_congrats_user and keyword_triggered_rule_data:
-                final_message_content_to_send = (
-                    f"# 🎉 \n woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: "
-                    f"**'{discord.utils.escape_markdown(keyword_triggered_rule_data['phrase_identifier'])}'**! 🎉\n\n"
-                    f"{ai_response_processed}"
-                )
-            else:
-                final_message_content_to_send = ai_response_processed
+        if not ai_response_raw:
+            await self.log_info(guild_for_log, f"AI for '{trigger_type}' in {channel_to_send_in.id} returned None/empty.")
+            if trigger_type == "AlwaysOn" and not mob_mode_details: # Don't send if mob mode was attempted and failed silently before this
+                await channel_to_send_in.send("... (my circuits are quiet right now 🤖)")
+            return
             
-            # Add a small note for regular keyword triggers
-            if trigger_type == "Keyword" and keyword_triggered_rule_data:
-                final_message_content_to_send += f"\n*(You triggered the keyword: `{discord.utils.escape_markdown(keyword_triggered_rule_data['phrase_identifier'])}`)*"
+        ai_response_processed = ai_response_raw.strip()
+        if ai_response_processed.endswith(('.', '!', '?')) and not any(ai_response_processed.endswith(x) for x in ['...', '?!', '!!']):
+            ai_response_processed = ai_response_processed[:-1]
+        
+        bot_name_prefix_lower = f"{self.bot.user.name.lower()}:" if self.bot.user and self.bot.user.name else "bot:"
+        if ai_response_processed.lower().startswith(bot_name_prefix_lower):
+            ai_response_processed = ai_response_processed[len(bot_name_prefix_lower):].lstrip()
 
-            try:
+        if len(ai_response_processed) > 1950:
+            ai_response_processed = ai_response_processed[:1947] + "..."
+
+        if not ai_response_processed.strip(): 
+            await self.log_info(guild_for_log, f"AI response for '{trigger_type}' became empty after processing.")
+            return
+
+        final_message_content_to_send = ai_response_processed
+        if trigger_type == "Discovery" and discovery_congrats_user and keyword_triggered_rule_data:
+            final_message_content_to_send = (
+                f"# 🎉 \n woohoo, {discovery_congrats_user.mention}! you're the first to find the secret phrase: "
+                f"**'{discord.utils.escape_markdown(keyword_triggered_rule_data['phrase_identifier'])}'**! 🎉\n\n"
+                f"{ai_response_processed}"
+            )
+        elif trigger_type == "Keyword" and keyword_triggered_rule_data and not mob_mode_details:
+            final_message_content_to_send += f"\n*(You triggered the keyword: `{discord.utils.escape_markdown(keyword_triggered_rule_data['phrase_identifier'])}`)*"
+
+        try:
+            if mob_mode_details and isinstance(channel_to_send_in, discord.TextChannel): # Ensure channel is TextChannel
+                await self._send_mob_webhook_message(
+                    channel_to_send_in,
+                    mob_mode_details['mob_name'],
+                    mob_mode_details['mob_image_path'],
+                    final_message_content_to_send
+                )
+            elif interaction_for_command_reply:
                 is_ephemeral_command = trigger_type.startswith("COMMAND_") and trigger_type.endswith("_EPHEMERAL")
-                
-                if interaction_for_command_reply:
-                    send_method = interaction_for_command_reply.followup.send if interaction_for_command_reply.response.is_done() else interaction_for_command_reply.response.send_message
-                    await send_method(final_message_content_to_send, ephemeral=is_ephemeral_command)
-                elif trigger_type == "AlwaysOn":
-                    await channel_to_send_in.send(final_message_content_to_send)
-                elif message_to_reply_to:
-                    # Reply with mention for direct interactions like Reply, Keyword, Discovery
-                    mention_author_flag = trigger_type in ["Reply", "Keyword", "Discovery"]
-                    await message_to_reply_to.reply(final_message_content_to_send, mention_author=mention_author_flag)
-                else: # Fallback: send to channel if no specific message to reply to (should be rare)
-                    await channel_to_send_in.send(final_message_content_to_send)
-                    log_msg_content = f"AI response for '{trigger_type}' sent to channel directly (no message_to_reply_to)."
-                    log_msg_content += f" (Orig Msg ID: {history[-1].id})" if history and history[-1] else ""
-                    await self.log_info(guild_for_log, log_msg_content)
+                send_method = interaction_for_command_reply.followup.send if interaction_for_command_reply.response.is_done() else interaction_for_command_reply.response.send_message
+                await send_method(final_message_content_to_send, ephemeral=is_ephemeral_command)
 
-            except (discord.Forbidden, discord.HTTPException) as reply_err:
-                log_msg_content = f"Failed to send processed AI '{trigger_type}' response"
-                log_msg_content += f" for msg {history[-1].id}" if history and history[-1] else ""
-                log_msg_content += f" for interaction {interaction_for_command_reply.id}" if interaction_for_command_reply else ""
-                await self.log_error(guild_for_log, log_msg_content, error=reply_err)
+            elif trigger_type == "AlwaysOn":
+                if random.random() < PINGSLAVE_SPECIAL_COMMENT_CHANCE:
+                    special_additions = ["\n*(...just some digital thoughts ✨)*", "\n*(...is this real life? 🤖)*", "\n*(...pondering the universe, brb 🌌)*", "\n*(...beep boop? 🤔)*"]
+                    final_message_content_to_send += random.choice(special_additions)
+                    if len(final_message_content_to_send) > 1980:
+                        final_message_content_to_send = final_message_content_to_send[:1977] + "..."
+                await channel_to_send_in.send(final_message_content_to_send)
+            else: 
+                mention_author_flag = trigger_type in ["Reply", "Keyword", "Discovery"]
+                await triggering_message.reply(final_message_content_to_send, mention_author=mention_author_flag)
+
+        except (discord.Forbidden, discord.HTTPException) as reply_err:
+            await self.log_error(guild_for_log, f"Failed to send AI '{trigger_type}' response in {channel_to_send_in.id}", error=reply_err)
+
+    async def _send_mob_webhook_message(self, channel: discord.TextChannel, mob_name: str, image_path: str, content: str):
+        webhook: Optional[discord.Webhook] = None
+        avatar_bytes: Optional[bytes] = None
+        try:
+            with open(image_path, 'rb') as f:
+                avatar_bytes = f.read()
+        except Exception as e:
+            await self.log_error(channel.guild, f"Error reading mob avatar for {mob_name} from {image_path}", error=e)
+            await channel.send(f"**{mob_name} (Appearing mysteriously):** {content}\n*(My grand entrance was... foiled by a file error! Imagine me looking suitably menacing.)*")
+            return
+
+        if not avatar_bytes:
+            await channel.send(f"**{mob_name} (A Formless Voice):** {content}\n*(My avatar is missing! Truly, a tragedy.)*")
+            return
+
+        try:
+            webhook = await channel.create_webhook(name=mob_name, avatar=avatar_bytes, reason=f"Temporary Pingslave Mob Mode: {mob_name}")
+            await webhook.send(content=content, wait=True) 
+            print(f"AI Cog: Sent mob message as '{mob_name}' with custom avatar in #{channel.name}.")
+        except discord.Forbidden:
+            await self.log_error(channel.guild, f"Missing 'Manage Webhooks' permission in #{channel.name} for Mob Mode avatar. Mob: {mob_name}. Sent as plain text.", ping_owner=False)
+            try:
+                await channel.send(f"**{mob_name}:** {content}\n*(Imagine I have a super cool picture right now!)*")
+            except Exception as fallback_e:
+                 await self.log_error(channel.guild, f"Mob mode fallback plain send also failed for {mob_name}", error=fallback_e)
+        except Exception as e:
+            await self.log_error(channel.guild, f"Error sending mob webhook message for {mob_name}", error=e)
+            try: 
+                await channel.send(f"**{mob_name} (My transformation had a glitch!):** {content}")
+            except: pass
+        finally:
+            if webhook:
+                try:
+                    await webhook.delete(reason=f"Temporary Pingslave Mob Mode cleanup: {mob_name}")
+                    print(f"AI Cog: Deleted temporary webhook for '{mob_name}' in #{channel.name}.")
+                except Exception as e_del:
+                    await self.log_error(channel.guild, f"Error deleting temporary webhook for {mob_name} in #{channel.name}", error=e_del, ping_owner=False)
+
+
+    def _parse_mob_name(self, filename: str) -> str:
+        name = os.path.splitext(filename)[0] 
+        for rarity_suffix in MOB_NAME_RARITIES_TO_STRIP:
+            if name.endswith(rarity_suffix):
+                name = name[:-len(rarity_suffix)]
+                break 
+        return name.strip() or "Mysterious Mob"
 
     async def load_keyword_data(self, guild_for_log: Optional[discord.Guild]):
         if not self.supabase:
@@ -646,7 +732,7 @@ class AICog(commands.Cog):
                                .execute()
             )
 
-            if not resp or not hasattr(resp, 'data'): # Check if response object and data attribute exist
+            if not resp or not hasattr(resp, 'data'):
                 await self.log_info(guild_for_log, "AI Cog: No keyword data found or failed to fetch from Supabase.")
                 self.keyword_data_cache = {}
                 self.total_keywords = 0
@@ -667,18 +753,18 @@ class AICog(commands.Cog):
                     incl_compiled = re.compile(incl_regex_str, re.IGNORECASE)
                 except (re.error, ValueError) as e:
                     compile_errors.append(f"ID '{entry_id_str}' (Identifier: {entry.get('phrase_identifier', 'N/A')}): Inclusion Regex Error: {e}")
-                    continue # Skip this rule if essential regex fails
+                    continue
                 
                 excl_compiled = None
                 if excl_regex_str:
                     try:
                         excl_compiled = re.compile(excl_regex_str, re.IGNORECASE)
-                    except re.error as e: # Non-fatal for this rule, exclusion just won't work
+                    except re.error as e: 
                         compile_errors.append(f"ID '{entry_id_str}' (Identifier: {entry.get('phrase_identifier', 'N/A')}): Exclusion Regex Error (will proceed without it): {e}")
 
                 temp_cache[entry_id_str] = {
                     'id': entry_id_str,
-                    'phrase_identifier': entry.get('phrase_identifier', f'Rule_{entry_id_str[:8]}'), # Fallback identifier
+                    'phrase_identifier': entry.get('phrase_identifier', f'Rule_{entry_id_str[:8]}'),
                     'inclusion_regex': incl_compiled,
                     'exclusion_regex': excl_compiled,
                     'speciality': entry.get('speciality'),
@@ -697,11 +783,11 @@ class AICog(commands.Cog):
             if compile_errors:
                 log_message = "AI Cog Keyword Regex Compilation Warnings/Errors:\n- " + "\n- ".join(compile_errors)
                 print(f"AI Cog WARNING: {log_message}")
-                await self.log_error(guild_for_log, log_message, ping_owner=False) # Don't ping for non-fatal regex issues
+                await self.log_error(guild_for_log, log_message, ping_owner=False)
 
         except Exception as e:
             await self.log_error(guild_for_log, "AI Cog: Critical failure loading keyword data from Supabase", error=e, ping_owner=True)
-            self.keyword_data_cache = {} # Clear cache on critical failure
+            self.keyword_data_cache = {} 
             self.total_keywords = 0
             self.discovered_keywords_count = 0
 
@@ -712,17 +798,16 @@ class AICog(commands.Cog):
 
         print(f"AI Cog: Recording discovery for keyword ID {keyword_id_str} by user {user_id}...")
         try:
-            # Ensure discovery_time is timezone-aware (UTC) for ISO format
             aware_discovery_time = discovery_time.astimezone(pytz.utc) if discovery_time.tzinfo is None else discovery_time
             
             await self.run_supabase_sync(
                 lambda: self.supabase.table(self.keyword_table_name)
                                .update({
-                                   'discovered_by_user_id': str(user_id), # Ensure user_id is string for DB if needed
+                                   'discovered_by_user_id': str(user_id), 
                                    'discovered_at': aware_discovery_time.isoformat()
                                })
                                .eq('id', keyword_id_str)
-                               .is_('discovered_by_user_id', 'null') # Only update if not already discovered
+                               .is_('discovered_by_user_id', 'null') 
                                .execute()
             )
             print(f"AI Cog: Successfully recorded discovery for keyword ID {keyword_id_str}.")
@@ -731,174 +816,137 @@ class AICog(commands.Cog):
             await self.log_error(guild_for_log, f"AI Cog: Failed to record discovery for keyword ID {keyword_id_str} in Supabase", error=e, ping_owner=True)
             return False
 
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or not self.bot.is_ready() or not self.bot.user or \
            message.author.id == self.bot.user.id or message.author.bot:
             return
-        if not message.content and not message.attachments and not message.stickers: # Also check stickers
+        if not message.content and not message.attachments and not message.stickers:
             return
 
-        guild = message.guild
-        channel = message.channel
-        author = message.author
-        
-        # Determine server/channel context for rule application
-        is_catercord = guild.id == self.catercord_guild_id
-        is_private_server = guild.id == self.private_server_id
-        is_owner = author.id == self.owner_user_id
-
-        is_staff_channel_catercord = is_catercord and channel.id in self.staff_channels
-        is_bot_commands_channel_catercord = is_catercord and channel.id in self.bot_commands_allowed_channel_ids
-        
-        # Keywords generally not discoverable/triggerable in staff/bot-commands channels in Catercord by non-owners
+        is_catercord = message.guild.id == self.catercord_guild_id
+        is_private_server = message.guild.id == self.private_server_id
+        is_owner = message.author.id == self.owner_user_id
+        is_staff_channel_catercord = is_catercord and message.channel.id in self.staff_channels
+        is_bot_commands_channel_catercord = is_catercord and message.channel.id in self.bot_commands_allowed_channel_ids
         is_restricted_keyword_channel_catercord = is_staff_channel_catercord or is_bot_commands_channel_catercord
-
-        # 1. Always-On AI Channels
-        if channel.id in self.always_on_ai_channels and not message.content.startswith(self.command_prefix):
-            print(f"AI Cog Trigger: Always-On Channel Message by {author.name} in #{channel.name}")
-            history = [msg async for msg in channel.history(limit=10, before=message)]
-            history.reverse()
-            history.append(message)
-
-            cleaned_prompt = message.content
-            if not cleaned_prompt.strip() and message.stickers: cleaned_prompt = f"(User sent a sticker: {message.stickers[0].name})"
-            elif not cleaned_prompt.strip(): cleaned_prompt = "(User sent an empty or attachment-only message)"
-            
-            await self.send_ai_chat_response(
-                trigger_type="AlwaysOn", history=history, user_message_content=cleaned_prompt,
-                system_instruction_key="HUMAN_SYSTEM_INSTRUCTION"
-            )
-            return # Prevent further processing if handled by AlwaysOn
-
-        # 2. Reply/Mention Trigger
-        is_reply_to_bot = False
-        if message.reference and message.reference.message_id:
-            try: # Fetching referenced message can fail if it's deleted or inaccessible
-                ref_msg = message.reference.resolved or await channel.fetch_message(message.reference.message_id)
-                if ref_msg and ref_msg.author.id == self.bot.user.id:
-                    is_reply_to_bot = True
-            except (discord.NotFound, discord.HTTPException) as e_ref:
-                print(f"AI Cog: Minor error fetching referenced message for reply check: {e_ref}")
         
+        history_context = []
+        try:
+            history_context = [m async for m in message.channel.history(limit=HISTORY_MESSAGE_LIMIT, before=message)]
+            history_context.reverse() 
+        except Exception as e_hist:
+            print(f"AI Cog Error fetching history for message {message.id}: {e_hist}")
+        
+        if message.channel.id in self.always_on_ai_channels and not message.content.startswith(self.command_prefix):
+            print(f"AI Cog Trigger: Always-On Channel by {message.author.name} ({message.author.id}) in #{message.channel.name} ({message.guild.name})")
+            
+            if random.random() < MOB_MODE_CHANCE and os.path.isdir(self.mobs_folder_path) and isinstance(message.channel, discord.TextChannel):
+                mob_files = [f for f in os.listdir(self.mobs_folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif'))] 
+                if mob_files:
+                    selected_mob_file = random.choice(mob_files)
+                    mob_name = self._parse_mob_name(selected_mob_file)
+                    mob_image_path = os.path.join(self.mobs_folder_path, selected_mob_file)
+                    
+                    print(f"AI Cog: MOB MODE triggered! Mob: {mob_name}, Image: {selected_mob_file}")
+                    await self.send_ai_chat_response(
+                        triggering_message=message, trigger_type="MobMode", history_context=history_context,
+                        mob_mode_details={'mob_name': mob_name, 'mob_image_path': mob_image_path, 'user_message_content': message.content or "(sent attachments/stickers)"}
+                    )
+                    return 
+
+            await self.send_ai_chat_response(
+                triggering_message=message, trigger_type="AlwaysOn", history_context=history_context
+            )
+            return
+
+        is_reply_to_bot = False
+        if message.reference:
+            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id == self.bot.user.id:
+                is_reply_to_bot = True
+            elif message.reference.message_id : # Try fetching if not resolved (e.g. older message, or just ID provided)
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                    if ref_msg.author.id == self.bot.user.id:
+                        is_reply_to_bot = True
+                except (discord.NotFound, discord.HTTPException):
+                    pass # Referenced message not found or inaccessible
+
+
         bot_mention_formats = [f'<@{self.bot.user.id}>', f'<@!{self.bot.user.id}>']
         is_mention_to_bot = any(mention in message.content for mention in bot_mention_formats)
 
         if is_reply_to_bot or is_mention_to_bot:
-            # In Catercord, if not an always-on channel, guide user to the AI channel
-            if is_catercord and channel.id not in self.always_on_ai_channels:
+            if is_catercord and message.channel.id not in self.always_on_ai_channels:
                 clickable_channel = f"<#{self.unrestricted_ai_channel_id}>" if self.unrestricted_ai_channel_id else "the designated AI channel"
                 info_message_text = f"ℹ️ Psst! You can chat with me freely in {clickable_channel} for AI-powered conversations! This message will disappear shortly."
-                try: await message.reply(info_message_text, mention_author=False, delete_after=10.0) # Increased delete_after
+                try: await message.reply(info_message_text, mention_author=False, delete_after=10.0)
                 except Exception as info_reply_err: print(f"AI Cog Error sending AI channel info message: {info_reply_err}")
-                return # Stop further processing
+                return
 
-            # Determine if bot can respond in the current channel context
-            can_respond_here = (channel.id in self.always_on_ai_channels or # Always respond in AI channels
-                               (not is_catercord and guild.me and guild.me.joined_at)) # Respond in other servers if formally invited
-
+            can_respond_here = (message.channel.id in self.always_on_ai_channels or
+                               (not is_catercord and message.guild.me and message.guild.me.joined_at))
             if can_respond_here:
                 trigger_method = "Reply" if is_reply_to_bot else "Mention"
-                print(f"AI Cog Trigger: {trigger_method} by {author.name} in #{channel.name}")
-                
-                history = [msg async for msg in channel.history(limit=10, before=message)]
-                history.reverse()
-                history.append(message)
-
-                cleaned_prompt = message.content
-                for mention in bot_mention_formats: cleaned_prompt = cleaned_prompt.replace(mention, "").strip()
-                if not cleaned_prompt.strip() and message.stickers: cleaned_prompt = f"(User {trigger_method.lower()}ed with a sticker: {message.stickers[0].name})"
-                elif not cleaned_prompt.strip(): cleaned_prompt = f"(User just {trigger_method.lower()}ed, no extra text)"
-
+                print(f"AI Cog Trigger: {trigger_method} by {message.author.name} ({message.author.id}) in #{message.channel.name} ({message.guild.name})")
                 await self.send_ai_chat_response(
-                    trigger_type=trigger_method, history=history,
-                    user_message_content=cleaned_prompt, system_instruction_key="HUMAN_SYSTEM_INSTRUCTION"
+                    triggering_message=message, trigger_type=trigger_method, history_context=history_context
                 )
-                return # Prevent further processing
+                return
 
-        # 3. Keyword Detection Logic
-        if self.keyword_data_cache and message.content: # Ensure there's content for regex
+        if self.keyword_data_cache and message.content:
             message_content_lower = message.content.lower()
             for rule_id_str, rule_data in self.keyword_data_cache.items():
-                # Basic validation of rule_data structure
-                if not isinstance(rule_data, dict) or not all(k in rule_data for k in ['inclusion_regex', 'phrase_identifier']):
-                    continue 
-                
+                if not isinstance(rule_data, dict) or not rule_data.get('inclusion_regex'): continue
                 try:
-                    # Check exclusion first
                     if rule_data.get('exclusion_regex') and rule_data['exclusion_regex'].search(message_content_lower):
                         continue
-                    # Then check inclusion
                     if not rule_data['inclusion_regex'].search(message_content_lower):
                         continue
 
-                    # --- Keyword Matched ---
                     phrase_identifier = rule_data['phrase_identifier']
-                    rule_is_discovered = bool(rule_data.get('discovered_by'))
+                    is_discovered = bool(rule_data.get('discovered_by'))
 
-                    if not rule_is_discovered:
-                        # Discovery Logic: Catercord public channels (non-owner) OR Private Server (owner only)
-                        can_discover_here = (is_catercord and not is_restricted_keyword_channel_catercord and not is_owner) or \
-                                            (is_private_server and is_owner)
-                        
-                        if can_discover_here:
+                    if not is_discovered:
+                        can_discover = (is_catercord and not is_restricted_keyword_channel_catercord and not is_owner) or \
+                                       (is_private_server and is_owner)
+                        if can_discover:
                             discovery_context = "Catercord (Public)" if is_catercord else "Private Server (Owner)"
-                            print(f"AI Cog Keyword DISCOVERY: '{phrase_identifier}' by {author.name} ({author.id}) in #{channel.name} ({guild.name} - {discovery_context})")
-                            discovery_time = discord.utils.utcnow() # Use discord.utils for timezone-aware UTC
-                            
-                            db_recorded = await self.record_discovery_in_db(guild, rule_id_str, author.id, discovery_time)
+                            print(f"AI Cog Keyword DISCOVERY: '{phrase_identifier}' by {message.author.name} ({message.author.id}) in #{message.channel.name} ({message.guild.name} - {discovery_context})")
+                            discovery_time = discord.utils.utcnow()
+                            db_recorded = await self.record_discovery_in_db(message.guild, rule_id_str, message.author.id, discovery_time)
                             if db_recorded:
-                                # Update cache immediately
-                                self.keyword_data_cache[rule_id_str]['discovered_by'] = str(author.id)
+                                self.keyword_data_cache[rule_id_str]['discovered_by'] = str(message.author.id)
                                 self.keyword_data_cache[rule_id_str]['discovered_at'] = discovery_time
                                 self.discovered_keywords_count += 1
-                                
-                                history = [msg async for msg in channel.history(limit=5, before=message)]
-                                history.reverse(); history.append(message)
-                                
                                 await self.send_ai_chat_response(
-                                    trigger_type="Discovery", history=history, user_message_content=message.content,
-                                    discovery_congrats_user=author, keyword_triggered_rule_data=rule_data
+                                    triggering_message=message, trigger_type="Discovery", history_context=history_context,
+                                    discovery_congrats_user=message.author, keyword_triggered_rule_data=rule_data
                                 )
-                                return # Handled by discovery, stop further keyword checks
+                                return 
                             else:
-                                await self.log_error(guild, f"AI Cog: Failed to record DB discovery for '{phrase_identifier}' by {author.name}.", ping_owner=True)
-                        # If discovery not allowed here, or DB record failed, loop continues or finishes
-                        continue # Move to next rule or finish if cannot discover here
+                                await self.log_error(message.guild, f"AI Cog: Failed to record DB discovery for '{phrase_identifier}' by {message.author.name}.", ping_owner=True)
+                        continue 
 
-                    # Rule is already discovered, check for regular trigger
-                    if rule_is_discovered:
-                        # Trigger Logic: Catercord public (any user), Private server (owner), Other servers (if bot is member)
-                        can_trigger_here = (is_catercord and not is_restricted_keyword_channel_catercord) or \
-                                           (is_private_server and is_owner) or \
-                                           (not is_catercord and not is_private_server and guild.me and guild.me.joined_at)
-
-                        if can_trigger_here:
+                    if is_discovered:
+                        can_trigger = (is_catercord and not is_restricted_keyword_channel_catercord) or \
+                                      (is_private_server and is_owner) or \
+                                      (not is_catercord and not is_private_server and message.guild.me and message.guild.me.joined_at)
+                        if can_trigger:
                             trigger_context = "Catercord (Public)" if is_catercord else \
                                               "Private Server (Owner)" if is_private_server else \
-                                              f"Other Server ({guild.name})"
-                            print(f"AI Cog Keyword TRIGGER: '{phrase_identifier}' by {author.name} in #{channel.name} ({guild.name} - {trigger_context})")
-                            
-                            history = [msg async for msg in channel.history(limit=5, before=message)]
-                            history.reverse(); history.append(message)
-                            
+                                              f"Other Server ({message.guild.name})"
+                            print(f"AI Cog Keyword TRIGGER: '{phrase_identifier}' by {message.author.name} ({message.author.id}) in #{message.channel.name} ({message.guild.name} - {trigger_context})")
                             await self.send_ai_chat_response(
-                                trigger_type="Keyword", history=history, user_message_content=message.content,
+                                triggering_message=message, trigger_type="Keyword", history_context=history_context,
                                 keyword_triggered_rule_data=rule_data
                             )
-                            return # Handled by keyword trigger, stop further keyword checks
-                except Exception as e_rule: # Catch errors during individual rule processing
-                    await self.log_error(guild, f"AI Cog Error processing keyword rule '{rule_data.get('phrase_identifier', rule_id_str)}'", error=e_rule)
-                    # Continue to next rule if one fails
+                            return 
+                except Exception as e_rule:
+                    await self.log_error(message.guild, f"AI Cog Error processing keyword rule '{rule_data.get('phrase_identifier', rule_id_str)}'", error=e_rule)
 
     @app_commands.command(name="addkeyword", description="[Owner Only] Add a new keyword rule.")
-    @app_commands.describe(
-        phrase_identifier="Unique identifier (e.g., 'hello_there_keyword').",
-        inclusion_regex="Regex pattern to trigger this (case-insensitive).",
-        speciality="Brief topic for AI context (e.g., 'Greeting responses').",
-        instructions="Guidance for AI response (e.g., 'Respond playfully to greetings.').",
-        exclusion_regex="Optional regex to PREVENT triggering (case-insensitive)."
-    )
     async def addkeyword(
         self, interaction: discord.Interaction,
         phrase_identifier: str, inclusion_regex: str, speciality: str, instructions: str,
@@ -911,7 +959,7 @@ class AICog(commands.Cog):
             await interaction.response.send_message("❌ Database connection unavailable.", ephemeral=True)
             return
 
-        if not all([phrase_identifier, inclusion_regex, speciality, instructions]): # Basic validation
+        if not all([phrase_identifier, inclusion_regex, speciality, instructions]):
             await interaction.response.send_message("❌ All fields (except exclusion_regex) are required.", ephemeral=True)
             return
         try:
@@ -933,40 +981,42 @@ class AICog(commands.Cog):
             )
             await interaction.followup.send(f"✅ Keyword rule `{phrase_identifier}` added!")
             await self.log_info(interaction.guild, f"Owner `{interaction.user}` added keyword: `{phrase_identifier}`.")
-            await self.log_info(interaction.guild, "Reloading keyword cache after addition...") # Log before actual load
-            await self.load_keyword_data(interaction.guild) # Reload cache
+            await self.log_info(interaction.guild, "Reloading keyword cache after addition...") 
+            await self.load_keyword_data(interaction.guild) 
         except Exception as e:
             err_msg = str(getattr(e, 'message', str(e)))
-            # Check for Supabase/PostgREST specific unique constraint violation
             if "unique constraint" in err_msg.lower() and f'"{self.keyword_table_name}_phrase_identifier_key"' in err_msg.lower():
                 await interaction.followup.send(f"❌ Failed: Phrase Identifier `{phrase_identifier}` already exists.")
             else:
                 await self.log_error(interaction.guild, f"AI Cog Keyword add failed for `{phrase_identifier}`.", error=e, interaction=interaction)
-                await interaction.followup.send(f"❌ Database Error adding keyword: {err_msg[:1500]}") # Limit error message length
+                await interaction.followup.send(f"❌ Database Error adding keyword: {err_msg[:1500]}")
 
     @app_commands.command(name="discoveries", description="Explore AI-powered secret keyword phrases!")
     async def discoveries(self, interaction: discord.Interaction):
-        if not self.bot.user or not self.bot.user.id: # Basic check
+        if not self.bot.user or not self.bot.user.id: 
             await interaction.response.send_message("🔍 Bot is initializing. Please try again shortly.", ephemeral=True); return
-        if not self.keyword_data_cache and self.total_keywords == 0 : # If cache is empty and total is 0 (initial load might be pending)
-             # Check if supabase is even available, if not, it's a bigger issue
+        if not self.keyword_data_cache and self.total_keywords == 0 : 
             if not self.supabase:
                 await interaction.response.send_message("🔍 Keyword system is currently unavailable (database connection).", ephemeral=True)
                 return
-            # Trigger a load if it seems like it hasn't happened yet
             await self.log_info(interaction.guild, "/discoveries used when cache was empty, attempting a load.")
             await self.load_keyword_data(interaction.guild)
-            if not self.keyword_data_cache and self.total_keywords == 0: # Still no data after load attempt
+            if not self.keyword_data_cache and self.total_keywords == 0:
                  await interaction.response.send_message("🔍 No keyword phrases are configured yet, or data is still loading. Try again in a moment!", ephemeral=True)
                  return
 
         guild = interaction.guild
         catercord_invite_link = "https://discord.gg/5gMRbeWNKw" 
-        bot_invite_link = discord.utils.oauth_url(self.bot.user.id, permissions=discord.Permissions(68608), scopes=("bot", "applications.commands"))
-        
+        bot_permissions = discord.Permissions(
+            send_messages=True, embed_links=True, attach_files=True, 
+            read_message_history=True, manage_webhooks=True
+        )
+        bot_invite_link = discord.utils.oauth_url(
+            self.bot.user.id, permissions=bot_permissions, scopes=("bot", "applications.commands")
+        )
+
         description_lines = []
         is_catercord_server = guild and guild.id == self.catercord_guild_id
-        # Check if bot is a "true" member (joined_at is set), not just interacting via gateway without being added
         bot_is_true_guild_member = guild and guild.me and guild.me.joined_at 
 
         if is_catercord_server:
@@ -980,12 +1030,12 @@ class AICog(commands.Cog):
                 f"🕵️‍♂️ I'll respond to *already discovered* secret phrases in this server ({discord.utils.escape_markdown(guild.name)}).",
                 f"➡️ To discover **new** secret phrases, the main adventure is in [**Catercord**]({catercord_invite_link})!"
             ])
-        else: # Bot not fully in server or in DMs
+        else: 
             bot_name_display = self.bot.user.name if self.bot.user else "this bot"
             guild_name_part = f" in **{discord.utils.escape_markdown(guild.name)}**" if guild and guild.name else ""
             description_lines.extend([
                 f"👋 Thanks for trying my keyword feature{guild_name_part}!",
-                f"To let me listen for keywords here, an admin needs to [add {bot_name_display} to this server]({bot_invite_link}).",
+                f"To let me listen for keywords here, an admin needs to [add {bot_name_display} to this server]({bot_invite_link}). (I need `Manage Webhooks` permission for all my tricks! 😉)",
                 f"➡️ For discovering **new** phrases and full keyword interaction, join [**Catercord**]({catercord_invite_link})!"
             ])
 
@@ -1000,7 +1050,6 @@ class AICog(commands.Cog):
         
         discovered_list_formatted = []
         undiscovered_count = 0
-        # Filter for valid rule structures before sorting
         valid_rules = [rule for rule in self.keyword_data_cache.values() if isinstance(rule, dict) and 'phrase_identifier' in rule]
         sorted_rules = sorted(valid_rules, key=lambda r: str(r.get('phrase_identifier', '')).lower())
 
@@ -1019,12 +1068,12 @@ class AICog(commands.Cog):
             discovered_text_joined = "\n".join(discovered_list_formatted)
             if len(discovered_text_joined) > 1020: discovered_text_joined = discovered_text_joined[:1015] + "\n... (more)"
             embed.add_field(name="📜 Known Phrases (Discovered Globally)", value=discovered_text_joined or "None yet!", inline=False)
-        elif self.total_keywords > 0: # No discovered, but keywords exist
+        elif self.total_keywords > 0:
             embed.add_field(name="📜 Known Phrases (Discovered Globally)", value="The scroll is blank... No phrases discovered yet!", inline=False)
 
         if self.total_keywords > 0 and undiscovered_count > 0:
             embed.add_field(name=f"❓ {undiscovered_count} Secret Phrase{'s' if undiscovered_count != 1 else ''} Still Hidden Globally", value="*The quest continues!*", inline=False)
-        elif self.total_keywords > 0 and undiscovered_count == 0: # All keywords discovered
+        elif self.total_keywords > 0 and undiscovered_count == 0: 
             embed.add_field(name="🎉 All Mysteries Solved Globally! 🎉", value="*The archives are complete!*", inline=False)
 
         bot_name_footer = self.bot.user.name if self.bot.user else "Pingslave"
@@ -1033,15 +1082,12 @@ class AICog(commands.Cog):
         
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
-
 async def setup(bot: commands.Bot):
-    # These attributes are expected to be set on the `bot` object in `bot.py`
-    # with the `_config` suffix, as per the LLM context block.
     ai_cog_config = {
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
         "ALWAYS_ON_AI_CHANNELS": getattr(bot, 'ALWAYS_ON_AI_CHANNELS_config', set()),
         "UNRESTRICTED_AI_CHANNEL_ID": getattr(bot, 'UNRESTRICTED_AI_CHANNEL_ID_config', None),
-        "KEYWORD_TABLE_NAME": "keyword_phrases", # Defaulted, but can be overridden by bot config
+        "KEYWORD_TABLE_NAME": "keyword_phrases",
         "OWNER_USER_ID": getattr(bot, 'OWNER_USER_ID_config', None),
         "CATERCORD_GUILD_ID": getattr(bot, 'CATERCORD_GUILD_ID_config', None),
         "PRIVATE_SERVER_ID": getattr(bot, 'PRIVATE_SERVER_ID_config', None),
@@ -1049,24 +1095,20 @@ async def setup(bot: commands.Bot):
         "STAFF_CHANNELS": getattr(bot, 'STAFF_CHANNELS_config', set()),
         "BOT_COMMANDS_ALLOWED_CHANNEL_IDS": getattr(bot, 'BOT_COMMANDS_ALLOWED_CHANNEL_IDS_config', set()),
         "COMMAND_PREFIX": getattr(bot, 'COMMAND_PREFIX_config', '.'),
-        "INGAME_NAME_CACHE_REF": getattr(bot, 'ingame_name_cache_ref_config', []), # Reference to bot's cache
-        "NERDY_YELLOW": getattr(bot, 'NERDY_YELLOW_config', discord.Color.gold())
+        "INGAME_NAME_CACHE_REF": getattr(bot, 'ingame_name_cache_ref_config', []),
+        "NERDY_YELLOW": getattr(bot, 'NERDY_YELLOW_config', discord.Color.gold()),
+        "MOBS_FOLDER_PATH_config": getattr(bot, 'MOBS_FOLDER_PATH_config', "Mobs")
     }
     
-    # Ensure essential functions are available from the bot instance
     supabase_client = getattr(bot, 'supabase_client', None)
     log_info_global = getattr(bot, 'log_info_global', None)
     log_error_global = getattr(bot, 'log_error_global', None)
     run_supabase_sync_global = getattr(bot, 'run_supabase_sync_global', None)
 
     if not all([supabase_client, log_info_global, log_error_global, run_supabase_sync_global]):
-        # Log this critical issue. If bot has a startup logger, use it. Otherwise, print.
-        missing_core_funcs_msg = "AI Cog CRITICAL: Missing one or more core functions/clients from bot instance (supabase_client, log_info_global, etc.). AI Cog may not function correctly."
+        missing_core_funcs_msg = "AI Cog CRITICAL: Missing core functions/clients from bot instance. AI Cog may not function correctly."
         print(missing_core_funcs_msg)
-        if log_error_global: # Attempt to use the logger if it exists
-            await log_error_global(None, missing_core_funcs_msg, ping_owner=True)
-        # Decide whether to proceed with adding the cog or raise an error
-        # For now, we'll let it load but with a warning.
+        # Consider logging to a file here if log_error_global might not be ready or available
     
     cog_instance = AICog(bot, 
                          supabase_client, 
