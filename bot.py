@@ -4,9 +4,8 @@ import os      # <--- Ensure this import is present
 import threading
 import asyncio
 from discord import app_commands
-from typing import Dict, Optional
 from discord.ext import commands
-from discord.ui import Modal, TextInput, View, Button, button
+from discord.ui import View, Button, button
 from flask import Flask
 from supabase import create_client, Client
 from postgrest import APIError
@@ -21,8 +20,6 @@ from discord.ext import tasks
 import re
 import asyncio
 import discord.utils
-import random
-from collections import defaultdict # Helpful for the interjection data
 import io # <--- ADD THIS IMPORT
 from PIL import Image
 import aiohttp
@@ -949,66 +946,6 @@ class ScreenshotConfirmView(View):
                 await log_error(self.guild_for_log, f"ScreenshotConfirmView: Failed to edit message on timeout for {self.message.id}", error=e)
         await log_info(self.guild_for_log, f"ScreenshotConfirmView for message {self.message_id_to_reply_to} by user {self.original_author_id} timed out.")
         self.stop()
-
-async def get_ai_response_with_image(
-    prompt: str,
-    image_bytes: bytes,
-) -> Optional[str]:
-    model_priority = get_ai_model_priority_list()
-    if not model_priority:
-        print("AI Error (Image): No AI models available.")
-        return None
-
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-    except Exception as e_img_open:
-        print(f"AI Error (Image): Could not open image bytes: {e_img_open}")
-        await log_error(None, "Error opening image for AI in get_ai_response_with_image", error=e_img_open)
-        return None
-
-    last_error = None
-    # Guild context is harder to get here unless passed in. Using None for now.
-    guild_for_log = None 
-
-    for model_info in model_priority:
-        model_instance = model_info['instance']
-        model_name = model_info['name']
-        try:
-            print(f"AI Info (Image): Attempting generation with {model_name}...")
-            # Gemini SDK expects a list for multimodal input
-            response = await model_instance.generate_content_async(
-                [prompt, img], # Send prompt, then image
-                # safety_settings=[...] # Keep safety settings
-            )
-
-            if not response.candidates:
-                print(f"AI Warning (Image): Response from {model_name} blocked. Prompt feedback: {response.prompt_feedback.safety_ratings if response.prompt_feedback else 'N/A'}")
-                await log_info(guild_for_log, f"AI image response from {model_name} blocked (safety filters).")
-                last_error = Exception(f"Blocked by safety filters using {model_name} for image.")
-                continue
-
-            ai_reply = response.text
-            print(f"AI Info (Image): Successfully generated response with {model_name}.")
-            return ai_reply
-
-        except google_exceptions.ResourceExhausted as e_rate_limit:
-            log_message = f"AI Rate Limit (Image): {model_name} hit a rate limit. Attempting fallback."
-            print(log_message)
-            await log_error(guild_for_log, log_message, error=e_rate_limit, ping_owner=False)
-            last_error = e_rate_limit
-            continue
-
-        except Exception as e:
-            log_message = f"AI Error (Image): Exception with {model_name} during generation."
-            print(f"{log_message} Error: {e}")
-            await log_error(guild_for_log, log_message, error=e, ping_owner=True)
-            last_error = e
-            continue
-            
-    print(f"AI Error (Image): All AI models failed for image processing. Last error: {last_error}")
-    if isinstance(last_error, google_exceptions.Aborted) and "blocked" in str(last_error).lower():
-         return "..."
-    return None
 
 async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
     """Loads all In-Game Names from Supabase into an in-memory cache."""
@@ -3366,7 +3303,7 @@ async def update_static_list_message(guild: discord.Guild):
         await log_error(guild, f"Static list update failed: Bot missing Send/Embed/History/ManageMessages permissions in {chan.mention}.")
         return
 
-    await log_info(guild, f"Updating interactive static list in {chan.mention}...")
+    await log_info(guild, f"Updating interactive static list in {chan.mention} and refreshing IGN cache...")
 
     # --- Fetch Fresh Base Data and Initial Display Data (Unchanged logic) ---
     member_data, total_count = [], 0
@@ -3375,6 +3312,14 @@ async def update_static_list_message(guild: discord.Guild):
     except Exception as e_fetch_base:
         await log_error(guild, "Static list update failed: Error fetching base member data.", error=e_fetch_base)
         return
+
+    try:
+        await log_info(guild, "Refreshing in-game name cache as part of static list update...")
+        await load_ign_cache(guild) # Pass guild for logging context
+        await log_info(guild, f"In-game name cache refreshed. Current size: {len(ingame_name_cache)}.")
+    except Exception as e_ign_cache:
+        # load_ign_cache logs its own critical errors, but we can log a general failure here too.
+        await log_error(guild, "Static list update proceeding, but IGN cache refresh failed during the process.", error=e_ign_cache)
 
     initial_display_data = list(member_data) # Default to base data
     try:
