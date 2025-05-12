@@ -208,24 +208,45 @@ class AICog(commands.Cog):
             try:
                 genai.configure(api_key=self.gemini_api_key)
                 print("AI Cog: Attempting to configure Google Gemini AI clients...")
+                
+                model_id_str_2_5 = 'gemini-2.5-flash-preview-04-17' # Or your latest preview like 'gemini-2.5-flash-preview-04-17'
                 try:
-                    self.ai_model_2_5_flash = genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
-                    print("  AI Cog: Successfully configured Gemini 2.5 Flash (Preview).")
+                    self.ai_model_2_5_flash = genai.GenerativeModel(model_id_str_2_5)
+                    if self.ai_model_2_5_flash:
+                        print(f"  AI Cog: Successfully configured and validated Gemini 2.5 Flash using '{model_id_str_2_5}'.")
+                    else:
+                        print(f"  AI Cog CRITICAL_INIT_FAIL: Configured Gemini 2.5 Flash using '{model_id_str_2_5}' BUT IT IS FALSY.")
+                        self.ai_model_2_5_flash = None
                 except Exception as e_highest:
-                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.5 Flash (Preview): {e_highest}.")
+                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.5 Flash using '{model_id_str_2_5}': {e_highest}.")
+                    self.ai_model_2_5_flash = None
+
+                model_id_str_2_0 = 'gemini-2.0-flash' # Or 'gemini-1.5-flash-latest' if 2.0 is problematic
                 try:
-                    self.ai_model_2_0_flash = genai.GenerativeModel('gemini-2.0-flash')
-                    print("  AI Cog: Successfully configured Gemini 2.0 Flash.")
+                    self.ai_model_2_0_flash = genai.GenerativeModel(model_id_str_2_0)
+                    if self.ai_model_2_0_flash:
+                        print(f"  AI Cog: Successfully configured and validated Gemini 2.0 Flash using '{model_id_str_2_0}'.")
+                    else:
+                        print(f"  AI Cog CRITICAL_INIT_FAIL: Configured Gemini 2.0 Flash using '{model_id_str_2_0}' BUT IT IS FALSY.")
+                        self.ai_model_2_0_flash = None
                 except Exception as e_standard:
-                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.0 Flash: {e_standard}.")
+                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.0 Flash using '{model_id_str_2_0}': {e_standard}.")
+                    self.ai_model_2_0_flash = None
+
+                model_id_str_lite = 'gemini-2.0-flash-lite' # Or 'gemini-1.5-flash-latest'
                 try:
-                    self.ai_model_2_0_flash_lite = genai.GenerativeModel('gemini-2.0-flash-lite')
-                    print("  AI Cog: Successfully configured Gemini 2.0 Flash Lite.")
+                    self.ai_model_2_0_flash_lite = genai.GenerativeModel(model_id_str_lite)
+                    if self.ai_model_2_0_flash_lite:
+                        print(f"  AI Cog: Successfully configured and validated Gemini 2.0 Flash Lite using '{model_id_str_lite}'.")
+                    else:
+                        print(f"  AI Cog CRITICAL_INIT_FAIL: Configured Gemini 2.0 Flash Lite using '{model_id_str_lite}' BUT IT IS FALSY.")
+                        self.ai_model_2_0_flash_lite = None
                 except Exception as e_lite:
-                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.0 Flash Lite: {e_lite}.")
+                    print(f"  AI Cog WARNING: Failed to configure Gemini 2.0 Flash Lite using '{model_id_str_lite}': {e_lite}.")
+                    self.ai_model_2_0_flash_lite = None
 
                 if not any([self.ai_model_2_5_flash, self.ai_model_2_0_flash, self.ai_model_2_0_flash_lite]):
-                    print("AI Cog CRITICAL: All Google Gemini AI models failed to initialize.")
+                    print("AI Cog CRITICAL: All Google Gemini AI models failed to initialize or are Falsy.")
                 else:
                     print("AI Cog: Google Gemini AI client configuration finished.")
             except Exception as e:
@@ -257,8 +278,8 @@ class AICog(commands.Cog):
         print(f"AI Cog Prompt Error: Prompt key '{prompt_key}' not found.")
         return None
 
-
-    def get_ai_model_priority_list(self) -> List[Dict[str, Any]]:
+    def get_all_available_models_details(self) -> List[Dict[str, Any]]:
+        """Returns a list of dictionaries for all successfully initialized AI models."""
         models = []
         if self.ai_model_2_5_flash:
             models.append({'instance': self.ai_model_2_5_flash, 'name': 'Gemini 2.5 Flash (Preview)', 'id': 'gemini_2_5_flash'})
@@ -267,24 +288,6 @@ class AICog(commands.Cog):
         if self.ai_model_2_0_flash_lite:
             models.append({'instance': self.ai_model_2_0_flash_lite, 'name': 'Gemini 2.0 Flash Lite', 'id': 'gemini_2_0_flash_lite'})
         return models
-
-    def _select_models_to_try(self, preferred_model_id: Optional[str]) -> List[Dict[str, Any]]:
-        all_available_models_with_instance = [m for m in self.get_ai_model_priority_list() if m['instance']]
-        if not all_available_models_with_instance: return []
-
-        models_to_try = []
-        if preferred_model_id:
-            preferred_model_info = next((m for m in all_available_models_with_instance if m['id'] == preferred_model_id), None)
-            if preferred_model_info:
-                models_to_try.append(preferred_model_info)
-                models_to_try.extend([m for m in all_available_models_with_instance if m['id'] != preferred_model_id])
-            else:
-                print(f"AI Cog Warning: Preferred model '{preferred_model_id}' not available or not initialized. Using default priority.")
-                models_to_try = all_available_models_with_instance
-        else:
-            models_to_try = all_available_models_with_instance
-        return models_to_try
-
 
     async def _format_message_for_ai(self, msg: discord.Message, is_latest_user_message: bool = False) -> List[Any]:
         parts = []
@@ -340,15 +343,48 @@ class AICog(commands.Cog):
         prompt_data: Dict[str, Any], 
         history: Optional[List[discord.Message]] = None,
         system_instruction_details: Optional[Dict[str, Any]] = None, 
-        preferred_model_id: Optional[str] = None
+        preferred_model_id: Optional[str] = 'gemini_2_0_flash' # Default preferred for text
     ) -> Optional[str]:
-        models_to_try = self._select_models_to_try(preferred_model_id or 'gemini_2.0_flash')
+        available_map = {m['id']: m for m in self.get_all_available_models_details()}
+        models_to_try_ordered = []
+        processed_ids = set()
+
+        # 1. Add preferred_model_id if specified, available, and not already processed
+        if preferred_model_id and preferred_model_id in available_map and preferred_model_id not in processed_ids:
+            models_to_try_ordered.append(available_map[preferred_model_id])
+            processed_ids.add(preferred_model_id)
+
+        # 2. Define the task-specific sequence for text
+        sequence_for_task = ['gemini_2_0_flash', 'gemini_2_0_flash_lite', 'gemini_2_5_flash']
+
+        # 3. Add models from task-specific sequence if available and not already processed
+        for model_id_in_seq in sequence_for_task:
+            if model_id_in_seq in available_map and model_id_in_seq not in processed_ids:
+                models_to_try_ordered.append(available_map[model_id_in_seq])
+                processed_ids.add(model_id_in_seq)
+
+        # 4. Add any remaining available models not yet included
+        all_configured_model_details = self.get_all_available_models_details()
+        for model_detail in all_configured_model_details:
+            if model_detail['id'] not in processed_ids and model_detail['id'] in available_map :
+                models_to_try_ordered.append(model_detail)
+                processed_ids.add(model_detail['id'])
+        
+        models_to_try = models_to_try_ordered # Use the constructed ordered list
+
         if not models_to_try:
             print("AI Cog Error (get_ai_response): No AI models available/configured to try.")
             return None
 
+        if preferred_model_id and (not models_to_try or models_to_try[0]['id'] != preferred_model_id):
+            if preferred_model_id not in available_map:
+                print(f"AI Cog Warning (get_ai_response): Specified preferred model '{preferred_model_id}' is not available. Using fallback sequence.")
+            else:
+                # This case should ideally not be hit if logic is correct, means preferred was available but not first
+                print(f"AI Cog Info (get_ai_response): Preferred model '{preferred_model_id}' was available but not selected as primary. Effective primary: {models_to_try[0]['name'] if models_to_try else 'None'}.")
+
+
         api_contents = []
-        
         sys_instruct_key = (system_instruction_details or {}).get('key', "HUMAN_SYSTEM_INSTRUCTION_V3")
         sys_instruct_kwargs = (system_instruction_details or {}).get('kwargs', {})
         
@@ -377,12 +413,12 @@ class AICog(commands.Cog):
         last_error = None
         guild_for_log = history[-1].guild if history and history[-1].guild else (prompt_data.get('current_message_object').guild if prompt_data.get('current_message_object') else None)
 
-
         for model_info in models_to_try:
             model_instance, model_name, current_model_id = model_info['instance'], model_info['name'], model_info['id']
             try:
-                print(f"AI Cog Info (get_ai_response): Attempting generation with {model_name} (ID: {current_model_id}). Preferred: {preferred_model_id or 'None'}")
+                print(f"AI Cog Info (get_ai_response): Attempting generation with {model_name} (ID: {current_model_id}). Preferred ID for this call: {preferred_model_id or 'Default (gemini_2_0_flash)'}")
                 
+                # (Debug printing of api_contents remains the same)
                 print(f"--- DEBUG: AI PROMPT (Multimodal Text/Image) for {model_name} ---")
                 debug_serializable_contents = []
                 for item in api_contents:
@@ -401,15 +437,15 @@ class AICog(commands.Cog):
                     print(f"Error serializing api_contents for debug: {e_json}")
                 print("--- END DEBUG ---")
 
-
                 response = await model_instance.generate_content_async(contents=api_contents)
 
                 if not response or not response.candidates:
                     feedback = response.prompt_feedback if response else None
                     safety_ratings_str = str(feedback.safety_ratings) if feedback and hasattr(feedback, 'safety_ratings') else 'N/A'
-                    print(f"AI Cog Warning (get_ai_response): Response from {model_name} blocked or empty. Feedback: {safety_ratings_str}")
-                    await self.log_info(guild_for_log, f"AI response from {model_name} (ID: {current_model_id}) blocked. Feedback: {safety_ratings_str}")
-                    last_error = Exception(f"Blocked or empty response from {model_name}. Feedback: {safety_ratings_str}")
+                    block_reason_str = str(feedback.block_reason) if feedback and hasattr(feedback, 'block_reason') else 'N/A'
+                    print(f"AI Cog Warning (get_ai_response): Response from {model_name} blocked or empty. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
+                    await self.log_info(guild_for_log, f"AI response from {model_name} (ID: {current_model_id}) blocked. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
+                    last_error = Exception(f"Blocked or empty response from {model_name}. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
                     if preferred_model_id and current_model_id == preferred_model_id:
                         await self.log_error(guild_for_log, f"AI response from PREFERRED model {model_name} blocked.", error=last_error, ping_owner=False)
                     continue
@@ -430,7 +466,7 @@ class AICog(commands.Cog):
                 last_error = e
         
         print(f"AI Cog Error (get_ai_response): All AI models failed. Last error: {last_error}")
-        if isinstance(last_error, google_exceptions.Aborted) and "blocked" in str(last_error).lower():
+        if isinstance(last_error, (google_exceptions.Aborted, google_exceptions.InvalidArgument)) and "blocked" in str(last_error).lower(): # InvalidArgument can also mean blocked
              return "..." 
         return None
 
@@ -438,12 +474,41 @@ class AICog(commands.Cog):
     async def get_ai_response_with_image( 
         self, prompt_key: str, image_bytes: bytes,
         prompt_kwargs: Optional[Dict[str, Any]] = None,
-        preferred_model_id: str = 'gemini_2_5_flash' 
+        preferred_model_id: str = 'gemini_2_5_flash' # Default preferred for images
     ) -> Optional[str]:
-        models_to_try = self._select_models_to_try(preferred_model_id)
+        available_map = {m['id']: m for m in self.get_all_available_models_details()}
+        models_to_try_ordered = []
+        processed_ids = set()
+
+        if preferred_model_id and preferred_model_id in available_map and preferred_model_id not in processed_ids:
+            models_to_try_ordered.append(available_map[preferred_model_id])
+            processed_ids.add(preferred_model_id)
+
+        sequence_for_task = ['gemini_2_5_flash', 'gemini_2_0_flash', 'gemini_2_0_flash_lite'] # Image preferred order
+
+        for model_id_in_seq in sequence_for_task:
+            if model_id_in_seq in available_map and model_id_in_seq not in processed_ids:
+                models_to_try_ordered.append(available_map[model_id_in_seq])
+                processed_ids.add(model_id_in_seq)
+        
+        all_configured_model_details = self.get_all_available_models_details()
+        for model_detail in all_configured_model_details:
+            if model_detail['id'] not in processed_ids and model_detail['id'] in available_map:
+                models_to_try_ordered.append(model_detail)
+                processed_ids.add(model_detail['id'])
+
+        models_to_try = models_to_try_ordered
+
         if not models_to_try:
             print("AI Cog Error (Image): No AI models available/configured to try.")
             return None
+
+        if preferred_model_id and (not models_to_try or models_to_try[0]['id'] != preferred_model_id):
+            if preferred_model_id not in available_map:
+                print(f"AI Cog Warning (get_ai_response_with_image): Specified preferred model '{preferred_model_id}' is not available. Using fallback sequence for images.")
+            # else: # Log if preferred was available but not first (shouldn't happen with this logic)
+            #    print(f"AI Cog Info (get_ai_response_with_image): Preferred model '{preferred_model_id}' available but not primary. Effective: {models_to_try[0]['name'] if models_to_try else 'None'}")
+
 
         final_prompt_text = self.get_prompt(prompt_key, **(prompt_kwargs or {}))
         if not final_prompt_text:
@@ -461,8 +526,9 @@ class AICog(commands.Cog):
         for model_info in models_to_try:
             model_instance, model_name, current_model_id = model_info['instance'], model_info['name'], model_info['id']
             try:
-                print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Prompt Key: {prompt_key}")
+                print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Prompt Key: {prompt_key}. Preferred ID for this call: {preferred_model_id or 'Default (gemini_2_5_flash)'}")
                 
+                # (Debug printing of prompt and image data remains the same)
                 print(f"--- DEBUG: AI PROMPT (Single Image Task) for {model_name} ---")
                 print(f"Prompt Text:\n{final_prompt_text}")
                 print(f"Image Data: Sent (PIL Image, Mode: {img_pil.mode}, Size: {img_pil.size}, Format: {img_pil.format or 'N/A'})")
@@ -473,13 +539,13 @@ class AICog(commands.Cog):
                 if not response or not response.candidates:
                     feedback = response.prompt_feedback if response else None
                     safety_ratings_str = str(feedback.safety_ratings) if feedback and hasattr(feedback, 'safety_ratings') else 'N/A'
-                    print(f"AI Cog Warning (Image): Response from {model_name} blocked or empty. Feedback: {safety_ratings_str}")
-                    await self.log_info(None, f"AI image response from {model_name} blocked. Feedback: {safety_ratings_str}")
-                    last_error = Exception(f"Blocked or empty response from {model_name} for image. Feedback: {safety_ratings_str}")
+                    block_reason_str = str(feedback.block_reason) if feedback and hasattr(feedback, 'block_reason') else 'N/A'
+                    print(f"AI Cog Warning (Image): Response from {model_name} blocked or empty. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
+                    await self.log_info(None, f"AI image response from {model_name} blocked. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
+                    last_error = Exception(f"Blocked or empty response from {model_name} for image. Reason: {block_reason_str}, Ratings: {safety_ratings_str}")
                     if preferred_model_id and current_model_id == preferred_model_id:
                          await self.log_error(None, f"AI image response from PREFERRED model {model_name} was blocked.", error=last_error, ping_owner=False)
                     continue
-
 
                 ai_reply = response.text
                 print(f"AI Cog Info (Image): Successfully generated response with {model_name} (ID: {current_model_id}).")
@@ -497,7 +563,7 @@ class AICog(commands.Cog):
                 last_error = e
                 
         print(f"AI Cog Error (Image): All AI models failed for image processing. Last error: {last_error}")
-        if isinstance(last_error, google_exceptions.Aborted) and "blocked" in str(last_error).lower():
+        if isinstance(last_error, (google_exceptions.Aborted, google_exceptions.InvalidArgument)) and "blocked" in str(last_error).lower():
             return "..."
         return None
 
@@ -515,7 +581,7 @@ class AICog(commands.Cog):
         interaction_for_command_reply: Optional[discord.Interaction] = None, 
         mob_mode_details: Optional[Dict[str, Any]] = None 
     ):
-        if not self.get_ai_model_priority_list():
+        if not self.get_all_available_models_details(): # Check if any models are available at all
             print("AI Cog Send Error: No AI models available/configured.")
             if interaction_for_command_reply:
                 try:
@@ -541,7 +607,8 @@ class AICog(commands.Cog):
         }
         
         system_instruction_details = {'key': system_instruction_key_override or "HUMAN_SYSTEM_INSTRUCTION_V3", 'kwargs': system_instruction_kwargs_override or {}}
-        preferred_model_id_for_call = 'gemini_2.0_flash' 
+        # Default preferred model for text generation unless overridden by specific conditions below
+        preferred_model_id_for_call = 'gemini_2_0_flash' 
 
         if mob_mode_details:
             system_instruction_details['key'] = "MOB_PERSONA_SYSTEM_INSTRUCTION_V2"
@@ -552,9 +619,9 @@ class AICog(commands.Cog):
                 'channel_name': prompt_data_for_ai_call['channel_name'],
                 'current_time_utc': datetime.datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
             }
-            preferred_model_id_for_call = 'gemini_2.5_flash' 
+            preferred_model_id_for_call = 'gemini_2_5_flash' # Mob mode might benefit from a stronger model
         elif trigger_type == "Discovery" and keyword_triggered_rule_data and discovery_congrats_user:
-            preferred_model_id_for_call = 'gemini_2.5_flash'
+            preferred_model_id_for_call = 'gemini_2_5_flash' # Discovery is special, use a good model
             system_instruction_details['key'] = "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION"
             system_instruction_details['kwargs'] = {
                 'phrase_identifier': keyword_triggered_rule_data['phrase_identifier'],
@@ -563,7 +630,7 @@ class AICog(commands.Cog):
                 'instructions': keyword_triggered_rule_data.get('instructions', 'Respond naturally.')
             }
         elif trigger_type == "Keyword" and keyword_triggered_rule_data:
-            preferred_model_id_for_call = 'gemini_2.5_flash'
+            preferred_model_id_for_call = 'gemini_2_5_flash' # Keywords can also use a better model
             base_human_system_prompt_kwargs = {
                 'server_name': prompt_data_for_ai_call['server_name'], 
                 'channel_name': prompt_data_for_ai_call['channel_name'],
@@ -579,7 +646,7 @@ class AICog(commands.Cog):
                 'instructions': keyword_triggered_rule_data.get('instructions', 'Respond naturally.')
             }
         elif trigger_type.startswith("COMMAND_"):
-            preferred_model_id_for_call = 'gemini_2.5_flash'
+            preferred_model_id_for_call = 'gemini_2_5_flash' # Commands generating content
             system_instruction_details['key'] = system_instruction_key_override or "BOT_PURPOSE_GENERAL" 
             
             if not prompt_key_for_ai:
@@ -592,33 +659,37 @@ class AICog(commands.Cog):
                 if interaction_for_command_reply: await interaction_for_command_reply.followup.send("Error: AI prompt load failed.", ephemeral=True)
                 return
             prompt_data_for_ai_call['current_message_content'] = command_ai_prompt_text
-            # history_context = None 
+            # history_context = None # For commands, history might not always be relevant or could be confusing
 
         ai_response_raw = None
         try:
+            # Typing context handling (remains the same)
             typing_context = channel_to_send_in.typing() if isinstance(channel_to_send_in, discord.TextChannel) and not interaction_for_command_reply and not mob_mode_details else contextlib.nullcontext()
             async with typing_context:
                 ai_response_raw = await self.get_ai_response(
                     prompt_data=prompt_data_for_ai_call,
                     history=history_context,
                     system_instruction_details=system_instruction_details,
-                    preferred_model_id=preferred_model_id_for_call
+                    preferred_model_id=preferred_model_id_for_call # Pass the determined preferred model
                 )
         except Exception as ai_call_err:
+            # Error handling for AI call (remains the same)
             log_msg_content = f"Error during get_ai_response call for '{trigger_type}' in channel {channel_to_send_in.id}"
             await self.log_error(guild_for_log, log_msg_content, error=ai_call_err)
             fail_msg = "... (ran into a cosmic ray 💫 trying to respond)"
             if interaction_for_command_reply: await interaction_for_command_reply.followup.send(fail_msg, ephemeral=True)
-            elif trigger_type == "AlwaysOn" and not mob_mode_details : await channel_to_send_in.send(fail_msg) # don't send fail if mob mode failed to init
+            elif trigger_type == "AlwaysOn" and not mob_mode_details : await channel_to_send_in.send(fail_msg) 
             elif not mob_mode_details and triggering_message: await triggering_message.reply(fail_msg, mention_author=False)
             return
 
         if not ai_response_raw:
+            # Handling for no response (remains the same)
             await self.log_info(guild_for_log, f"AI for '{trigger_type}' in {channel_to_send_in.id} returned None/empty.")
-            if trigger_type == "AlwaysOn" and not mob_mode_details: # Don't send if mob mode was attempted and failed silently before this
+            if trigger_type == "AlwaysOn" and not mob_mode_details: 
                 await channel_to_send_in.send("... (my circuits are quiet right now 🤖)")
             return
             
+        # Processing and sending the response (remains the same)
         ai_response_processed = ai_response_raw.strip()
         if ai_response_processed.endswith(('.', '!', '?')) and not any(ai_response_processed.endswith(x) for x in ['...', '?!', '!!']):
             ai_response_processed = ai_response_processed[:-1]
@@ -645,7 +716,7 @@ class AICog(commands.Cog):
             final_message_content_to_send += f"\n*(You triggered the keyword: `{discord.utils.escape_markdown(keyword_triggered_rule_data['phrase_identifier'])}`)*"
 
         try:
-            if mob_mode_details and isinstance(channel_to_send_in, discord.TextChannel): # Ensure channel is TextChannel
+            if mob_mode_details and isinstance(channel_to_send_in, discord.TextChannel): 
                 await self._send_mob_webhook_message(
                     channel_to_send_in,
                     mob_mode_details['mob_name'],
@@ -672,6 +743,7 @@ class AICog(commands.Cog):
             await self.log_error(guild_for_log, f"Failed to send AI '{trigger_type}' response in {channel_to_send_in.id}", error=reply_err)
 
     async def _send_mob_webhook_message(self, channel: discord.TextChannel, mob_name: str, image_path: str, content: str):
+        # This method remains the same
         webhook: Optional[discord.Webhook] = None
         avatar_bytes: Optional[bytes] = None
         try:
@@ -711,6 +783,7 @@ class AICog(commands.Cog):
 
 
     def _parse_mob_name(self, filename: str) -> str:
+        # This method remains the same
         name = os.path.splitext(filename)[0] 
         for rarity_suffix in MOB_NAME_RARITIES_TO_STRIP:
             if name.endswith(rarity_suffix):
@@ -719,6 +792,7 @@ class AICog(commands.Cog):
         return name.strip() or "Mysterious Mob"
 
     async def load_keyword_data(self, guild_for_log: Optional[discord.Guild]):
+        # This method remains the same
         if not self.supabase:
             await self.log_error(guild_for_log, "AI Cog Keyword loading failed: Supabase unavailable.", ping_owner=True)
             return
@@ -792,6 +866,7 @@ class AICog(commands.Cog):
             self.discovered_keywords_count = 0
 
     async def record_discovery_in_db(self, guild_for_log: Optional[discord.Guild], keyword_id_str: str, user_id: int, discovery_time: datetime.datetime):
+        # This method remains the same
         if not self.supabase:
             await self.log_error(guild_for_log, f"AI Cog Discovery recording failed for {keyword_id_str}: Supabase unavailable.", ping_owner=True)
             return False
@@ -819,6 +894,7 @@ class AICog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # This method's logic for when to trigger AI remains largely the same
         if not message.guild or not self.bot.is_ready() or not self.bot.user or \
            message.author.id == self.bot.user.id or message.author.bot:
             return
@@ -858,6 +934,7 @@ class AICog(commands.Cog):
 
             await self.send_ai_chat_response(
                 triggering_message=message, trigger_type="AlwaysOn", history_context=history_context
+                # send_ai_chat_response will use its default preferred_model_id ('gemini_2_0_flash')
             )
             return
 
@@ -865,13 +942,13 @@ class AICog(commands.Cog):
         if message.reference:
             if message.reference.resolved and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id == self.bot.user.id:
                 is_reply_to_bot = True
-            elif message.reference.message_id : # Try fetching if not resolved (e.g. older message, or just ID provided)
+            elif message.reference.message_id : 
                 try:
                     ref_msg = await message.channel.fetch_message(message.reference.message_id)
                     if ref_msg.author.id == self.bot.user.id:
                         is_reply_to_bot = True
                 except (discord.NotFound, discord.HTTPException):
-                    pass # Referenced message not found or inaccessible
+                    pass 
 
 
         bot_mention_formats = [f'<@{self.bot.user.id}>', f'<@!{self.bot.user.id}>']
@@ -896,6 +973,7 @@ class AICog(commands.Cog):
                 return
 
         if self.keyword_data_cache and message.content:
+            # Keyword processing logic remains the same
             message_content_lower = message.content.lower()
             for rule_id_str, rule_data in self.keyword_data_cache.items():
                 if not isinstance(rule_data, dict) or not rule_data.get('inclusion_regex'): continue
@@ -952,6 +1030,7 @@ class AICog(commands.Cog):
         phrase_identifier: str, inclusion_regex: str, speciality: str, instructions: str,
         exclusion_regex: Optional[str] = None
     ):
+        # This command remains the same
         if interaction.user.id != self.owner_user_id:
             await interaction.response.send_message("❌ You don't have permission for this.", ephemeral=True)
             return
@@ -993,6 +1072,7 @@ class AICog(commands.Cog):
 
     @app_commands.command(name="discoveries", description="Explore AI-powered secret keyword phrases!")
     async def discoveries(self, interaction: discord.Interaction):
+        # This command remains the same
         if not self.bot.user or not self.bot.user.id: 
             await interaction.response.send_message("🔍 Bot is initializing. Please try again shortly.", ephemeral=True); return
         if not self.keyword_data_cache and self.total_keywords == 0 : 
@@ -1083,6 +1163,7 @@ class AICog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
 async def setup(bot: commands.Bot):
+    # Setup function remains the same
     ai_cog_config = {
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
         "ALWAYS_ON_AI_CHANNELS": getattr(bot, 'ALWAYS_ON_AI_CHANNELS_config', set()),
@@ -1109,7 +1190,53 @@ async def setup(bot: commands.Bot):
         missing_core_funcs_msg = "AI Cog CRITICAL: Missing core functions/clients from bot instance. AI Cog may not function correctly."
         print(missing_core_funcs_msg)
         # Consider logging to a file here if log_error_global might not be ready or available
-    
+
+    async def simple_gemini_2_0_flash_test():
+      """
+      A self-contained test for the gemini-2.0-flash model.
+      Prints the response or the exact error to the console.
+      """
+      print("--- Starting simple_gemini_2_0_flash_test ---")
+      api_key = os.getenv("GEMINI_API_KEY")
+  
+      if not api_key:
+          print("TEST ERROR: GEMINI_API_KEY environment variable not found.")
+          return
+  
+      try:
+          genai.configure(api_key=api_key)
+          
+          model_id_for_test = 'gemini-2.0-flash' # Or 'gemini-1.5-flash-latest'
+          print(f"Test: Configuring '{model_id_for_test}' model...")
+          model = genai.GenerativeModel(model_id_for_test)
+          print(f"Test: Model '{model_id_for_test}' configured.")
+  
+          test_prompt = f"Hello {model_id_for_test}! In one short sentence, what's a fun fact about Python programming?"
+          print(f"Test: Sending prompt: '{test_prompt}'")
+          
+          response = await model.generate_content_async(test_prompt)
+          
+          if response and response.text:
+              print(f"Test SUCCESS: {model_id_for_test} Response: '{response.text}'")
+          elif response and response.prompt_feedback:
+              block_reason_test = getattr(response.prompt_feedback, 'block_reason', 'N/A')
+              safety_ratings_test = getattr(response.prompt_feedback, 'safety_ratings', 'N/A')
+              print(f"Test WARNING: Response from {model_id_for_test} was blocked or empty. Reason: {block_reason_test}, Ratings: {safety_ratings_test}")
+          else:
+              print(f"Test WARNING: Response from {model_id_for_test} was empty or malformed, with no specific feedback.")
+  
+      except google_exceptions.GoogleAPIError as e:
+          print(f"Test FAILED (GoogleAPIError): An API error occurred with {model_id_for_test}: {e}")
+          print(f"    Error Details: {getattr(e, 'message', 'No specific message attribute')}")
+          if hasattr(e, 'grpc_status_code'): print(f"    GRPC Status Code: {e.grpc_status_code}")
+          if hasattr(e, 'trailing_metadata'): print(f"    Trailing Metadata: {e.trailing_metadata}")
+      except Exception as e:
+          print(f"Test FAILED (General Exception): An unexpected error occurred with {model_id_for_test}: {e}")
+          import traceback
+          print(f"    Traceback: {traceback.format_exc()}")
+      finally:
+          print(f"--- Finished simple_gemini_2_0_flash_test for {model_id_for_test} ---")
+
     cog_instance = AICog(bot, 
                          supabase_client, 
                          log_info_global, 
@@ -1117,4 +1244,5 @@ async def setup(bot: commands.Bot):
                          run_supabase_sync_global, 
                          ai_cog_config)
     await bot.add_cog(cog_instance)
+    await simple_gemini_2_0_flash_test() # Test a key model after cog setup
     print("AI Cog loaded successfully via setup.")
