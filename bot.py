@@ -5292,7 +5292,7 @@ async def nerdhelp(interaction: discord.Interaction):
 @app_commands.describe(
     limit="Max number of messages to check PER CHANNEL (default 15000, be careful!)."
 )
-async def temporarycommand_exportusermsgs(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50000] = 15000):
+async def temporarycommand_exportusermsgs(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 500000] = 200000):
     if interaction.user.id != OWNER_USER_ID:
         await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
         return
