@@ -5629,6 +5629,135 @@ async def temp_create_thenerd_owner_role(interaction: discord.Interaction):
         await interaction.followup.send(error_msg, ephemeral=True)
         await log_error(guild, "temp_create_thenerd_owner_role: Unexpected error.", error=e_unknown, interaction=interaction, ping_owner=True)
 
+ROLE_ID_TO_MOVE = 1372446248400846951 # The specific Role ID you want to move
+
+@tree.command(name="temp_move_role_up", description="[Owner Only] Moves a specific role up by N positions.")
+@app_commands.describe(
+    positions_to_move_up="How many positions to move the role UP the list (e.g., 1 means one slot higher)."
+)
+async def temp_move_role_up(interaction: discord.Interaction, positions_to_move_up: app_commands.Range[int, 1, 100]): # Max 100 seems reasonable
+    # 1. Owner check
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    # 2. Guild check
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    # 3. Defer ephemerally
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # 4. Get the role object
+    role_to_move = guild.get_role(ROLE_ID_TO_MOVE)
+    if not role_to_move:
+        await interaction.followup.send(f"❌ Role with ID `{ROLE_ID_TO_MOVE}` not found in this server.", ephemeral=True)
+        await log_warning(guild, f"temp_move_role_up: Role ID {ROLE_ID_TO_MOVE} not found.", interaction=interaction)
+        return
+    
+    # 5. Get bot's member object and its top role
+    bot_member = guild.me
+    if not bot_member: # Should not happen if bot is running in the guild
+        await interaction.followup.send("❌ Internal error: Could not find bot's member object.", ephemeral=True)
+        await log_error(guild, "temp_move_role_up: Bot member object not found.", interaction=interaction, ping_owner=True)
+        return
+        
+    bot_top_role = bot_member.top_role
+    if not bot_top_role: # Should not happen if bot has any role (even @everyone technically is one)
+        await interaction.followup.send("❌ Internal error: Bot seems to have no roles, cannot determine hierarchy.", ephemeral=True)
+        await log_error(guild, "temp_move_role_up: Bot's top_role is None.", interaction=interaction, ping_owner=True)
+        return
+
+    # 6. Initial state logging
+    current_pos_attr = role_to_move.position
+    await log_info(guild, f"temp_move_role_up: Attempting to move '{role_to_move.name}' (ID: {role_to_move.id}, current pos_attr: {current_pos_attr}) up by {positions_to_move_up} positions. Bot's top role: '{bot_top_role.name}' (pos_attr: {bot_top_role.position}).")
+
+    # 7. Check if bot can even manage this role at all
+    if bot_top_role.position <= role_to_move.position and role_to_move.id != bot_top_role.id : # Bot's top role is lower or same as target role (and target isn't bot's top role itself)
+        msg = f"❌ Cannot move role '{role_to_move.name}'. My highest role ('{bot_top_role.name}') is not above it."
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+    
+    # 8. Calculate the new target position attribute
+    # Moving "up" visually means INCREASING the .position attribute.
+    desired_new_pos_attr = current_pos_attr + positions_to_move_up
+
+    # 9. Determine the maximum position attribute the bot can set for this role.
+    # The bot cannot move any role to a position attribute higher than its own top_role's position attribute.
+    # If it's moving a role *other* than its own top role, the max is bot_top_role.position - 1.
+    # If it *is* trying to move its own top role, it effectively can't move it higher via this method (it is already its highest).
+    max_settable_pos_attr_for_this_role = bot_top_role.position
+    if role_to_move.id != bot_top_role.id: # If we are not moving the bot's own top role
+        max_settable_pos_attr_for_this_role = bot_top_role.position -1
+
+
+    if current_pos_attr >= max_settable_pos_attr_for_this_role and role_to_move.id != bot_top_role.id:
+        msg = f"ℹ️ Role '{role_to_move.name}' (pos_attr {current_pos_attr}) is already at or above the highest position I can move it to (max settable: {max_settable_pos_attr_for_this_role}, due to my top role '{bot_top_role.name}' at pos_attr {bot_top_role.position}). No change made."
+        await interaction.followup.send(msg, ephemeral=True)
+        await log_info(guild, f"temp_move_role_up: {msg}", interaction=interaction)
+        return
+    
+    if role_to_move.id == bot_top_role.id:
+        # This check is a bit redundant if the one above catches it, but good for clarity
+        msg = f"ℹ️ Cannot move the role '{role_to_move.name}' as it is my own highest role. No change made."
+        await interaction.followup.send(msg, ephemeral=True)
+        await log_info(guild, f"temp_move_role_up: {msg}", interaction=interaction)
+        return
+
+
+    # 10. Cap the desired_new_pos_attr to what's achievable by the bot
+    actual_target_pos_attr_for_edit = min(desired_new_pos_attr, max_settable_pos_attr_for_this_role)
+    
+    # Ensure it's at least 1 (lowest possible position attribute for a non-@everyone role)
+    actual_target_pos_attr_for_edit = max(1, actual_target_pos_attr_for_edit)
+
+    if actual_target_pos_attr_for_edit == current_pos_attr:
+        msg = f"ℹ️ Role '{role_to_move.name}' is already at the target position attribute ({current_pos_attr}) or cannot be moved further up by me. No change made."
+        await interaction.followup.send(msg, ephemeral=True)
+        await log_info(guild, f"temp_move_role_up: {msg} (Desired: {desired_new_pos_attr}, Max Settable: {max_settable_pos_attr_for_this_role})", interaction=interaction)
+        return
+
+    await log_info(guild, f"temp_move_role_up: Target position attribute for '{role_to_move.name}' set to {actual_target_pos_attr_for_edit} (Original desired: {desired_new_pos_attr}, Max settable by bot: {max_settable_pos_attr_for_this_role}).")
+
+    try:
+        # 11. Perform the edit
+        await role_to_move.edit(
+            position=actual_target_pos_attr_for_edit,
+            reason=f"Temporary role move by {interaction.user.name} ({interaction.user.id})"
+        )
+        # Fetch the role again to confirm its new position attribute
+        updated_role = guild.get_role(role_to_move.id)
+        final_pos_attr = updated_role.position if updated_role else "N/A (role not found after edit)"
+
+        success_msg = (
+            f"✅ Role '{role_to_move.name}' moved.\n"
+            f"Original position attribute: {current_pos_attr}\n"
+            f"Requested move up by: {positions_to_move_up} positions\n"
+            f"Attempted new position attribute: {actual_target_pos_attr_for_edit}\n"
+            f"Final confirmed position attribute: {final_pos_attr}"
+        )
+        await interaction.followup.send(success_msg, ephemeral=True)
+        await log_info(guild, f"temp_move_role_up: Successfully moved '{role_to_move.name}'. Old_pos_attr: {current_pos_attr}, New_pos_attr: {final_pos_attr}.", interaction=interaction)
+
+    except discord.Forbidden as e_forbidden:
+        error_msg = f"❌ Forbidden: I lack permissions to move '{role_to_move.name}'. This might be because my highest role ('{bot_top_role.name}') is not high enough, or I lack 'Manage Roles'."
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, f"temp_move_role_up: Forbidden error trying to move role '{role_to_move.name}'.", error=e_forbidden, interaction=interaction)
+    except discord.HTTPException as e_http:
+        error_msg = f"❌ Discord API Error occurred while moving '{role_to_move.name}': {e_http.code} - {e_http.text}"
+        await interaction.followup.send(error_msg[:1990], ephemeral=True) # Truncate if too long
+        await log_error(guild, f"temp_move_role_up: HTTP error trying to move role '{role_to_move.name}'.", error=e_http, interaction=interaction)
+    except discord.InvalidArgument as e_invalid_arg: # Should be caught by earlier checks, but good to have
+        error_msg = f"❌ Invalid Argument: The target position for '{role_to_move.name}' was invalid (e.g., out of bounds). Error: {e_invalid_arg}"
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, f"temp_move_role_up: InvalidArgument error trying to move role '{role_to_move.name}'.", error=e_invalid_arg, interaction=interaction)
+    except Exception as e_unknown:
+        error_msg = f"❌ An unexpected error occurred while moving '{role_to_move.name}': {type(e_unknown).__name__}"
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, f"temp_move_role_up: Unexpected error trying to move role '{role_to_move.name}'.", error=e_unknown, interaction=interaction, ping_owner=True)
+
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
