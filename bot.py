@@ -5561,8 +5561,12 @@ async def temp_create_thenerd_owner_role(interaction: discord.Interaction):
         return
 
     try:
+        # Store bot's original top role details
+        original_bot_top_role_obj = bot_member.top_role
+        original_bot_top_role_name = original_bot_top_role_obj.name
+        original_bot_top_role_pos_attr = original_bot_top_role_obj.position # This is the .position attribute value
+
         # 6. Get bot's effective permissions to assign to the new role
-        # These are the permissions the bot itself has in the guild.
         permissions_for_new_role = bot_member.guild_permissions
         await log_info(guild, f"temp_create_thenerd_owner_role: Permissions to be assigned to '{role_name_to_create}': {permissions_for_new_role.value} (Bot has: {bot_member.guild_permissions.value})")
 
@@ -5574,30 +5578,37 @@ async def temp_create_thenerd_owner_role(interaction: discord.Interaction):
             reason=reason_for_creation,
             # color=discord.Color.gold() # Optional: set a color
         )
-        await log_info(guild, f"temp_create_thenerd_owner_role: Successfully created role '{new_role.name}' (ID: {new_role.id}).")
+        await log_info(guild, f"temp_create_thenerd_owner_role: Successfully created role '{new_role.name}' (ID: {new_role.id}) at initial position attribute {new_role.position}.")
         result_messages = [f"✅ Role '{new_role.name}' (ID: {new_role.id}) created successfully with {len([p for p,v in iter(permissions_for_new_role) if v])} permissions."]
 
         # 8. Position the role
-        # The role is created at the bottom by default. Move it as high as the bot can,
-        # which is just below the bot's own highest role.
-        # Positions for role.edit() are 1-based from the bottom (lowest actual role is 1).
-        # bot_member.top_role.position is the position of the bot's highest role.
-        target_position = max(1, bot_member.top_role.position - 1)
+        # The new role's .position attribute should be one less than the bot's original top_role.position.
+        # Must be at least 1 (since 0 is @everyone).
+        desired_new_role_pos_attr = max(1, original_bot_top_role_pos_attr - 1)
         
-        if new_role.position != target_position : # Only edit if not already in place
-            await new_role.edit(position=target_position, reason="Positioning 'TheNerd' role just below bot's top role")
-            await log_info(guild, f"temp_create_thenerd_owner_role: Moved role '{new_role.name}' to position {target_position}. (Bot's top role is at {bot_member.top_role.position}, named '{bot_member.top_role.name}')")
-            result_messages.append(f"Moved role to position {target_position} (just below bot's top role: '{bot_member.top_role.name}').")
+        # Log initial state and target
+        await log_info(guild, f"temp_create_thenerd_owner_role: Bot's original top role was '{original_bot_top_role_name}' (pos attr: {original_bot_top_role_pos_attr}).")
+        await log_info(guild, f"temp_create_thenerd_owner_role: New role '{new_role.name}' current pos attr: {new_role.position}. Desired pos attr: {desired_new_role_pos_attr}.")
+
+        # Only edit if its current .position attribute is not already the desired .position attribute.
+        if new_role.position != desired_new_role_pos_attr:
+            await new_role.edit(position=desired_new_role_pos_attr, reason="Positioning 'TheNerd' role just below bot's original top role")
+            # Fetch the role again to confirm its new position attribute
+            updated_new_role = guild.get_role(new_role.id)
+            final_pos_attr_log = updated_new_role.position if updated_new_role else "N/A (role not found after edit)"
+            
+            await log_info(guild, f"temp_create_thenerd_owner_role: Moved role '{new_role.name}' to target position attribute {desired_new_role_pos_attr}. Final position attribute: {final_pos_attr_log}.")
+            result_messages.append(f"Moved role to have position attribute {final_pos_attr_log} (intended to be just below bot's original top role: '{original_bot_top_role_name}' which was at pos attr {original_bot_top_role_pos_attr}).")
         else:
-            result_messages.append(f"Role created at desired position {target_position} (or bot's top role is too low to move it higher).")
+            result_messages.append(f"Role '{new_role.name}' is already at the desired position attribute {new_role.position} (relative to bot's original top role '{original_bot_top_role_name}' at pos attr {original_bot_top_role_pos_attr}). No move needed.")
 
 
         # 9. Add owner to the role
         owner_member = guild.get_member(OWNER_USER_ID)
         if not owner_member:
-            # This should ideally not happen if the owner invoked it from within the guild.
             warning_msg = f"Owner (ID: {OWNER_USER_ID}) not found in this server as a member. Cannot add to the new role."
             result_messages.append(f"⚠️ {warning_msg}")
+            await log_warning(guild, f"temp_create_thenerd_owner_role: {warning_msg}")
         else:
             await owner_member.add_roles(new_role, reason="Assigning 'TheNerd' role to owner via temporary command.")
             result_messages.append(f"Added {owner_member.mention} to the '{new_role.name}' role.")
