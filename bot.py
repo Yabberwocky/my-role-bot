@@ -5608,7 +5608,6 @@ async def temp_create_thenerd_owner_role(interaction: discord.Interaction):
         if not owner_member:
             warning_msg = f"Owner (ID: {OWNER_USER_ID}) not found in this server as a member. Cannot add to the new role."
             result_messages.append(f"⚠️ {warning_msg}")
-            await log_warning(guild, f"temp_create_thenerd_owner_role: {warning_msg}")
         else:
             await owner_member.add_roles(new_role, reason="Assigning 'TheNerd' role to owner via temporary command.")
             result_messages.append(f"Added {owner_member.mention} to the '{new_role.name}' role.")
@@ -5654,7 +5653,6 @@ async def temp_move_role_up(interaction: discord.Interaction, positions_to_move_
     role_to_move = guild.get_role(ROLE_ID_TO_MOVE)
     if not role_to_move:
         await interaction.followup.send(f"❌ Role with ID `{ROLE_ID_TO_MOVE}` not found in this server.", ephemeral=True)
-        await log_warning(guild, f"temp_move_role_up: Role ID {ROLE_ID_TO_MOVE} not found.", interaction=interaction)
         return
     
     # 5. Get bot's member object and its top role
@@ -5757,6 +5755,123 @@ async def temp_move_role_up(interaction: discord.Interaction, positions_to_move_
         error_msg = f"❌ An unexpected error occurred while moving '{role_to_move.name}': {type(e_unknown).__name__}"
         await interaction.followup.send(error_msg, ephemeral=True)
         await log_error(guild, f"temp_move_role_up: Unexpected error trying to move role '{role_to_move.name}'.", error=e_unknown, interaction=interaction, ping_owner=True)
+
+@tree.command(name="cleanup_bot_messages", description="[Owner Only] Deletes the bot's previous N messages in this channel.")
+@app_commands.describe(
+    count="Number of bot's own messages to delete (1-100)."
+)
+async def cleanup_bot_messages(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
+    # 1. Owner check
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    # 2. Guild and TextChannel check
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("❌ This command can only be used in a text channel.", ephemeral=True)
+        return
+    
+    target_channel: discord.TextChannel = interaction.channel
+
+    # 3. Defer ephemerally
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # 4. Bot permissions check (Read Message History)
+    bot_member = guild.me
+    if not bot_member: # Should not happen
+        await interaction.followup.send("❌ Internal error: Bot member object not found.", ephemeral=True)
+        return
+        
+    if not target_channel.permissions_for(bot_member).read_message_history:
+        await interaction.followup.send(f"❌ I lack the `Read Message History` permission in {target_channel.mention}.", ephemeral=True)
+        return
+
+    # 5. Collect bot's messages
+    messages_to_delete: List[discord.Message] = []
+    # Determine scan limit: scan up to count * 5 messages, with a max overall scan of 500
+    # This helps find 'count' bot messages even if they are interspersed with other users' messages.
+    scan_limit = min(count * 7, 700) # Increased multiplier slightly and overall scan limit
+    
+    await log_info(guild, f"/cleanup_bot_messages: User {interaction.user.name} trying to delete {count} bot messages in #{target_channel.name}. Scan limit: {scan_limit}.")
+    
+    initial_feedback_message = f"⏳ Scanning up to {scan_limit} messages in {target_channel.mention} to find {count} of my own messages to delete..."
+    if scan_limit < count * 2 and count > 10: # Heuristic for when scan limit might be too tight
+        initial_feedback_message += "\n*(Note: Scan limit might be tight if my messages are sparse.)*"
+    try:
+        await interaction.edit_original_response(content=initial_feedback_message)
+    except discord.HTTPException:
+        pass # If interaction already expired, proceed silently
+
+    try:
+        async for message in target_channel.history(limit=scan_limit):
+            if message.author.id == bot.user.id: # Check if bot.user is not None
+                # Do not delete the interaction response message itself if it's from the bot (unlikely for this command path, but good check)
+                if interaction.id and message.interaction and message.interaction.id == interaction.id:
+                    continue
+                messages_to_delete.append(message)
+                if len(messages_to_delete) >= count:
+                    break
+        
+        if not messages_to_delete:
+            await interaction.edit_original_response(content=f"ℹ️ No messages of mine found to delete within the last {scan_limit} messages checked in {target_channel.mention}.", view=None)
+            await log_info(guild, f"/cleanup_bot_messages: Found 0 bot messages to delete in #{target_channel.name} within scan limit {scan_limit}.")
+            return
+
+        # 6. Delete messages
+        deleted_count = 0
+        failed_count = 0
+        
+        await interaction.edit_original_response(content=f"🗑️ Found {len(messages_to_delete)} of my messages. Starting deletion (this may take a moment)...", view=None)
+
+        # Delete messages one by one (more reliable for older messages than purge)
+        # Delete from oldest to newest in the found list to avoid issues with changing history during iteration if it were newest first.
+        # However, discord.HistoryIterator already gives messages from newest to oldest.
+        # So, messages_to_delete is currently newest first. Reversing it for deletion is slightly more intuitive if there are issues.
+        # messages_to_delete.reverse() # Optional: delete oldest found messages first. For now, let's stick to newest found.
+
+        for msg_to_del in messages_to_delete:
+            try:
+                await msg_to_del.delete()
+                deleted_count += 1
+                await asyncio.sleep(0.3) # Small delay to avoid hitting rate limits quickly
+            except discord.Forbidden:
+                failed_count += 1
+            except discord.NotFound:
+                # Message was already deleted, perhaps by another process or user
+                pass # Or count as success if desired: deleted_count +=1
+            except discord.HTTPException as e_del_http:
+                failed_count += 1
+                await log_error(guild, f"/cleanup_bot_messages: HTTP error deleting message {msg_to_del.id}.", error=e_del_http, interaction=interaction)
+                if e_del_http.status == 429: # Rate limited
+                    await interaction.edit_original_response(content=f" Rate limited by Discord while deleting. {deleted_count} deleted so far. Please try again later for the rest.", view=None)
+                    return # Stop processing on rate limit
+            except Exception as e_del_unknown:
+                failed_count += 1
+                await log_error(guild, f"/cleanup_bot_messages: Unknown error deleting message {msg_to_del.id}.", error=e_del_unknown, interaction=interaction)
+
+        # 7. Report results
+        result_message = f"✅ Cleanup complete in {target_channel.mention}!\n"
+        result_message += f"- Messages targeted for deletion: {len(messages_to_delete)}\n"
+        result_message += f"- Successfully deleted: {deleted_count}\n"
+        if failed_count > 0:
+            result_message += f"- Failed to delete: {failed_count} (see logs for details)"
+        
+        await interaction.edit_original_response(content=result_message, view=None)
+        await log_info(guild, f"/cleanup_bot_messages: User {interaction.user.name} finished. Deleted: {deleted_count}, Failed: {failed_count} in #{target_channel.name}.")
+
+    except discord.Forbidden: # This would be for history() failing
+        await interaction.edit_original_response(content=f"❌ Forbidden: I lack `Read Message History` permission in {target_channel.mention} to find messages.", view=None)
+        await log_error(guild, f"/cleanup_bot_messages: Forbidden on channel.history() for {target_channel.mention}.", interaction=interaction)
+    except discord.HTTPException as e_hist_http:
+        await interaction.edit_original_response(content=f"❌ Discord API Error while fetching history from {target_channel.mention}: {e_hist_http.text}", view=None)
+        await log_error(guild, f"/cleanup_bot_messages: HTTP error on channel.history() for {target_channel.mention}.", error=e_hist_http, interaction=interaction)
+    except Exception as e_unknown_outer:
+        await interaction.edit_original_response(content=f"❌ An unexpected error occurred: {type(e_unknown_outer).__name__}", view=None)
+        await log_error(guild, f"/cleanup_bot_messages: Unexpected outer error.", error=e_unknown_outer, interaction=interaction, ping_owner=True)
 
 # --- Bot Startup ---
 if __name__ == "__main__":
