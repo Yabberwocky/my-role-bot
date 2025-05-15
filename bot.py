@@ -5288,11 +5288,17 @@ async def nerdhelp(interaction: discord.Interaction):
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
         except Exception: pass
 
-@tree.command(name="temporarycommand_exportusermsgs", description="[Owner Only] Export messages from a specific user to a file.")
+TARGET_CHANNEL_ID_CONST = 1317943895606165579
+HISTORY_FETCH_LIMIT_CONST = 1000000  # 1 million
+
+# OLD NAME that caused the error:
+# @tree.command(name="temporarycommand_exportchannelmsgs", description="[Owner Only] Export ALL messages from a specific channel.")
+# NEW, SHORTER NAME:
+@tree.command(name="temp_export_chan_msgs", description="[Owner Only] Export ALL messages from a specific channel.")
 @app_commands.describe(
-    limit="Max number of messages to check PER CHANNEL (default 15000, be careful!)."
+    limit="Max number of messages to check. NOTE: This parameter is IGNORED by the current specific configuration of this command."
 )
-async def temporarycommand_exportusermsgs(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 500000] = 200000):
+async def temporarycommand_exportchannelmsgs(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 500000] = 200000): # limit param is unused
     if interaction.user.id != OWNER_USER_ID:
         await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
         return
@@ -5301,164 +5307,316 @@ async def temporarycommand_exportusermsgs(interaction: discord.Interaction, limi
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    # Defer ephemerally, the final result will be DMed or sent as a new message
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    target_user_id = 828712236960448562
-    target_user_obj = None
-    try:
-        target_user_obj = await bot.fetch_user(target_user_id)
-    except discord.NotFound:
-        print(f"Message Export: Target user ID {target_user_id} not found.")
-    except discord.HTTPException as e:
-        print(f"Message Export: HTTP error fetching target user {target_user_id}: {e}")
-
-    target_user_name_safe = (target_user_obj.name if target_user_obj else str(target_user_id)).replace('#', '_').replace('/', '_')
-    filename = f"messages_from_{target_user_name_safe}.txt"
-    filepath = filename # Saves in the bot's current working directory
+    channel_to_process = interaction.guild.get_channel(TARGET_CHANNEL_ID_CONST)
+    
+    if not channel_to_process:
+        await interaction.edit_original_response(content=f"❌ Target channel ID `{TARGET_CHANNEL_ID_CONST}` not found in this server.")
+        await log_error(interaction.guild, f"Message Export: Target channel ID {TARGET_CHANNEL_ID_CONST} not found.")
+        return
+    if not isinstance(channel_to_process, discord.TextChannel):
+        await interaction.edit_original_response(content=f"❌ Target channel `{channel_to_process.name}` (ID: `{TARGET_CHANNEL_ID_CONST}`) is not a text channel.")
+        await log_error(interaction.guild, f"Message Export: Target channel {TARGET_CHANNEL_ID_CONST} is not a text channel.")
+        return
+    if not channel_to_process.permissions_for(interaction.guild.me).read_message_history:
+        await interaction.edit_original_response(content=f"❌ I don't have permission to read message history in channel #{channel_to_process.name} (ID: `{TARGET_CHANNEL_ID_CONST}`).")
+        await log_error(interaction.guild, f"Message Export: No read_message_history permission in channel {channel_to_process.name} ({TARGET_CHANNEL_ID_CONST}).")
+        return
+    
+    channel_name_safe_for_file = channel_to_process.name.replace('#', '').replace('/', '_').replace(' ', '_').replace(':', '_')
+    filename = f"all_messages_in_{channel_name_safe_for_file}.txt"
+    filepath = filename 
 
     messages_found_count = 0
-    channels_processed_count = 0
-    accessible_text_channels = [
-        ch for ch in interaction.guild.text_channels
-        if ch.permissions_for(interaction.guild.me).read_message_history
-    ]
-
-    if not accessible_text_channels:
-        # Edit the deferred response
-        await interaction.edit_original_response(content="❌ I don't have permission to read message history in any text channels in this server.")
-        return
+    messages_checked_in_channel = 0
+    
+    actual_limit_used = HISTORY_FETCH_LIMIT_CONST
 
     initial_message = (
-        f"⏳ Starting export for user ID {target_user_id} ({target_user_name_safe}). This may take a very long time...\n"
-        f"Processing {len(accessible_text_channels)} channels with a limit of {limit} messages per channel.\n"
-        f"I will DM you the file when finished."
+        f"⏳ Starting export of ALL messages from channel #{channel_to_process.name}.\n"
+        f"Checking up to {actual_limit_used:,} messages. This may take a very long time...\n"
+        f"I will DM you the file when finished. (Command's `limit` parameter is currently ignored)."
     )
     try:
         await interaction.edit_original_response(content=initial_message)
     except discord.HTTPException:
-        print("Message Export: Failed to send initial deferred response edit (token might have already expired or other issue). Process will continue.")
-        # If this fails, the user just won't get the "Starting..." message.
+        print("Message Export: Failed to send initial deferred response edit. Process will continue.")
+
+    channel_processing_error_info = ""
 
     try:
         with open(filepath, "w", encoding="utf-8") as f:
-            separator = "\n{|||MESSAGE_SEPARATOR|||}\n" # Added newlines for better readability in file
+            separator = "\n{|||MESSAGE_SEPARATOR|||}\n" 
+            current_channel = channel_to_process 
+            
+            try:
+                print(f"Message Export: Processing channel: #{current_channel.name} ({current_channel.id}) for ALL messages.")
+                await asyncio.sleep(0.5) 
+                
+                async for message_obj in current_channel.history(limit=actual_limit_used):
+                    messages_checked_in_channel += 1
 
-            for channel_idx, channel in enumerate(accessible_text_channels):
-                channels_processed_count += 1
-                channel_message_count = 0
-                try:
-                    print(f"Processing channel: #{channel.name} ({channel_idx + 1}/{len(accessible_text_channels)})")
-                    # Introduce a small delay to be nicer to the API, especially before a history call
-                    await asyncio.sleep(0.5) 
-                    async for message_obj in channel.history(limit=limit):
-                        if message_obj.author.id == target_user_id and message_obj.content:
-                            # Sanitize content slightly for file writing, replace newlines within message
+                    # We are exporting all messages with content. 
+                    # If you want to also export messages without message_obj.content (e.g. some system messages, pure embeds),
+                    # you might need to adjust this or add more fields (like attachments, embed details).
+                    if message_obj.content or message_obj.attachments or message_obj.embeds:
+                        author_name_safe = message_obj.author.name.replace('\r\n', '<NL>').replace('\n', '<NL>')
+                        author_info = f"Author: {author_name_safe} ({message_obj.author.id})"
+                        
+                        f.write(f"Message ID: {message_obj.id} | Timestamp: {message_obj.created_at.isoformat()} | {author_info} | Channel: #{current_channel.name} ({current_channel.id})\n")
+                        
+                        if message_obj.content:
                             content_to_write = message_obj.content.replace('\r\n', '<NEWLINE>').replace('\n', '<NEWLINE>')
-                            f.write(content_to_write)
-                            f.write(separator)
-                            messages_found_count += 1
-                            channel_message_count +=1
-                    print(f"  Found {channel_message_count} messages from target user in #{channel.name}.")
+                            f.write(f"Content: {content_to_write}\n")
+                        
+                        if message_obj.attachments:
+                            f.write(f"Attachments: ({len(message_obj.attachments)})\n")
+                            for att_idx, attachment in enumerate(message_obj.attachments):
+                                f.write(f"  - Attachment {att_idx+1}: {attachment.filename} ({attachment.size} bytes) - URL: {attachment.url}\n")
+                        
+                        # Basic embed info, could be expanded
+                        if message_obj.embeds:
+                            f.write(f"Embeds: ({len(message_obj.embeds)})\n")
+                            for em_idx, embed in enumerate(message_obj.embeds):
+                                title = embed.title if embed.title else "N/A"
+                                description = embed.description if embed.description else "N/A"
+                                f.write(f"  - Embed {em_idx+1}: Title: {title[:50]}... | Description: {description[:50]}...\n")
 
-                except discord.Forbidden:
-                    print(f"  Skipping channel #{channel.name} (Forbidden to read history).")
-                    await log_info(interaction.guild, f"Message Export: Skipped channel #{channel.name} (Forbidden).")
-                except discord.HTTPException as e_http:
-                    print(f"  HTTP Error in channel #{channel.name}: {e_http}. Moving to next channel.")
-                    await log_info(interaction.guild, f"Message Export: HTTP Error in #{channel.name} ({e_http.status}).")
-                    if e_http.status == 429: # Rate limited
-                        print("  RATELIMITED! Waiting for 60 seconds.")
-                        await asyncio.sleep(60) # Wait longer if rate limited
-                except Exception as e:
-                    print(f"  Unexpected error in channel #{channel.name}: {e}")
-                    await log_error(interaction.guild, f"Message Export: Unexpected error in #{channel.name}", error=e)
+                        f.write(separator.strip()) # Strip leading/trailing newlines from separator for this format
+                        f.write("\n\n") # Add two newlines for separation
+                        messages_found_count += 1
+                    
+                    if messages_checked_in_channel % 25000 == 0: # Update more frequently for very long tasks
+                        progress_message = (
+                            f"⏳ Exporting ALL messages from #{current_channel.name}...\n"
+                            f"Checked {messages_checked_in_channel:,}/{actual_limit_used:,} messages.\n"
+                            f"Found {messages_found_count} messages so far."
+                        )
+                        try:
+                            await interaction.edit_original_response(content=progress_message)
+                            print(f"  Message Export Progress: Checked {messages_checked_in_channel}, Found {messages_found_count} in #{current_channel.name}")
+                        except discord.HTTPException as e_edit: 
+                            print(f"  Message Export: Could not update interaction progress (token likely expired: {e_edit.code}). Continuing silently.")
+                        except Exception as e_unexp_edit:
+                            print(f"  Message Export: Unexpected error updating interaction progress: {e_unexp_edit}")
+                
+                print(f"  Message Export: Finished processing #{current_channel.name}. Found {messages_found_count} messages. Checked {messages_checked_in_channel} total messages in channel.")
 
-                if (channel_idx + 1) % 5 == 0: # Update every 5 channels
-                    progress_message = (
-                        f"⏳ Exporting for user ID {target_user_id} ({target_user_name_safe})...\n"
-                        f"Processed {channels_processed_count}/{len(accessible_text_channels)} channels.\n"
-                        f"Found {messages_found_count} messages so far."
-                    )
-                    try:
-                        await interaction.edit_original_response(content=progress_message)
-                    except discord.HTTPException as e_edit: # Catches 40005 (Unknown Webhook) or 50027 (Invalid Webhook Token)
-                        print(f"  Could not update interaction progress (token likely expired: {e_edit.code}). Continuing silently.")
-                    except Exception as e_unexp_edit:
-                        print(f"  Unexpected error updating interaction progress: {e_unexp_edit}")
-
+            except discord.Forbidden:
+                err_msg = f"Error: Lost permission to read history in #{current_channel.name} during processing."
+                print(f"  Message Export: {err_msg}")
+                await log_error(interaction.guild, f"Message Export: Skipped channel #{current_channel.name} (Forbidden mid-process).")
+                channel_processing_error_info = "\n⚠️ " + err_msg + " Export might be incomplete."
+            except discord.HTTPException as e_http:
+                err_msg = f"HTTP Error ({e_http.status}) in channel #{current_channel.name}. Export may be incomplete."
+                print(f"  Message Export: {err_msg} - {e_http.text}")
+                await log_info(interaction.guild, f"Message Export: {err_msg} ({e_http.text})")
+                channel_processing_error_info = "\n⚠️ " + err_msg
+                if e_http.status == 429: 
+                    print("  Message Export: RATELIMITED! Waiting for 60 seconds. Export for this channel is likely incomplete.")
+                    channel_processing_error_info += " Bot was rate-limited."
+                    await asyncio.sleep(60) 
+            except Exception as e:
+                err_msg = f"Unexpected error processing channel #{current_channel.name}. Export may be incomplete."
+                print(f"  Message Export: {err_msg} Error: {e}")
+                await log_error(interaction.guild, f"Message Export: Unexpected error in #{current_channel.name}", error=e)
+                channel_processing_error_info = "\n⚠️ " + err_msg
 
         final_message_to_user = ""
         discord_file_to_send: Optional[discord.File] = None
+        file_is_too_large = False
 
         if messages_found_count > 0:
-            discord_file_to_send = discord.File(filepath, filename=filename)
-            final_message_to_user = (
-                f"✅ Export complete! Found {messages_found_count} messages from user ID {target_user_id} ({target_user_name_safe}) "
-                f"across {channels_processed_count} channels (limit: {limit} per channel). File is attached."
-            )
-            await log_info(interaction.guild, f"Message Export: User {interaction.user.name} exported {messages_found_count} messages from user ID {target_user_id}.")
-        else:
-            final_message_to_user = (
-                f"ℹ️ No messages found from user ID {target_user_id} ({target_user_name_safe}) "
-                f"in the {channels_processed_count} accessible channels checked (limit: {limit} per channel)."
-            )
-            await log_info(interaction.guild, f"Message Export: User {interaction.user.name} ran export for user ID {target_user_id}, 0 messages found.")
-
-        # Send the final result to the user via DM
-        try:
-            if discord_file_to_send:
-                await interaction.user.send(content=final_message_to_user, file=discord_file_to_send)
+            if os.path.getsize(filepath) > 25 * 1024 * 1024: # Approx 25MB limit for bot DMs/uploads
+                file_is_too_large = True
             else:
-                await interaction.user.send(content=final_message_to_user)
-            print(f"Message Export: Sent final result to {interaction.user.name} via DM.")
-            # Optionally, you can still try to edit the original ephemeral "Thinking..." message to say "Check DMs"
+                discord_file_to_send = discord.File(filepath, filename=filename)
+            
+            final_message_to_user = (
+                f"✅ Export complete! Found {messages_found_count} messages "
+                f"in channel #{channel_to_process.name} (checked {messages_checked_in_channel:,}/{actual_limit_used:,} messages)."
+                f"{channel_processing_error_info}"
+            )
+            if file_is_too_large:
+                final_message_to_user += f"\n⚠️ The export file (`{filename}`) is too large to send via Discord. It was saved on the bot's host and will be cleaned up."
+            else:
+                 final_message_to_user += "\nFile is attached."
+            await log_info(interaction.guild, f"Message Export: User {interaction.user.name} ({interaction.user.id}) exported {messages_found_count} messages from channel #{channel_to_process.name} ({channel_to_process.id}). Checked {messages_checked_in_channel} msgs.{' File too large.' if file_is_too_large else ''}{channel_processing_error_info}")
+        else: 
+            if channel_processing_error_info:
+                 final_message_to_user = (
+                    f"⚠️ Export process encountered issues while fetching messages "
+                    f"from channel #{channel_to_process.name} (checked {messages_checked_in_channel:,}/{actual_limit_used:,} messages)."
+                    f"{channel_processing_error_info}\nNo messages were successfully exported to the file."
+                )
+            else:
+                final_message_to_user = (
+                    f"ℹ️ No messages found or exported "
+                    f"from channel #{channel_to_process.name} (checked {messages_checked_in_channel:,}/{actual_limit_used:,} messages)."
+                )
+            await log_info(interaction.guild, f"Message Export: User {interaction.user.name} ({interaction.user.id}) ran export for channel #{channel_to_process.name} ({channel_to_process.id}), 0 messages found. Checked {messages_checked_in_channel} msgs.{channel_processing_error_info}")
+
+        try:
+            user_to_dm = interaction.user
+            if discord_file_to_send: 
+                await user_to_dm.send(content=final_message_to_user, file=discord_file_to_send)
+            else: 
+                await user_to_dm.send(content=final_message_to_user)
+            
+            print(f"Message Export: Sent final result to {user_to_dm.name} via DM.")
             try:
                 await interaction.edit_original_response(content="✅ Process finished. Check your DMs for the result and file (if any).")
             except discord.HTTPException:
-                pass # Ignore if token expired
-        except discord.Forbidden:
-            print(f"Message Export: Could not DM {interaction.user.name}. Trying to send to original channel if possible.")
+                pass 
+        except discord.Forbidden: 
+            print(f"Message Export: Could not DM {interaction.user.name}. Trying to send to original channel.")
             await log_error(interaction.guild, f"Message Export: Could not DM results to {interaction.user.name}.")
-            # Fallback to sending in the original channel (if permissions allow and not a DM channel itself)
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
                 try:
-                    if discord_file_to_send:
-                        # Need to re-open the file object for sending again if it was closed or consumed
-                        with open(filepath, "rb") as f_reopen:
-                            discord_file_reopened = discord.File(f_reopen, filename=filename)
-                            await interaction.channel.send(f"{interaction.user.mention} {final_message_to_user}", file=discord_file_reopened)
+                    file_for_channel = None
+                    if messages_found_count > 0 and not file_is_too_large and os.path.exists(filepath):
+                         file_for_channel = discord.File(filepath, filename=filename)
+
+                    if file_for_channel:
+                        await interaction.channel.send(f"{interaction.user.mention} {final_message_to_user}", file=file_for_channel, allowed_mentions=discord.AllowedMentions(users=True))
                     else:
-                        await interaction.channel.send(f"{interaction.user.mention} {final_message_to_user}")
+                        await interaction.channel.send(f"{interaction.user.mention} {final_message_to_user}", allowed_mentions=discord.AllowedMentions(users=True))
+                    
                     print(f"Message Export: Sent final result to channel #{interaction.channel.name} as DM failed.")
+                    try:
+                        await interaction.edit_original_response(content=f"✅ Process finished. DM failed, so I've sent the results to #{interaction.channel.name}.")
+                    except discord.HTTPException: pass
                 except Exception as e_ch_send:
                     print(f"Message Export: Failed to send result to channel after DM failure: {e_ch_send}")
                     await log_error(interaction.guild, "Message Export: Failed channel fallback send", error=e_ch_send)
-        except Exception as e_dm:
+                    try: await interaction.edit_original_response(content="❌ Process finished, but I could not DM you or send the results in the channel.")
+                    except discord.HTTPException: pass
+        except Exception as e_dm: 
             print(f"Message Export: Error DMing {interaction.user.name}: {e_dm}")
             await log_error(interaction.guild, "Message Export: Error sending DM to user", error=e_dm)
-
+            try: await interaction.edit_original_response(content="❌ Process finished, but an error occurred while trying to DM you the results.")
+            except discord.HTTPException: pass
 
     except IOError as e:
         error_msg = f"❌ An error occurred while writing to the file: {e}"
         print(f"Message Export: File I/O Error - {e}")
         await log_error(interaction.guild, "Message Export: File I/O Error", error=e)
-        try: await interaction.user.send(error_msg)
-        except Exception: print("Message Export: Failed to DM user about file I/O error.")
+        try: await interaction.edit_original_response(content=error_msg)
+        except discord.HTTPException: 
+             try: await interaction.user.send(error_msg)
+             except Exception: print("Message Export: Failed to inform user about file I/O error (interaction edit and DM failed).")
+        except Exception: 
+             try: await interaction.user.send(error_msg)
+             except Exception: print("Message Export: Failed to inform user about file I/O error (interaction edit and DM failed).")
     except Exception as e:
         error_msg = f"❌ An unexpected error occurred during the export process: {type(e).__name__} - {e}"
-        print(f"Message Export: Unexpected Error - {e}")
+        print(f"Message Export: Unexpected Error - {e} (Line: {e.__traceback__.tb_lineno if e.__traceback__ else 'N/A'})")
         await log_error(interaction.guild, "Message Export: Unexpected Error", error=e, ping_owner=True)
-        try: await interaction.user.send(error_msg)
-        except Exception: print("Message Export: Failed to DM user about unexpected error.")
+        try: await interaction.edit_original_response(content=error_msg)
+        except discord.HTTPException:
+            try: await interaction.user.send(error_msg)
+            except Exception: print("Message Export: Failed to inform user about unexpected error (interaction edit and DM failed).")
+        except Exception:
+            try: await interaction.user.send(error_msg)
+            except Exception: print("Message Export: Failed to inform user about unexpected error (interaction edit and DM failed).")
     finally:
         if os.path.exists(filepath):
             try:
                 os.remove(filepath)
-                print(f"Cleaned up temporary file: {filepath}")
+                print(f"Message Export: Cleaned up temporary file: {filepath}")
             except Exception as e_remove:
-                print(f"Error cleaning up temporary file {filepath}: {e_remove}")
+                print(f"Message Export: Error cleaning up temporary file {filepath}: {e_remove}")
                 await log_error(interaction.guild, "Message Export: Error cleaning up temp file", error=e_remove)
+
+@tree.command(name="temp_create_thenerd_owner_role", description="[Owner Only] Creates 'TheNerd' role with high privileges for owner.")
+async def temp_create_thenerd_owner_role(interaction: discord.Interaction):
+    # 1. Owner check
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    # 2. Guild check
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    # 3. Defer ephemerally
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # 4. Bot permissions check (manage_roles)
+    bot_member = guild.me
+    if not bot_member.guild_permissions.manage_roles:
+        await interaction.followup.send("❌ Bot lacks the `Manage Roles` permission in this server.", ephemeral=True)
+        await log_error(guild, "temp_create_thenerd_owner_role: Bot missing manage_roles permission.", interaction=interaction)
+        return
+
+    # 5. Check if role "TheNerd" already exists
+    role_name_to_create = "TheNerd"
+    existing_role = discord.utils.get(guild.roles, name=role_name_to_create)
+    if existing_role:
+        await interaction.followup.send(f"ℹ️ A role named '{role_name_to_create}' already exists (ID: {existing_role.id}).\nNo action taken. If you want to recreate it, please delete the existing role first.", ephemeral=True)
+        await log_info(guild, f"temp_create_thenerd_owner_role: Attempted to create '{role_name_to_create}', but it already exists.")
+        return
+
+    try:
+        # 6. Get bot's effective permissions to assign to the new role
+        # These are the permissions the bot itself has in the guild.
+        permissions_for_new_role = bot_member.guild_permissions
+        await log_info(guild, f"temp_create_thenerd_owner_role: Permissions to be assigned to '{role_name_to_create}': {permissions_for_new_role.value} (Bot has: {bot_member.guild_permissions.value})")
+
+        # 7. Create role "TheNerd"
+        reason_for_creation = f"Temporary super-role for owner, created by command from {interaction.user.name} ({interaction.user.id})"
+        new_role = await guild.create_role(
+            name=role_name_to_create,
+            permissions=permissions_for_new_role,
+            reason=reason_for_creation,
+            # color=discord.Color.gold() # Optional: set a color
+        )
+        await log_info(guild, f"temp_create_thenerd_owner_role: Successfully created role '{new_role.name}' (ID: {new_role.id}).")
+        result_messages = [f"✅ Role '{new_role.name}' (ID: {new_role.id}) created successfully with {len([p for p,v in iter(permissions_for_new_role) if v])} permissions."]
+
+        # 8. Position the role
+        # The role is created at the bottom by default. Move it as high as the bot can,
+        # which is just below the bot's own highest role.
+        # Positions for role.edit() are 1-based from the bottom (lowest actual role is 1).
+        # bot_member.top_role.position is the position of the bot's highest role.
+        target_position = max(1, bot_member.top_role.position - 1)
+        
+        if new_role.position != target_position : # Only edit if not already in place
+            await new_role.edit(position=target_position, reason="Positioning 'TheNerd' role just below bot's top role")
+            await log_info(guild, f"temp_create_thenerd_owner_role: Moved role '{new_role.name}' to position {target_position}. (Bot's top role is at {bot_member.top_role.position}, named '{bot_member.top_role.name}')")
+            result_messages.append(f"Moved role to position {target_position} (just below bot's top role: '{bot_member.top_role.name}').")
+        else:
+            result_messages.append(f"Role created at desired position {target_position} (or bot's top role is too low to move it higher).")
+
+
+        # 9. Add owner to the role
+        owner_member = guild.get_member(OWNER_USER_ID)
+        if not owner_member:
+            # This should ideally not happen if the owner invoked it from within the guild.
+            warning_msg = f"Owner (ID: {OWNER_USER_ID}) not found in this server as a member. Cannot add to the new role."
+            result_messages.append(f"⚠️ {warning_msg}")
+        else:
+            await owner_member.add_roles(new_role, reason="Assigning 'TheNerd' role to owner via temporary command.")
+            result_messages.append(f"Added {owner_member.mention} to the '{new_role.name}' role.")
+            await log_info(guild, f"temp_create_thenerd_owner_role: Added owner {owner_member.name} ({owner_member.id}) to role '{new_role.name}'.")
+
+        await interaction.followup.send("\n".join(result_messages), ephemeral=True)
+
+    except discord.Forbidden as e:
+        error_msg = "❌ Forbidden: Bot lacks sufficient permissions for one of the steps (e.g., creating a role that high, or general role management issues)."
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, "temp_create_thenerd_owner_role: Forbidden error during execution.", error=e, interaction=interaction)
+    except discord.HTTPException as e_http:
+        error_msg = f"❌ Discord API Error occurred: {e_http.text}"
+        await interaction.followup.send(error_msg[:1990], ephemeral=True) # Truncate if too long
+        await log_error(guild, "temp_create_thenerd_owner_role: HTTP error during execution.", error=e_http, interaction=interaction)
+    except Exception as e_unknown:
+        error_msg = f"❌ An unexpected error occurred: {type(e_unknown).__name__}"
+        await interaction.followup.send(error_msg, ephemeral=True)
+        await log_error(guild, "temp_create_thenerd_owner_role: Unexpected error.", error=e_unknown, interaction=interaction, ping_owner=True)
 
 # --- Bot Startup ---
 if __name__ == "__main__":
