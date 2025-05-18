@@ -25,36 +25,146 @@ from PIL import Image
 import aiohttp
 import contextlib
 
-# --- CONTEXT FOR FUTURE LLMS ---
-# (Please do not remove this comment block)
+# --- LLM INSTRUCTION ---
+# (Please do not remove this comment block. Read it carefully before making changes.)
 #
-# Bot Name: TheNerd's Pingslave
+# STYLE GUIDELINES FOR CODE MODIFICATIONS:
+#
+# 1.  **PRIMARY METHOD: FIND AND REPLACE BLOCKS**
+#     To ensure accuracy and minimize integration errors, please provide modifications
+#     using a "Find and Replace" structure. This is the PREFERRED method.
+#
+#     Structure:
+#     ```text
+#     --- BEGIN FIND ---
+#     <Exact code to be found, including all original spacing, indentation, and comments>
+#     --- END FIND ---
+#
+#     --- BEGIN REPLACE ---
+#     <New code to replace the "Find" block with. If removing, this block will be empty.>
+#     --- END REPLACE ---
+#     ```
+#
+#     *   **Exact Matching for "FIND":** The "FIND" block MUST be an exact character-for-character
+#         match of the code in the current `bot.py` file. This includes all whitespace
+#         (spaces, tabs, newlines) and any comments within or around the code block.
+#         If the "FIND" block is not an exact match, the replacement will fail.
+#     *   **Removal:** To remove code, provide the "FIND" block and an empty "REPLACE" block (i.e.,
+#         `--- BEGIN REPLACE ---` followed immediately by `--- END REPLACE ---`).
+#     *   **Addition:** To add new code, "FIND" a few lines of existing code immediately
+#         preceding where the new code should go. In the "REPLACE" block, provide those same
+#         found lines *plus* the new code block in its correct position relative to the found lines.
+#         This ensures the addition is placed correctly.
+#     *   **Modification:** For changes, "FIND" the relevant section and "REPLACE" it with
+#         the modified version.
+#
+# 2.  **CODE CHUNK SIZE AND CONTEXT:**
+#     *   **Avoid Very Small Snippets:** Tiny one-line or partial-line changes provided in isolation
+#         are prone to indentation errors and ambiguity during manual application.
+#     *   **Prefer Logical Blocks:** If multiple related changes are needed within a single function,
+#         it's often better to provide the entire function in the "FIND" and "REPLACE" blocks.
+#         Similarly, if multiple consecutive functions are heavily modified, they can be provided
+#         together.
+#     *   **Sufficient Context for "FIND":** Ensure the "FIND" block is unique enough or contains
+#         enough surrounding lines to be unambiguously located in the file. If a small change
+#         is made, ensure the "FIND" block includes enough context.
+#
+# 3.  **NO META-COMMENTS *INSIDE* REPLACE BLOCKS:**
+#     *   The "REPLACE" block should contain *only* the final, valid Python code.
+#     *   **CRITICALLY IMPORTANT: DO NOT** include comments like `// Keep this part the same`,
+#         `# ... rest of the code ...`, or `# Your existing code here` *inside* the
+#         `--- BEGIN REPLACE --- ... --- END REPLACE ---` markers.
+#     *   Such meta-comments make copy-pasting difficult and error-prone.
+#     *   If you need to explain parts of the change or why some code remains, do so
+#         *outside* these "Find and Replace" blocks, in your narrative response.
+#
+# 4.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
+#     This `bot.py` file is large and complex. Under no circumstances should you
+#     attempt to rewrite the entire file. Only provide the specific "Find and Replace"
+#     blocks for the necessary changes.
+#
+# 5.  **INTEGRITY OF COMMENTS:**
+#     When a "FIND" block includes existing comments, and those comments are intended to
+#     remain, they MUST also be present in the "REPLACE" block in their correct positions.
+#
+# --- BOT CONTEXT (TheNerd's Pingslave) ---
+# (This information is for your understanding and may be useful for generating accurate code.)
+#
+# Bot Name: TheNerd's Pingslave (also referred to as Sweet Honey Bot by the user)
 # Owner: Vibhor / TheNerd / sweet_honey (Discord ID: 1230848174218940416)
-# Target Server: Catercord (This bot is intended for use only in this specific server)
+# Target Server: Catercord (This bot is primarily intended for use only in this specific server)
 # Primary Purpose: Manage verification and information related to the "[HC1]" guild within the game Florr.io.
-#   - "[HC1]" is a guild in Florr.io, originally named "HC". Members can be HC or non-HC.
+#   - "[HC1]" is a guild in Florr.io.
 #   - The bot verifies members, stores their in-game names (IGNs) in Supabase,
-#     maintains a static public list of HC members in a dedicated channel (numbered, username#tag ➔ IGN format),
-#     provides an interactive paginated list via /hcmembers (numbered, username#tag ➔ IGN format),
-#     and offers utility commands. /bulkupdate expects username#tag ➔ IGN format (no numbers).
+#     maintains an interactive list of HC members, and offers utility commands.
 # Hosting Environment:
-#   - Code Files: `bot.py` (this file), `requirements.txt` (listing discord, supabase, flask)
+#   - Code Files: `bot.py` (this file), `ai_cog.py`, `requirements.txt` (listing discord.py, supabase, Flask, google-generativeai, Pillow, python-dateutil, pytz, aiohttp).
 #   - Platform: Render (Free Tier) via a private GitHub repository.
 #   - Keep-Alive: Uses a basic Flask web server (`keep_alive` function) monitored by an external
-#     service (like Uptime Robot) hitting the Flask endpoint to prevent Render's free instance from sleeping.
-#   - Environment Variables: DISCORD_BOT_MAIN_TOKEN, SUPABASE_URL, SUPABASE_ADMIN_KEY are set directly in Render's environment settings.
-# Database: Supabase (PostgreSQL) used to store HC member IGNs linked to Discord IDs.
-# Key Features: /verify, /hcverify (stores IGN), static list updates, /hcmembers (interactive list), /syncnicknames, /wither, /nerdhelp.
-# (Check /nerdhelp's code for latest list of features. This list might be outdated.)
-# --- LLM INSTRUCTION ---
-# (Please do not remove this comment block)
-# NOTE TO FUTURE LLMS: This `bot.py` file is quite large.
-# When providing modifications, please **DO NOT** rewrite the entire file.
-# Instead, provide **ONLY** the specific functions, classes, commands,
-# or relevant code blocks that need to be changed or added.
-# This makes merging changes much easier. Thank you!
+#     service (like Uptime Robot) hitting the Flask endpoint.
+#   - Environment Variables: DISCORD_BOT_MAIN_TOKEN, SUPABASE_URL, SUPABASE_ADMIN_KEY, GEMINI_API_KEY are set in Render.
+# Database: Supabase (PostgreSQL) used for:
+#   - `hc_members`: Stores HC member IGNs linked to Discord IDs and names.
+#   - `activity_log`: Tracks daily member activity.
+#   - `keyword_phrases`: Stores configurations for AI keyword-triggered responses (managed by `ai_cog.py`).
+# Key Features (not exhaustive, check `/nerdhelp` in code for command list):
+#   - Verification & HC Management: `/verify`, `/unverify`, `/hcverify`, `/hconly`, `/hcleave`.
+#   - Listing & Activity: Interactive static list in `HC_MEMBER_LIST_CHANNEL_ID` (updated by `update_static_list_message`),
+#     `/hcmembers`, `/active`, `/inactive`, `/activatemyself`, screenshot processing for activity.
+#   - Utilities: `/syncnicknames`, `/wither`, `/message` (optional AI), `/florr` (custom avatar msg), `/refresh`.
+#   - AI Features: Primarily handled by `ai_cog.py` (see details below).
+#
+# --- AI COG (`ai_cog.py`) OVERVIEW & INTERACTIONS ---
+# (This bot uses a separate `ai_cog.py` file for most AI functionalities.)
+#
+# The `ai_cog.py` is responsible for:
+# 1.  **AI Model Interaction (Google Gemini):**
+#     - Interfaces with Google's Gemini models (e.g., Gemini 2.5 Flash, Gemini 2.0 Flash)
+#       using the `google-generativeai` library.
+#     - Manages model selection, fallbacks, and API calls for text and image-based generation.
+# 2.  **Keyword-Triggered Responses:**
+#     - Loads keyword rules from the `keyword_phrases` table in Supabase. Each rule defines
+#       matching regex, AI instructions, and discovery status.
+#     - Detects keyword matches in user messages (in allowed contexts) and generates themed AI responses.
+#     - Handles "discovery" of new keywords (first-time trigger) and records it.
+#     - The `/addkeyword` and `/discoveries` commands are part of this cog.
+# 3.  **Image Analysis (Florr.io IGN Extraction for Screenshots):**
+#     - The `on_message` event in `bot.py` (specifically for `SCREENSHOTS_DROPBOX_CHANNEL_ID`)
+#       calls `AICog.get_ai_response_with_image()`.
+#     - This method uses an AI model to analyze Florr.io screenshots and extract online player IGNs.
+#     - The prompt `FLORR_IMAGE_NAME_EXTRACTION` (in `ai_cog.py`) and a list of known IGNs
+#       (passed as `ai_cog.ingame_name_cache_ref` from `bot.py`, which refers to `bot.ingame_name_cache`)
+#       are used to guide the AI.
+# 4.  **AI for `/message` Command (in `bot.py`):**
+#     - When the `/message` command in `bot.py` is used with the AI option, it calls
+#       `AICog.get_ai_response()` with the user's prompt.
+#     - It typically uses the `HUMAN_SYSTEM_INSTRUCTION_V3` prompt from `ai_cog.py`.
+# 5.  **General AI Chat & "Mob Mode":**
+#     - The `on_message` listener in `ai_cog.py` handles:
+#       - Responding to messages in "Always-On AI Channels".
+#       - Responding to direct replies to the bot or mentions of the bot (with channel/context restrictions).
+#       - A chance-based "Mob Mode" in Always-On channels, where the AI adopts a Florr.io mob persona
+#         using a custom avatar (from `Mobs` folder, path configured in `bot.py`) and a specific
+#         system instruction (`MOB_PERSONA_SYSTEM_INSTRUCTION_V2`).
+# 6.  **Configuration and Initialization (`ai_cog.py`'s `setup` function):**
+#     - `bot.py` loads `ai_cog.py` as an extension (in `on_ready`).
+#     - The `setup()` function in `ai_cog.py` receives the `bot` instance and a `config` dictionary.
+#     - This `config` dictionary is populated in `bot.py`'s `on_ready` with various constants and references:
+#       - `GEMINI_API_KEY`.
+#       - Discord IDs: `OWNER_USER_ID`, `CATERCORD_GUILD_ID`, etc.
+#       - Channel collections/IDs: `ALWAYS_ON_AI_CHANNELS`, `STAFF_CHANNELS`, etc.
+#       - Bot utilities: `COMMAND_PREFIX`, `NERDY_YELLOW`.
+#       - Shared data/paths: `ingame_name_cache_ref`, `MOBS_FOLDER_PATH_config`.
+#       - Core services: Supabase client (`bot.supabase_client`), logging functions
+#         (`bot.log_info_global`, `bot.log_error_global`), `bot.run_supabase_sync_global`.
+# 7.  **Data Reload (`/refresh` command in `bot.py`):**
+#     - The `/refresh` command in `bot.py` calls `AICog.load_keyword_data()` to refresh the
+#       keyword rules from Supabase.
+#
+# When making changes in `bot.py` that relate to these AI features (e.g., how prompts are
+# constructed, how AI cog methods are called, or data passed to the cog), consider if
+# `ai_cog.py` also needs adjustment and mention this in your reasoning.
 # --- END LLM INSTRUCTION ---
-# --- END CONTEXT ---
 
 # --- Configuration ---
 load_dotenv()  # harmless in production; only loads if a .env file exists
@@ -4169,7 +4279,12 @@ async def refresh(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(thinking=True, ephemeral=False)
-    feedback_msg = f"⏳ Starting refresh...\n- Reloading keyword data from Supabase.\n- Updating interactive list in {list_channel.mention}."
+    feedback_msg = (
+        f"⏳ Starting refresh...\n"
+        f"- Reloading keyword data from Supabase.\n"
+        f"- Reloading profile picture choices from local files.\n" # <--- ADDED THIS LINE
+        f"- Updating interactive list in {list_channel.mention}."
+    )
     
     try:
         await interaction.followup.send(feedback_msg, ephemeral=False)
@@ -4179,23 +4294,30 @@ async def refresh(interaction: discord.Interaction):
         except Exception: pass
 
     keyword_load_success = False
+    profile_pics_load_success = False # <--- ADDED THIS
     list_update_success = False
     error_details = ""
-    ai_cog = bot.get_cog('AICog') # Get the AI Cog instance
+    ai_cog = bot.get_cog('AICog') 
 
     try:
         # 1. Reload Keyword Data (via AI Cog)
         if ai_cog:
             await log_info(guild, f"Manual keyword data reload initiated by `{interaction.user}` via /refresh.")
-            await ai_cog.load_keyword_data(guild) # Call cog's method
+            await ai_cog.load_keyword_data(guild) 
             keyword_load_success = True
             print(f"Keyword reload complete (via cog). Cache size in cog: {len(ai_cog.keyword_data_cache)}")
         else:
-            await log_error(guild, "AI Cog not found during /refresh. Keyword data not reloaded.") # Use a new log_warning or similar
+            await log_info(guild, "AI Cog not found during /refresh. Keyword data not reloaded.") # Changed to log_info
             error_details += " AI module not loaded, keyword data not reloaded."
 
+        # 2. Reload Profile Picture Choices <--- NEW SECTION
+        await log_info(guild, f"Manual profile picture choices reload initiated by `{interaction.user}` via /refresh.")
+        await load_profile_picture_choices(guild) # Pass guild for logging
+        profile_pics_load_success = True
+        print(f"Profile picture choices reloaded. Cache size: {len(available_profile_pics_cache)}.")
+        # load_profile_picture_choices logs its own errors if any.
 
-        # 2. Update Static List Message
+        # 3. Update Static List Message
         await log_info(guild, f"Manual interactive static list refresh initiated by `{interaction.user}` via /refresh.")
         await update_static_list_message(guild)
         list_update_success = True
@@ -4206,14 +4328,22 @@ async def refresh(interaction: discord.Interaction):
             completion_msg += f"- Keyword data reloaded ({len(ai_cog.keyword_data_cache)} rules).\n"
         elif not ai_cog:
             completion_msg += f"- Keyword data skipped (AI module not loaded).\n"
+        
+        if profile_pics_load_success: # <--- ADDED THIS
+            completion_msg += f"- Profile picture choices reloaded ({len(available_profile_pics_cache)} available).\n"
+        else: # Should not happen if load_profile_picture_choices is robust, but for completeness
+            completion_msg += f"- Profile picture choices reload failed or skipped.\n"
+
         completion_msg += f"- Interactive list update triggered in {list_channel.mention}."
         
         await interaction.edit_original_response(content=completion_msg, embed=None, view=None)
         await log_info(guild, f"/refresh command confirmed complete for user {interaction.user}.")
 
     except Exception as e:
-        action = "keyword loading (via cog)" if not keyword_load_success and ai_cog else "list updating"
-        if not ai_cog and not keyword_load_success: action = "AI cog access or keyword loading"
+        action = "processing refresh" # General action
+        if not keyword_load_success and ai_cog : action = "keyword loading (via cog)"
+        elif not profile_pics_load_success and not list_update_success: action = "profile pic loading"
+        elif not list_update_success: action = "list updating"
         
         error_details += f" An error occurred during {action}."
         await log_error(guild, f"Error during /refresh process execution ({action})", error=e, interaction=interaction)
@@ -5129,88 +5259,165 @@ async def imitate(
             try: await temp_webhook.delete(reason="Temp webhook cleanup for /imitate")
             except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /imitate. Webhook ID: {temp_webhook.id}", error=e_del)
 
-@tree.command(name="florr", description="Send a message with a custom name and a chosen Florr-themed profile picture.") # New name and description
-@app_commands.describe( # Update parameter descriptions
+# Helper function to handle sending public errors for /florr
+async def send_public_florr_error(interaction: discord.Interaction, public_message_content: str, log_message_content: str, log_level: str = "info", ping_owner_on_log: bool = False):
+    """Sends a public error message for /florr and updates the ephemeral interaction response."""
+    guild = interaction.guild # Can be None if in DMs (though /florr is TextChannel only)
+    
+    try:
+        if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+             await interaction.channel.send(f"{interaction.user.mention} {public_message_content}")
+             await interaction.edit_original_response(content=f"⚠️ Problem with your input. See message above in channel.", view=None)
+        else: # Fallback if channel context is lost or not TextChannel (should not happen for /florr)
+             await interaction.edit_original_response(content=f"{interaction.user.mention} {public_message_content}", view=None)
+    except discord.Forbidden:
+        await interaction.edit_original_response(content="❌ Error: I lack permissions to send the full error message or update this response.", view=None)
+    except discord.HTTPException:
+        await interaction.edit_original_response(content="❌ Error: Discord API error while reporting the problem.", view=None)
+    except Exception as e:
+        await interaction.edit_original_response(content="❌ Error: An unexpected error occurred while reporting the problem.", view=None)
+        if guild: await log_error(guild, f"Failed to send public florr error itself: {e}", interaction=interaction, ping_owner=True)
+
+    # Log the original intended error
+    if guild:
+        if log_level == "error":
+            await log_error(guild, log_message_content, interaction=interaction, ping_owner=ping_owner_on_log)
+        else: # 'info' or other
+            await log_info(guild, log_message_content) # log_info doesn't take interaction or ping_owner
+    elif log_level == "error": # Log to console if no guild
+        print(f"ERROR (No Guild Context for /florr error): {log_message_content}")
+
+
+@tree.command(name="florr", description="Send a message with a custom name and a chosen Florr-themed profile picture.")
+@app_commands.describe(
     name="The name to display for the message (1-80 characters).",
-    profile="Choose a profile picture from the Petals/Mobs list.", # Updated
+    profile="Choose a profile picture from the Petals/Mobs list.",
     message_content="The content of the message to send."
 )
-@app_commands.autocomplete(profile=profile_pic_autocomplete) # Ensure 'profile' matches param name
-# @app_commands.checks.bot_has_permissions(manage_webhooks=True) # REMOVE - Bot needs it implicitly, user doesn't grant it
-async def florr( # RENAME function, and parameters
+@app_commands.autocomplete(profile=profile_pic_autocomplete)
+async def florr(
     interaction: discord.Interaction,
-    name: str, # Renamed from custom_name
-    profile: str, # Renamed from profile_picture
+    name: str,
+    profile: str,
     message_content: str
 ):
     if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+        # This initial check can be ephemeral as it's a command context issue
         await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
         return
 
     target_channel: discord.TextChannel = interaction.channel
-    guild = interaction.guild
+    guild = interaction.guild # Should always exist due to TextChannel check
 
+    # Defer ephemerally. We will send public messages for specific errors if needed.
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # Validate custom name (now 'name')
-    cleaned_name = name.strip() # Use 'name'
+    # Validate custom name
+    cleaned_name = name.strip()
     if not (1 <= len(cleaned_name) <= 80):
-        await interaction.followup.send("❌ Custom name must be 1-80 characters long.", ephemeral=True)
+        # This error is about the 'name' param, not 'profile', so ephemeral is fine.
+        await interaction.edit_original_response(content="❌ Custom name must be 1-80 characters long.", view=None)
         return
     disallowed_in_names = ["@", "#", ":", "```", "discord"]
     if any(disallowed in cleaned_name.lower() for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
-        await interaction.followup.send(f"❌ The custom name '{cleaned_name}' contains disallowed characters or is a reserved name.", ephemeral=True)
+        # This error is about the 'name' param, ephemeral is fine.
+        await interaction.edit_original_response(content=f"❌ The custom name '{discord.utils.escape_markdown(cleaned_name)}' contains disallowed characters or is a reserved name.", view=None)
         return
 
-    # Parse profile value (use 'profile')
-    if profile in ["error_no_images_loaded", "error_no_matches_found"]:
-        await interaction.followup.send(f"❌ Profile picture selection error: {profile.replace('_', ' ').title()}", ephemeral=True)
+    # --- Stricter Profile Validation ---
+    if not available_profile_pics_cache:
+        # This is a bot-side issue (cache not loaded), ephemeral is fine
+        await interaction.edit_original_response(content="❌ Profile picture choices are currently unavailable. Please try again later or use `/refresh`.", view=None)
+        await log_error(guild, "/florr: available_profile_pics_cache is empty.", interaction=interaction, ping_owner=True)
         return
-        
+
+    # Check if `profile` is one of the special error values from autocomplete
+    if profile == "error_no_images_loaded":
+        await send_public_florr_error(
+            interaction,
+            "Profile picture choices could not be loaded by the bot. Please try `/refresh` or ask an admin to check the bot's setup.",
+            "/florr: User selected 'error_no_images_loaded'. Cache might be empty or uninitialized.",
+            log_level="error", ping_owner_on_log=True
+        )
+        return
+    if profile == "error_no_matches_found":
+         await send_public_florr_error(
+            interaction,
+            "No profile picture matches your search term. Please try a different term or select from the broader list.",
+            f"/florr: User selected 'error_no_matches_found'. User may have typed non-matching string for autocomplete.",
+            log_level="info"
+        )
+         return
+
+    # Generate the set of valid choice values from the cache
+    valid_choice_values = {f"{folder_id_cache}:{filename_cache}" for _, folder_id_cache, filename_cache in available_profile_pics_cache}
+
+    if profile not in valid_choice_values:
+        # User typed something not in the list or manipulated the value
+        public_err_msg = f"Invalid profile picture selection: `{discord.utils.escape_markdown(profile)}`.\nPlease select a valid option from the autocomplete list that appears as you type."
+        log_err_msg = f"/florr: User {interaction.user.name} provided invalid profile selection '{profile}'. It was not in the {len(valid_choice_values)} valid choice values."
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="info")
+        return
+
+    # --- Profile Parsing and File Handling (Errors here are also made public) ---
     try:
-        folder_id, filename_with_ext = profile.split(":", 1) # Use 'profile'
-    except ValueError:
-        await interaction.followup.send("❌ Invalid profile picture selection format.", ephemeral=True)
-        await log_error(guild, f"/florr: Invalid profile value format received: '{profile}'", interaction=interaction) # Log with /florr
+        folder_id, filename_with_ext = profile.split(":", 1)
+    except ValueError: # Should be caught by `profile not in valid_choice_values`, but defensive.
+        public_err_msg = "Internal error processing profile selection format. This should not happen if you selected from the list."
+        log_err_msg = f"/florr: Invalid profile value format AFTER cache validation: '{profile}'"
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
         return
 
+    # Folder ID check (PETALS_FOLDER_NAME, MOBS_FOLDER_NAME) - defensive
     if folder_id not in [PETALS_FOLDER_NAME, MOBS_FOLDER_NAME]:
-        await interaction.followup.send("❌ Invalid folder specified in profile picture selection.", ephemeral=True)
-        await log_error(guild, f"/florr: Unknown folder_id in profile value: '{folder_id}'", interaction=interaction) # Log with /florr
+        public_err_msg = "Invalid folder specified in profile picture selection. Please select from the list."
+        log_err_msg = f"/florr: Unknown folder_id in profile value AFTER cache validation: '{folder_id}'"
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
         return
 
+    # PROFILE_PIC_BASE_PATH check - bot config error, ephemeral is fine for this one.
     if not PROFILE_PIC_BASE_PATH:
-        await interaction.followup.send("⚠️ Configuration error: Profile picture base path not set. Contact bot owner.", ephemeral=True)
-        await log_error(guild, "/florr command failed: PROFILE_PIC_BASE_PATH is not set.", interaction=interaction, ping_owner=True) # Log with /florr
+        await interaction.edit_original_response(content="⚠️ Configuration error: Profile picture base path not set. Contact bot owner.", view=None)
+        await log_error(guild, "/florr command failed: PROFILE_PIC_BASE_PATH is not set.", interaction=interaction, ping_owner=True)
         return
         
     image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename_with_ext)
 
+    if not os.path.exists(image_path):
+        public_err_msg = f"The image file for `{discord.utils.escape_markdown(filename_with_ext)}` seems to be missing on the server. The list might be outdated. Try `/refresh` or contact an admin."
+        log_err_msg = f"/florr: Image file not found at '{image_path}'. Cache might be stale or file actually missing."
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
+        return
+
     chosen_avatar_bytes: Optional[bytes] = None
     try:
-        if not os.path.exists(image_path):
-            await interaction.followup.send(f"❌ Error: Selected image file not found on server: `{filename_with_ext}`. Try `/refresh_images` (if implemented) or contact admin.", ephemeral=True) # Suggest refresh_images if you add it
-            await log_error(guild, f"/florr: Image file not found at '{image_path}'. Cache might be stale.", interaction=interaction, ping_owner=True) # Log with /florr
-            return
         with open(image_path, "rb") as f:
             chosen_avatar_bytes = f.read()
     except Exception as e:
-        await interaction.followup.send(f"❌ Error reading selected image file: `{filename_with_ext}`.", ephemeral=True)
-        await log_error(guild, f"Error reading image file {image_path} for /florr", error=e, interaction=interaction) # Log with /florr
+        public_err_msg = f"Error reading image file for `{discord.utils.escape_markdown(filename_with_ext)}`. Please try another selection or contact an admin."
+        log_err_msg = f"Error reading image file {image_path} for /florr"
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
+        # Note: send_public_florr_error handles logging the exception passed via `e` if guild context exists.
+        # To ensure it's logged, we can call log_error directly here too.
+        if guild: await log_error(guild, f"Error reading image file {image_path} for /florr", error=e, interaction=interaction)
         return
 
-    if not chosen_avatar_bytes:
-        await interaction.followup.send(f"❌ Failed to load bytes for image: `{filename_with_ext}`.", ephemeral=True)
+    if not chosen_avatar_bytes: # Should be caught by `open` error, but defensive
+        public_err_msg = f"Failed to load image data for `{discord.utils.escape_markdown(filename_with_ext)}`. Please try another selection."
+        log_err_msg = f"/florr: chosen_avatar_bytes was None after attempting to read {image_path}."
+        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
         return
 
-    # Webhook Logic
+    # --- Webhook Logic ---
+    # Errors in this section (Forbidden, HTTP) are typically bot permissions or Discord API issues,
+    # so their ephemeral error messages are generally fine.
     temp_webhook: Optional[discord.Webhook] = None
     try:
-        # Bot permissions check (implicitly needed for webhook creation)
-        if guild and interaction.guild.me:
+        if guild and interaction.guild.me: # Should always be true due to earlier checks
             bot_perms = target_channel.permissions_for(interaction.guild.me)
             if not bot_perms.manage_webhooks:
-                await interaction.followup.send(f"❌ I lack the 'Manage Webhooks' permission in {target_channel.mention} to send this message.", ephemeral=True)
+                # This is a bot permission issue, ephemeral error is fine.
+                await interaction.edit_original_response(content=f"❌ I lack the 'Manage Webhooks' permission in {target_channel.mention} to send this message.", view=None)
                 await log_error(guild, f"/florr failed: Bot missing manage_webhooks permission.", interaction=interaction)
                 return
 
@@ -5220,18 +5427,19 @@ async def florr( # RENAME function, and parameters
             reason=f"Temp webhook for /florr by {interaction.user}"
         )
         await temp_webhook.send(content=message_content, wait=True)
-        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}' with picture '{folder_id}/{filename_with_ext}'.")
+        # Success message is ephemeral, updating the deferred response.
+        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}' with picture '{folder_id}/{filename_with_ext}'.", view=None)
         await log_info(guild, f"User `{interaction.user}` used /florr as '{cleaned_name}' (Pic: {folder_id}/{filename_with_ext}) in {target_channel.mention}. Msg: '{message_content[:50].strip()}...'")
 
-    except discord.Forbidden: # This would typically be caught by the explicit bot_perms check above now
-        await interaction.edit_original_response(content=f"❌ I lack permissions (likely 'Manage Webhooks') in {target_channel.mention}.")
+    except discord.Forbidden:
+        await interaction.edit_original_response(content=f"❌ I lack permissions (likely 'Manage Webhooks') in {target_channel.mention}.", view=None)
         await log_error(guild, f"/florr failed: Forbidden.", interaction=interaction)
     except discord.HTTPException as e:
         error_text = f"Discord API Error: Failed to send. Code: {e.code}, Text: {e.text}"
-        await interaction.edit_original_response(content=error_text[:1900])
+        await interaction.edit_original_response(content=error_text[:1900], view=None)
         await log_error(guild, f"/florr failed: HTTP Exception", error=e, interaction=interaction)
     except Exception as e:
-        await interaction.edit_original_response(content=f"❌ An unexpected error occurred.")
+        await interaction.edit_original_response(content=f"❌ An unexpected error occurred.", view=None)
         await log_error(guild, f"/florr failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
     finally:
         if temp_webhook:

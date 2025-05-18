@@ -1,9 +1,9 @@
-discord.py>=2.5.2
-flask
+discord.py
 supabase
-python-dotenv
-pytz
-python-dateutil
+Flask
 google-generativeai
 Pillow
+python-dotenv
+python-dateutil
+pytz
 aiohttp

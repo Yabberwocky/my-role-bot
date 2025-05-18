@@ -1,51 +1,132 @@
 # -*- coding: utf-8 -*-
-# --- LLM CONTEXT FOR AI COG ---
-# (Please do not remove this comment block)
+# --- LLM INSTRUCTION ---
+# (Please do not remove this comment block. Read it carefully before making changes.)
 #
-# This `ai_cog.py` file contains the primary AI-related functionalities for TheNerd's Pingslave bot.
-# However, certain features in the main `bot.py` file still interact with or depend on this cog.
+# STYLE GUIDELINES FOR CODE MODIFICATIONS:
 #
-# When modifying this AI Cog, especially functions related to AI responses,
-# image processing, or keyword data, be aware that the following areas
-# in `bot.py` might require corresponding updates:
+# 1.  **PRIMARY METHOD: FIND AND REPLACE BLOCKS**
+#     To ensure accuracy and minimize integration errors, please provide modifications
+#     using a "Find and Replace" structure. This is the PREFERRED method.
 #
-# 1. Image-Based Activity Logging (in `on_message` within `bot.py`):
-#    - The screenshot processing logic in `bot.py`'s `on_message` event
-#      (specifically for messages in `SCREENSHOTS_DROPBOX_CHANNEL_ID`)
-#      calls `AICog.get_ai_response_with_image()` for extracting in-game names.
-#    - It also relies on `AICog.ingame_name_cache_ref` (passed during cog setup
-#      and referring to `bot.ingame_name_cache` in `bot.py`) for validating
-#      extracted names.
-#    - Changes to the `FLORR_IMAGE_NAME_EXTRACTION` prompt or the behavior/signature
-#      of `get_ai_response_with_image()` in this cog will likely affect `bot.py`.
+#     Structure:
+#     ```text
+#     --- BEGIN FIND ---
+#     <Exact code to be found, including all original spacing, indentation, and comments>
+#     --- END FIND ---
 #
-# 2. `/message` Command (in `bot.py`):
-#    - This command has an option to use AI for generating message content.
-#    - When AI is selected, it calls `AICog.get_ai_response()` and uses
-#      `AICog.get_prompt("HUMAN_SYSTEM_INSTRUCTION_V3")`.
-#    - Modifications to these methods or the `HUMAN_SYSTEM_INSTRUCTION_V3` prompt
-#      in this cog could impact the `/message` command in `bot.py`.
+#     --- BEGIN REPLACE ---
+#     <New code to replace the "Find" block with. If removing, this block will be empty.>
+#     --- END REPLACE ---
+#     ```
 #
-# 3. `/refresh` Command (in `bot.py`):
-#    - This command is responsible for reloading keyword data, among other things.
-#    - It calls `AICog.load_keyword_data()`.
-#    - Changes to the `load_keyword_data()` method in this cog (e.g., its
-#      parameters or return values, though currently it has none it directly uses)
-#      might necessitate changes in how `/refresh` calls it in `bot.py`.
+#     *   **Exact Matching for "FIND":** The "FIND" block MUST be an exact character-for-character
+#         match of the code in the current `ai_cog.py` file. This includes all whitespace
+#         (spaces, tabs, newlines) and any comments within or around the code block.
+#         If the "FIND" block is not an exact match, the replacement will fail.
+#     *   **Removal:** To remove code, provide the "FIND" block and an empty "REPLACE" block (i.e.,
+#         `--- BEGIN REPLACE ---` followed immediately by `--- END REPLACE ---`).
+#     *   **Addition:** To add new code, "FIND" a few lines of existing code immediately
+#         preceding where the new code should go. In the "REPLACE" block, provide those same
+#         found lines *plus* the new code block in its correct position relative to the found lines.
+#         This ensures the addition is placed correctly.
+#     *   **Modification:** For changes, "FIND" the relevant section and "REPLACE" it with
+#         the modified version.
 #
-# 4. Configuration and Initialization:
-#    - This cog is initialized in `bot.py` (typically in `on_ready` via `bot.load_extension('ai_cog')`).
-#    - The `setup()` function in this cog receives the `bot` instance and a `config` dictionary.
-#    - This `config` dictionary is populated in `bot.py` with various constants and references
-#      (e.g., `OWNER_USER_ID`, `CATERCORD_GUILD_ID`, `ALWAYS_ON_AI_CHANNELS`, `STAFF_CHANNELS`,
-#      `ingame_name_cache_ref`, logging functions, Supabase client, `MOBS_FOLDER_PATH_config`).
-#    - If the way these configurations are passed or named changes in `bot.py`,
-#      the `setup()` function and potentially the `__init__` method of `AICog`
-#      will need to be updated accordingly.
+# 2.  **CODE CHUNK SIZE AND CONTEXT:**
+#     *   **Avoid Very Small Snippets:** Tiny one-line or partial-line changes provided in isolation
+#         are prone to indentation errors and ambiguity during manual application.
+#     *   **Prefer Logical Blocks:** If multiple related changes are needed within a single function,
+#         it's often better to provide the entire function in the "FIND" and "REPLACE" blocks.
+#         Similarly, if multiple consecutive functions are heavily modified, they can be provided
+#         together.
+#     *   **Sufficient Context for "FIND":** Ensure the "FIND" block is unique enough or contains
+#         enough surrounding lines to be unambiguously located in the file. If a small change
+#         is made, ensure the "FIND" block includes enough context.
 #
-# Always consider these interactions when making changes to ensure both `ai_cog.py`
-# and `bot.py` remain synchronized and functional.
-# --- END LLM CONTEXT ---
+# 3.  **NO META-COMMENTS *INSIDE* REPLACE BLOCKS:**
+#     *   The "REPLACE" block should contain *only* the final, valid Python code.
+#     *   **CRITICALLY IMPORTANT: DO NOT** include comments like `// Keep this part the same`,
+#         `# ... rest of the code ...`, or `# Your existing code here` *inside* the
+#         `--- BEGIN REPLACE --- ... --- END REPLACE ---` markers.
+#     *   Such meta-comments make copy-pasting difficult and error-prone.
+#     *   If you need to explain parts of the change or why some code remains, do so
+#         *outside* these "Find and Replace" blocks, in your narrative response.
+#
+# 4.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
+#     This `ai_cog.py` file is specialized for AI functionalities. Under no circumstances
+#     should you attempt to rewrite the entire file. Only provide the specific "Find and Replace"
+#     blocks for the necessary changes.
+#
+# 5.  **INTEGRITY OF COMMENTS:**
+#     When a "FIND" block includes existing comments, and those comments are intended to
+#     remain, they MUST also be present in the "REPLACE" block in their correct positions.
+#
+# --- AI COG CONTEXT & INTERACTIONS WITH `bot.py` ---
+# (This information is for your understanding of how this cog functions and integrates.)
+#
+# This `ai_cog.py` file encapsulates the primary Artificial Intelligence functionalities for
+# TheNerd's Pingslave bot. It is loaded as an extension by the main `bot.py` file.
+#
+# CORE RESPONSIBILITIES OF THIS COG:
+#
+# 1.  **AI Model Management (Google Gemini):**
+#     - Initializes and manages client instances for Google Gemini models (e.g., `ai_model_2_5_flash`, `ai_model_2_0_flash`).
+#     - Handles API calls to Gemini for text generation (`get_ai_response`) and combined
+#       text/image generation (`get_ai_response_with_image`).
+#     - Implements logic for model preference and fallbacks.
+#
+# 2.  **Keyword-Triggered AI Responses:**
+#     - Loads keyword rules from the `keyword_phrases` table in Supabase via `load_keyword_data()`.
+#       These rules include regex for matching, AI instructions, discovery status, etc.
+#     - The `on_message` listener in this cog checks incoming messages against these rules.
+#     - Manages the "discovery" mechanic: when a user first triggers an undiscovered keyword
+#       in an appropriate context, it's recorded in the database and announced.
+#     - Generates context-aware AI responses based on triggered keywords using specific prompts.
+#     - Includes commands like `/addkeyword` (owner-only, to add new rules) and `/discoveries`
+#       (to show keyword progress).
+#
+# 3.  **AI-Powered Image Analysis (Florr.io Screenshots):**
+#     - Provides the `get_ai_response_with_image()` method, which is called by `bot.py`'s
+#       `on_message` event when screenshots are posted in `SCREENSHOTS_DROPBOX_CHANNEL_ID`.
+#     - This method uses a Gemini model to analyze images (expected to be Florr.io screenshots)
+#       to extract In-Game Names (IGNs) of online players.
+#     - It relies on the `FLORR_IMAGE_NAME_EXTRACTION` prompt (defined in `AI_PROMPTS` herein) and
+#       a list of known valid IGNs (`self.ingame_name_cache_ref`, passed from `bot.py`).
+#
+# 4.  **General AI Chat Capabilities:**
+#     - The `on_message` listener in this cog also enables conversational AI:
+#       - In "Always-On AI Channels" (list of channel IDs configured in `bot.py`).
+#       - When the bot is directly replied to or mentioned (subject to channel restrictions).
+#     - These interactions typically use the `HUMAN_SYSTEM_INSTRUCTION_V3` prompt.
+#
+# 5.  **"Mob Mode" - Creative AI Persona:**
+#     - A probabilistic feature active in "Always-On AI Channels".
+#     - If triggered, the AI adopts the persona of a Florr.io mob, using a custom avatar
+#       (image from the `Mobs` folder, path configured via `bot.py`) and the
+#       `MOB_PERSONA_SYSTEM_INSTRUCTION_V2` prompt.
+#     - Messages are sent via webhook for the custom name/avatar.
+#
+# 6.  **Prompt Management:**
+#     - All system instructions and task-specific prompts for the AI are stored in the
+#       `AI_PROMPTS` dictionary within this file.
+#     - The `get_prompt()` method is used to retrieve and format these prompts.
+#
+# 7.  **Setup and Dependencies from `bot.py`:**
+#     - This cog is initialized by `bot.py` through the `setup()` function at the end of this file.
+#     - The `setup()` function receives the main `bot` instance and a `config` dictionary.
+#     - This `config` dictionary, populated in `bot.py`'s `on_ready` event, provides:
+#       - `GEMINI_API_KEY` (essential for AI model operation).
+#       - Various Discord entity IDs (owner, specific server IDs, channel IDs/sets for behavior modification).
+#       - Shared data references like `ingame_name_cache_ref` (points to `bot.ingame_name_cache`) and `MOBS_FOLDER_PATH_config`.
+#       - Core services from `bot.py`: the Supabase client, logging functions (`log_info_global`,
+#         `log_error_global`), and `run_supabase_sync_global`.
+#     - The `AICog.__init__` method stores these passed-in dependencies.
+#
+# When modifying this cog, especially its interaction points with `bot.py` (like method signatures
+# called by `bot.py`, data structures expected from `bot.py`, or prompts used by features
+# initiated in `bot.py`), ensure that corresponding changes are considered for `bot.py` to
+# maintain functional integrity.
+# --- END LLM INSTRUCTION ---
 
 import discord
 from discord.ext import commands, tasks
