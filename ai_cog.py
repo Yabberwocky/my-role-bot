@@ -4,62 +4,59 @@
 #
 # STYLE GUIDELINES FOR CODE MODIFICATIONS:
 #
-# 1.  **PRIMARY METHOD: FIND AND REPLACE BLOCKS**
-#     To ensure accuracy and minimize integration errors, please provide modifications
-#     using a "Find and Replace" structure. This is the PREFERRED method.
+# 1.  **PRIMARY METHOD: FULL FUNCTION REPLACEMENT**
+#     - When a function is modified, please provide the *entire function* in your response.
+#     - This helps ensure accuracy and minimizes integration errors.
 #
-#     Structure:
-#     ```text
-#     --- BEGIN FIND ---
-#     <Exact code to be found, including all original spacing, indentation, and comments>
-#     --- END FIND ---
+# 2.  **HANDLING VERY LONG FUNCTIONS WITH MINOR CHANGES:**
+#     - If a function is exceptionally long (e.g., over 150-200 lines) and only
+#       a small, clearly definable portion is changed:
+#       1.  Mark the beginning and end of significant *unchanged* blocks of code
+#           within that function using comments like:
+#           ```python
+#           # // --- UNCHANGED SECTION (A) --- //
+#           # <original, unchanged code block>
+#           # // --- END UNCHANGED SECTION (A) --- //
+#           ```
+#       2.  In your narrative, *explicitly state* that "SECTION (A) (and B, C, etc.)
+#           remains unchanged."
+#       3.  Provide the rest of the function's code (the parts that *are* new or modified,
+#           plus the surrounding structure) in full.
+#     - **Use this method sparingly.** Prefer providing the whole function if the
+#       changes are complex or spread out, even if it's long. The goal is clarity
+#       and ease of integration.
 #
-#     --- BEGIN REPLACE ---
-#     <New code to replace the "Find" block with. If removing, this block will be empty.>
-#     --- END REPLACE ---
-#     ```
+# 3.  **ADDING NEW FUNCTIONS OR CLASSES:**
+#     - Provide the complete new function or class.
+#     - Indicate clearly where it should be placed (e.g., "Add this new function
+#       after the `existing_function_name()` function.").
 #
-#     *   **Exact Matching for "FIND":** The "FIND" block MUST be an exact character-for-character
-#         match of the code in the current `ai_cog.py` file. This includes all whitespace
-#         (spaces, tabs, newlines) and any comments within or around the code block.
-#         If the "FIND" block is not an exact match, the replacement will fail.
-#     *   **Removal:** To remove code, provide the "FIND" block and an empty "REPLACE" block (i.e.,
-#         `--- BEGIN REPLACE ---` followed immediately by `--- END REPLACE ---`).
-#     *   **Addition:** To add new code, "FIND" a few lines of existing code immediately
-#         preceding where the new code should go. In the "REPLACE" block, provide those same
-#         found lines *plus* the new code block in its correct position relative to the found lines.
-#         This ensures the addition is placed correctly.
-#     *   **Modification:** For changes, "FIND" the relevant section and "REPLACE" it with
-#         the modified version.
+# 4.  **REMOVING FUNCTIONS OR CLASSES:**
+#     - Clearly state: "Remove the `function_to_remove_name()` function entirely."
 #
-# 2.  **CODE CHUNK SIZE AND CONTEXT:**
-#     *   **Avoid Very Small Snippets:** Tiny one-line or partial-line changes provided in isolation
-#         are prone to indentation errors and ambiguity during manual application.
-#     *   **Prefer Logical Blocks:** If multiple related changes are needed within a single function,
-#         it's often better to provide the entire function in the "FIND" and "REPLACE" blocks.
-#         Similarly, if multiple consecutive functions are heavily modified, they can be provided
-#         together.
-#     *   **Sufficient Context for "FIND":** Ensure the "FIND" block is unique enough or contains
-#         enough surrounding lines to be unambiguously located in the file. If a small change
-#         is made, ensure the "FIND" block includes enough context.
+# 5.  **GLOBAL SCOPE CHANGES (Imports, Constants, `AI_PROMPTS` dictionary):**
+#     - For changes to imports or global constants (including entries in `AI_PROMPTS`),
+#       clearly list the additions, removals, or modifications. For example:
+#       - "Add `import new_module` at the top."
+#       - "In `AI_PROMPTS`, change the value of `MY_PROMPT_KEY` to 'New prompt text...'"
+#       - "Remove the constant `OLD_CONSTANT`."
+#     - If `AI_PROMPTS` has many changes, you may provide the entire dictionary.
 #
-# 3.  **NO META-COMMENTS *INSIDE* REPLACE BLOCKS:**
-#     *   The "REPLACE" block should contain *only* the final, valid Python code.
-#     *   **CRITICALLY IMPORTANT: DO NOT** include comments like `// Keep this part the same`,
-#         `# ... rest of the code ...`, or `# Your existing code here` *inside* the
-#         `--- BEGIN REPLACE --- ... --- END REPLACE ---` markers.
-#     *   Such meta-comments make copy-pasting difficult and error-prone.
-#     *   If you need to explain parts of the change or why some code remains, do so
-#         *outside* these "Find and Replace" blocks, in your narrative response.
+# 6.  **NO META-COMMENTS ABOUT UNCHANGED CODE (Unless Marked as Above):**
+#     - **DO NOT** include comments like `# ... rest of the code ...` or
+#       `# Your existing code here` within the code you provide, *unless*
+#       it's part of a formally marked "UNCHANGED SECTION" as described in point 2.
+#     - The code you provide should be directly usable.
 #
-# 4.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
-#     This `ai_cog.py` file is specialized for AI functionalities. Under no circumstances
-#     should you attempt to rewrite the entire file. Only provide the specific "Find and Replace"
-#     blocks for the necessary changes.
+# 7.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
+#     This `ai_cog.py` file is specialized. Under no circumstances should you
+#     attempt to rewrite the entire file. Only provide the specific functions,
+#     classes, or import/constant/prompt changes requested.
 #
-# 5.  **INTEGRITY OF COMMENTS:**
-#     When a "FIND" block includes existing comments, and those comments are intended to
-#     remain, they MUST also be present in the "REPLACE" block in their correct positions.
+# 8.  **INTEGRITY OF EXISTING COMMENTS:**
+#     - When providing a modified function, ensure that all original comments
+#       within that function (that are intended to remain) are preserved in their
+#       correct positions.
 #
 # --- AI COG CONTEXT & INTERACTIONS WITH `bot.py` ---
 # (This information is for your understanding of how this cog functions and integrates.)

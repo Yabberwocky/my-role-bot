@@ -1,91 +1,61 @@
 # -*- coding: utf-8 -*-
-import discord # Keep your original discord import
-import os      # <--- Ensure this import is present
-import threading
-import asyncio
-from discord import app_commands
-from discord.ext import commands
-from discord.ui import View, Button, button
-from flask import Flask
-from supabase import create_client, Client
-from postgrest import APIError
-import traceback
-import math
-from typing import Optional, Tuple, List, Dict, Any, Set # Keep this one, it's used more broadly
-from dotenv import load_dotenv
-import datetime
-import pytz
-from dateutil.parser import parse as date_parse
-from discord.ext import tasks
-import re
-import asyncio
-import discord.utils
-import io # <--- ADD THIS IMPORT
-from PIL import Image
-import aiohttp
-import contextlib
-
 # --- LLM INSTRUCTION ---
 # (Please do not remove this comment block. Read it carefully before making changes.)
 #
 # STYLE GUIDELINES FOR CODE MODIFICATIONS:
 #
-# 1.  **PRIMARY METHOD: FIND AND REPLACE BLOCKS**
-#     To ensure accuracy and minimize integration errors, please provide modifications
-#     using a "Find and Replace" structure. This is the PREFERRED method.
+# 1.  **PRIMARY METHOD: FULL FUNCTION REPLACEMENT**
+#     - When a function is modified, please provide the *entire function* in your response.
+#     - This helps ensure accuracy and minimizes integration errors.
 #
-#     Structure:
-#     ```text
-#     --- BEGIN FIND ---
-#     <Exact code to be found, including all original spacing, indentation, and comments>
-#     --- END FIND ---
+# 2.  **HANDLING VERY LONG FUNCTIONS WITH MINOR CHANGES:**
+#     - If a function is exceptionally long (e.g., over 150-200 lines) and only
+#       a small, clearly definable portion is changed:
+#       1.  Mark the beginning and end of significant *unchanged* blocks of code
+#           within that function using comments like:
+#           ```python
+#           # // --- UNCHANGED SECTION (A) --- //
+#           # <original, unchanged code block>
+#           # // --- END UNCHANGED SECTION (A) --- //
+#           ```
+#       2.  In your narrative, *explicitly state* that "SECTION (A) (and B, C, etc.)
+#           remains unchanged."
+#       3.  Provide the rest of the function's code (the parts that *are* new or modified,
+#           plus the surrounding structure) in full.
+#     - **Use this method sparingly.** Prefer providing the whole function if the
+#       changes are complex or spread out, even if it's long. The goal is clarity
+#       and ease of integration.
 #
-#     --- BEGIN REPLACE ---
-#     <New code to replace the "Find" block with. If removing, this block will be empty.>
-#     --- END REPLACE ---
-#     ```
+# 3.  **ADDING NEW FUNCTIONS OR CLASSES:**
+#     - Provide the complete new function or class.
+#     - Indicate clearly where it should be placed (e.g., "Add this new function
+#       after the `existing_function_name()` function.").
 #
-#     *   **Exact Matching for "FIND":** The "FIND" block MUST be an exact character-for-character
-#         match of the code in the current `bot.py` file. This includes all whitespace
-#         (spaces, tabs, newlines) and any comments within or around the code block.
-#         If the "FIND" block is not an exact match, the replacement will fail.
-#     *   **Removal:** To remove code, provide the "FIND" block and an empty "REPLACE" block (i.e.,
-#         `--- BEGIN REPLACE ---` followed immediately by `--- END REPLACE ---`).
-#     *   **Addition:** To add new code, "FIND" a few lines of existing code immediately
-#         preceding where the new code should go. In the "REPLACE" block, provide those same
-#         found lines *plus* the new code block in its correct position relative to the found lines.
-#         This ensures the addition is placed correctly.
-#     *   **Modification:** For changes, "FIND" the relevant section and "REPLACE" it with
-#         the modified version.
+# 4.  **REMOVING FUNCTIONS OR CLASSES:**
+#     - Clearly state: "Remove the `function_to_remove_name()` function entirely."
 #
-# 2.  **CODE CHUNK SIZE AND CONTEXT:**
-#     *   **Avoid Very Small Snippets:** Tiny one-line or partial-line changes provided in isolation
-#         are prone to indentation errors and ambiguity during manual application.
-#     *   **Prefer Logical Blocks:** If multiple related changes are needed within a single function,
-#         it's often better to provide the entire function in the "FIND" and "REPLACE" blocks.
-#         Similarly, if multiple consecutive functions are heavily modified, they can be provided
-#         together.
-#     *   **Sufficient Context for "FIND":** Ensure the "FIND" block is unique enough or contains
-#         enough surrounding lines to be unambiguously located in the file. If a small change
-#         is made, ensure the "FIND" block includes enough context.
+# 5.  **GLOBAL SCOPE CHANGES (Imports, Constants):**
+#     - For changes to imports or global constants, clearly list the additions,
+#       removals, or modifications. For example:
+#       - "Add `import new_module` at the top."
+#       - "Change `MY_CONSTANT = 10` to `MY_CONSTANT = 20`."
+#       - "Remove the constant `OLD_CONSTANT`."
 #
-# 3.  **NO META-COMMENTS *INSIDE* REPLACE BLOCKS:**
-#     *   The "REPLACE" block should contain *only* the final, valid Python code.
-#     *   **CRITICALLY IMPORTANT: DO NOT** include comments like `// Keep this part the same`,
-#         `# ... rest of the code ...`, or `# Your existing code here` *inside* the
-#         `--- BEGIN REPLACE --- ... --- END REPLACE ---` markers.
-#     *   Such meta-comments make copy-pasting difficult and error-prone.
-#     *   If you need to explain parts of the change or why some code remains, do so
-#         *outside* these "Find and Replace" blocks, in your narrative response.
+# 6.  **NO META-COMMENTS ABOUT UNCHANGED CODE (Unless Marked as Above):**
+#     - **DO NOT** include comments like `# ... rest of the code ...` or
+#       `# Your existing code here` within the code you provide, *unless*
+#       it's part of a formally marked "UNCHANGED SECTION" as described in point 2.
+#     - The code you provide should be directly usable.
 #
-# 4.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
+# 7.  **FULL FILE REWRITES ARE STRICTLY PROHIBITED:**
 #     This `bot.py` file is large and complex. Under no circumstances should you
-#     attempt to rewrite the entire file. Only provide the specific "Find and Replace"
-#     blocks for the necessary changes.
+#     attempt to rewrite the entire file. Only provide the specific functions,
+#     classes, or import/constant changes requested.
 #
-# 5.  **INTEGRITY OF COMMENTS:**
-#     When a "FIND" block includes existing comments, and those comments are intended to
-#     remain, they MUST also be present in the "REPLACE" block in their correct positions.
+# 8.  **INTEGRITY OF EXISTING COMMENTS:**
+#     - When providing a modified function, ensure that all original comments
+#       within that function (that are intended to remain) are preserved in their
+#       correct positions.
 #
 # --- BOT CONTEXT (TheNerd's Pingslave) ---
 # (This information is for your understanding and may be useful for generating accurate code.)
@@ -165,6 +135,32 @@ import contextlib
 # constructed, how AI cog methods are called, or data passed to the cog), consider if
 # `ai_cog.py` also needs adjustment and mention this in your reasoning.
 # --- END LLM INSTRUCTION ---
+
+import discord # Keep your original discord import
+import os      # <--- Ensure this import is present
+import threading
+import asyncio
+from discord import app_commands
+from discord.ext import commands
+from discord.ui import View, Button, button
+from flask import Flask
+from supabase import create_client, Client
+from postgrest import APIError
+import traceback
+import math
+from typing import Optional, Tuple, List, Dict, Any, Set # Keep this one, it's used more broadly
+from dotenv import load_dotenv
+import datetime
+import pytz
+from dateutil.parser import parse as date_parse
+from discord.ext import tasks
+import re
+import asyncio
+import discord.utils
+import io # <--- ADD THIS IMPORT
+from PIL import Image
+import aiohttp
+import contextlib
 
 # --- Configuration ---
 load_dotenv()  # harmless in production; only loads if a .env file exists
@@ -248,11 +244,611 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+def _generate_activity_week_display(
+    relevant_active_dates: Set[datetime.date],
+    week_start_calendar_date: datetime.date, 
+    num_days_in_row: int, 
+    today_date: datetime.date,
+    current_month_for_padding_check: Optional[int] = None
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Generates lists of raw strings for day names, day numbers, and activity status characters.
+    Day names: "Mon", "Tue", etc.
+    Day numbers: " 1", "12" (2 chars, right-aligned)
+    Status chars: "Y", "X", "o", ".", " " (1 char) - Using your specified chars
+    """
+    raw_day_names = []
+    raw_day_numbers = [] 
+    raw_activity_status_chars = []
+
+    day_abbreviations = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    
+    # Using your specified characters
+    CHAR_ACTIVE = "Y"
+    CHAR_PAST_INACTIVE = "x"
+    CHAR_TODAY = "." # Using dot for Today and Future as per your example
+    CHAR_FUTURE = "."
+    CHAR_PADDING = " " 
+
+    for i in range(num_days_in_row):
+        current_date_in_loop = week_start_calendar_date + datetime.timedelta(days=i)
+        raw_day_names.append(day_abbreviations[current_date_in_loop.weekday()])
+
+        is_padding_day = current_month_for_padding_check and current_date_in_loop.month != current_month_for_padding_check
+        
+        if is_padding_day:
+            raw_day_numbers.append("  ") 
+            raw_activity_status_chars.append(CHAR_PADDING)
+        else:
+            raw_day_numbers.append(f"{current_date_in_loop.day:>2}") 
+
+            status_char = CHAR_FUTURE # Default for future days
+            if current_date_in_loop == today_date:
+                status_char = CHAR_TODAY 
+            elif current_date_in_loop in relevant_active_dates:
+                status_char = CHAR_ACTIVE
+            elif current_date_in_loop < today_date: # Past, and not in relevant_active_dates
+                status_char = CHAR_PAST_INACTIVE
+            
+            raw_activity_status_chars.append(status_char)
+    
+    return raw_day_names, raw_day_numbers, raw_activity_status_chars
+
+def _create_activity_legend_string() -> str:
+    # Using your specified characters for the legend
+    return "`Y` = Active, `x` = Inactive (Past), `.` = Today/Future/No Data"
+
+def generate_monthly_activity_string_v2(
+    all_active_dates_for_target_month: Set[datetime.date], 
+    target_month: int, 
+    target_year: int,
+    today_date_actual: datetime.date
+) -> str:
+    if not today_date_actual: return "`N/A (Date Error)`"
+
+    try:
+        first_day_of_target_month = datetime.date(target_year, target_month, 1)
+        if target_month == 12:
+            first_day_of_next_month = datetime.date(target_year + 1, 1, 1)
+        else:
+            first_day_of_next_month = datetime.date(target_year, target_month + 1, 1)
+        last_day_of_target_month = first_day_of_next_month - datetime.timedelta(days=1)
+    except ValueError:
+        return "`N/A (Invalid Month/Year for Calendar)`"
+
+    output_lines = []
+    month_year_header = first_day_of_target_month.strftime("%B %Y")
+    output_lines.append(month_year_header)
+    
+    day_names_header_list_raw, _, _ = _generate_activity_week_display(set(), first_day_of_target_month, 7, today_date_actual)
+    day_names_line_joined = " ".join(f"{name:<3}" for name in day_names_header_list_raw)
+    
+    output_lines.append("```") 
+    output_lines.append(day_names_line_joined)
+    output_lines.append("-" * len(day_names_line_joined))
+
+    calendar_grid_start_date = first_day_of_target_month - datetime.timedelta(days=first_day_of_target_month.weekday())
+    current_date_for_grid_row = calendar_grid_start_date
+    
+    while current_date_for_grid_row <= last_day_of_target_month:
+        _, week_day_numbers_raw, week_status_chars_raw = _generate_activity_week_display(
+            all_active_dates_for_target_month,
+            current_date_for_grid_row, 
+            7, 
+            today_date_actual,
+            target_month 
+        )
+        
+        line_nums_cells = [f"{n_str:^3}" for n_str in week_day_numbers_raw]
+        line_nums_joined = " ".join(line_nums_cells)
+        output_lines.append(line_nums_joined)
+
+        line_status_cells = [f"{s_char:^3}" for s_char in week_status_chars_raw]
+        line_status_joined = " ".join(line_status_cells)
+        output_lines.append(line_status_joined)
+        
+        # Add a blank line after the status characters for visual separation within the month view
+        if current_date_for_grid_row + datetime.timedelta(days=6) < last_day_of_target_month : # Avoid extra blank line after last week
+             output_lines.append("") # This creates the 1-line gap
+
+        current_date_for_grid_row += datetime.timedelta(days=7)
+        
+    output_lines.append("```") # End of code block
+    
+    legend = _create_activity_legend_string()
+    output_lines.append(legend) # Add legend after the code block
+    
+    activity_in_target_month = any(d.month == target_month and d.year == target_year for d in all_active_dates_for_target_month)
+    if not activity_in_target_month:
+         # This note should appear *before* the legend if possible, or make legend part of footer for embed.
+         # For now, adding it before the legend string is appended.
+         output_lines.insert(-1, f"\n*No activity logged in {first_day_of_target_month.strftime('%B %Y')}.*")
 
 
+    return "\n".join(output_lines)
+
+# Replace the ProfilePagesView class with this new version
+
+class ProfileMonthSelect(discord.ui.Select):
+    def __init__(self, current_real_year: int, current_real_month: int, 
+                 currently_selected_year: int, currently_selected_month: int, # NEW PARAMETERS
+                 num_months_to_show: int = 12):
+        options = []
+        for i in range(num_months_to_show):
+            # Generate options based on current_real_year/month to go backwards
+            year, month = current_real_year, current_real_month - i 
+            while month <= 0:
+                month += 12
+                year -= 1
+            
+            month_date_obj = datetime.date(year, month, 1)
+            option_label = month_date_obj.strftime("%B %Y")
+            option_value = f"{year}-{month:02d}"
+            
+            # Determine if this option should be the default
+            is_default = (year == currently_selected_year and month == currently_selected_month)
+            
+            options.append(discord.SelectOption(label=option_label, value=option_value, default=is_default))
+
+        super().__init__(
+            placeholder="Select Month...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="profile_month_select" 
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        # // --- UNCHANGED SECTION (ProfileMonthSelect.callback) --- //
+        view: ProfilePagesView = self.view 
+        if view:
+            await view.handle_month_selection(interaction, self.values[0])
+        # // --- END UNCHANGED SECTION (ProfileMonthSelect.callback) --- //
 
 
+class ProfilePagesView(discord.ui.View):
+    MAIN_PAGE = "main"
+    # WEEKLY_PAGE = "weekly" # REMOVED
+    MONTHLY_PAGE = "monthly"
 
+    def __init__(self, interaction: discord.Interaction,
+                 target_user_display_data: Dict[str, Any],
+                 hc_profile_data: Optional[Dict[str, Any]],
+                 activity_summary_data: Optional[Dict[str, Any]],
+                 # weekly_active_dates: Optional[Set[datetime.date]], # REMOVED
+                 initial_monthly_active_dates: Optional[Set[datetime.date]], # For current month display
+                 today_date_obj: datetime.date,
+                 timeout=180.0):
+        super().__init__(timeout=timeout)
+        self.original_command_interaction = interaction
+        self.target_user_display_data = target_user_display_data
+        self.hc_profile_data = hc_profile_data # Contains IGN needed for fetching later
+        self.activity_summary_data = activity_summary_data
+        
+        # State for currently displayed monthly data
+        self.current_display_month = today_date_obj.month
+        self.current_display_year = today_date_obj.year
+        self.monthly_active_dates_for_current_view = initial_monthly_active_dates or set()
+        
+        self.today_date_obj = today_date_obj # Actual current date
+        
+        self.current_page_mode = self.MAIN_PAGE
+        self.message: Optional[discord.Message] = None 
+
+        self._update_ui_elements() # Changed from _update_buttons
+
+    def _update_ui_elements(self): # Renamed for clarity
+        self.clear_items()
+        
+        if self.current_page_mode == self.MAIN_PAGE:
+            if self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
+                monthly_btn = discord.ui.Button(label="🗓️ View Monthly Activity", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.MONTHLY_PAGE}", row=0)
+                monthly_btn.callback = self.navigation_button_callback
+                self.add_item(monthly_btn)
+        else: # On MONTHLY_PAGE
+            back_to_main_btn = discord.ui.Button(label="⬅️ Back to Main Profile", style=discord.ButtonStyle.primary, custom_id=f"profile_nav_{self.MAIN_PAGE}", row=0)
+            back_to_main_btn.callback = self.navigation_button_callback
+            self.add_item(back_to_main_btn)
+            
+            if self.current_page_mode == self.MONTHLY_PAGE:
+                # Pass the view's currently displayed month/year to the select
+                self.add_item(ProfileMonthSelect(
+                    current_real_year=self.today_date_obj.year, 
+                    current_real_month=self.today_date_obj.month,
+                    currently_selected_year=self.current_display_year, # Pass current view's year
+                    currently_selected_month=self.current_display_month, # Pass current view's month
+                    num_months_to_show=12
+                ))
+
+    # _create_main_embed remains the same as your last working version
+    def _create_main_embed(self) -> discord.Embed:
+        # // --- UNCHANGED SECTION (FROM PREVIOUS WORKING VERSION) --- //
+        # This function should be exactly as it was when the main profile page looked correct.
+        embed = discord.Embed(
+            title=f"🌟 [HC1] Profile: {discord.utils.escape_markdown(self.target_user_display_data['name'])}",
+            color=NERDY_YELLOW
+        )
+        if self.target_user_display_data['avatar_url']:
+            embed.set_thumbnail(url=self.target_user_display_data['avatar_url'])
+
+        ign_display = "`Not Linked / Not Found`"
+        hc_status_display = "❔ `Status Unknown (Not in DB)`"
+        if self.hc_profile_data:
+            ign = self.hc_profile_data.get("ingame_name")
+            is_in_hc = self.hc_profile_data.get("is_in_hc")
+            ign_display = f"`{discord.utils.escape_markdown(ign)}`" if ign else "`Not Set in DB`"
+            if ign is not None:
+                if is_in_hc is True: hc_status_display = "✅ `In Guild (HC1)`"
+                elif is_in_hc is False: hc_status_display = "⏳ `Formerly in Guild (HC1)`"
+                else: hc_status_display = "❔ `HC Status Unknown (DB)`"
+        
+        general_info_value = (
+            f"**Discord:** {self.target_user_display_data['mention_or_status']}\n"
+            f"**In-Game Name (IGN):** {ign_display}\n"
+            f"**[HC1] Guild Status:** {hc_status_display}"
+        )
+        embed.add_field(name="📋 General", value=general_info_value, inline=False)
+
+        if self.activity_summary_data:
+            activity_overview_value = (
+                f"**Active Today:** {self.activity_summary_data['active_today_display']}\n"
+                f"**Total Days Logged:** `{self.activity_summary_data['total_days_logged']}`\n"
+                f"**Last Seen Active:** {self.activity_summary_data['last_seen_display']}"
+            )
+            embed.add_field(name="📈 Activity Overview", value=activity_overview_value, inline=False)
+        elif self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
+            embed.add_field(name="📈 Activity Overview", value="`No activity data found.`", inline=False)
+        else:
+            embed.add_field(name="📈 Activity Overview", value="`Activity data N/A (No IGN Linked).`", inline=False)
+        
+        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()} | Use /activatemyself to mark active!")
+        return embed
+        # // --- END UNCHANGED SECTION --- //
+
+
+    # _create_weekly_embed is REMOVED
+
+    def _create_monthly_embed(self) -> discord.Embed:
+        ign = self.hc_profile_data.get("ingame_name") if self.hc_profile_data else "N/A"
+        embed = discord.Embed(
+            title=f"🗓️ Monthly Activity - {discord.utils.escape_markdown(ign)}",
+            color=NERDY_YELLOW
+        )
+        # REMOVED: Do not set thumbnail for the monthly view to maximize text space
+        # if self.target_user_display_data['avatar_url']:
+        #     embed.set_thumbnail(url=self.target_user_display_data['avatar_url'])
+            
+        monthly_string = generate_monthly_activity_string_v2(
+            self.monthly_active_dates_for_current_view,
+            self.current_display_month,
+            self.current_display_year,
+            self.today_date_obj
+        )
+        embed.description = monthly_string
+        display_month_obj = datetime.date(self.current_display_year, self.current_display_month, 1)
+        embed.set_footer(text=f"Calendar for {display_month_obj.strftime('%B %Y')}")
+        return embed
+
+    async def _update_message(self, interaction_to_respond_to: discord.Interaction):
+        self._update_ui_elements() 
+        embed_to_send: discord.Embed
+        if self.current_page_mode == self.MONTHLY_PAGE:
+            embed_to_send = self._create_monthly_embed()
+        else: 
+            embed_to_send = self._create_main_embed()
+        
+        try:
+            await interaction_to_respond_to.response.edit_message(embed=embed_to_send, view=self)
+        except discord.HTTPException as e:
+            print(f"Error updating profile page view: {e}")
+            guild_for_log = interaction_to_respond_to.guild 
+            if bot and hasattr(bot, 'log_error_global'):
+                 await bot.log_error_global(guild_for_log, "Failed to update profile page message", error=e)
+            elif guild_for_log:
+                 await log_error(guild_for_log, "Failed to update profile page message (fallback log)", error=e)
+            if not interaction_to_respond_to.response.is_done():
+                try: await interaction_to_respond_to.response.defer()
+                except discord.HTTPException: pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return True # Allow anyone to interact
+
+    async def navigation_button_callback(self, interaction: discord.Interaction):
+        button_custom_id = interaction.data.get('custom_id')
+        if not button_custom_id or not button_custom_id.startswith("profile_nav_"):
+            if not interaction.response.is_done(): await interaction.response.defer()
+            return
+
+        new_mode = button_custom_id.split("profile_nav_")[1]
+        
+        if new_mode not in [self.MAIN_PAGE, self.MONTHLY_PAGE]: # WEEKLY_PAGE removed
+            if not interaction.response.is_done(): await interaction.response.defer()
+            return
+
+        if self.current_page_mode == new_mode: 
+            if not interaction.response.is_done(): await interaction.response.defer()
+            return
+
+        self.current_page_mode = new_mode
+        # If switching to monthly, ensure data is for current real month initially
+        if new_mode == self.MONTHLY_PAGE and \
+           (self.current_display_month != self.today_date_obj.month or self.current_display_year != self.today_date_obj.year):
+            
+            # Fetch data for the actual current month before displaying
+            # This is if user goes Main -> Monthly, ensure monthly isn't showing an old selected month
+            if self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
+                ign_lower = self.hc_profile_data.get("ingame_name").lower()
+                first_day_current_month = self.today_date_obj.replace(day=1)
+                if self.today_date_obj.month == 12:
+                    first_day_next_month = first_day_current_month.replace(year=self.today_date_obj.year + 1, month=1)
+                else:
+                    first_day_next_month = first_day_current_month.replace(month=self.today_date_obj.month + 1)
+                last_day_current_month = first_day_next_month - datetime.timedelta(days=1)
+
+                self.monthly_active_dates_for_current_view = await fetch_activity_dates_in_range(
+                    self.original_command_interaction.guild, # Use guild from original interaction
+                    ign_lower, 
+                    first_day_current_month, 
+                    last_day_current_month
+                )
+                self.current_display_month = self.today_date_obj.month
+                self.current_display_year = self.today_date_obj.year
+            else: # No IGN, cannot fetch monthly data
+                self.monthly_active_dates_for_current_view = set()
+
+
+        await self._update_message(interaction)
+
+    async def handle_month_selection(self, interaction: discord.Interaction, selected_value: str):
+        """Callback for the month select dropdown."""
+        # selected_value is "YYYY-MM"
+        try:
+            year_str, month_str = selected_value.split('-')
+            selected_year = int(year_str)
+            selected_month = int(month_str)
+        except ValueError:
+            await interaction.response.send_message("Invalid month selection format.", ephemeral=True)
+            return
+
+        if not self.hc_profile_data or not self.hc_profile_data.get("ingame_name"):
+            await interaction.response.send_message("Cannot fetch monthly data: No In-Game Name linked.", ephemeral=True)
+            return
+
+        ign_lower = self.hc_profile_data.get("ingame_name").lower()
+        
+        # Defer the select interaction while fetching
+        # await interaction.response.defer() # Already handled by _update_message if it's called
+                                        # But if fetch is long, defer early here is good.
+                                        # For now, _update_message will handle the response edit.
+
+        # Fetch data for the selected month
+        try:
+            first_day_selected_month = datetime.date(selected_year, selected_month, 1)
+            if selected_month == 12:
+                first_day_next_selected_month = datetime.date(selected_year + 1, 1, 1)
+            else:
+                first_day_next_selected_month = datetime.date(selected_year, selected_month + 1, 1)
+            last_day_selected_month = first_day_next_selected_month - datetime.timedelta(days=1)
+        except ValueError:
+            await interaction.response.send_message("Invalid date for selected month/year.", ephemeral=True)
+            return
+
+        self.monthly_active_dates_for_current_view = await fetch_activity_dates_in_range(
+            self.original_command_interaction.guild, # Use guild from original interaction
+            ign_lower, 
+            first_day_selected_month, 
+            last_day_selected_month
+        )
+        self.current_display_month = selected_month
+        self.current_display_year = selected_year
+        
+        # Update the message with new monthly data
+        # Ensure current_page_mode is MONTHLY_PAGE before calling _update_message
+        self.current_page_mode = self.MONTHLY_PAGE 
+        await self._update_message(interaction) # Pass the select's interaction
+
+    async def on_timeout(self):
+        if self.message: 
+            try:
+                timeout_embed: discord.Embed
+                if self.current_page_mode == self.MONTHLY_PAGE: timeout_embed = self._create_monthly_embed()
+                else: timeout_embed = self._create_main_embed()
+                
+                if timeout_embed.footer.text:
+                    timeout_embed.set_footer(text=f"{timeout_embed.footer.text} (Interaction timed out)")
+                else:
+                    timeout_embed.set_footer(text="Interaction timed out")
+
+                self.clear_items() 
+                await self.message.edit(embed=timeout_embed, view=self) 
+            except discord.HTTPException:
+                pass 
+        self.stop()
+
+async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches core profile data for a given In-Game Name from hc_members.
+    Performs a case-insensitive search for the IGN.
+    Returns a dict {'ingame_name': str (actual case from DB), 
+                    'discord_id': str | None, 
+                    'is_in_hc': bool, 
+                    'discord_name': str | None} 
+    or None if not found.
+    """
+    if not supabase:
+        if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for IGN '{input_ign}'.")
+        return None
+    try:
+        # Perform a case-insensitive query for the ingame_name
+        # Note: Supabase ilike is good for patterns. For exact case-insensitive match,
+        # you might need to query without ilike and handle case in Python if your DB collation is case-sensitive
+        # OR rely on a GIN/GIST index with pg_trgm for faster ilike if this becomes slow.
+        # For now, a simple .eq() and then checking a lowercase version (if needed) or direct .ilike()
+        # Let's try .ilike() as it's simpler for case-insensitivity directly in query
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("ingame_name, discord_id, is_in_hc, discord_name")
+                           .ilike("ingame_name", input_ign) # Case-insensitive match
+                           .maybe_single() # Expecting at most one due to unique constraint on ingame_name
+                           .execute()
+        )
+        
+        # PostgREST `ilike` with an exact string (no wildcards) effectively becomes a case-insensitive equality check.
+        # If multiple results were possible due to no unique constraint, you'd need to loop or pick one.
+        # With a unique constraint on ingame_name, ilike should return 0 or 1.
+
+        if resp and hasattr(resp, 'data') and resp.data:
+            # Ensure we return the ingame_name exactly as it is in the database for correct casing
+            return {
+                "ingame_name": resp.data.get("ingame_name"), # Actual case from DB
+                "discord_id": str(resp.data.get("discord_id")) if resp.data.get("discord_id") else None,
+                "is_in_hc": resp.data.get("is_in_hc"),
+                "discord_name": resp.data.get("discord_name")
+            }
+        return None
+    except (ConnectionError, APIError) as e:
+        if guild: await log_error(guild, f"Profile: DB error fetching profile data for IGN '{input_ign}'", error=e)
+    except Exception as e_gen:
+        if guild: await log_error(guild, f"Profile: Unexpected error fetching profile data for IGN '{input_ign}'", error=e_gen)
+    return None
+
+async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_id_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches core profile data (IGN, is_in_hc) for a given Discord ID from hc_members.
+    Returns a dict {'ingame_name': str, 'is_in_hc': bool, 'discord_name': str | None} or None if not found.
+    """
+    if not supabase:
+        if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for user {discord_id_str}.")
+        return None
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("ingame_name, is_in_hc, discord_name")
+                           .eq("discord_id", discord_id_str)
+                           .maybe_single()
+                           .execute()
+        )
+        if resp and hasattr(resp, 'data') and resp.data:
+            return {
+                "ingame_name": resp.data.get("ingame_name"),
+                "is_in_hc": resp.data.get("is_in_hc"),
+                "discord_name": resp.data.get("discord_name") # Store this for users not in guild
+            }
+        return None
+    except (ConnectionError, APIError) as e:
+        if guild: await log_error(guild, f"Profile: DB error fetching profile data for user {discord_id_str}", error=e)
+    except Exception as e_gen:
+        if guild: await log_error(guild, f"Profile: Unexpected error fetching profile data for user {discord_id_str}", error=e_gen)
+    return None
+
+async def fetch_activity_dates_in_range(guild: Optional[discord.Guild], ign_lower: str, start_date: datetime.date, end_date: datetime.date) -> Set[datetime.date]:
+    """Fetches all distinct activity dates for a given lowercase IGN within a date range."""
+    if not supabase or not ign_lower:
+        return set()
+    active_dates: Set[datetime.date] = set()
+    try:
+        # Fetch all activity_date entries for the member_identifier within the date range
+        query = supabase.table("activity_log").select("activity_date").eq("member_identifier", ign_lower)
+        query = query.gte("activity_date", start_date.isoformat())
+        query = query.lte("activity_date", end_date.isoformat())
+        
+        # Potentially many dates, but for 30 days it's fine. Consider pagination for much larger ranges if ever needed.
+        resp = await run_supabase_sync(lambda: query.execute())
+
+        if resp and hasattr(resp, 'data') and resp.data:
+            for log_entry in resp.data:
+                activity_date_str = log_entry.get('activity_date')
+                if activity_date_str:
+                    try:
+                        # Parse YYYY-MM-DD string to date object
+                        parsed_date = datetime.datetime.strptime(activity_date_str, '%Y-%m-%d').date()
+                        active_dates.add(parsed_date)
+                    except ValueError:
+                        # Log if parsing fails, but continue
+                        if guild: 
+                            await log_info(guild, f"Profile: Invalid date format '{activity_date_str}' in activity log for {ign_lower} during range fetch.")
+    except (ConnectionError, APIError) as e:
+        if guild: 
+            await log_error(guild, f"Profile: Error fetching activity dates for {ign_lower}", error=e)
+    except Exception as e_gen:
+        if guild:
+            await log_error(guild, f"Profile: Unexpected error fetching activity dates for {ign_lower}", error=e_gen)
+    return active_dates
+
+def generate_weekly_activity_string(active_dates_in_period: Set[datetime.date], today: datetime.date) -> str:
+    """Generates an emoji string for the last 7 days of activity."""
+    if not active_dates_in_period and not today : return "`N/A`" # Guard against empty input if it happens
+    
+    days_of_week_initials = ["M", "Tu", "W", "Th", "F", "Sa", "Su"] # Using Tu and Th for clarity
+    # Ensure today is a date object
+    if isinstance(today, datetime.datetime):
+        today = today.date()
+
+    header_parts = []
+    activity_parts = []
+    
+    for i in range(6, -1, -1): # From 6 days ago up to today
+        current_date = today - datetime.timedelta(days=i)
+        day_initial = days_of_week_initials[current_date.weekday()]
+        header_parts.append(f"{day_initial:<{len(day_initial)+ (1 if len(day_initial) == 1 else 0)}}") # Pad single char more
+
+        if current_date == today:
+            activity_emoji = "🗓️" if current_date in active_dates_in_period else "🗓️" # Today's emoji (could be different if not active)
+        elif current_date in active_dates_in_period:
+            activity_emoji = "✅"
+        else:
+            activity_emoji = "➖"
+        activity_parts.append(f"{activity_emoji:<{len(day_initial)+ (1 if len(day_initial) == 1 else 0)}}")
+
+    # Join with a slightly wider space for better visual separation
+    # Using three spaces between emojis/headers. Adjust if needed.
+    header_str = "   ".join(header_parts)
+    activity_str = "   ".join(activity_parts)
+    
+    return f"```{header_str}\n{activity_str}```*(Past → Today)*"
+
+
+def generate_monthly_activity_string(active_dates_in_period: Set[datetime.date], today: datetime.date) -> str:
+    """Generates a multi-line emoji string for the last 30 days of activity."""
+    if not active_dates_in_period and not today: return "`N/A`"
+    
+    # Ensure today is a date object
+    if isinstance(today, datetime.datetime):
+        today = today.date()
+
+    activity_lines = []
+    num_days_to_show = 30
+    
+    # Iterate through the 30-day period, grouping into weeks
+    # Day 0 is `today - 29 days`, Day 29 is `today`
+    all_period_dates = [(today - datetime.timedelta(days=(num_days_to_show - 1 - i))) for i in range(num_days_to_show)]
+
+    week_count = 0
+    for i in range(0, num_days_to_show, 7):
+        week_count += 1
+        week_dates = all_period_dates[i : min(i + 7, num_days_to_show)]
+        if not week_dates: continue
+
+        week_emojis = []
+        for day_date in week_dates:
+            if day_date == today:
+                week_emojis.append("🗓️" if day_date in active_dates_in_period else "🗓️")
+            elif day_date in active_dates_in_period:
+                week_emojis.append("✅")
+            else:
+                week_emojis.append("➖")
+        
+        # Format week start/end dates carefully
+        start_of_week_fmt = week_dates[0].strftime('%d') # Day only
+        end_of_week_fmt = week_dates[-1].strftime('%d %b') # Day and Month (e.g., 23 Jul)
+        if week_dates[0].month != week_dates[-1].month: # If week spans months, show month for start too
+            start_of_week_fmt = week_dates[0].strftime('%d %b')
+
+        week_header = f"W{week_count} ({start_of_week_fmt} - {end_of_week_fmt}):"
+        activity_lines.append(f"{week_header.ljust(20)} {' '.join(week_emojis)}")
+
+    if not activity_lines: return "`No activity data to display for the last 30 days.`"
+    return "```\n" + "\n".join(activity_lines) + "\n```"
 
 class HelpPagesView(discord.ui.View):
     def __init__(self, bot_user: discord.User, is_staff_view_allowed: bool, timeout=180.0):
@@ -680,25 +1276,26 @@ class ScreenshotConfirmView(View):
         self.stop()
 
 async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
-    """Loads all In-Game Names from Supabase into an in-memory cache."""
+    """Loads all In-Game Names where is_in_hc is TRUE from Supabase into an in-memory cache."""
     global ingame_name_cache
     if not supabase:
         await log_error(guild_for_log, "IGN Cache loading failed: Supabase unavailable.", ping_owner=True)
         ingame_name_cache = [] # Ensure it's empty on failure
         return
 
-    print("Loading IGN cache from Supabase...")
+    print("Loading IGN cache from Supabase (only members with is_in_hc = TRUE)...")
     try:
-        # Fetch all non-null ingame_name entries
+        # Fetch ingame_name for entries where is_in_hc is TRUE and ingame_name is not null
         resp = await run_supabase_sync(
             lambda: supabase.table("hc_members")
                            .select("ingame_name")
-                           .not_.is_("ingame_name", "null") # Ensure we only get non-null IGNs
+                           .eq("is_in_hc", True)  # <-- ADDED THIS FILTER
+                           .not_.is_("ingame_name", "null")
                            .execute()
         )
 
         if not resp or not hasattr(resp, 'data') or not resp.data:
-            await log_info(guild_for_log, "No IGN data found or failed to fetch for cache. IGN cache will be empty.")
+            await log_info(guild_for_log, "No IGN data found (where is_in_hc=TRUE) or failed to fetch for cache. IGN cache will be empty.")
             ingame_name_cache = []
             return
 
@@ -711,11 +1308,11 @@ async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
 
         ingame_name_cache = sorted(list(temp_igns), key=str.lower) # Store as a sorted list (case-insensitive sort)
 
-        print(f"Loaded {len(ingame_name_cache)} unique In-Game Names into cache.")
-        await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs into local cache.")
+        print(f"Loaded {len(ingame_name_cache)} unique In-Game Names (is_in_hc=TRUE) into cache.")
+        await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs (is_in_hc=TRUE) into local cache.")
 
     except (APIError, ConnectionError, Exception) as e:
-        await log_error(guild_for_log, "Failed to load IGN cache from Supabase", error=e, ping_owner=True)
+        await log_error(guild_for_log, "Failed to load IGN cache (is_in_hc=TRUE) from Supabase", error=e, ping_owner=True)
         ingame_name_cache = [] # Clear cache on error
 
 
@@ -1562,36 +2159,75 @@ class StaticHCPagesView(View):
 
 async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Fetches ALL HC member data directly from Supabase (IGN, Discord ID/Name)
+    Fetches HC member data (where is_in_hc = TRUE) directly from Supabase (IGN, Discord ID/Name)
     and correlates with ALL activity data. Used when Discord context is unavailable/irrelevant.
-    Returns a list of dicts: [{'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
+    Returns a list of dicts: [{'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None, 'is_in_hc': bool}]
     and the total count. Sorted by IGN case-insensitive.
     """
-    print("Fetch All Supabase Data: Starting fetch...")
+    print("Fetch All Supabase Data (is_in_hc=TRUE): Starting fetch...")
     if not supabase:
         await log_error(guild_for_log, "fetch_all_supabase_hc_data failed: Supabase client unavailable.", ping_owner=True)
         return [], 0
 
-    # 1. Fetch all members from hc_members table
-    all_members_data = []
+    # 1. Fetch members from hc_members table where is_in_hc is TRUE
+    active_hc_members_data = []
     try:
-        print("Fetch All Supabase Data: Fetching all from hc_members...")
+        print("Fetch All Supabase Data: Fetching from hc_members where is_in_hc = TRUE...")
         resp_members = await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                           .select("discord_id, discord_name, ingame_name")
+                           .select("discord_id, discord_name, ingame_name, is_in_hc") # Added is_in_hc
+                           .eq("is_in_hc", True)  # <-- ADDED THIS FILTER
                            .execute()
         )
         if resp_members and hasattr(resp_members, 'data') and resp_members.data:
-            all_members_data = resp_members.data
-            print(f"Fetch All Supabase Data: Found {len(all_members_data)} total entries in hc_members.")
+            active_hc_members_data = resp_members.data
+            print(f"Fetch All Supabase Data: Found {len(active_hc_members_data)} entries in hc_members with is_in_hc = TRUE.")
         else:
-            print("Fetch All Supabase Data: No data returned from hc_members.")
-            # No need to fetch activity if no members found
+            print("Fetch All Supabase Data: No data returned from hc_members (is_in_hc=TRUE).")
             return [], 0
 
     except (ConnectionError, APIError, Exception) as e:
-        await log_error(guild_for_log, "Failed to fetch all data from Supabase hc_members", error=e, ping_owner=True)
-        return [], 0 # Return empty on critical DB failure
+        await log_error(guild_for_log, "Failed to fetch data from Supabase hc_members (is_in_hc=TRUE)", error=e, ping_owner=True)
+        return [], 0
+
+    # 2. Fetch all activity data (for the IGNs found)
+    activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
+    all_igns_in_db = [entry['ingame_name'] for entry in active_hc_members_data if entry.get('ingame_name')]
+
+    if not all_igns_in_db:
+         print("Fetch All Supabase Data: No IGNs found in fetched member data (is_in_hc=TRUE). Skipping activity fetch.")
+    else:
+        print(f"Fetch All Supabase Data: Fetching all-time activity for {len(all_igns_in_db)} IGNs (is_in_hc=TRUE)...")
+        try:
+            activity_summary = await fetch_activity_data(guild_for_log, all_igns_in_db)
+            print(f"Fetch All Supabase Data: Fetched activity summary for {len(activity_summary)} IGNs.")
+        except Exception as e_act:
+             await log_error(guild_for_log, "Failed during all-time activity fetch in fetch_all_supabase_hc_data", error=e_act, ping_owner=True)
+
+    # 3. Combine Member and Activity Data
+    final_data: List[Dict[str, Any]] = []
+    for member_entry in active_hc_members_data:
+        ign = member_entry.get("ingame_name")
+        if not ign: continue
+
+        ign_lower = ign.lower()
+        activity = activity_summary.get(ign_lower, {'count': 0, 'last_seen': None})
+
+        final_data.append({
+            "discord_id": member_entry.get("discord_id"),
+            "discord_name": member_entry.get("discord_name"),
+            "ign": ign,
+            "activity_count": activity.get('count', 0),
+            "last_seen": activity.get('last_seen'),
+            "is_in_hc": member_entry.get("is_in_hc", True) # Should always be true due to query
+        })
+
+    # 4. Sort by IGN (case-insensitive) as default
+    final_data.sort(key=lambda item: item['ign'].lower())
+
+    total_members = len(final_data)
+    print(f"Fetch All Supabase Data (is_in_hc=TRUE): Finished. Total entries prepared: {total_members}.")
+    return final_data, total_members
 
     # 2. Fetch all activity data
     activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
@@ -2513,157 +3149,163 @@ class HCPagesView(View):
 # --- REVISED fetch_hc_member_data (Adding logs for scenario 2) ---
 async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Fetches HC members from Discord and Supabase, including all-time activity counts.
-    Logs warnings for mismatches (Role w/o DB, DB w/o Role/Member).
-    Returns a list of dicts: [{'member': discord.Member | None, 'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None}]
+    Fetches HC members (is_in_hc=TRUE) from Discord and Supabase, including all-time activity counts.
+    Logs warnings for mismatches (Role w/o DB, DB w/o Role/Member or not is_in_hc).
+    Returns a list of dicts: [{'member': discord.Member | None, 'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None, 'is_in_hc': bool}]
     and the total count.
     Data is sorted by Discord name (if available), then IGN (case-insensitive).
     """
-    print(f"Fetch HC Data ({guild.name}): Starting fetch...")
+    print(f"Fetch HC Data ({guild.name}, is_in_hc=TRUE): Starting fetch...")
     hc_role = guild.get_role(HC1_ROLE_ID)
     if not hc_role:
-        await log_error(guild, f"HC Role {HC1_ROLE_ID} not found during fetch.", ping_owner=True) # Ping owner on critical role missing
+        await log_error(guild, f"HC Role {HC1_ROLE_ID} not found during fetch.", ping_owner=True)
         return [], 0
 
-    # 1. Fetch ALL entries from Supabase hc_members table
-    all_db_members: Dict[str, Dict] = {} # discord_id -> {'ign': ign, 'discord_name': discord_name, 'processed': False}
-    ign_only_members: Dict[str, Dict] = {} # ign_lower -> {'ign_original': ign, 'processed': False}
-    all_igns_in_db: List[str] = [] # List of all original-case IGNs for activity fetching
-
+    all_db_entries_raw: List[Dict] = []
     try:
         if not supabase: raise ConnectionError("Supabase client unavailable.")
-        print(f"Fetch HC Data ({guild.name}): Fetching all from Supabase hc_members table...")
-        # MODIFIED: Select discord_name as well
+        print(f"Fetch HC Data ({guild.name}): Fetching all entries from Supabase hc_members table for correlation...")
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members").select("discord_id, ingame_name, discord_name").execute()
+            lambda: supabase.table("hc_members").select("discord_id, ingame_name, discord_name, is_in_hc").execute()
         )
         if resp and hasattr(resp, 'data') and resp.data:
-            for entry in resp.data:
-                ign = entry.get("ingame_name")
-                if not ign: continue # Skip entries without an IGN
-                all_igns_in_db.append(ign) # Add original case IGN
-                d_id = entry.get("discord_id")
-                d_name = entry.get("discord_name") # Get discord_name
-                if d_id:
-                    # Store discord_id as string consistently
-                    all_db_members[str(d_id)] = {"ign": ign, "discord_name": d_name, "processed": False}
-                else:
-                    ign_only_members[ign.lower()] = {"ign_original": ign, "processed": False}
-            print(f"Fetch HC Data ({guild.name}): Found {len(all_db_members)} DB entries with Discord ID, {len(ign_only_members)} without.")
+            all_db_entries_raw = resp.data
+            print(f"Fetch HC Data ({guild.name}): Fetched {len(all_db_entries_raw)} total entries from Supabase.")
         else:
-            print(f"Fetch HC Data ({guild.name}): No data returned from Supabase hc_members.")
-
-    except ConnectionError as e: # Specific catch for connection error
-        await log_error(guild, "Failed to fetch data from Supabase hc_members: Connection Error.", error=e, ping_owner=True)
+            print(f"Fetch HC Data ({guild.name}): No data returned from Supabase hc_members for correlation.")
+    except ConnectionError as e:
+        await log_error(guild, "Failed to fetch data from Supabase hc_members for correlation: Connection Error.", error=e, ping_owner=True)
         return [], 0
-    except APIError as e: # Specific catch for API errors
-         await log_error(guild, "Failed to fetch data from Supabase hc_members: API Error.", error=e, ping_owner=True)
+    except APIError as e:
+         await log_error(guild, "Failed to fetch data from Supabase hc_members for correlation: API Error.", error=e, ping_owner=True)
          return [], 0
-    except Exception as e: # Catch other exceptions during Supabase fetch
-        await log_error(guild, "Failed to fetch data from Supabase hc_members: Unexpected Error.", error=e, ping_owner=True)
-        return [], 0 # Return empty on critical DB failure
+    except Exception as e:
+        await log_error(guild, "Failed to fetch data from Supabase hc_members for correlation: Unexpected Error.", error=e, ping_owner=True)
+        return [], 0
 
-    # 2. Fetch ALL activity data for the IGNs found
-    print(f"Fetch HC Data ({guild.name}): Fetching all-time activity for {len(all_igns_in_db)} IGNs...")
-    activity_counts = await fetch_activity_data(guild, all_igns_in_db) # Fetches count and last_seen
-    print(f"Fetch HC Data ({guild.name}): Fetched activity data for {len(activity_counts)} IGNs.")
+    # Create lookup maps from the raw DB data, ensuring shared payload objects
+    db_payloads_by_discord_id: Dict[str, Dict] = {}
+    db_payloads_by_ign_lower: Dict[str, Dict] = {}
+    all_igns_for_activity_fetch: Set[str] = set()
 
-    # 3. Get Discord members with the HC role
+    for entry in all_db_entries_raw:
+        ign = entry.get("ingame_name")
+        if not ign: continue
+        
+        all_igns_for_activity_fetch.add(ign)
+        d_id_str = str(entry["discord_id"]) if entry.get("discord_id") else None
+        is_in_hc_status = entry.get("is_in_hc", False)
+
+        # Construct the payload once
+        payload = {
+            "ign_original": ign, # Keep original case for consistent reference
+            "discord_id": d_id_str,
+            "discord_name": entry.get("discord_name"),
+            "is_in_hc": is_in_hc_status,
+            "processed": False # This flag will be set on this shared payload object
+        }
+        
+        if d_id_str:
+            db_payloads_by_discord_id[d_id_str] = payload
+        
+        # If an entry with this IGN (case-insensitive) already exists in ign_map,
+        # prefer the one with a discord_id if this one also has one, or if the existing one doesn't.
+        # This handles potential duplicate IGNs if one is linked and other isn't (should be rare).
+        # For simplicity, last one wins or prioritize linked ones.
+        # A robust solution for duplicate IGNs might need more complex logic based on your data integrity rules.
+        # For now, if d_id_str is present, it's likely the more "authoritative" entry for that IGN.
+        # Or, if no d_id_str, it's an IGN-only entry.
+        existing_ign_payload = db_payloads_by_ign_lower.get(ign.lower())
+        if not existing_ign_payload or (d_id_str and not existing_ign_payload.get("discord_id")):
+            db_payloads_by_ign_lower[ign.lower()] = payload
+        elif not d_id_str and existing_ign_payload.get("discord_id"):
+            pass # Keep the existing one that has a discord_id
+        else: # Both have/don't have d_id, last one wins (or add more specific tie-breaking)
+            db_payloads_by_ign_lower[ign.lower()] = payload
+
+
+    print(f"Fetch HC Data ({guild.name}): Processed into {len(db_payloads_by_discord_id)} Discord ID payloads, {len(db_payloads_by_ign_lower)} IGN payloads.")
+
+    activity_counts: Dict[str, Dict[str, Any]] = {}
+    if all_igns_for_activity_fetch:
+        print(f"Fetch HC Data ({guild.name}): Fetching all-time activity for {len(all_igns_for_activity_fetch)} IGNs...")
+        activity_counts = await fetch_activity_data(guild, list(all_igns_for_activity_fetch))
+        print(f"Fetch HC Data ({guild.name}): Fetched activity data for {len(activity_counts)} IGNs.")
+
     discord_hc_members: List[discord.Member] = []
     try:
         if not guild.chunked and guild.member_count is not None and guild.member_count > 1000:
-             try:
-                 print(f"Fetch HC Data ({guild.name}): Chunking guild..."); await guild.chunk(cache=True)
-             except Exception as chunk_e: print(f"WARN: Chunking failed: {chunk_e}") # Log warning, don't stop
-
+             try: print(f"Fetch HC Data ({guild.name}): Chunking guild..."); await guild.chunk(cache=True)
+             except Exception as chunk_e: print(f"WARN: Chunking failed: {chunk_e}")
         discord_hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
         print(f"Fetch HC Data ({guild.name}): Found {len(discord_hc_members)} Discord members with HC role.")
     except Exception as e:
-        await log_error(guild, "Guild chunking/member fetch failed during data fetch. List might be incomplete.", error=e, ping_owner=False)
+        await log_error(guild, "Guild chunking/member fetch failed during data fetch. List might be incomplete.", error=e)
 
-    # 4. Correlate and Build Final Data Structure
     final_data: List[Dict[str, Any]] = []
 
-    # Process Discord members with HC role
+    # Process Discord members WITH HC role
     for member in discord_hc_members:
         member_id_str = str(member.id)
-        db_entry = all_db_members.get(member_id_str)
-        ign = "Unknown"
-        activity = {'count': 0, 'last_seen': None} # Default activity
-        # Get member's current name for storage consistency if updating
+        # Use the payload from db_payloads_by_discord_id
+        db_payload = db_payloads_by_discord_id.get(member_id_str)
         current_discord_name = f"{member.name}#{member.discriminator}" if member.discriminator != '0' else member.name
 
+        if db_payload:
+            db_payload["processed"] = True # Mark this shared payload as processed
+            if db_payload["is_in_hc"]:
+                ign = db_payload["ign_original"]
+                activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
+                final_data.append({
+                    "member": member, "discord_id": member_id_str, "discord_name": current_discord_name,
+                    "ign": ign, "activity_count": activity['count'], "last_seen": activity['last_seen'],
+                    "is_in_hc": True
+                })
+            else: # Has HC role, but DB says is_in_hc=FALSE
+                await log_info(guild, f"Fetch HC Data Warning: Member {member.mention} (`{member_id_str}`) has HC role, but DB entry (IGN: `{db_payload['ign_original']}`) is_in_hc=FALSE.")
+        else: # Has HC role, but no DB entry AT ALL
+            await log_info(guild, f"Fetch HC Data Warning: Member {member.mention} (`{member_id_str}`) has HC role but no matching DB entry found.")
 
-        if db_entry:
-            ign = db_entry["ign"]
-            db_entry["processed"] = True
-            activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
-        else:
-            await log_info(guild, f"Fetch HC Data Warning: Discord member {member.mention} (`{member.id}`) has HC role but no matching DB entry found.")
+    # Process remaining DB entries that are is_in_hc=TRUE and were NOT processed above
+    # (These are IGN-only entries, or users who have DB record with is_in_hc=TRUE but no HC role on Discord)
+    for ign_l, db_payload in db_payloads_by_ign_lower.items():
+        if db_payload["processed"] or not db_payload["is_in_hc"]:
+            continue
 
-        final_data.append({
-            "member": member,
-            "discord_id": member_id_str, # Add discord_id directly
-            "discord_name": current_discord_name, # Add current discord_name
-            "ign": ign,
-            "activity_count": activity['count'],
-            "last_seen": activity['last_seen']
-        })
+        # This payload was not processed via a Discord ID match above, or it's an IGN-only entry.
+        # And its is_in_hc flag is TRUE.
+        
+        ign = db_payload["ign_original"]
+        activity = activity_counts.get(ign_l, {'count': 0, 'last_seen': None})
+        d_id_str = db_payload.get("discord_id") # This is already a string or None from payload creation
+        stored_discord_name = db_payload.get("discord_name")
 
-    # Process remaining DB entries (Discord member lost role/left or IGN-only)
-    for d_id, entry_data in all_db_members.items():
-        if not entry_data["processed"]:
-            ign = entry_data["ign"]
-            stored_discord_name = entry_data.get("discord_name") # Get stored name
-            activity = activity_counts.get(ign.lower(), {'count': 0, 'last_seen': None})
-
-            # Logging for Scenario 2 (DB entry exists, but member not found/no role)
-            try:
-                member_in_guild = guild.get_member(int(d_id))
-                if member_in_guild:
-                    if hc_role not in member_in_guild.roles:
-                        await log_info(guild, f"Fetch HC Data Warning: DB entry exists for {member_in_guild.mention} (`{d_id}`), but they do **not** currently have the HC role. IGN: `{ign}`")
-                else:
-                    name_to_log = stored_discord_name or f"ID {d_id}"
-                    await log_info(guild, f"Fetch HC Data Info: DB entry exists for user `{name_to_log}` (`{d_id}`), but they are not currently in this server (or couldn't be found). IGN: `{ign}`")
-            except ValueError:
-                 await log_error(guild, f"Fetch HC Data Error: Invalid Discord ID '{d_id}' found in database for IGN '{ign}'.", ping_owner=True)
-            except Exception as e_log:
-                 await log_error(guild, f"Fetch HC Data Error: Failed during Scenario 2 check for ID '{d_id}'", error=e_log, ping_owner=False)
-
-            # Add to final data with member: None
+        if d_id_str: # DB entry has a Discord ID, is_in_hc=TRUE, but user wasn't in discord_hc_members
+            member_in_guild = guild.get_member(int(d_id_str))
+            if member_in_guild:
+                 # This is the case: DB says user is IN HC, member IS in guild, but DOES NOT have the role.
+                 await log_info(guild, f"Fetch HC Data Info: DB entry (IGN: `{ign}`, is_in_hc=TRUE) for user {member_in_guild.mention} (`{d_id_str}`), but they do not have the HC role currently.")
+            else: # DB says user is IN HC, but member NOT in guild.
+                 name_to_log = stored_discord_name or f"ID {d_id_str}"
+                 await log_info(guild, f"Fetch HC Data Info: DB entry (IGN: `{ign}`, is_in_hc=TRUE) for user `{name_to_log}` (`{d_id_str}`), but they are not currently in this server.")
+            # Such entries (is_in_hc=TRUE in DB but no Discord role match) are NOT added to final_data for the list
+        else: # IGN-only entry, is_in_hc=TRUE. Add to the list.
             final_data.append({
-                "member": None,
-                "discord_id": d_id, # Stored discord_id
-                "discord_name": stored_discord_name, # Stored discord_name
-                "ign": ign,
-                "activity_count": activity['count'],
-                "last_seen": activity['last_seen']
+                "member": None, "discord_id": None, "discord_name": stored_discord_name,
+                "ign": ign, "activity_count": activity['count'], "last_seen": activity['last_seen'],
+                "is_in_hc": True
             })
+        
+        db_payload["processed"] = True # Mark as handled in this pass
 
-    # Add IGN-only entries (no discord_id)
-    for ign_lower, entry_data in ign_only_members.items():
-         ign = entry_data["ign_original"]
-         activity = activity_counts.get(ign_lower, {'count': 0, 'last_seen': None})
-         final_data.append({
-             "member": None,
-             "discord_id": None, # Explicitly None
-             "discord_name": None, # Explicitly None
-             "ign": ign,
-             "activity_count": activity['count'],
-             "last_seen": activity['last_seen']
-         })
-
-
-    # 5. Sort the final list
     final_data.sort(key=lambda item: (
         item['member'].name.lower() if item.get('member') else (item.get('discord_name', 'zzz') or 'zzz').lower(),
-        item['member'].discriminator if item.get('member') else 'zzz', # Fallback for sorting
+        item['member'].discriminator if item.get('member') else 'zzz',
         item['ign'].lower()
     ))
 
     total_members = len(final_data)
-    print(f"Fetch HC Data ({guild.name}): Finished. Total members for list: {total_members}.")
+    print(f"Fetch HC Data ({guild.name}, is_in_hc=TRUE): Finished. Total members for list: {total_members}.")
     return final_data, total_members
 
 # --- Background Task for Static List Reset ---
@@ -3564,76 +4206,91 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
         log_summary.append(f"DB fail: Empty IGN provided.")
     else:
         try:
-            # 1. Check if IGN exists and if it's linked
             print(f"HCVerify: Checking DB for IGN '{ign_to_process}' before upsert/update.")
             existing_entry_resp = await run_supabase_sync(
                 lambda: supabase.table("hc_members")
-                               .select("discord_id, ingame_name") # Select needed fields
+                               .select("discord_id, ingame_name, is_in_hc") # Select is_in_hc
                                .eq("ingame_name", ign_to_process)
-                               .maybe_single() # Expect 0 or 1 result
+                               .maybe_single()
                                .execute()
             )
             existing_entry = existing_entry_resp.data if existing_entry_resp and hasattr(existing_entry_resp, 'data') else None
+            operation_type = "store/update" # Default operation type
 
-            operation_type = "link" # Default to linking if IGN exists but unlinked
+            current_user_data = {
+                "discord_id": str(user.id),
+                "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
+                "ingame_name": ign_to_process,
+                "is_in_hc": True # Explicitly setting to True for verification
+            }
 
             if existing_entry:
                 existing_discord_id = existing_entry.get("discord_id")
+                existing_is_in_hc = existing_entry.get("is_in_hc")
+
                 if existing_discord_id is None:
-                    # Case 1: IGN exists, discord_id is NULL -> Update existing row
-                    print(f"HCVerify: IGN '{ign_to_process}' found with NULL discord_id. Updating...")
+                    # Case 1: IGN exists, discord_id is NULL. Update this entry to link it and set is_in_hc = TRUE.
+                    operation_type = "link_and_activate"
+                    print(f"HCVerify: IGN '{ign_to_process}' found unlinked. Linking and activating...")
                     await run_supabase_sync(
                         lambda: supabase.table("hc_members")
-                                       .update({
-                                           "discord_id": str(user.id),
-                                           "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name
-                                       })
-                                       .eq("ingame_name", ign_to_process) # Match by IGN
-                                       .is_("discord_id", "null") # Ensure we only update unlinked entries
+                                       .update(current_user_data) # Update all fields including is_in_hc
+                                       .eq("ingame_name", ign_to_process)
+                                       .is_("discord_id", "null") # Safety condition
                                        .execute()
                     )
-                    result_summary.append(f"🔗 IGN Linked: `{discord.utils.escape_markdown(ign_to_process)}` linked to {user.mention}.")
-                    log_summary.append("Supabase update OK (linked existing IGN)")
+                    result_summary.append(f"🔗 IGN Linked & Activated: `{discord.utils.escape_markdown(ign_to_process)}` linked to {user.mention}.")
+                    log_summary.append("Supabase update OK (linked existing IGN, set is_in_hc=TRUE)")
                     db_success = True
                 elif str(existing_discord_id) == str(user.id):
-                    # Case 2: IGN exists and already linked to THIS user -> Upsert to potentially update IGN case/discord name
-                    print(f"HCVerify: IGN '{ign_to_process}' already linked to this user ({user.id}). Performing upsert...")
-                    operation_type = "update"
-                    await run_supabase_sync( lambda: supabase.table("hc_members").upsert({
-                            "discord_id": str(user.id),
-                            "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
-                            "ingame_name": ign_to_process # Use potentially corrected case
-                        }, on_conflict="discord_id").execute()
+                    # Case 2: IGN exists and linked to THIS user. Upsert to update IGN case, name, and ensure is_in_hc=TRUE.
+                    operation_type = "update_and_activate"
+                    print(f"HCVerify: IGN '{ign_to_process}' already linked to this user. Updating and ensuring active...")
+                    await run_supabase_sync(
+                        lambda: supabase.table("hc_members")
+                                       .upsert(current_user_data, on_conflict="discord_id") # Upsert on discord_id
+                                       .execute()
                     )
-                    result_summary.append(f"💾 IGN Stored/Updated: `{discord.utils.escape_markdown(ign_to_process)}`")
-                    log_summary.append("Supabase upsert OK (updated existing user link)")
+                    status_change_msg = " (marked as in HC)" if not existing_is_in_hc else ""
+                    result_summary.append(f"💾 IGN Updated: `{discord.utils.escape_markdown(ign_to_process)}`{status_change_msg}.")
+                    log_summary.append(f"Supabase upsert OK (updated existing user link, ensured is_in_hc=TRUE {status_change_msg})")
                     db_success = True
                 else:
-                    # Case 3: IGN exists and linked to ANOTHER user -> Error
+                    # Case 3: IGN exists and linked to ANOTHER user. Error.
                     errors_occurred=True
                     err_detail=f"IGN Conflict: '{ign_to_process}' is already linked to another Discord account (<@{existing_discord_id}>)."
                     result_summary.append(f"⚠️ DB Error: {err_detail}")
-                    log_summary.append(f"DB upsert fail: IGN Unique Conflict for {ign_to_process} (linked to {existing_discord_id})")
+                    log_summary.append(f"DB fail: IGN Unique Conflict for {ign_to_process} (linked to {existing_discord_id})")
                     await log_info(guild, f"HCVerify DB Error: IGN '{ign_to_process}' conflict for user {user.mention}. Already linked to ID {existing_discord_id}.", interaction=interaction)
             else:
-                # Case 4: IGN does not exist -> Upsert normally
-                print(f"HCVerify: IGN '{ign_to_process}' not found. Performing upsert...")
-                operation_type = "store/update"
-                await run_supabase_sync( lambda: supabase.table("hc_members").upsert({
-                        "discord_id": str(user.id),
-                        "discord_name": f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name,
-                        "ingame_name": ign_to_process
-                    }, on_conflict="discord_id").execute()
+                # Case 4: IGN does not exist. Upsert to create new entry with is_in_hc=TRUE.
+                operation_type = "create_and_activate"
+                print(f"HCVerify: IGN '{ign_to_process}' not found. Creating new active entry...")
+                # Attempt to upsert on discord_id first to handle cases where user changes IGN
+                # If user has an old IGN linked, this will update it.
+                # If user has no entry, it will create one.
+                await run_supabase_sync(
+                    lambda: supabase.table("hc_members")
+                                   .upsert(current_user_data, on_conflict="discord_id")
+                                   .execute()
                 )
-                result_summary.append(f"💾 IGN Stored/Updated: `{discord.utils.escape_markdown(ign_to_process)}`")
-                log_summary.append("Supabase upsert OK (new/updated user link)")
+                result_summary.append(f"💾 IGN Stored & Activated: `{discord.utils.escape_markdown(ign_to_process)}`.")
+                log_summary.append("Supabase upsert OK (new/updated user link, set is_in_hc=TRUE)")
                 db_success = True
-
+        
         except APIError as e:
             errors_occurred=True
-            err_detail=f"API Error ({e.code or 'N/A'}): {e.message or 'Unknown'}"
-            result_summary.append(f"⚠️ DB Error during {operation_type}: {err_detail}")
-            log_summary.append(f"DB {operation_type} fail: {e}")
+            # Check for unique constraint violation specifically on ingame_name if discord_id upsert strategy changes
+            # For now, general API error handling is fine.
+            if "unique constraint" in str(e.message).lower() and "hc_members_ingame_name_key" in str(e.message).lower() and operation_type == "create_and_activate":
+                 # This might happen if user existed with different discord_id but same IGN
+                 err_detail=f"IGN Conflict: '{ign_to_process}' might already exist under a different Discord ID."
+                 result_summary.append(f"⚠️ DB Error: {err_detail}")
+                 log_summary.append(f"DB upsert fail: Potential IGN Unique Conflict on create for {ign_to_process}")
+            else:
+                err_detail=f"API Error ({e.code or 'N/A'}): {e.message or 'Unknown'}"
+                result_summary.append(f"⚠️ DB Error during {operation_type}: {err_detail}")
+                log_summary.append(f"DB {operation_type} fail: {e}")
             await log_error(guild, f"HCVerify DB {operation_type} fail (APIError)", error=e, interaction=interaction)
         except Exception as e:
             errors_occurred=True
@@ -3678,68 +4335,49 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
          print(f"HCVerify: Triggering list update for {user.name} (HC role added: {role_hc in roles_to_add_final}, DB success: {db_success}).")
          asyncio.create_task(update_static_list_message(guild))
 
-# --- New HCLeave Command (MODIFIED: Includes Role Changes if Discord ID found) ---
-@tree.command(name="hcleave", description="Remove member from HC database by IGN & update roles if linked.") # MODIFIED Description
+# --- New HCLeave Command (MODIFIED: Sets is_in_hc=FALSE, includes Role Changes) ---
+@tree.command(name="hcleave", description="Mark member as not in HC (sets is_in_hc=false) & update roles.") # MODIFIED Description
 @app_commands.describe(
-    ingame_name="The IGN to remove from the database."
+    ingame_name="The IGN to mark as not in HC."
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True) # User needs permission to trigger potential role changes
-@app_commands.checks.bot_has_permissions(manage_roles=True) # Bot needs permission to manage roles
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.checks.bot_has_permissions(manage_roles=True)
 async def hcleave(interaction: discord.Interaction, ingame_name: str):
-    """Removes HC database entry based on IGN and handles linked user roles."""
+    """Marks a member as not in HC in the database and handles linked user roles."""
     guild = interaction.guild
     if not await check_supabase_available(interaction):
-        try: # Attempt cleanup if deferred
+        try:
             if interaction.response.is_done(): await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
         except (discord.NotFound, discord.HTTPException): pass
         return
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
-    if not supabase:
+    if not supabase: # Should be caught by check_supabase_available
         await interaction.response.send_message("❌ Database connection unavailable.", ephemeral=False)
         await log_error(guild, "hcleave failed: Supabase unavailable.", interaction=interaction)
         return
 
-    # Defer publicly as it might involve visible role changes
     await interaction.response.defer(thinking=True, ephemeral=False)
 
-    # --- Role Setup ---
     role_hc = guild.get_role(HC1_ROLE_ID)
     role_maybe_exhc = guild.get_role(EX_MEMBER_ROLE_ID)
     bot_member = guild.me
 
-    # --- Role Existence Checks ---
-    critical_roles_found = True
-    missing_roles_log = []
-    if not role_hc:
-        critical_roles_found = False
-        missing_roles_log.append(f"HC Role ({HC1_ROLE_ID})")
-        print(f"hcleave Warning ({guild.name}): HC Role {HC1_ROLE_ID} not found.")
-    if not role_maybe_exhc:
-        # Not strictly critical for DB delete, but needed for role add
-        # Consider if this should prevent the command entirely or just the role part
-        # For now, let it proceed but log warning
-        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role {EX_MEMBER_ROLE_ID} not found.")
-        # If Maybe-ExHC MUST be added, uncomment below:
-        # critical_roles_found = False
-        # missing_roles_log.append(f"Maybe-ExHC Role ({EX_MEMBER_ROLE_ID})")
-
-    # Stop if critical HC role is missing
     if not role_hc:
         msg = f"❌ Setup Error: HC Role (ID: {HC1_ROLE_ID}) not found. Cannot perform role actions."
         await interaction.followup.send(msg, ephemeral=False)
         await log_error(guild, f"hcleave failed: Missing critical HC role {HC1_ROLE_ID}", interaction=interaction)
         return
+    if not role_maybe_exhc:
+        print(f"hcleave Warning ({guild.name}): Maybe-ExHC Role {EX_MEMBER_ROLE_ID} not found. Will skip adding it.")
 
-    # --- Prepare for actions ---
     log_summary = []
     result_summary = []
     errors_occurred = False
-    db_removed = False
-    role_changes_attempted = False
-    role_changes_succeeded = False
+    db_updated_to_not_in_hc = False
+    # ... (role change flags remain the same) ...
     hc_role_removed_flag = False
     exhc_role_added_flag = False
     reason = f"HC Leave processed by {interaction.user} (ID: {interaction.user.id})"
@@ -3752,40 +4390,49 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
         await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=False)
         return
 
-    # --- Step 1: Check Database for IGN and potential Discord ID ---
+    # --- Step 1: Check Database for IGN, its discord_id, and is_in_hc status ---
     try:
         print(f"hcleave: Checking DB for entry matching IGN '{cleaned_ign}'...")
         fetch_resp = await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                           .select("discord_id, ingame_name") # Fetch discord_id
+                           .select("discord_id, ingame_name, is_in_hc") # Fetch discord_id and is_in_hc
                            .eq("ingame_name", cleaned_ign)
                            .maybe_single()
                            .execute()
         )
 
-        if fetch_resp and hasattr(fetch_resp, 'data') and fetch_resp.data:
-            found_discord_id = fetch_resp.data.get("discord_id")
-            print(f"hcleave: Found DB entry for '{cleaned_ign}'. Linked Discord ID: {found_discord_id or 'None'}")
-            if found_discord_id:
-                 try:
-                      member_to_modify = guild.get_member(int(found_discord_id))
-                      if member_to_modify:
-                           print(f"hcleave: Found Discord member {member_to_modify} ({found_discord_id}) linked to IGN '{cleaned_ign}'.")
-                      else:
-                           result_summary.append(f"ℹ️ DB entry found for `{cleaned_ign}`, but linked user ID `{found_discord_id}` is not in this server.")
-                           log_summary.append(f"DB fetch OK, linked user {found_discord_id} not found in guild.")
-                 except ValueError:
-                      result_summary.append(f"⚠️ DB data issue: Invalid Discord ID '{found_discord_id}' found for IGN `{cleaned_ign}`.")
-                      log_summary.append(f"DB fetch OK, but invalid Discord ID '{found_discord_id}' found.")
-                      errors_occurred = True
-                      found_discord_id = None # Treat as unlinked if ID is invalid
-        else:
-            print(f"hcleave: No DB entry found matching IGN '{cleaned_ign}'.")
+        db_entry = fetch_resp.data if fetch_resp and hasattr(fetch_resp, 'data') else None
+
+        if not db_entry:
             result_summary.append(f"ℹ️ No database entry found matching {target_identifier_log}.")
             log_summary.append(f"DB check: No match found for {cleaned_ign}")
-            # If no DB entry, send message and stop. Nothing to delete or change roles for.
             await interaction.followup.send(embed=create_embed(title="ℹ️ HC Leave: No Action Needed", description="\n".join(result_summary), color=discord.Color.blue()))
-            return # Exit the command
+            return
+        
+        current_is_in_hc = db_entry.get("is_in_hc")
+        found_discord_id = db_entry.get("discord_id")
+        
+        if current_is_in_hc is False: # Explicitly check for False
+            result_summary.append(f"ℹ️ {target_identifier_log} is already marked as not in HC.")
+            log_summary.append(f"DB check: {cleaned_ign} already is_in_hc=FALSE.")
+            # Optionally, still check roles if a discord_id is linked? For now, exit if already marked.
+            await interaction.followup.send(embed=create_embed(title="ℹ️ HC Leave: No DB Change Needed", description="\n".join(result_summary), color=discord.Color.blue()))
+            return
+
+        print(f"hcleave: Found DB entry for '{cleaned_ign}'. Linked Discord ID: {found_discord_id or 'None'}, is_in_hc: {current_is_in_hc}.")
+        if found_discord_id:
+             try:
+                  member_to_modify = guild.get_member(int(found_discord_id))
+                  if member_to_modify:
+                       print(f"hcleave: Found Discord member {member_to_modify} ({found_discord_id}) linked to IGN '{cleaned_ign}'.")
+                  else:
+                       result_summary.append(f"ℹ️ DB entry indicates user ID `{found_discord_id}` for `{cleaned_ign}`, but user is not in this server. Will only update DB status.")
+                       log_summary.append(f"DB fetch OK for {cleaned_ign}, linked user {found_discord_id} not found in guild.")
+             except ValueError:
+                  result_summary.append(f"⚠️ DB data issue: Invalid Discord ID '{found_discord_id}' found for IGN `{cleaned_ign}`. Will only update DB status based on IGN.")
+                  log_summary.append(f"DB fetch OK for {cleaned_ign}, but invalid Discord ID '{found_discord_id}' found.")
+                  errors_occurred = True # Log as an error but proceed with DB update on IGN
+                  found_discord_id = None # Treat as unlinked if ID is invalid for role changes
 
     except (APIError, ConnectionError, Exception) as e:
         errors_occurred = True
@@ -3793,11 +4440,39 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
         log_summary.append(f"DB check fail: {type(e).__name__}")
         await log_error(guild, f"hcleave DB check error for {cleaned_ign}", error=e, interaction=interaction)
         await interaction.followup.send(embed=create_embed(title="❌ HC Leave Failed", description="\n".join(result_summary), color=discord.Color.red()))
-        return # Exit command on DB check failure
+        return
 
-    # --- Step 2: Attempt Role Changes (if member found) ---
-    if member_to_modify and role_hc: # Ensure member and HC role objects exist
-        role_changes_attempted = True
+    # --- Step 2: Update Database: Set is_in_hc = FALSE ---
+    try:
+        print(f"hcleave: Attempting to set is_in_hc=FALSE for IGN '{cleaned_ign}'...")
+        update_result = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .update({"is_in_hc": False})
+                           .eq("ingame_name", cleaned_ign) # Match by IGN
+                           .eq("is_in_hc", True) # Ensure we only update if currently true (safety)
+                           .execute()
+        )
+        if update_result and hasattr(update_result, 'data') and update_result.data:
+             db_updated_to_not_in_hc = True
+             result_summary.append(f"💾 Database: {target_identifier_log} marked as no longer in HC.")
+             log_summary.append(f"DB update OK: {cleaned_ign} set to is_in_hc=FALSE")
+        else:
+             # This might happen if the is_in_hc was already false (should be caught above) or another issue.
+             result_summary.append(f"ℹ️ Database: No update made for {target_identifier_log} (possibly already marked, or no match).")
+             log_summary.append(f"DB update: No rows affected for {cleaned_ign} (is_in_hc=FALSE).")
+             # If this happens unexpectedly, it might be an error.
+             # For now, treat as info, but consider if it should be an error.
+    except (APIError, ConnectionError, Exception) as e:
+        errors_occurred = True
+        result_summary.append(f"⚠️ DB Error updating {target_identifier_log} to not in HC: {getattr(e, 'message', type(e).__name__)}")
+        log_summary.append(f"DB update fail (is_in_hc=FALSE): {type(e).__name__}")
+        await log_error(guild, f"hcleave DB update error for {cleaned_ign}", error=e, interaction=interaction)
+        # Continue to attempt role changes if member_to_modify exists, as roles might still need fixing.
+
+    # --- Step 3: Attempt Role Changes (if member found and HC role exists) ---
+    if member_to_modify and role_hc: # role_hc existence already checked
+        # ... (Keep existing role change logic exactly as is from previous version) ...
+        # ... This includes hierarchy checks, adding/removing roles, appending to result_summary and log_summary ...
         can_manage_member = bot_member.top_role.position > member_to_modify.top_role.position
         can_remove_hc = bot_member.top_role.position > role_hc.position
         can_add_exhc = role_maybe_exhc and (bot_member.top_role.position > role_maybe_exhc.position)
@@ -3807,78 +4482,61 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
             result_summary.append(f"⚠️ Role Skipped: Bot hierarchy too low to manage {member_to_modify.mention}.")
             log_summary.append(f"Role change skipped (Bot hierarchy vs member {member_to_modify.id})")
         elif not (role_hc in member_to_modify.roles):
-            result_summary.append(f"ℹ️ Role Info: {member_to_modify.mention} did not have the `{role_hc.name}` role.")
+            result_summary.append(f"ℹ️ Role Info: {member_to_modify.mention} did not have the `{role_hc.name}` role to remove.")
             log_summary.append(f"Role removal skipped ({member_to_modify.id} didn't have HC role)")
-        else:
-            roles_to_remove = []
-            roles_to_add = []
+            # Still attempt to add ExHC role if applicable
+            if role_maybe_exhc and can_add_exhc and role_maybe_exhc not in member_to_modify.roles:
+                try:
+                    await member_to_modify.add_roles(role_maybe_exhc, reason=reason + " (Ex-HC role addition)")
+                    exhc_role_added_flag = True
+                    result_summary.append(f"➕ Role Added: `{role_maybe_exhc.name}` to {member_to_modify.mention}.")
+                    log_summary.append(f"Ex-HC role added for {member_to_modify.id} as they lacked HC role.")
+                except Exception as e_exhc:
+                    errors_occurred = True; result_summary.append(f"⚠️ Role Error: Failed to add `{role_maybe_exhc.name}` to {member_to_modify.mention}."); log_summary.append(f"Ex-HC role add fail: {type(e_exhc).__name__}"); await log_error(guild, f"hcleave Ex-HC role add failed for {member_to_modify.id}", error=e_exhc)
+        else: # Has HC role and bot can manage member
+            roles_to_remove_list = []
+            roles_to_add_list = []
 
             if can_remove_hc:
-                roles_to_remove.append(role_hc)
-            else:
+                roles_to_remove_list.append(role_hc)
+            else: # Should not happen if can_manage_member is true and role_hc is below member top_role, but defensive
                 errors_occurred = True
-                result_summary.append(f"⚠️ Role Skipped: Bot hierarchy too low to remove `{role_hc.name}`.")
-                log_summary.append(f"Role removal skipped (Bot hierarchy vs HC role)")
+                result_summary.append(f"⚠️ Role Skipped: Bot hierarchy too low to remove `{role_hc.name}` from {member_to_modify.mention}.")
+                log_summary.append(f"Role removal skipped (Bot hierarchy vs HC role for {member_to_modify.id})")
 
-            if role_maybe_exhc: # Only attempt add if the role exists
+            if role_maybe_exhc:
                 if can_add_exhc:
                     if role_maybe_exhc not in member_to_modify.roles:
-                         roles_to_add.append(role_maybe_exhc)
+                         roles_to_add_list.append(role_maybe_exhc)
                 else:
-                    # Don't mark as error, just log inability to add maybe_exhc
-                    result_summary.append(f"ℹ️ Role Info: Bot hierarchy too low to add `{role_maybe_exhc.name}`.")
-                    log_summary.append(f"Role add skipped (Bot hierarchy vs Maybe-ExHC role)")
+                    result_summary.append(f"ℹ️ Role Info: Bot hierarchy too low to add `{role_maybe_exhc.name}` to {member_to_modify.mention}.")
+                    log_summary.append(f"Role add skipped (Bot hierarchy vs Maybe-ExHC role for {member_to_modify.id})")
 
-            if roles_to_remove or roles_to_add:
+            if roles_to_remove_list or roles_to_add_list:
                 try:
-                    current_roles = member_to_modify.roles
-                    final_role_set = [r for r in current_roles if r not in roles_to_remove] + roles_to_add
-                    final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] # Ensure @everyone isn't duplicated
+                    # Use user.edit for atomicity if possible (requires fetching current roles and constructing new set)
+                    current_roles = list(member_to_modify.roles)
+                    final_role_set = [r for r in current_roles if r not in roles_to_remove_list] + roles_to_add_list
+                    final_role_set = [r for r in final_role_set if r.id != guild.default_role.id]
 
                     await member_to_modify.edit(roles=final_role_set, reason=reason)
-                    role_changes_succeeded = True
-                    if role_hc in roles_to_remove:
+                    # role_changes_succeeded = True # Not used directly for now
+                    if role_hc in roles_to_remove_list:
                          hc_role_removed_flag = True
                          result_summary.append(f"➖ Role Removed: `{role_hc.name}` from {member_to_modify.mention}.")
-                    if role_maybe_exhc in roles_to_add:
+                    if role_maybe_exhc in roles_to_add_list:
                          exhc_role_added_flag = True
                          result_summary.append(f"➕ Role Added: `{role_maybe_exhc.name}` to {member_to_modify.mention}.")
-                    log_summary.append(f"Role update successful for {member_to_modify.id}. Removed: {hc_role_removed_flag}, Added ExHC: {exhc_role_added_flag}")
+                    log_summary.append(f"Role update successful for {member_to_modify.id}. Removed HC: {hc_role_removed_flag}, Added ExHC: {exhc_role_added_flag}")
                 except discord.Forbidden: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Permissions error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: Forbidden for {member_to_modify.id}"); await log_error(guild, f"hcleave role update Forbidden for {member_to_modify.id}", interaction=interaction)
                 except discord.HTTPException as e: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Discord API Error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: HTTP {e.status} for {member_to_modify.id}"); await log_error(guild, f"hcleave role update HTTP for {member_to_modify.id}", error=e, interaction=interaction)
                 except Exception as e: errors_occurred = True; result_summary.append(f"⚠️ Role Error: Unknown error updating {member_to_modify.mention}."); log_summary.append(f"Role update fail: {type(e).__name__} for {member_to_modify.id}"); await log_error(guild, f"hcleave role update unexpected error for {member_to_modify.id}", error=e, interaction=interaction)
 
-    # --- Step 3: Database Deletion (if entry was found initially) ---
-    # This runs regardless of role change success, as long as DB entry was found.
-    try:
-        print(f"hcleave: Attempting to delete DB entry matching IGN '{cleaned_ign}'...")
-        delete_result = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
-                           .delete()
-                           .eq("ingame_name", cleaned_ign) # Match by IGN
-                           .execute()
-        )
-        # Check if deletion happened based on response data
-        if delete_result and hasattr(delete_result, 'data') and delete_result.data:
-             db_removed = True
-             result_summary.append(f"🗑️ Database entry removed for {target_identifier_log}.")
-             log_summary.append(f"DB entry delete OK for {cleaned_ign}")
-        else:
-             # This case *shouldn't* happen if we found the entry earlier, but handle defensively
-             result_summary.append(f"ℹ️ Database entry for {target_identifier_log} seems to have disappeared before deletion.")
-             log_summary.append(f"DB entry delete: No match found (unexpected) for {cleaned_ign}")
-             # Consider setting errors_occurred=True here if this is unexpected
-    except (APIError, ConnectionError, Exception) as e:
-        errors_occurred = True
-        result_summary.append(f"⚠️ DB Error removing {target_identifier_log}: {getattr(e, 'message', type(e).__name__)}")
-        log_summary.append(f"DB delete fail: {type(e).__name__}")
-        await log_error(guild, f"hcleave DB delete error for {cleaned_ign}", error=e, interaction=interaction)
-
     # --- Final Response & Logging ---
-    final_color = discord.Color.green() if not errors_occurred else discord.Color.orange()
-    final_title = f"{'✅' if not errors_occurred else '⚠️'} HC Leave Processed: {target_identifier_log}"
+    final_color = discord.Color.green() if not errors_occurred and db_updated_to_not_in_hc else discord.Color.orange()
+    final_title = f"{'✅' if not errors_occurred and db_updated_to_not_in_hc else '⚠️'} HC Leave Processed: {target_identifier_log}"
     if errors_occurred: final_title += " (with issues/skips)"
-    if not result_summary: result_summary.append("ℹ️ No specific actions were performed or needed (check logs).") # Fallback if logic somehow leads here
+    if not result_summary: result_summary.append("ℹ️ No specific actions were performed or needed (check logs).")
 
     final_embed = create_embed(title=final_title, description="\n".join(result_summary), color=final_color)
     try:
@@ -3888,9 +4546,9 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
 
     await log_info(guild, f"`{interaction.user}` processed /hcleave for {target_identifier_log}. Summary: {'; '.join(log_summary)}.")
 
-    # Trigger list update ONLY if DB entry was successfully removed
-    if db_removed:
-        print(f"hcleave: Triggering list update for {target_identifier_log} (DB removed: {db_removed}).")
+    # Trigger list update if DB status was successfully changed from TRUE to FALSE
+    if db_updated_to_not_in_hc:
+        print(f"hcleave: Triggering list update for {target_identifier_log} (DB updated is_in_hc=FALSE).")
         asyncio.create_task(update_static_list_message(guild))
 
 @tree.command(name="hconly", description="Register an HC member by IGN only (no Discord link).")
@@ -3924,19 +4582,63 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
         return
 
     try:
-        # Prepare data for insertion, explicitly setting discord_id and discord_name to None
+        # Prepare data for insertion, explicitly setting discord_id and discord_name to None, and is_in_hc to TRUE
         data_to_insert = {
             "ingame_name": cleaned_ign,
             "discord_id": None,
-            "discord_name": None # Keep consistency, set to None as well
+            "discord_name": None,
+            "is_in_hc": True # Explicitly set to TRUE
         }
 
-        # Attempt to insert the new record
-        insert_result = await run_supabase_sync(
+        # Attempt to insert the new record.
+        # If an IGN already exists (unique constraint on ingame_name), this will fail.
+        # We want to ensure that if it exists but is_in_hc=FALSE, we update it.
+        # So, we'll try an upsert strategy.
+        # The DB default for is_in_hc is TRUE, so insert alone would work for new entries.
+        # But to handle re-activating an IGN-only entry, upsert is better.
+        
+        # Check if IGN already exists
+        existing_entry_resp = await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                           .insert(data_to_insert)
+                           .select("ingame_name, is_in_hc")
+                           .eq("ingame_name", cleaned_ign)
+                           .maybe_single()
                            .execute()
         )
+        existing_entry = existing_entry_resp.data if existing_entry_resp and hasattr(existing_entry_resp, 'data') else None
+
+        if existing_entry:
+            if existing_entry.get("is_in_hc") is True:
+                # Already exists and is in HC
+                success_msg = f"ℹ️ **{discord.utils.escape_markdown(cleaned_ign)}** (IGN only) is already registered and marked as in HC."
+                await interaction.followup.send(success_msg, ephemeral=False)
+                await log_info(guild, f"`{interaction.user}` used /hconly for IGN: `{cleaned_ign}` (already exists and active).")
+                # No list update needed if no change
+                return # Exit command
+            else:
+                # Exists but is_in_hc is False, so update it
+                print(f"HCOnly: IGN '{cleaned_ign}' found with is_in_hc=FALSE. Updating to TRUE.")
+                await run_supabase_sync(
+                    lambda: supabase.table("hc_members")
+                                   .update({"is_in_hc": True, "discord_id": None, "discord_name": None}) # Ensure discord parts are Null
+                                   .eq("ingame_name", cleaned_ign)
+                                   .execute()
+                )
+                success_msg = f"✅ Reactivated **{discord.utils.escape_markdown(cleaned_ign)}** (IGN only) in the database."
+                log_action = "reactivated IGN (was is_in_hc=FALSE)"
+        else:
+            # Does not exist, insert new
+            print(f"HCOnly: IGN '{cleaned_ign}' not found. Inserting new entry.")
+            await run_supabase_sync(
+                lambda: supabase.table("hc_members")
+                               .insert(data_to_insert)
+                               .execute()
+            )
+            success_msg = f"✅ Successfully registered **{discord.utils.escape_markdown(cleaned_ign)}** (IGN only) in the database."
+            log_action = "registered new IGN"
+
+        await interaction.followup.send(success_msg, ephemeral=False)
+        await log_info(guild, f"`{interaction.user}` used /hconly to {log_action}: `{cleaned_ign}`.")
 
         # Check if insert was successful (basic check, Supabase client might evolve)
         # Typically, if no exception is raised, it's considered successful for basic inserts.
@@ -4258,6 +4960,169 @@ async def hcmembers(interaction: discord.Interaction):
         await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction, ping_owner=True)
         try: await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
         except (discord.NotFound, discord.HTTPException): pass
+
+# Replace the /profile command with this new version
+
+@tree.command(name="profile", description="View Florr.io [HC1] profile, activity stats, and recent activity patterns.")
+@app_commands.describe(
+    user="[Optional] Select a Discord user to view their profile.",
+    ingame_name="[Optional] Or, type an In-Game Name to view its profile."
+)
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+async def profile(interaction: discord.Interaction, 
+                  user: Optional[discord.Member] = None, 
+                  ingame_name: Optional[str] = None):
+    guild = interaction.guild
+    
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    if not await check_supabase_available(interaction):
+        await interaction.edit_original_response(content="❌ Database connection unavailable. Cannot fetch profile data.", embed=None, view=None)
+        return
+
+    # --- Determine Target and Fetch Base HC Profile Data ---
+    # ... (This large block of target determination logic remains UNCHANGED from your last working version) ...
+    # // --- UNCHANGED SECTION (Profile Target Determination) --- //
+    target_user_for_display: discord.User 
+    hc_profile_db_data: Optional[Dict[str, Any]] = None 
+    target_discord_id_str: Optional[str] = None
+    target_ign_from_db: Optional[str] = None 
+    target_is_self_profile = False
+    error_message_for_user: Optional[str] = None
+    if user: 
+        target_user_for_display = user
+        target_discord_id_str = str(user.id)
+        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
+        if hc_profile_db_data:
+            target_ign_from_db = hc_profile_db_data.get("ingame_name")
+        if user.id == interaction.user.id:
+            target_is_self_profile = True
+    elif ingame_name: 
+        cleaned_ign_param = ingame_name.strip()
+        if not cleaned_ign_param:
+            error_message_for_user = "❌ Provided In-Game Name was empty."
+        else:
+            hc_profile_db_data = await fetch_profile_details_by_ign(guild, cleaned_ign_param)
+            if hc_profile_db_data:
+                target_ign_from_db = hc_profile_db_data["ingame_name"] 
+                target_discord_id_str = hc_profile_db_data.get("discord_id")
+                if target_discord_id_str and guild:
+                    try:
+                        target_user_for_display = await guild.fetch_member(int(target_discord_id_str))
+                    except (discord.NotFound, ValueError, AttributeError):
+                        target_user_for_display = bot.user 
+                elif target_discord_id_str: 
+                    target_user_for_display = bot.user 
+                else: 
+                    target_user_for_display = bot.user 
+                if target_discord_id_str and target_discord_id_str == str(interaction.user.id):
+                    target_is_self_profile = True
+                    if isinstance(interaction.user, (discord.Member, discord.User)):
+                         target_user_for_display = interaction.user 
+            else:
+                error_message_for_user = f"❌ No profile data found for IGN `{discord.utils.escape_markdown(cleaned_ign_param)}`."
+    else: 
+        target_is_self_profile = True
+        target_user_for_display = interaction.user 
+        target_discord_id_str = str(interaction.user.id)
+        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
+        if hc_profile_db_data:
+            target_ign_from_db = hc_profile_db_data.get("ingame_name")
+    if error_message_for_user:
+        await interaction.edit_original_response(content=error_message_for_user, embed=None, view=None)
+        return
+    if not target_is_self_profile:
+        invoker_is_staff_or_owner = False
+        if guild and isinstance(interaction.user, discord.Member):
+            invoker_is_staff_or_owner = await can_manage_guild_or_is_bypass_user(interaction)
+        if not invoker_is_staff_or_owner:
+            await interaction.edit_original_response(content="❌ You can only view your own profile or require staff permissions to view others'.", embed=None, view=None)
+            return
+    display_name_for_view: str
+    avatar_url_for_view: Optional[str] = None
+    mention_or_status_for_view: str
+    if isinstance(target_user_for_display, (discord.Member, discord.User)):
+        display_name_for_view = target_user_for_display.display_name
+        avatar_url_for_view = target_user_for_display.display_avatar.url if target_user_for_display.display_avatar else target_user_for_display.default_avatar.url
+        mention_or_status_for_view = target_user_for_display.mention
+    elif hc_profile_db_data and hc_profile_db_data.get("ingame_name"): 
+        display_name_for_view = hc_profile_db_data.get("ingame_name") 
+        if bot.user and bot.user.display_avatar : avatar_url_for_view = bot.user.display_avatar.url 
+        db_disc_name = hc_profile_db_data.get("discord_name")
+        db_disc_id = hc_profile_db_data.get("discord_id")
+        if db_disc_id:
+            mention_or_status_for_view = f"`{discord.utils.escape_markdown(db_disc_name or f'ID: {db_disc_id}')}` (Info from DB)"
+        else:
+            mention_or_status_for_view = "`Not Linked to Discord`"
+    else: 
+        await interaction.edit_original_response(content="❌ Critical error: Could not determine target for profile display.", embed=None, view=None)
+        return
+    target_user_display_data_for_view = {
+        "name": display_name_for_view,
+        "avatar_url": avatar_url_for_view,
+        "mention_or_status": mention_or_status_for_view
+    }
+    # // --- END UNCHANGED SECTION (Profile Target Determination) --- //
+
+    activity_summary_for_view: Optional[Dict[str, Any]] = None
+    # REMOVED weekly_active_dates_for_view
+    initial_monthly_dates_for_view: Set[datetime.date] = set()
+    today_utc_obj, _ = get_utc_date()
+
+    if target_ign_from_db and today_utc_obj:
+        ign_lower = target_ign_from_db.lower()
+        
+        is_active_today = await check_activity_exists(guild, ign_lower, today_utc_obj)
+        active_today_disp = "❔ `N/A (DB Error)`"
+        if is_active_today is True: active_today_disp = "✅ `Yes`" # Using standard emoji here
+        elif is_active_today is False: active_today_disp = "❌ `No`" # Using standard emoji here
+        
+        all_time_summary = await fetch_activity_data(guild, [ign_lower])
+        ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
+        
+        activity_summary_for_view = {
+            "active_today_display": active_today_disp,
+            "total_days_logged": ign_all_time_data['count'],
+            "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"
+        }
+        
+        # Fetch active dates for the *current calendar month* for initial display
+        first_day_of_current_month = today_utc_obj.replace(day=1)
+        if today_utc_obj.month == 12:
+            first_day_of_next_month = first_day_of_current_month.replace(year=today_utc_obj.year + 1, month=1)
+        else:
+            first_day_of_next_month = first_day_of_current_month.replace(month=today_utc_obj.month + 1)
+        last_day_of_current_month = first_day_of_next_month - datetime.timedelta(days=1)
+        
+        initial_monthly_dates_for_view = await fetch_activity_dates_in_range(
+            guild, ign_lower, first_day_of_current_month, last_day_of_current_month
+        )
+    
+    if not today_utc_obj:
+        await log_error(guild, "Profile command: Failed to get today's date object.", interaction=interaction)
+
+    profile_view = ProfilePagesView(
+        interaction=interaction,
+        target_user_display_data=target_user_display_data_for_view,
+        hc_profile_data=hc_profile_db_data,
+        activity_summary_data=activity_summary_for_view,
+        initial_monthly_active_dates=initial_monthly_dates_for_view, 
+        today_date_obj=today_utc_obj if today_utc_obj else datetime.date.today() 
+    )
+    
+    initial_embed = profile_view._create_main_embed()
+    
+    try:
+        await interaction.edit_original_response(embed=initial_embed, view=profile_view)
+        profile_view.message = await interaction.original_response()
+    except discord.HTTPException as e_edit_final:
+        # // --- UNCHANGED SECTION (Final Error Handling) --- //
+        if guild: await log_error(guild, "Failed to send initial profile embed with view", error=e_edit_final, interaction=interaction)
+        else: print(f"Failed to send initial profile embed (DM/No Guild): {e_edit_final}")
+        try:
+            await interaction.edit_original_response(content="❌ Error displaying profile. Please try again.", embed=None, view=None)
+        except: pass
+        # // --- END UNCHANGED SECTION (Final Error Handling) --- //
 
 @tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.")
 @app_commands.checks.has_permissions(manage_roles=True)
