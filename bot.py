@@ -6478,6 +6478,50 @@ async def cleanup_bot_messages(interaction: discord.Interaction, count: app_comm
         await interaction.edit_original_response(content=f"❌ An unexpected error occurred: {type(e_unknown_outer).__name__}", view=None)
         await log_error(guild, f"/cleanup_bot_messages: Unexpected outer error.", error=e_unknown_outer, interaction=interaction, ping_owner=True)
 
+@tree.command(name="ping", description="Check the bot's latency to Discord.")
+async def ping(interaction: discord.Interaction):
+    # Defer the response to acknowledge the command immediately
+    # Use ephemeral=False so the "Pinging..." message is visible
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    # 1. WebSocket Latency
+    ws_latency_ms = round(bot.latency * 1000)
+
+    # 2. API Latency (Message Send/Edit)
+    # Send an initial message
+    start_time = discord.utils.utcnow()
+    # We use followup.send() because we deferred with thinking=True
+    # If we used defer(ephemeral=False, thinking=False), we could use edit_original_response
+    # But followup.send() after defer(thinking=True) is also a common pattern for this.
+    # For this specific case, editing the original deferred response is cleaner.
+    
+    # Send a placeholder message to measure edit time
+    message_to_edit = await interaction.edit_original_response(content="Pinging API...")
+    end_time = discord.utils.utcnow()
+
+    api_latency_ms = round((end_time - start_time).total_seconds() * 1000)
+    
+    # Create embed for results
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        color=NERDY_YELLOW # Use your defined color
+    )
+    embed.add_field(name="🤖 Bot Latency (WebSocket)", value=f"`{ws_latency_ms} ms`", inline=False)
+    embed.add_field(name="↔️ API Latency (Message Edit)", value=f"`{api_latency_ms} ms`", inline=False)
+    
+    current_time_formatted = get_formatted_utc_now()
+    embed.set_footer(text=f"Measured at: {current_time_formatted}")
+
+    # Edit the original (deferred) response with the results
+    await interaction.edit_original_response(content=None, embed=embed)
+    
+    # Optional: Log the ping
+    guild = interaction.guild
+    if guild:
+        await log_info(guild, f"/ping by {interaction.user}: WS Latency={ws_latency_ms}ms, API Latency={api_latency_ms}ms")
+    else:
+        print(f"/ping by {interaction.user} (DM): WS Latency={ws_latency_ms}ms, API Latency={api_latency_ms}ms")
+
 # --- Bot Startup ---
 if __name__ == "__main__":
     print("--- Initializing Pingslave Bot ---")
