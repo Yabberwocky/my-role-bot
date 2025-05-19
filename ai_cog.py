@@ -874,6 +874,118 @@ class AICog(commands.Cog):
                 except Exception as e_del:
                     await self.log_error(channel.guild, f"Error deleting temporary webhook for {mob_name} in #{channel.name}", error=e_del, ping_owner=False)
 
+    @app_commands.command(name="aiping", description="Check the API latency of configured AI models.")
+    async def aiping(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=False)
+
+        guild = interaction.guild # For logging context
+        
+        available_models = self.get_all_available_models_details()
+        
+        if not available_models:
+            await interaction.followup.send("⚠️ No AI models are currently configured or available for pinging.", ephemeral=True)
+            await self.log_info(guild, "/aiping: No AI models configured.")
+            return
+
+        embed = discord.Embed(
+            title="🛰️ AI Model Ping Test Results",
+            description="Pinging configured AI models...",
+            color=getattr(self.bot, 'NERDY_YELLOW_config', discord.Color.gold())
+        )
+        embed.timestamp = discord.utils.utcnow()
+
+        # Send initial embed
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except discord.HTTPException:
+            # If interaction expired quickly or other issue
+            await interaction.followup.send(embed=embed)
+
+
+        test_prompt = "Hello! Tell me a one-sentence fun fact about Earth's oceans."
+        results_summary = []
+
+        for model_info in available_models:
+            model_instance = model_info['instance']
+            model_name_display = model_info['name'] # e.g., "Gemini 2.5 Flash (Preview)"
+            model_id_internal = model_info['id']   # e.g., "gemini_2_5_flash"
+            
+            status_emoji = "❓"
+            latency_str = "`N/A`"
+            details_str = ""
+
+            if not model_instance:
+                status_emoji = "❌"
+                details_str = "`Model not initialized/configured.`"
+                results_summary.append(f"{status_emoji} **{model_name_display} ({model_id_internal})**: {details_str}")
+                continue
+
+            print(f"AI Ping: Testing model {model_name_display} ({model_id_internal})...")
+            start_time = datetime.datetime.now(pytz.utc)
+            
+            try:
+                # For a simple text prompt, we can directly pass the string.
+                response = await model_instance.generate_content_async(test_prompt)
+                end_time = datetime.datetime.now(pytz.utc)
+                latency_ms = round((end_time - start_time).total_seconds() * 1000)
+                latency_str = f"`{latency_ms} ms`"
+
+                if response and response.text:
+                    status_emoji = "✅"
+                    details_str = f"Latency: {latency_str}"
+                    print(f"AI Ping Success: {model_name_display} responded in {latency_ms}ms. Text: '{response.text[:50]}...'")
+                elif response and response.prompt_feedback:
+                    status_emoji = "⚠️"
+                    block_reason = getattr(response.prompt_feedback, 'block_reason', 'Unknown Block')
+                    details_str = f"Blocked/Empty (Reason: `{block_reason}`). Latency: {latency_str}"
+                    print(f"AI Ping Warning: {model_name_display} blocked/empty. Reason: {block_reason}. Latency: {latency_ms}ms")
+                else:
+                    status_emoji = "❔"
+                    details_str = f"No response/text. Latency: {latency_str}"
+                    print(f"AI Ping Info: {model_name_display} no response/text. Latency: {latency_ms}ms")
+
+            except google_exceptions.GoogleAPIError as e_api:
+                status_emoji = "🔥"
+                details_str = f"API Error: `{type(e_api).__name__}`"
+                await self.log_error(guild, f"/aiping test failed for {model_name_display}", error=e_api)
+                print(f"AI Ping API Error: {model_name_display} - {e_api}")
+            except Exception as e:
+                status_emoji = "💥"
+                details_str = f"General Error: `{type(e).__name__}`"
+                await self.log_error(guild, f"/aiping test failed for {model_name_display}", error=e, ping_owner=True)
+                print(f"AI Ping General Error: {model_name_display} - {e}")
+            
+            results_summary.append(f"{status_emoji} **{model_name_display}** ({model_id_internal}): {details_str}")
+
+            # Update embed after each model test
+            embed.description = "\n".join(results_summary)
+            try:
+                await interaction.edit_original_response(embed=embed)
+            except discord.HTTPException:
+                # Possible if the interaction token expires during long pings
+                print(f"AI Ping: Failed to update embed for {model_name_display}, interaction might have expired.")
+                pass 
+            
+            await asyncio.sleep(0.5) # Small delay between pings
+
+        final_description = "\n".join(results_summary)
+        if not final_description:
+            final_description = "No models were pinged or an issue occurred."
+        
+        embed.description = final_description
+        embed.add_field(name="Legend", value="✅ Success | ⚠️ Blocked/Empty | 🔥 API Error | 💥 General Error | ❌ Not Configured | ❓ Unknown", inline=False)
+        
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except discord.HTTPException:
+            # Attempt to send a new message if edit fails (e.g., interaction expired)
+            try:
+                await interaction.followup.send(embed=embed)
+            except Exception as e_followup:
+                 await self.log_error(guild, "/aiping final followup send failed", error=e_followup)
+        
+        await self.log_info(guild, f"/aiping executed by {interaction.user}. Results summary logged internally.")
+
 
     def _parse_mob_name(self, filename: str) -> str:
         name = os.path.splitext(filename)[0]
