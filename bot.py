@@ -892,12 +892,14 @@ class HelpPagesView(discord.ui.View):
         embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('profile')} · View your [HC1] profile and activity.", value="\u200B", inline=False)
         embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
         embed.add_field(name="\u200B\n💬 Messaging", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
@@ -922,6 +924,8 @@ class HelpPagesView(discord.ui.View):
         embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync all HC nicks. `[Manage Nicks]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('aiping')} · Check AI model latencies. `[Owner Only]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages. `[Owner Only]`", value="\u200B", inline=False)
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
