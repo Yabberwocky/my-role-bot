@@ -163,6 +163,7 @@ import aiohttp
 import contextlib
 import difflib
 
+
 # --- Configuration ---
 load_dotenv()  # harmless in production; only loads if a .env file exists
 MAIN_TOKEN = os.getenv("MAIN_DISCORD_BOT_TOKEN")
@@ -250,141 +251,6 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
-
-@bot.event
-async def on_automod_action_execution(event: discord.AutoModActionExecutionEvent):
-    # Only proceed if it's a message block action in a guild
-    if not isinstance(event.action, discord.AutoModBlockMessageAction) or not event.guild:
-        return
-
-    # Check if the matched keyword is the one we're interested in
-    # Using ZORR_PRO_AUTOMOD_KEYWORD_REGEX to match the exact string from the image.
-    # If your AutoMod rule uses a simpler keyword like "zorr", change this check accordingly.
-    # Example: if "zorr" in (event.matched_keyword or "").lower() or "zorr" in (event.matched_content or "").lower():
-    if event.matched_keyword != ZORR_PRO_AUTOMOD_KEYWORD_REGEX:
-        return
-
-    # Ensure we have the necessary member and channel information
-    if not event.member or not event.channel or not isinstance(event.channel, discord.TextChannel):
-        await log_error(event.guild, "AutoMod Relay: Missing member or original channel context.", message_context=None) # No direct message context
-        return
-
-    original_channel = event.channel
-    user_who_was_blocked = event.member
-    blocked_content = event.content
-    
-    # Get the designated channel for zorr.pro discussions
-    designated_channel = event.guild.get_channel(ZORR_PRO_DESIGNATED_CHANNEL_ID)
-    if not isinstance(designated_channel, discord.TextChannel):
-        await log_error(event.guild, f"AutoMod Relay: Designated zorr.pro channel (ID: {ZORR_PRO_DESIGNATED_CHANNEL_ID}) not found or not a text channel.", ping_owner=True)
-        # Optionally, notify user in original channel that redirection failed
-        try:
-            await original_channel.send(
-                f"{user_who_was_blocked.mention}, your message was blocked by AutoMod. "
-                f"I tried to redirect it, but the designated channel is misconfigured. Please contact an admin."
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    # 1. Notify user in the original channel
-    notification_message = (
-        f"{user_who_was_blocked.mention}, your message in {original_channel.mention} was blocked by AutoMod "
-        f"because it seemed related to `zorr.pro`.\n\n"
-        f"Please continue discussions about `zorr.pro` in {designated_channel.mention}.\n"
-        f"I will try my best to re-initiate your conversation there for you."
-    )
-    try:
-        await original_channel.send(notification_message)
-    except discord.HTTPException as e:
-        await log_error(event.guild, f"AutoMod Relay: Failed to send notification to original channel {original_channel.mention}", error=e)
-        # Don't stop; still try to relay the message
-
-    # 2. Prepare attachments for relay
-    relayed_files: List[discord.File] = []
-    if event.attachments:
-        for attachment in event.attachments:
-            try:
-                # Ensure file size is within limits (e.g., 8MB for webhooks, Discord's general limits)
-                # attachment.to_file() will raise if file too large for what Discord allows bots usually
-                if attachment.size < 25 * 1024 * 1024: # Check against Discord's typical bot file size limit (25MB)
-                    relayed_files.append(await attachment.to_file())
-                else:
-                    await log_info(event.guild, f"AutoMod Relay: Attachment '{attachment.filename}' too large ({attachment.size} bytes) to relay for {user_who_was_blocked.name}.")
-                    # Optionally inform user in designated_channel or original_channel about skipped large attachment
-                    try: await designated_channel.send(f"*(Note: An attachment from {user_who_was_blocked.mention}'s original message was too large to be relayed.)*")
-                    except: pass
-            except discord.HTTPException as e_att:
-                await log_error(event.guild, f"AutoMod Relay: Failed to convert attachment '{attachment.filename}' for relay.", error=e_att)
-            except Exception as e_att_other: # Catch any other error like file too large for bot
-                 await log_error(event.guild, f"AutoMod Relay: General error processing attachment '{attachment.filename}' for relay.", error=e_att_other)
-
-
-    # 3. Relay the message to the designated channel
-    await _send_message_via_webhook(
-        target_channel=designated_channel,
-        user_to_imitate=user_who_was_blocked,
-        content=blocked_content,
-        files=relayed_files,
-        guild_for_log=event.guild
-    )
-
-async def _send_message_via_webhook(
-    target_channel: discord.TextChannel,
-    user_to_imitate: discord.Member,
-    content: str,
-    files: Optional[List[discord.File]] = None,
-    guild_for_log: Optional[discord.Guild] = None  # For logging
-):
-    """Sends a message via a temporary webhook, imitating the specified user."""
-    if not target_channel:
-        if guild_for_log: await log_error(guild_for_log, "AutoMod Relay failed: Target channel is None.")
-        return
-
-    avatar_bytes: Optional[bytes] = None
-    # Use existing fetch_avatar_bytes if available, or inline logic
-    async with aiohttp.ClientSession() as session:
-        avatar_url_to_fetch = user_to_imitate.display_avatar.url if user_to_imitate.display_avatar else user_to_imitate.default_avatar.url
-        avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch) # Assumes fetch_avatar_bytes is defined
-
-    temp_webhook: Optional[discord.Webhook] = None
-    try:
-        webhook_name = user_to_imitate.display_name[:80]
-        disallowed_in_names = ["@", "#", ":", "```", "discord"] # Discord webhook name restrictions
-        if any(disallowed in webhook_name.lower() for disallowed in disallowed_in_names) or webhook_name.lower() == "clyde":
-             webhook_name = f"{user_to_imitate.name}'s Post" # Fallback if display name is problematic
-
-        temp_webhook = await target_channel.create_webhook(
-            name=webhook_name,
-            avatar=avatar_bytes, # Can be None, Discord will use default
-            reason=f"AutoMod Relay for {user_to_imitate.name} ({user_to_imitate.id})"
-        )
-        
-        # Ensure content is not empty for webhook, Discord API requires it.
-        # If original content was only an attachment, webhook needs some text.
-        effective_content = content if content and content.strip() else f"*(Message originally by {user_to_imitate.display_name}, contained attachments only)*"
-        if len(effective_content) > 2000: effective_content = effective_content[:1997] + "..."
-
-        await temp_webhook.send(
-            content=effective_content, 
-            files=files or [], 
-            wait=True,
-            allowed_mentions=discord.AllowedMentions.none() # Prevent pings from relayed message
-        )
-        if guild_for_log:
-            await log_info(guild_for_log, f"Successfully relayed AutoMod-blocked message for {user_to_imitate.mention} to {target_channel.mention}.")
-    except discord.Forbidden:
-        if guild_for_log: await log_error(guild_for_log, f"AutoMod Relay failed (Forbidden - check Manage Webhooks & Send Messages perms) for {user_to_imitate.name} in {target_channel.mention}.")
-    except discord.HTTPException as e:
-        if guild_for_log: await log_error(guild_for_log, f"AutoMod Relay failed (HTTP Error {e.status}) for {user_to_imitate.name} in {target_channel.mention}", error=e)
-    except Exception as e:
-        if guild_for_log: await log_error(guild_for_log, f"AutoMod Relay failed (Unexpected Error) for {user_to_imitate.name} in {target_channel.mention}", error=e, ping_owner=True)
-    finally:
-        if temp_webhook:
-            try:
-                await temp_webhook.delete(reason="AutoMod Relay cleanup")
-            except Exception as e_del:
-                if guild_for_log: await log_error(guild_for_log, f"Failed to delete AutoMod Relay webhook (ID: {temp_webhook.id})", error=e_del)
 
 class SuperAttemptButton(discord.ui.Button):
     """Base class for super attempt related buttons for easier type hinting."""
