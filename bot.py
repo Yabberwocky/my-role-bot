@@ -6392,6 +6392,7 @@ async def on_message(message: discord.Message):
     if message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and \
        message.type == discord.MessageType.auto_moderation_action and \
        message.embeds: # AutoMod action messages have an embed with details
+        embed = message.embeds[0]
 
         # --- Extract Information from Embed ---
         original_message_content = embed.description
