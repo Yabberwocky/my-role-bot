@@ -213,7 +213,7 @@ PROFILE_PIC_BASE_PATH = "" # Will be set in on_ready to the script's directory
 ALWAYS_ON_AI_CHANNELS = {1330664430148780102, 1364657218175107162} # Channels for AI to respond to every message
 RARITY_PREFIXES = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "ultra", "super", "unique"]
 DISABLE_STATIC_LIST_FOR_TESTING_INSTANCE = (BOT_INSTANCE_TYPE == "TESTING")
-PETAL_ABBREVIATIONS = {"ygg": "yggdrasil", "begg": "beetle egg", "beggs": "beetle egg"}
+PETAL_ABBREVIATIONS = {"ygg": "yggdrasil", "begg": "beetle egg", "beggs": "beetle egg", "pinger": "stinger", "binger": "blood stinger", "minger": "magic stinger"}
 SUPER_ATTEMPT_CHANNEL_ID = 1303267777284673566 # Channel for super attempt logging
 ZORR_PRO_DESIGNATED_CHANNEL_ID = 1236340209239724115
 ZORR_PRO_AUTOMOD_KEYWORD_REGEX = r"(?:(?:z\s*[o0]\s*r(?:\s*r)*)|(?:z\s*[o0]\s*r(?:\s*r)*\s*\.\s*p\s*r\s*[o0])|(?:z\s*[o0]\s*r(?:\s*r)*\s*p\s*r\s*[o0])|(?:r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*\.\s*r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*r(?:\s*r)*\s*[o0]\s*z))"
