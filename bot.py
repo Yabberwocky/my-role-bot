@@ -218,6 +218,7 @@ SUPER_ATTEMPT_CHANNEL_ID = 1303267777284673566 # Channel for super attempt loggi
 ZORR_PRO_DESIGNATED_CHANNEL_ID = 1236340209239724115
 ZORR_PRO_AUTOMOD_KEYWORD_REGEX = r"(?:(?:z\s*[o0]\s*r(?:\s*r)*)|(?:z\s*[o0]\s*r(?:\s*r)*\s*\.\s*p\s*r\s*[o0])|(?:z\s*[o0]\s*r(?:\s*r)*\s*p\s*r\s*[o0])|(?:r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*\.\s*r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*r(?:\s*r)*\s*[o0]\s*z))"
 AUTOMOD_ALERT_CHANNEL_ID = 1236340209239724115
+DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE = (BOT_INSTANCE_TYPE == "TESTING")
 
 
 
@@ -252,6 +253,91 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def get_all_time_super_attempt_count(guild: Optional[discord.Guild], author_ign: str) -> int:
+    """Fetches the total number of super attempts logged for a given IGN."""
+    if not supabase or not author_ign:
+        return 0
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("super_attempts")
+                           .select("id", count='exact')
+                           .eq("ingame_name", author_ign) # Match the IGN
+                           # No date filter, so it counts all-time
+                           .execute()
+        )
+        return resp.count if resp and hasattr(resp, 'count') and resp.count is not None else 0
+    except Exception as e:
+        if guild:
+            await log_error(guild, f"Error fetching all-time super attempt count for {author_ign}", error=e)
+        else:
+            print(f"Error fetching all-time super attempt count for {author_ign} (no guild context): {e}")
+        return 0
+
+async def update_custom_nickname_on_attempt(
+    guild: discord.Guild,
+    user: discord.Member,
+    author_ign: str, # IGN of the user
+    all_time_attempt_count: Optional[int] = None # Can be pre-fetched
+):
+    """
+    Updates a user's nickname if they have bot management enabled and a template.
+    Uses the provided all_time_attempt_count or fetches it if None.
+    """
+    if not supabase or not guild or not user:
+        return
+
+    try:
+        # Fetch nickname management settings
+        settings_resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("manage_nickname_by_bot, custom_nickname_template")
+                           .eq("discord_id", str(user.id))
+                           .maybe_single()
+                           .execute()
+        )
+
+        if not (settings_resp and hasattr(settings_resp, 'data') and settings_resp.data):
+            # User not in hc_members or no settings, do nothing for nickname
+            return
+
+        settings = settings_resp.data
+        manage_by_bot = settings.get("manage_nickname_by_bot", False)
+        template = settings.get("custom_nickname_template")
+
+        if not manage_by_bot or not template:
+            # Nickname management not enabled or no template
+            return
+
+        # Fetch all-time attempt count if not provided
+        if all_time_attempt_count is None:
+            current_all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
+        else:
+            current_all_time_count = all_time_attempt_count
+            
+        # Format nickname
+        new_nickname_unprocessed = template.replace("{satt}", str(current_all_time_count))
+        
+        # Discord nickname length limit is 32
+        new_nickname = new_nickname_unprocessed[:32]
+        
+        if user.nick == new_nickname:
+            # Nickname already correct
+            return
+
+        bot_member = guild.me
+        if bot_member.top_role <= user.top_role:
+            await log_info(guild, f"Nickname update skipped for {user.mention}: Bot hierarchy too low.")
+            return
+        if not bot_member.guild_permissions.manage_nicknames:
+            await log_info(guild, f"Nickname update skipped for {user.mention}: Bot lacks Manage Nicknames permission.")
+            return
+
+        await user.edit(nick=new_nickname, reason=f"Automatic super attempt nickname update ({current_all_time_count} attempts)")
+        await log_info(guild, f"Updated nickname for {user.mention} to '{new_nickname}' based on super attempts.")
+
+    except Exception as e:
+        await log_error(guild, f"Error updating custom nickname for {user.mention}", error=e)
 
 class SuperAttemptButton(discord.ui.Button):
     """Base class for super attempt related buttons for easier type hinting."""
@@ -312,6 +398,7 @@ class UndoSuperAttemptButton(SuperAttemptButton):
 
 
 class SuperAttemptDisambiguationView(discord.ui.View):
+    # // --- UNCHANGED SECTION (SuperAttemptDisambiguationView.__init__) --- //
     def __init__(self, target_user_id: int, candidate_petals: List[Dict[str, Any]], 
                  petals_lost: int, original_user_message: discord.Message, 
                  author_ign: str, attempt_date_obj: datetime.date, timeout=120.0):
@@ -344,10 +431,14 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             cancel_row = 0
 
         self.add_item(CancelButton(row=cancel_row, original_user_message_id=original_user_message.id))
-        
+    # // --- END UNCHANGED SECTION (SuperAttemptDisambiguationView.__init__) --- //
+
     async def handle_disambiguation_choice(self, interaction: discord.Interaction, button: ChosenPetalButton):
         guild = interaction.guild
-        # Log the chosen attempt
+        if not guild: # Should not happen if original message was in a guild
+            await interaction.followup.send("Error: Guild context lost.", ephemeral=True)
+            return
+            
         try:
             insert_resp = await run_supabase_sync(
                 lambda: supabase.table("super_attempts").insert({
@@ -357,15 +448,14 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                     "petals_lost": self.petals_lost,
                     "message_id": str(self.original_user_message.id),
                     "channel_id": str(self.original_user_message.channel.id),
-                    "chosen_petal_name": button.chosen_petal_data['original_full_name'] # Store chosen petal
+                    "chosen_petal_name": button.chosen_petal_data['original_full_name'] 
                 }).execute()
             )
             
             new_attempt_db_id = None
             if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
                 new_attempt_db_id = insert_resp.data[0]['id']
-            else: # Fallback if ID not directly returned (should not happen with default Supabase setup)
-                # This is a less reliable way to get the ID if insert doesn't return it
+            else: 
                 fetch_id_resp = await run_supabase_sync(
                     lambda: supabase.table("super_attempts")
                                 .select("id")
@@ -380,48 +470,59 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             if not new_attempt_db_id:
                 await interaction.followup.send("Error: Could not confirm database ID for the logged attempt. Undo might not work.", ephemeral=True)
                 await log_error(guild, f"Super Attempt Disambiguation: Failed to get DB ID after insert for {self.author_ign}, chosen {button.chosen_petal_data['display_friendly_name']}", message_context=self.original_user_message)
-                # Still try to show a success message but without undo
                 confirm_embed = discord.Embed(
                     description=f"Logged: Lost {self.petals_lost}x {button.chosen_petal_data['display_friendly_name']}.",
                     color=discord.Color.green()
                 )
-                await self.message.edit(content=f"{interaction.user.mention}", embed=confirm_embed, view=None)
+                if self.message: # Check if bot's reply message exists
+                     await self.message.edit(content=f"{interaction.user.mention}", embed=confirm_embed, view=None)
                 await _update_reactions(self.original_user_message, "success")
+                # Even if DB ID failed, try to update nickname if user is available
+                if isinstance(interaction.user, discord.Member):
+                    all_time_count_after_log = await get_all_time_super_attempt_count(guild, self.author_ign)
+                    await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_count_after_log)
                 return
 
-            count_resp = await run_supabase_sync(
-                lambda: supabase.table("super_attempts")
-                               .select("id", count='exact')
-                               .eq("ingame_name", self.author_ign)
-                               .eq("attempt_date", self.attempt_date_obj.isoformat())
-                               .execute()
-            )
-            attempt_num_today = count_resp.count if count_resp and hasattr(count_resp, 'count') and count_resp.count is not None else 1
+            # Get ALL-TIME attempt count for the user
+            all_time_attempts_count = await get_all_time_super_attempt_count(guild, self.author_ign)
 
-            # Create the success view with Undo
             confirm_view_after_choice = SuperAttemptConfirmView(
                 target_user_id=self.target_user_id,
                 attempt_db_id=new_attempt_db_id,
                 petals_lost=self.petals_lost,
                 petal_display_name=button.chosen_petal_data['display_friendly_name'],
                 author_ign=self.author_ign,
-                attempt_num_today=attempt_num_today,
+                all_time_attempt_count=all_time_attempts_count, # MODIFIED: Pass all-time count
                 original_user_message=self.original_user_message
             )
-            # Edit the bot's reply message (self.message)
             success_embed = confirm_view_after_choice.create_embed()
-            await self.message.edit(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
-            confirm_view_after_choice.message = self.message # Link message to new view
+            if self.message: # Check if bot's reply message exists
+                await self.message.edit(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
+                confirm_view_after_choice.message = self.message 
+            else: # Fallback if self.message wasn't set (should not happen)
+                await interaction.edit_original_response(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
+
 
             await _update_reactions(self.original_user_message, "success")
-            await log_info(guild, f"Super attempt (disambiguated choice: {button.chosen_petal_data['display_friendly_name']}) by `{self.author_ign}`: Lost {self.petals_lost}. Attempt #{attempt_num_today} for {self.attempt_date_obj.isoformat()}.")
+            await log_info(guild, f"Super attempt (disambiguated choice: {button.chosen_petal_data['display_friendly_name']}) by `{self.author_ign}`: Lost {self.petals_lost}. All-time attempts: {all_time_attempts_count}.")
+            
+            # Update custom nickname
+            if isinstance(interaction.user, discord.Member): # Ensure we have member object
+                await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_attempts_count)
 
         except Exception as e:
             await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message)
-            await interaction.followup.send("An error occurred while processing your choice.", ephemeral=True)
-            if self.message: await self.message.edit(content=f"{interaction.user.mention} An error occurred. Please try again or ask an admin.", embed=None, view=None)
-            await _update_reactions(self.original_user_message, "error") # Or keep neutral
+            try: # Try to send ephemeral error if interaction not already responded
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("An error occurred while processing your choice.", ephemeral=True)
+                else:
+                    await interaction.followup.send("An error occurred while processing your choice.", ephemeral=True)
+            except discord.HTTPException: pass # Ignore if sending ephemeral fails too
 
+            if self.message: await self.message.edit(content=f"{interaction.user.mention} An error occurred. Please try again or ask an admin.", embed=None, view=None)
+            await _update_reactions(self.original_user_message, "error") 
+
+    # // --- UNCHANGED SECTION (SuperAttemptDisambiguationView.handle_cancel & on_timeout) --- //
     async def handle_cancel(self, interaction: discord.Interaction):
         if self.message:
             await self.message.edit(content=f"{interaction.user.mention} Super attempt logging cancelled.", embed=None, view=None)
@@ -444,20 +545,21 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             except discord.HTTPException:
                 pass # Message might already be gone
         self.stop()
+    # // --- END UNCHANGED SECTION (SuperAttemptDisambiguationView.handle_cancel & on_timeout) --- //
 
 class SuperAttemptConfirmView(discord.ui.View):
     def __init__(self, target_user_id: int, attempt_db_id: int, petals_lost: int, 
-                 petal_display_name: str, author_ign: str, attempt_num_today: int,
-                 original_user_message: discord.Message, timeout=180.0): # 3 min timeout for undo
+                 petal_display_name: str, author_ign: str, all_time_attempt_count: int, # MODIFIED PARAM
+                 original_user_message: discord.Message, timeout=180.0): 
         super().__init__(timeout=timeout)
         self.target_user_id = target_user_id
         self.attempt_db_id = attempt_db_id
         self.petals_lost = petals_lost
         self.petal_display_name = petal_display_name
         self.author_ign = author_ign
-        self.attempt_num_today = attempt_num_today
+        self.all_time_attempt_count = all_time_attempt_count # MODIFIED ATTRIBUTE
         self.original_user_message = original_user_message
-        self.message: Optional[discord.Message] = None # Bot's reply message
+        self.message: Optional[discord.Message] = None 
         self.is_undone = False
 
         self.add_item(UndoSuperAttemptButton(attempt_db_id, original_user_message, row=0))
@@ -469,9 +571,10 @@ class SuperAttemptConfirmView(discord.ui.View):
                 color=discord.Color.orange()
             )
         else:
+            # MODIFIED description to use all_time_attempt_count
             return discord.Embed(
                 description=(
-                    f"Logged! That's super attempt **#{self.attempt_num_today}** for you today, {self.author_ign} "
+                    f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign} "
                     f"(lost {self.petals_lost}x Ultra {self.petal_display_name})."
                 ),
                 color=discord.Color.green()
@@ -479,11 +582,11 @@ class SuperAttemptConfirmView(discord.ui.View):
 
     async def handle_undo(self, interaction: discord.Interaction, attempt_db_id_from_button: int, original_user_msg_obj: discord.Message):
         guild = interaction.guild
-        if self.is_undone: # Already undone
+        if self.is_undone: 
             await interaction.followup.send("This attempt has already been undone.", ephemeral=True)
             return
 
-        if attempt_db_id_from_button != self.attempt_db_id: # Should not happen
+        if attempt_db_id_from_button != self.attempt_db_id: 
             await interaction.followup.send("Error: Undo ID mismatch.", ephemeral=True)
             return
 
@@ -491,39 +594,62 @@ class SuperAttemptConfirmView(discord.ui.View):
             delete_resp = await run_supabase_sync(
                 lambda: supabase.table("super_attempts").delete().eq("id", self.attempt_db_id).execute()
             )
-            if delete_resp.data: # Successfully deleted
+            if delete_resp.data: 
                 self.is_undone = True
-                for item in self.children: # Disable buttons
+                for item in self.children: 
                     if isinstance(item, discord.ui.Button): item.disabled = True
                 
                 embed = self.create_embed()
-                await self.message.edit(embed=embed, view=self)
+                if self.message: # Check if self.message is set
+                    await self.message.edit(embed=embed, view=self)
+                else: # Fallback if self.message isn't set (should not happen if view is sent correctly)
+                    await interaction.edit_original_response(embed=embed, view=self)
+
                 await _update_reactions(original_user_msg_obj, "undone")
                 await log_info(guild, f"Super attempt ID {self.attempt_db_id} (Petal: {self.petal_display_name}, User: {self.author_ign}) undone by {interaction.user.name}.")
-                # No followup needed for interaction as message is edited
+                # After undoing, update the user's nickname as their attempt count changed
+                if guild and isinstance(interaction.user, discord.Member): # Ensure we have guild and Member object
+                    # Fetch new all-time count after deletion
+                    new_all_time_count = await get_all_time_super_attempt_count(guild, self.author_ign)
+                    await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, new_all_time_count)
+
             else:
                 await interaction.followup.send("Could not find the attempt in the database to undo. It might have already been removed.", ephemeral=True)
-                # If not found, also disable buttons as a precaution
-                self.is_undone = True # Mark as logically undone
+                self.is_undone = True 
                 for item in self.children:
                     if isinstance(item, discord.ui.Button): item.disabled = True
-                await self.message.edit(view=self)
+                if self.message: await self.message.edit(view=self)
+                elif interaction.message: await interaction.edit_original_response(view=self)
 
 
         except Exception as e:
             await log_error(guild, f"Error undoing super attempt ID {self.attempt_db_id}", error=e, message_context=self.original_user_message)
             await interaction.followup.send("An error occurred while trying to undo the attempt.", ephemeral=True)
-            await _update_reactions(original_user_msg_obj, "error") # Or keep neutral
+            await _update_reactions(original_user_msg_obj, "error") 
 
     async def on_timeout(self):
         if self.message:
             try:
-                # If not undone, just delete. If undone, the message already reflects it.
-                # No need to edit content again if simply timing out.
-                await self.message.delete()
-                # Optionally remove reactions from user's message or change to neutral
-                if not self.is_undone: # Only if it wasn't explicitly undone
-                     await _update_reactions(self.original_user_message, "timeout_or_neutral")
+                # Disable buttons
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button):
+                        item.disabled = True
+                await self.message.edit(view=self) # Edit to show disabled buttons
+                
+                # Reaction handling is now managed by _update_reactions based on self.is_undone
+                # If it was a successful log (not undone), ✅ will remain.
+                # If it was undone, ❌ will remain.
+                # We call _update_reactions with a generic timeout state ONLY if we want specific timeout reaction.
+                # For this view, if it's simply timing out, the existing state (✅ or ❌) is usually desired.
+                # However, the current _update_reactions will clear previous reactions if not handled carefully.
+                # The change in _update_reactions to preserve ✅ for "timeout_or_neutral" state handles this.
+                await _update_reactions(self.original_user_message, "timeout_or_neutral")
+
+                # Optionally, delete the bot's reply message after a longer delay if desired, or leave it with disabled buttons.
+                # For now, let's leave it with disabled buttons.
+                # await asyncio.sleep(60) # Example: Wait a minute
+                # await self.message.delete()
+
             except discord.HTTPException:
                 pass
         self.stop()
@@ -536,14 +662,32 @@ async def _update_reactions(user_message: discord.Message, state: str):
     if not bot_member: return
 
     try:
-        # Clear previous bot reactions first to avoid clutter
-        # Be careful with clear_reactions if other bots/users might react.
-        # A more targeted approach is to remove specific emojis the bot might have added.
-        # For simplicity, let's try removing common ones it might have placed.
-        common_bot_reactions = ["✅", "❓", "❌", "⌛", "📝"]
+        # Clear previous bot reactions first to avoid clutter for states that replace others.
+        # For "timeout_or_neutral" when it's a successful log, we want to AVOID clearing ✅.
+        
+        current_reactions = []
+        if bot_member.guild_permissions.read_message_history: # Check if we can see existing reactions
+            try:
+                # Re-fetch the message to get current reactions to be absolutely sure
+                refetched_message = await user_message.channel.fetch_message(user_message.id)
+                current_reactions = [str(r.emoji) for r in refetched_message.reactions if r.me]
+            except discord.HTTPException: # Message might be gone, or other issues
+                pass # Proceed with adding if possible, removal might fail
+
+        # Special handling for timeout of a successfully logged attempt:
+        # If state is "timeout_or_neutral" AND "✅" is already present, do nothing.
+        if state == "timeout_or_neutral" and "✅" in current_reactions:
+            # This means a SuperAttemptConfirmView (which placed ✅) timed out,
+            # and it wasn't undone. We want to keep the ✅.
+            print(f"Reaction Info: Timeout for successful log (message {user_message.id}), keeping ✅ reaction.")
+            return # Explicitly do nothing further with reactions for this case
+
+        # For other states, or if the special timeout case above wasn't met, proceed with normal reaction management.
+        common_bot_reactions = ["✅", "❓", "❌", "⌛", "📝", "❔", "⚠️"] # Added new ones
         for r_emoji in common_bot_reactions:
-            with contextlib.suppress(discord.HTTPException, discord.Forbidden, discord.NotFound):
-                await user_message.remove_reaction(r_emoji, bot_member)
+            if r_emoji in current_reactions: # Only try to remove if present
+                with contextlib.suppress(discord.HTTPException, discord.Forbidden, discord.NotFound):
+                    await user_message.remove_reaction(r_emoji, bot_member)
         
         await asyncio.sleep(0.1) # Brief pause
 
@@ -553,34 +697,18 @@ async def _update_reactions(user_message: discord.Message, state: str):
             await user_message.add_reaction("❓")
         elif state == "undone":
             await user_message.add_reaction("❌")
-        elif state == "cancelled": # From disambiguation cancel
-            await user_message.add_reaction("❔") # Or remove all
-        elif state == "error": # General error during processing
+        elif state == "cancelled": 
+            await user_message.add_reaction("❔") 
+        elif state == "error": 
             await user_message.add_reaction("⚠️")
-        elif state == "timeout_or_neutral":
-            # If the confirmation timed out, what should the user's message show?
-            # Maybe a "logged" emoji if it wasn't undone.
-            # This part is tricky. If it was successfully logged and just timed out, ✅ might still be appropriate.
-            # If view simply timed out, and it was logged, ✅ might already be there.
-            # If it was a disambiguation view that timed out, ❓ might be there.
-            # Let's assume for now "timeout_or_neutral" means "view interaction ended, but action might have been taken".
-            # One option: remove all bot reactions. Another: add a specific "logged" reaction.
-            # For now, let's not add a new one if it's just a timeout, previous state should reflect it.
-            # If we want to ensure only ONE state emoji, then clearing all and adding one is best.
-            # The current clear + add one logic does this.
-            # For timeout, if not undone, maybe we change it to a "logged" symbol like 📝.
-            # This needs more thought on desired final state. For now, timeout might just leave the last valid reaction.
-            # If we want to signify "interaction over", we could remove all bot reactions.
-            # Let's try adding 📝 for a timed-out successful log.
-             if user_message.guild.me.guild_permissions.read_message_history: # Check if we can see existing reactions
-                # Re-fetch the message to get current reactions
-                try:
-                    current_message = await user_message.channel.fetch_message(user_message.id)
-                    already_has_cross = any(str(r.emoji) == "❌" for r in current_message.reactions if r.me)
-                    if not already_has_cross: # Don't add 📝 if it was undone
-                        await user_message.add_reaction("📝")
-                except Exception: pass # Ignore errors fetching for this specific case
-
+        elif state == "timeout_or_neutral": # Generic timeout or neutral state not covered by specific success case
+            # This state is now for when a disambiguation view times out, or confirm view times out *after* being undone.
+            # Or if we explicitly want to mark it as "interaction over, but not necessarily error/success/undone".
+            # Adding 📝 for a timed-out successful log (if not undone) was removed, handled by the explicit return above.
+            # So, if it reaches here for "timeout_or_neutral", it means it wasn't a successful non-undone log.
+            # We might clear all reactions, or add a generic "timeout" one if desired.
+            # For now, after clearing, let's not add a new one unless a specific state implies it.
+            pass # No specific reaction added for this generic timeout state now, relies on prior clear.
 
     except discord.Forbidden:
         print(f"Reaction Error: Bot lacks 'Add Reactions' or 'Read Message History' permission in {user_message.channel.mention}.")
@@ -5927,16 +6055,15 @@ async def refresh(interaction: discord.Interaction):
 
 
 # --- Sync Nicknames Command (Optimized DB Query) ---
-@tree.command(name="syncnicknames", description="Sync all HC members' nicknames with their stored IGNs.")
-@app_commands.checks.has_permissions(manage_nicknames=True) # User needs manage nicknames
-@app_commands.checks.bot_has_permissions(manage_nicknames=True) # Bot needs manage nicknames
+@tree.command(name="syncnicknames", description="Sync nicknames for users with bot-managed nickname templates.") # MODIFIED DESCRIPTION
+@app_commands.checks.has_permissions(manage_nicknames=True) 
+@app_commands.checks.bot_has_permissions(manage_nicknames=True) 
 async def syncnicknames(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
 
-    # Defer ephemerally while processing
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     if not supabase:
@@ -5944,176 +6071,133 @@ async def syncnicknames(interaction: discord.Interaction):
         await log_error(guild, "/syncnicknames failed: Supabase unavailable.", interaction=interaction)
         return
 
-    hc_role = guild.get_role(HC1_ROLE_ID)
-    if not hc_role:
-        await interaction.edit_original_response(content=f"❌ Configuration Error: HC Role (ID: {HC1_ROLE_ID}) not found.")
-        await log_error(guild, f"/syncnicknames failed: HC role not found.", interaction=interaction)
-        return
-
-    # --- Start Sync Process ---
     start_time = discord.utils.utcnow()
-    await log_info(guild, f"Nickname sync initiated by `{interaction.user}`.")
-    loading_emoji = "🔄" # Simple fallback emoji
-    await interaction.edit_original_response(content=f"{loading_emoji} Fetching members...")
+    await log_info(guild, f"Custom Nickname Sync initiated by `{interaction.user}`.")
+    loading_emoji = "🔄" 
+    await interaction.edit_original_response(content=f"{loading_emoji} Fetching users with managed nicknames...")
 
-    # ... (keep member fetching logic) ...
-    hc_members: List[discord.Member] = []
+    users_to_update: List[Dict[str, Any]] = []
     try:
-        # Ensure members are cached
-        if not guild.chunked:
-            print(f"Chunking guild {guild.name} for sync nicknames...")
-            await guild.chunk(cache=True)
-        hc_members = [m for m in guild.members if hc_role in m.roles and not m.bot]
-        total_hc_members = len(hc_members)
-        print(f"SyncNick ({guild.name}): Found {total_hc_members} members with the '{hc_role.name}' role.")
+        # Fetch users who have manage_nickname_by_bot = TRUE and a non-null template
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("discord_id, ingame_name, custom_nickname_template")
+                           .eq("manage_nickname_by_bot", True)
+                           .not_.is_("custom_nickname_template", "null")
+                           .execute()
+        )
+        if resp and hasattr(resp, 'data') and resp.data:
+            users_to_update = resp.data
+        
+        total_users_to_process = len(users_to_update)
+        print(f"SyncNickCustom ({guild.name}): Found {total_users_to_process} users with bot-managed nicknames.")
+
     except Exception as e:
-        await log_error(guild, "SyncNick: Member fetch/chunking failed", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Failed to fetch server members.")
+        await log_error(guild, "SyncNickCustom: Database fetch failed for managed users", error=e, interaction=interaction)
+        await interaction.edit_original_response(content="❌ Database fetch for managed users failed. Cannot proceed.")
         return
 
-    if total_hc_members == 0:
-        await interaction.edit_original_response(content=f"ℹ️ No members found with the `{hc_role.name}` role. Nothing to sync.")
+    if total_users_to_process == 0:
+        await interaction.edit_original_response(content=f"ℹ️ No users found with bot-managed nickname templates. Nothing to sync.")
         return
 
-    hc_member_ids = [str(m.id) for m in hc_members]
-
-    # ... (keep IGN fetching logic) ...
-    await interaction.edit_original_response(content=f"{loading_emoji} Fetching IGN data for {total_hc_members} members...")
-    ign_data = {} # discord_id (str) -> ingame_name (str)
-    try:
-        chunk_size = 500
-        for i in range(0, len(hc_member_ids), chunk_size):
-            id_chunk = hc_member_ids[i:i+chunk_size]
-            print(f"SyncNick ({guild.name}): Fetching IGNs for chunk {i//chunk_size + 1}/{math.ceil(len(hc_member_ids)/chunk_size)}")
-            resp = await run_supabase_sync(
-                lambda: supabase.table("hc_members")
-                                .select("discord_id, ingame_name")
-                                .in_("discord_id", id_chunk)
-                                .execute()
-            )
-            if resp and hasattr(resp, 'data') and resp.data:
-                ign_data.update({str(item['discord_id']): item['ingame_name']
-                                 for item in resp.data
-                                 if item.get('discord_id') and item.get('ingame_name')})
-            await asyncio.sleep(0.1) # Small delay between chunks
-        print(f"SyncNick ({guild.name}): Fetched {len(ign_data)} relevant IGNs from database.")
-    except ConnectionError as e:
-        await log_error(guild, "SyncNick: Database connection failed during IGN fetch.", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Database connection failed. Cannot proceed.")
-        return
-    except APIError as e:
-        await log_error(guild, "SyncNick: Database API error during IGN fetch.", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Database API error. Cannot proceed.")
-        return
-    except Exception as e:
-        await log_error(guild, "SyncNick: Database fetch failed (unexpected)", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Database fetch failed. Cannot proceed.")
-        return
-
-    # ... (keep nickname update logic) ...
-    await interaction.edit_original_response(content=f"{loading_emoji} Syncing {total_hc_members} members...")
-    counts = {'proc': 0, 'upd': 0, 'skip_match': 0, 'skip_no_ign': 0, 'skip_empty': 0, 'skip_hier': 0, 'fail_forbid': 0, 'fail_http': 0, 'fail_other': 0}
+    await interaction.edit_original_response(content=f"{loading_emoji} Syncing {total_users_to_process} custom nicknames...")
+    
+    counts = {'proc': 0, 'upd_ok': 0, 'upd_fail_perm': 0, 'upd_fail_hier': 0, 'upd_fail_other': 0, 'no_member': 0, 'no_ign': 0}
     bot_member = guild.me
     bot_pos = bot_member.top_role.position
+    bot_can_manage_nicks_globally = bot_member.guild_permissions.manage_nicknames
+
     last_prog_update_time = asyncio.get_event_loop().time()
     update_interval = 5.0
 
-    for idx, member in enumerate(hc_members):
+    for user_data in users_to_update:
         counts['proc'] += 1
-        member_id_str = str(member.id)
+        discord_id_str = user_data.get("discord_id")
+        author_ign = user_data.get("ingame_name")
+        template = user_data.get("custom_nickname_template")
+
+        if not discord_id_str or not author_ign or not template:
+            counts['no_ign'] +=1 # Or some other specific count for bad data
+            continue
+
+        member = guild.get_member(int(discord_id_str))
+        if not member:
+            counts['no_member'] += 1
+            continue
+        
+        if not bot_can_manage_nicks_globally: # Global check, stop if bot loses perm mid-sync
+            counts['upd_fail_perm'] += (total_users_to_process - counts['proc'] + 1) # Mark rest as failed
+            await log_error(guild, "SyncNickCustom: Bot lost Manage Nicknames permission mid-sync.", interaction=interaction)
+            break 
+        
         if bot_pos <= member.top_role.position:
-            counts['skip_hier'] += 1
+            counts['upd_fail_hier'] += 1
             continue
-        stored_ign = ign_data.get(member_id_str)
-        if not stored_ign:
-            counts['skip_no_ign'] += 1
-            continue
-        target_nick = stored_ign.strip()
-        if not target_nick:
-            counts['skip_empty'] += 1
-            continue
-        target_nick = target_nick[:32]
-        if member.nick == target_nick:
-            counts['skip_match'] += 1
-            continue
+        
         try:
-            await member.edit(nick=target_nick, reason=f"Nickname Sync initiated by {interaction.user.id}")
-            counts['upd'] += 1
-            await asyncio.sleep(0.2)
-        except discord.Forbidden: counts['fail_forbid'] += 1
+            all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
+            new_nickname_unprocessed = template.replace("{satt}", str(all_time_count))
+            new_nickname = new_nickname_unprocessed[:32]
+
+            if member.nick == new_nickname:
+                # counts['upd_ok'] += 1 # Optionally count "already correct" as success
+                continue 
+
+            await member.edit(nick=new_nickname, reason=f"Custom Nickname Sync ({interaction.user.id})")
+            counts['upd_ok'] += 1
+            await asyncio.sleep(0.2) # Be gentle with API
+        except discord.Forbidden:
+            counts['upd_fail_perm'] += 1
         except discord.HTTPException as e_http:
-            counts['fail_http'] += 1
-            if e_http.status == 429: print(f"SyncNick ({guild.name}): Rate limit hit!")
-        except Exception as e_other:
-            counts['fail_other'] += 1
-            await log_error(guild, f"SyncNick: Unexpected error updating nick for {member.mention}", error=e_other, interaction=interaction)
+            counts['upd_fail_other'] += 1 # Group HTTP with other for this summary
+            if e_http.status == 429: print(f"SyncNickCustom ({guild.name}): Rate limit hit!")
+        except Exception as e_other_nick:
+            counts['upd_fail_other'] += 1
+            await log_error(guild, f"SyncNickCustom: Unexpected error updating nick for {member.mention}", error=e_other_nick, interaction=interaction)
 
         now = asyncio.get_event_loop().time()
-        if (now - last_prog_update_time > update_interval) or (counts['proc'] == total_hc_members):
+        if (now - last_prog_update_time > update_interval) or (counts['proc'] == total_users_to_process):
              if interaction.is_expired():
-                  print(f"SyncNick ({guild.name}): Interaction expired, cannot update progress.")
-                  last_prog_update_time = now + 999
+                  print(f"SyncNickCustom ({guild.name}): Interaction expired, cannot update progress.")
+                  last_prog_update_time = now + 999 
                   continue
              try:
-                await interaction.edit_original_response(content=f"{loading_emoji} Syncing... ({counts['proc']}/{total_hc_members})")
+                await interaction.edit_original_response(content=f"{loading_emoji} Syncing custom nicknames... ({counts['proc']}/{total_users_to_process})")
                 last_prog_update_time = now
              except (discord.NotFound, discord.HTTPException):
-                print(f"SyncNick ({guild.name}): Progress update failed. Continuing sync...")
+                print(f"SyncNickCustom ({guild.name}): Progress update failed. Continuing sync...")
                 last_prog_update_time = now + 999
 
 
-    # 4. Send Final Summary
     end_time = discord.utils.utcnow()
     duration = (end_time - start_time).total_seconds()
 
-    # --- MODIFIED EMBED CREATION ---
-    # Get Unix timestamp from the datetime object
-    end_unix_ts = int(end_time.timestamp())
-    # Create embed without the timestamp attribute
-    summary_embed = discord.Embed(title="✅ Nickname Sync Complete!", color=NERDY_YELLOW)
-    # --- END MODIFIED EMBED CREATION ---
-
-    total_skipped = counts['skip_match'] + counts['skip_no_ign'] + counts['skip_empty'] + counts['skip_hier']
-    total_failed = counts['fail_forbid'] + counts['fail_http'] + counts['fail_other']
+    summary_embed = discord.Embed(title="✅ Custom Nickname Sync Complete!", color=NERDY_YELLOW)
+    
     summary_lines = [
         f"⏱️ **Duration:** {duration:.2f} seconds",
-        f"👥 **Total HC Members Found:** {total_hc_members}",
-        f"📊 **Relevant IGNs Fetched:** {len(ign_data)}",
-        f"🔄 **Members Processed:** {counts['proc']}",
-        f"✅ **Nicknames Updated:** {counts['upd']}",
-        f"ℹ️ **Skipped (No Change/Hierarchy/No IGN):** {total_skipped}",
-        f"   - Already Matched: {counts['skip_match']}",
-        f"   - No/Empty IGN Stored: {counts['skip_no_ign'] + counts['skip_empty']}",
-        f"   - Bot Hierarchy Too Low: {counts['skip_hier']}",
-        f"❌ **Failed Updates:** {total_failed}",
-        f"   - Permissions Error: {counts['fail_forbid']}",
-        f"   - API/HTTP Error: {counts['fail_http']}",
-        f"   - Other Errors: {counts['fail_other']}"
+        f"👥 **Users with Managed Nicknames Found:** {total_users_to_process}",
+        f"📊 **Users Processed:** {counts['proc']}",
+        f"✅ **Nicknames Updated/Correct:** {counts['upd_ok']}",
+        f"ℹ️ **Skipped (No Member/IGN):** {counts['no_member'] + counts['no_ign']}",
+        f"❌ **Failed Updates:** {counts['upd_fail_perm'] + counts['upd_fail_hier'] + counts['upd_fail_other']}",
+        f"   - Permissions Error: {counts['upd_fail_perm']}",
+        f"   - Bot Hierarchy Too Low: {counts['upd_fail_hier']}",
+        f"   - Other Errors: {counts['upd_fail_other']}"
     ]
     summary_embed.description = "\n".join(summary_lines)
-
-    # --- MODIFIED FOOTER ---
     summary_embed.set_footer(text=f"Completed: {get_formatted_utc_now()}")
-    # --- END MODIFIED FOOTER ---
 
-    # ... (keep the final sending logic) ...
     try:
         if not interaction.is_expired():
             await interaction.edit_original_response(content=None, embed=summary_embed)
         else:
-            print(f"SyncNick ({guild.name}): Interaction expired before final summary edit. Attempting followup.")
             await interaction.followup.send(embed=summary_embed, ephemeral=False)
-    except (discord.NotFound, discord.HTTPException) as e_edit:
-        print(f"SyncNick ({guild.name}): Final summary edit failed ({e_edit}). Attempting followup.")
-        try: await interaction.followup.send(embed=summary_embed, ephemeral=False)
-        except Exception as e_followup: print(f"SyncNick ({guild.name}): Final followup send also failed: {e_followup}")
-        await log_error(guild, "SyncNick: Could not send final summary to user.", embed=summary_embed, interaction=interaction)
-    except Exception as e_outer:
-        print(f"SyncNick ({guild.name}): Unknown error sending final summary: {e_outer}")
-        await log_error(guild, "SyncNick: Unknown error sending final summary.", error=e_outer, embed=summary_embed, interaction=interaction)
+    except Exception as e_final_send:
+        await log_error(guild, "SyncNickCustom: Could not send final summary.", error=e_final_send, embed=summary_embed, interaction=interaction)
 
-    # Log detailed summary internally
-    log_embed = discord.Embed(title="Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
+    log_embed = discord.Embed(title="Custom Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
     log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: {get_formatted_utc_now()}")
     await log_info(guild, "", embed=log_embed)
 
@@ -6622,72 +6706,190 @@ async def on_message(message: discord.Message):
 
     # --- Super Attempt Logging ---
     if message.channel.id == SUPER_ATTEMPT_CHANNEL_ID:
-        # --- Start of Super Attempt Logic ---
         msg_content = message.content.strip()
         attempt_match = re.fullmatch(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", msg_content, re.IGNORECASE)
+        
         if attempt_match:
             petals_lost_str = attempt_match.group("petals")
             petal_query_str = attempt_match.group("petal_query").strip()
-            try: petals_lost = int(petals_lost_str)
-            except ValueError: return 
-            if not petal_query_str: return
+            try:
+                petals_lost = int(petals_lost_str)
+            except ValueError:
+                return # Not a valid number of petals
+            
+            if not petal_query_str:
+                return # No petal name provided
 
             author_ign = await get_ign_from_user(guild, message.author.id)
             if not author_ign:
-                try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Can't record this. Use `/hcverify` or `/verify`.")
-                except: pass
+                try:
+                    await message.reply(f"{message.author.mention}, your IGN isn't linked. Can't record this. Use `/hcverify` or `/verify` (with your IGN).")
+                except discord.HTTPException: pass
                 return
 
             attempt_date_obj, date_error_msg = get_utc_date()
             if date_error_msg or not attempt_date_obj:
-                try: await message.reply(f"Sorry {message.author.mention}, error determining date for attempt.")
-                except: pass
-                await log_error(guild, f"Super Attempt for {author_ign}: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
+                try: await message.reply(f"Sorry {message.author.mention}, there was an error determining the date for this attempt.")
+                except discord.HTTPException: pass
+                await log_error(guild, f"Super Attempt Log for {author_ign}: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
                 return
 
-            if not await check_supabase_available(message.channel):
-                await log_info(guild, f"Super Attempt for query '{petal_query_str}': Supabase unavailable.")
+            if not await check_supabase_available(message.channel): # Pass channel for potential ephemeral reply context
+                await log_info(guild, f"Super Attempt Log for query '{petal_query_str}': Supabase unavailable, logging skipped.")
+                # check_supabase_available will handle ephemeral reply if needed
                 return
 
+            # Use the refined find_ultra_petal_candidates_for_query
+            # This function internally uses fuzzy_match_petal_name and then finds Ultras of that base.
             ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
-            if not ultra_candidates: return
-
             bot_reply_msg: Optional[discord.Message] = None
-            if len(ultra_candidates) == 1:
-                chosen_petal_data = ultra_candidates
+
+            if len(ultra_candidates) == 1: # Single, confident match
+                chosen_petal_data = ultra_candidates[0] # {'original_full_name', 'display_friendly_name', 'base_name_for_db'}
+                chosen_petal_name_for_db = chosen_petal_data['original_full_name']
+                display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
+                
+                # Log this attempt (common logic block)
                 try:
-                    insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id), "attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost, "message_id": str(message.id), "channel_id": str(message.channel.id), "chosen_petal_name": chosen_petal_data['original_full_name']}).execute())
+                    insert_resp = await run_supabase_sync(
+                        lambda: supabase.table("super_attempts").insert({
+                            "ingame_name": author_ign,
+                            "discord_user_id": str(message.author.id),
+                            "attempt_date": attempt_date_obj.isoformat(),
+                            "petals_lost": petals_lost,
+                            "message_id": str(message.id),
+                            "channel_id": str(message.channel.id),
+                            "chosen_petal_name": chosen_petal_name_for_db
+                        }).execute()
+                    )
                     attempt_db_id = None
-                    if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data: attempt_db_id = insert_resp.data['id']
-                    if not attempt_db_id:
-                        fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                    if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
+                        attempt_db_id = insert_resp.data[0]['id']
+                    
+                    if not attempt_db_id: # Fallback to fetch ID if insert didn't return it as expected
+                        fetch_id_resp = await run_supabase_sync(
+                            lambda: supabase.table("super_attempts").select("id")
+                                       .eq("message_id", str(message.id))
+                                       .eq("ingame_name", author_ign)
+                                       .eq("chosen_petal_name", chosen_petal_name_for_db)
+                                       .order("recorded_at", desc=True).limit(1).maybe_single().execute()
+                        )
                         if fetch_id_resp.data: attempt_db_id = fetch_id_resp.data['id']
+                    
                     if not attempt_db_id:
-                        await log_error(guild, f"Super Attempt: Fail to get DB ID for {author_ign}, {chosen_petal_data['display_friendly_name']}", message_context=message)
-                        try: await message.reply(f"Sorry {message.author.mention}, error saving (no DB ID). Admin notified.")
-                        except: pass
+                        await log_error(guild, f"Super Attempt (single/unknown): Failed to get DB ID for {author_ign}, petal '{display_friendly_name_for_reply}'", message_context=message)
+                        try: await message.reply(f"Sorry {message.author.mention}, an error occurred while saving your attempt (could not confirm DB ID). Admin has been notified.")
+                        except discord.HTTPException: pass
                         await _update_reactions(message, "error"); return
-                    count_resp = await run_supabase_sync( lambda: supabase.table("super_attempts").select("id", count='exact').eq("ingame_name", author_ign).eq("attempt_date", attempt_date_obj.isoformat()).execute())
-                    attempt_num = count_resp.count if count_resp and hasattr(count_resp, 'count') and count_resp.count is not None else 1
-                    sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, chosen_petal_data['display_friendly_name'], author_ign, attempt_num, message)
+
+                    # Get ALL-TIME attempt count for the user
+                    all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+
+                    sa_view = SuperAttemptConfirmView(
+                        target_user_id=message.author.id,
+                        attempt_db_id=attempt_db_id,
+                        petals_lost=petals_lost,
+                        petal_display_name=display_friendly_name_for_reply,
+                        author_ign=author_ign,
+                        all_time_attempt_count=all_time_attempts_count, # Pass all-time count
+                        original_user_message=message
+                    )
+                    embed = sa_view.create_embed()
+                    bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                    sa_view.message = bot_reply_msg # Link the bot's message to the view
+
+                    await _update_reactions(message, "success")
+                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time attempts: {all_time_attempts_count}.")
+                    
+                    # Update custom nickname
+                    if isinstance(message.author, discord.Member):
+                         await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+
+                except Exception as e:
+                    await log_error(guild, f"Error logging single/unknown super attempt for {author_ign} ({display_friendly_name_for_reply})", error=e, message_context=message, ping_owner=True)
+                    try: await message.reply(f"Sorry {message.author.mention}, an error occurred while logging your attempt. Admin has been notified.")
+                    except discord.HTTPException: pass
+                    await _update_reactions(message, "error")
+
+            elif len(ultra_candidates) > 1: # Multiple candidates, needs disambiguation
+                disamb_embed = discord.Embed(
+                    title="❓ Which Ultra Petal Was It?",
+                    description=(
+                        f"{message.author.mention}, your query \"{discord.utils.escape_markdown(petal_query_str)}\" "
+                        f"could refer to multiple Ultra petals. Please choose the one you lost:"
+                    ),
+                    color=discord.Color.blue()
+                )
+                sa_disamb_view = SuperAttemptDisambiguationView(
+                    target_user_id=message.author.id,
+                    candidate_petals=ultra_candidates,
+                    petals_lost=petals_lost,
+                    original_user_message=message,
+                    author_ign=author_ign,
+                    attempt_date_obj=attempt_date_obj
+                )
+                bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
+                sa_disamb_view.message = bot_reply_msg # Link bot's message to the view
+                await _update_reactions(message, "disambiguation")
+            
+            else: # No candidates found (ultra_candidates is empty) -> Log as "Unknown Ultra Petal"
+                chosen_petal_name_for_db = "Unknown Ultra Petal" 
+                display_friendly_name_for_reply = "Unknown Ultra"
+                await log_info(guild, f"Super Attempt Log: No specific Ultra petal matched query '{petal_query_str}' by {author_ign}. Logging as '{chosen_petal_name_for_db}'.")
+                # Now, use the same logging block as the single match case
+                try:
+                    insert_resp = await run_supabase_sync(
+                        lambda: supabase.table("super_attempts").insert({
+                            "ingame_name": author_ign,
+                            "discord_user_id": str(message.author.id),
+                            "attempt_date": attempt_date_obj.isoformat(),
+                            "petals_lost": petals_lost,
+                            "message_id": str(message.id),
+                            "channel_id": str(message.channel.id),
+                            "chosen_petal_name": chosen_petal_name_for_db 
+                        }).execute()
+                    )
+                    attempt_db_id = None
+                    if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
+                        attempt_db_id = insert_resp.data[0]['id']
+                    if not attempt_db_id:
+                        fetch_id_resp = await run_supabase_sync(
+                            lambda: supabase.table("super_attempts").select("id")
+                                       .eq("message_id", str(message.id))
+                                       .order("recorded_at", desc=True).limit(1).maybe_single().execute()
+                        )
+                        if fetch_id_resp.data: attempt_db_id = fetch_id_resp.data['id']
+                    
+                    if not attempt_db_id:
+                        await log_error(guild, f"Super Attempt (Unknown Petal): Failed to get DB ID for {author_ign}", message_context=message)
+                        try: await message.reply(f"Sorry {message.author.mention}, error saving (no DB ID for unknown petal). Admin notified.")
+                        except discord.HTTPException: pass
+                        await _update_reactions(message, "error"); return
+
+                    all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                    sa_view = SuperAttemptConfirmView(
+                        target_user_id=message.author.id,
+                        attempt_db_id=attempt_db_id,
+                        petals_lost=petals_lost,
+                        petal_display_name=display_friendly_name_for_reply,
+                        author_ign=author_ign,
+                        all_time_attempt_count=all_time_attempts_count,
+                        original_user_message=message
+                    )
                     embed = sa_view.create_embed()
                     bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
                     sa_view.message = bot_reply_msg
                     await _update_reactions(message, "success")
-                    await log_info(guild, f"Super by `{author_ign}`: Lost {petals_lost}x {chosen_petal_data['display_friendly_name']}. Attempt #{attempt_num}.")
+                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time attempts: {all_time_attempts_count}.")
+                    if isinstance(message.author, discord.Member):
+                         await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
                 except Exception as e:
-                    await log_error(guild, f"Error logging single super for {author_ign}", error=e, message_context=message, ping_owner=True)
-                    try: await message.reply(f"Sorry {message.author.mention}, error occurred. Admin notified.")
-                    except: pass
+                    await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True)
+                    try: await message.reply(f"Sorry {message.author.mention}, error occurred logging unknown petal. Admin notified.")
+                    except discord.HTTPException: pass
                     await _update_reactions(message, "error")
-            else: # Disambiguation
-                disamb_embed = discord.Embed(title="❓ Which Ultra Petal?", description=f"{message.author.mention}, your query \"{petal_query_str}\" matched multiple. Choose:", color=discord.Color.blue())
-                sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj)
-                bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
-                sa_disamb_view.message = bot_reply_msg
-                await _update_reactions(message, "disambiguation")
+            return # Handled super attempt
         # --- End of Super Attempt Logic ---
-        return
 
     # --- AI Cog processing ---
     ai_cog = bot.get_cog('AICog')
@@ -7411,6 +7613,96 @@ async def test_petal_match(interaction: discord.Interaction, petal_query: str):
         await interaction.followup.send(response_message)
     else:
         await interaction.followup.send("An unexpected result occurred during matching.")
+
+@tree.command(name="setnickname", description="Manage your custom nickname template for super attempts.")
+@app_commands.describe(
+    template="Nickname template (e.g., \"MyName | {satt} attempts\"). Leave blank to disable bot management.",
+    user="[Optional] Target another user (requires Manage Nicknames permission)."
+)
+async def setnickname(interaction: discord.Interaction, template: Optional[str] = None, user: Optional[discord.Member] = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not await check_supabase_available(interaction):
+        return
+
+    target_user = user or interaction.user
+    if not isinstance(target_user, discord.Member): # Should be ensured by type hint, but defensive
+        await interaction.response.send_message("Invalid user provided.", ephemeral=True)
+        return
+        
+    # Permission check if targeting another user
+    if user and user.id != interaction.user.id:
+        if not interaction.permissions.manage_nicknames:
+            await interaction.response.send_message(f"❌ You need 'Manage Nicknames' permission to set templates for others.", ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    author_ign = await get_ign_from_user(guild, target_user.id)
+    if not author_ign:
+        await interaction.followup.send(f"❌ {target_user.mention} does not have an In-Game Name linked in the database. Cannot manage nickname.", ephemeral=True)
+        return
+
+    manage_by_bot_new_value = False
+    template_to_store: Optional[str] = None
+    response_message_parts = []
+
+    if template:
+        cleaned_template = template.strip()
+        if not cleaned_template: # User provided blank string explicitly
+            manage_by_bot_new_value = False
+            template_to_store = None
+            response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
+        elif len(cleaned_template) > 200: # Arbitrary limit for template length
+            await interaction.followup.send(f"❌ Nickname template is too long (max 200 characters).", ephemeral=True)
+            return
+        else:
+            manage_by_bot_new_value = True
+            template_to_store = cleaned_template
+            response_message_parts.append(f"⚙️ Nickname template for {target_user.mention} set to: `{discord.utils.escape_markdown(template_to_store)}`.")
+            response_message_parts.append(f"🤖 Bot nickname management **enabled**.")
+            if "{satt}" not in template_to_store:
+                response_message_parts.append(f"⚠️ Your template does not include `{{satt}}`. The super attempt count will not be shown.")
+    else: # Template parameter was omitted (None)
+        manage_by_bot_new_value = False
+        template_to_store = None
+        response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
+
+    try:
+        await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .update({
+                               "manage_nickname_by_bot": manage_by_bot_new_value,
+                               "custom_nickname_template": template_to_store
+                           })
+                           .eq("discord_id", str(target_user.id))
+                           .execute()
+        )
+        response_message_parts.append(f"💾 Settings saved.")
+
+        # Immediately update nickname if management is now on
+        if manage_by_bot_new_value and template_to_store:
+            all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
+            await update_custom_nickname_on_attempt(guild, target_user, author_ign, all_time_count)
+            # update_custom_nickname_on_attempt logs its own success/failure for nick change
+            # We can add a small note about the attempt to update
+            current_nick = target_user.nick # Get nick after potential update
+            if current_nick and template_to_store.replace("{satt}", str(all_time_count))[:32] == current_nick:
+                 response_message_parts.append(f"🏷️ Nickname updated to: `{discord.utils.escape_markdown(current_nick)}`")
+            else:
+                 response_message_parts.append(f"ℹ️ Nickname update attempted (check server for changes or bot logs for errors if it didn't update as expected).")
+
+
+    except Exception as e:
+        await log_error(guild, f"Error saving nickname settings for {target_user.mention}", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An error occurred while saving your nickname settings.", ephemeral=True)
+        return
+
+    await interaction.followup.send("\n".join(response_message_parts), ephemeral=True)
+    await log_info(guild, f"`{interaction.user}` used /setnickname for {target_user.mention}. Manage: {manage_by_bot_new_value}, Template: '{template_to_store}'.")
 
 # --- Bot Startup ---
 if __name__ == "__main__":
