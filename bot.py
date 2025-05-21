@@ -310,7 +310,10 @@ async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str)
         petal_counts: Dict[str, Dict[str, Any]] = {} # petal_name -> {'attempts': int, 'total_petals_lost': float}
         
         for attempt in all_attempts_data:
-            petal_name = attempt.get("chosen_petal_name", "Unknown Ultra Petal")
+            # Ensure petal_name is always a string, defaulting to "Unknown Ultra Petal" if None or missing
+            petal_name_raw = attempt.get("chosen_petal_name")
+            petal_name = petal_name_raw if petal_name_raw is not None else "Unknown Ultra Petal"
+            
             petals_lost_in_attempt = 0.0
             try:
                 petals_lost_in_attempt = float(attempt.get("petals_lost", 0.0))
@@ -325,7 +328,7 @@ async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str)
         # Filter out "Unknown Ultra Petal" for favorite and top display lists
         displayable_petals = {
             name: data for name, data in petal_counts.items()
-            if name.lower() != "unknown ultra petal" # Case-insensitive exclusion
+            if name and name.lower() != "unknown ultra petal" # MODIFIED: Add check for name being non-None
         }
 
         if displayable_petals:
@@ -627,33 +630,44 @@ async def update_custom_nickname_on_attempt(
     all_time_attempt_count: Optional[int] = None # Can be pre-fetched
 ):
     """
-    Updates a user's nickname if they have bot management enabled and a template.
+    Updates a user's nickname if they have bot management enabled.
+    Uses custom template if provided, otherwise a default HC format.
     Uses the provided all_time_attempt_count or fetches it if None.
     """
-    if not supabase or not guild or not user:
+    if not supabase or not guild or not user or not author_ign: # Added author_ign check
         return
 
     try:
-        # Fetch nickname management settings
         settings_resp = await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                           .select("manage_nickname_by_bot, custom_nickname_template")
+                           .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc") # Fetch is_in_hc
                            .eq("discord_id", str(user.id))
+                           .eq("ingame_name", author_ign) # Ensure we're updating for the correct IGN if user has multiple (though not typical)
                            .maybe_single()
                            .execute()
         )
 
         if not (settings_resp and hasattr(settings_resp, 'data') and settings_resp.data):
-            # User not in hc_members or no settings, do nothing for nickname
             return
 
         settings = settings_resp.data
         manage_by_bot = settings.get("manage_nickname_by_bot", False)
-        template = settings.get("custom_nickname_template")
+        is_in_hc = settings.get("is_in_hc", False) # Check if user is actually in HC
+        custom_template = settings.get("custom_nickname_template")
 
-        if not manage_by_bot or not template:
-            # Nickname management not enabled or no template
-            return
+        if not manage_by_bot:
+            # If management is off, but they are IN HC, we might want to revert their nick to just IGN
+            # This ensures if they turn management off, the SATT part is removed.
+            if is_in_hc and user.nick != author_ign:
+                 # Check bot permissions before trying to revert
+                bot_member = guild.me
+                if bot_member.top_role > user.top_role and bot_member.guild_permissions.manage_nicknames:
+                    try:
+                        await user.edit(nick=author_ign[:32], reason="Nickname management disabled, reverting to IGN")
+                        await log_info(guild, f"Reverted nickname for {user.mention} to '{author_ign[:32]}' as management was disabled.")
+                    except Exception as e_revert:
+                        await log_error(guild, f"Error reverting nickname for {user.mention} after disabling management", error=e_revert)
+            return # Nickname management not enabled by user choice
 
         # Fetch all-time attempt count if not provided
         if all_time_attempt_count is None:
@@ -661,14 +675,20 @@ async def update_custom_nickname_on_attempt(
         else:
             current_all_time_count = all_time_attempt_count
             
-        # Format nickname
-        new_nickname_unprocessed = template.replace("{satt}", str(current_all_time_count))
-        
-        # Discord nickname length limit is 32
+        new_nickname_unprocessed: str
+        if custom_template: # User has a specific template
+            new_nickname_unprocessed = custom_template.replace("{satt}", str(current_all_time_count))
+        elif is_in_hc: # User is in HC, management is ON, but NO custom template -> Apply default HC format
+            if current_all_time_count > 0:
+                new_nickname_unprocessed = f"{author_ign} ({current_all_time_count} satt)"
+            else:
+                new_nickname_unprocessed = author_ign # Just IGN if 0 SATT
+        else: # Not in HC, but management somehow ON without template (should be rare) -> Just IGN
+            new_nickname_unprocessed = author_ign
+
         new_nickname = new_nickname_unprocessed[:32]
         
         if user.nick == new_nickname:
-            # Nickname already correct
             return
 
         bot_member = guild.me
@@ -679,11 +699,12 @@ async def update_custom_nickname_on_attempt(
             await log_info(guild, f"Nickname update skipped for {user.mention}: Bot lacks Manage Nicknames permission.")
             return
 
-        await user.edit(nick=new_nickname, reason=f"Automatic super attempt nickname update ({current_all_time_count} attempts)")
-        await log_info(guild, f"Updated nickname for {user.mention} to '{new_nickname}' based on super attempts.")
+        await user.edit(nick=new_nickname, reason=f"Automatic nickname update (S.Attempts: {current_all_time_count})")
+        log_reason_nick_type = "custom template" if custom_template else ("default HC format" if is_in_hc else "IGN default")
+        await log_info(guild, f"Updated nickname for {user.mention} to '{new_nickname}' ({log_reason_nick_type}).")
 
     except Exception as e:
-        await log_error(guild, f"Error updating custom nickname for {user.mention}", error=e)
+        await log_error(guild, f"Error updating nickname for {user.mention}", error=e)
 
 class SuperAttemptButton(discord.ui.Button):
     """Base class for super attempt related buttons for easier type hinting."""
@@ -5174,7 +5195,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
-    # Defer before Supabase check for consistency
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     if not await check_supabase_available(interaction):
@@ -5185,7 +5205,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
     role_to_add = guild.get_role(FLORRIST_ROLE_ID)
     bot_member = guild.me
 
-    # // --- UNCHANGED SECTION (verify - Role existence & hierarchy checks) --- //
     missing_roles = []
     if NEWBEE_ROLE_ID and not role_to_remove: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
     if FLORRIST_ROLE_ID and not role_to_add: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
@@ -5194,30 +5213,33 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
         await interaction.edit_original_response(content=msg, embed=None, view=None)
         await log_error(guild, f"Verify failed: Missing roles - {', '.join(missing_roles)}", interaction=interaction)
         return
-    if not role_to_add:
+    if not role_to_add: # Should be caught by above, but defensive
          msg = f"❌ Setup Error: Verified Role (ID: {FLORRIST_ROLE_ID}) not configured correctly."
          await interaction.edit_original_response(content=msg, embed=None, view=None)
          await log_error(guild, msg, interaction=interaction)
          return
+    
     hierarchy_fail = False
     hierarchy_reason = ""
     if bot_member.top_role.position <= role_to_add.position:
         hierarchy_fail=True
         hierarchy_reason=f"Cannot assign the '{role_to_add.name}' role."
-    elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
+    elif role_to_remove and bot_member.top_role.position <= role_to_remove.position: # Check role_to_remove exists before accessing its position
         hierarchy_fail=True
         hierarchy_reason=f"Cannot remove the '{role_to_remove.name}' role."
+    
     if hierarchy_fail:
         msg = f"❌ Hierarchy Error: {hierarchy_reason} My highest role ('{bot_member.top_role.name}') is not high enough."
         await interaction.edit_original_response(content=msg, embed=None, view=None)
         await log_error(guild, f"Verify failed: Bot hierarchy issue. Reason: {hierarchy_reason}", interaction=interaction)
         return
-    # // --- END UNCHANGED SECTION (verify - Role existence & hierarchy checks) --- //
 
     actions_taken = []
-    db_messages = [] # For messages related to IGN linking
+    db_messages = [] 
     reason = f"Verified by {interaction.user} (ID: {interaction.user.id})"
     modified_roles = False
+    db_changed_is_in_hc_status = False # Flag to track if is_in_hc was explicitly set/updated
+    ign_for_final_nick_update: Optional[str] = None # Store the relevant IGN for nick update
 
     try:
         has_verified_role = role_to_add in user.roles
@@ -5234,17 +5256,19 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
         if roles_to_add_list or roles_to_remove_list:
             current_roles = user.roles
             final_role_set = [r for r in current_roles if r not in roles_to_remove_list] + roles_to_add_list
-            final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] # Ensure @everyone is not duplicated
+            final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] 
             await user.edit(roles=final_role_set, reason=reason)
             modified_roles = True
-            if roles_to_remove_list: actions_taken.append(f"➖ Removed `{role_to_remove.name if role_to_remove else 'Unverified Role'}`")
+            if roles_to_remove_list and role_to_remove: actions_taken.append(f"➖ Removed `{role_to_remove.name}`")
             if roles_to_add_list: actions_taken.append(f"➕ Added `{role_to_add.name}`")
         else:
             actions_taken.append(f"ℹ️ Roles already correct for standard verification.")
             
-        # --- IGN Linking/Updating Logic ---
+        # IGN Linking/Updating Logic
+        cleaned_ign: Optional[str] = None
         if ingame_name:
             cleaned_ign = ingame_name.strip()
+            ign_for_final_nick_update = cleaned_ign # Set for later nick update
             user_id_str = str(user.id)
             user_discord_name_tag = f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name
 
@@ -5252,13 +5276,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                 db_messages.append("⚠️ IGN provided was empty, so no database update attempted for IGN.")
             else:
                 try:
-                    # Check if the cleaned_ign is already linked to a DIFFERENT user
                     conflict_resp = await run_supabase_sync(
                         lambda: supabase.table("hc_members")
                                        .select("discord_id")
-                                       .ilike("ingame_name", cleaned_ign) # Case-insensitive check for the IGN
-                                       .not_.eq("discord_id", user_id_str) # Where it's NOT this user
-                                       .not_.is_("discord_id", "null") # And it IS linked to someone
+                                       .ilike("ingame_name", cleaned_ign) 
+                                       .not_.eq("discord_id", user_id_str) 
+                                       .not_.is_("discord_id", "null") 
                                        .maybe_single()
                                        .execute()
                     )
@@ -5267,13 +5290,10 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                         db_messages.append(f"⚠️ **IGN Conflict:** `{discord.utils.escape_markdown(cleaned_ign)}` is already linked to another user (<@{other_user_id}>). IGN not updated.")
                         await log_info(guild, f"/verify IGN conflict: User `{interaction.user}` tried to link `{cleaned_ign}` to `{user.name}`, but it's linked to ID {other_user_id}.")
                     else:
-                        # No conflict with another *linked* user. Proceed with upsert for the current user.
-                        # This will create a new record if user_id_str doesn't exist, or update if it does.
-                        # It sets is_in_hc to FALSE.
                         data_to_upsert = {
                             "discord_id": user_id_str,
                             "discord_name": user_discord_name_tag,
-                            "ingame_name": cleaned_ign, # Store with original casing from param
+                            "ingame_name": cleaned_ign,
                             "is_in_hc": False # Explicitly FALSE for /verify
                         }
                         await run_supabase_sync(
@@ -5283,11 +5303,11 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                         )
                         db_messages.append(f"💾 IGN `{discord.utils.escape_markdown(cleaned_ign)}` linked/updated for {user.mention} (marked as standard verified, not in HC).")
                         await log_info(guild, f"/verify: IGN `{cleaned_ign}` linked/updated for {user.mention} by `{interaction.user}` (is_in_hc=FALSE).")
+                        db_changed_is_in_hc_status = True 
                 
                 except APIError as e_db:
-                    # Check for unique constraint violation on ingame_name specifically
                     if "unique constraint" in str(e_db.message).lower() and "hc_members_ingame_name_key" in str(e_db.message).lower():
-                        db_messages.append(f"⚠️ **IGN Not Linked:** `{discord.utils.escape_markdown(cleaned_ign)}` already exists in the database (possibly unlinked or an unexpected conflict). Please use `/hcverify` or contact staff if this IGN should be linked to this user for HC.")
+                        db_messages.append(f"⚠️ **IGN Not Linked:** `{discord.utils.escape_markdown(cleaned_ign)}` already exists (possibly unlinked). Use `/hcverify` or contact staff if this IGN should be linked for HC.")
                         await log_info(guild, f"/verify DB Error: IGN `{cleaned_ign}` unique constraint hit for user {user.mention}. User: `{interaction.user}`. Error: {e_db.message}")
                     else:
                         db_messages.append(f"⚠️ Database error during IGN update: {e_db.message}")
@@ -5296,48 +5316,63 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                     db_messages.append(f"⚠️ An unexpected database error occurred during IGN update.")
                     await log_error(guild, f"Verify Unexpected DB Error for IGN `{cleaned_ign}` (user: {user.mention})", error=e_db_other, interaction=interaction)
         
-        elif not ingame_name: # IGN not provided, ensure is_in_hc is False if user exists in DB
+        elif not ingame_name: # IGN not provided by command invoker
+            # Fetch current IGN from DB if user exists, for nickname update purposes
+            ign_for_final_nick_update = await get_ign_from_user(guild, user.id)
+            # Ensure is_in_hc is False if user exists in DB
             try:
-                # Check if user is in DB and if is_in_hc is true
                 user_db_resp = await run_supabase_sync(
                     lambda: supabase.table("hc_members")
-                                   .select("is_in_hc")
+                                   .select("is_in_hc, ingame_name") # Also fetch ingame_name
                                    .eq("discord_id", str(user.id))
                                    .maybe_single()
                                    .execute()
                 )
-                if user_db_resp and hasattr(user_db_resp, 'data') and user_db_resp.data and user_db_resp.data.get("is_in_hc") is True:
-                    await run_supabase_sync(
-                        lambda: supabase.table("hc_members")
-                                       .update({"is_in_hc": False})
-                                       .eq("discord_id", str(user.id))
-                                       .execute()
-                    )
-                    db_messages.append(f"ℹ️ {user.mention} (already in DB) now correctly marked as standard verified (not in HC guild).")
-                    await log_info(guild, f"/verify: User {user.mention} (no IGN param) found in DB with is_in_hc=TRUE, updated to FALSE.")
+                if user_db_resp and hasattr(user_db_resp, 'data') and user_db_resp.data:
+                    # If ign_for_final_nick_update was None, set it from this DB fetch
+                    if not ign_for_final_nick_update:
+                        ign_for_final_nick_update = user_db_resp.data.get("ingame_name")
+
+                    if user_db_resp.data.get("is_in_hc") is True:
+                        await run_supabase_sync(
+                            lambda: supabase.table("hc_members")
+                                           .update({"is_in_hc": False})
+                                           .eq("discord_id", str(user.id))
+                                           .execute()
+                        )
+                        db_messages.append(f"ℹ️ {user.mention} (already in DB) now correctly marked as standard verified (not in HC guild).")
+                        await log_info(guild, f"/verify: User {user.mention} (no IGN param) found in DB with is_in_hc=TRUE, updated to FALSE.")
+                        db_changed_is_in_hc_status = True
+                    # else: No DB message if is_in_hc was already false or user not in DB.
             except Exception as e_db_check:
                  await log_error(guild, f"Verify DB check/update (no IGN param) error for user {user.mention}", error=e_db_check, interaction=interaction)
+        
+        # After all DB operations, attempt nickname update if an IGN is associated and is_in_hc status might affect it.
+        if ign_for_final_nick_update and db_changed_is_in_hc_status: # Only if is_in_hc was potentially changed
+            current_satt_for_nick_update = await get_all_time_super_attempt_count(guild, ign_for_final_nick_update)
+            # This will apply custom template, or revert to IGN if no template and management is on (due to is_in_hc=False)
+            await update_custom_nickname_on_attempt(guild, user, ign_for_final_nick_update, current_satt_for_nick_update)
+            # update_custom_nickname_on_attempt logs its own outcome.
 
-
-        # --- Construct Final Message ---
         final_response_parts = []
         if actions_taken: final_response_parts.extend(actions_taken)
         if db_messages: final_response_parts.extend(db_messages)
         
-        if not final_response_parts: # Should ideally not happen if roles were already correct
+        if not final_response_parts:
             final_response_parts.append("ℹ️ No changes made (roles already correct and no IGN specified/updated).")
 
         await log_info(guild, f"`{interaction.user}` verified {user.mention}. Actions: {'; '.join(final_response_parts)}.")
         
         final_embed_desc = "\n".join(final_response_parts)
         final_embed_title = f"✅ Verification Processed: {user.display_name}"
+        final_color = discord.Color.green()
         if any("⚠️" in msg for msg in final_response_parts):
             final_embed_title = f"⚠️ Verification Processed with Issues: {user.display_name}"
+            final_color = discord.Color.orange()
         
-        final_embed = create_embed(title=final_embed_title, description=final_embed_desc, color=discord.Color.green() if "⚠️" not in final_embed_title else discord.Color.orange())
+        final_embed = create_embed(title=final_embed_title, description=final_embed_desc, color=final_color)
         await interaction.edit_original_response(embed=final_embed, view=None)
 
-        # Optional: Send public notification if roles were actually modified
         if modified_roles:
             public_notif_desc = f"✅ **{user.display_name}** has been verified!"
             role_actions_for_public = [line for line in actions_taken if "Role" not in line and ("Added" in line or "Removed" in line)]
@@ -5346,7 +5381,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
             public_embed = create_embed(public_notif_desc, discord.Color.green())
             try:
                 if isinstance(interaction.channel, discord.TextChannel):
-                    await interaction.channel.send(embed=public_embed)
+                    # Check bot has send_messages and embed_links in the interaction channel
+                    if interaction.channel.permissions_for(bot_member).send_messages and \
+                       interaction.channel.permissions_for(bot_member).embed_links:
+                        await interaction.channel.send(embed=public_embed)
+                    else:
+                        await log_info(guild, f"Skipped public /verify notification for {user.mention}: Missing Send/Embed perms in {interaction.channel.mention}")
             except Exception as e_public:
                  await log_error(guild,"Failed to send public verify notification", error=e_public, interaction=interaction)
 
@@ -5687,7 +5727,11 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, ingam
     truncated = ign_to_process != nickname_to_set and ign_to_process
 
     if not nickname_to_set:
-        if db_success: errors_occurred=True; result_summary.append("⚠️ Nickname Error: Cannot set empty nickname."); log_summary.append("Nick skipped (empty IGN)")
+        if db_success: # And manage_nickname_by_bot is true for the user
+            # Fetch current SATT count
+            current_satt_for_nick_update = await get_all_time_super_attempt_count(guild, ign_to_process)
+            # This will apply custom template or default HC format
+            await update_custom_nickname_on_attempt(guild, user, ign_to_process, current_satt_for_nick_update)
     elif user.nick == nickname_to_set: result_summary.append(f"🏷️ Nickname already matches stored IGN."); log_summary.append("Nick already set"); nick_success = True
     elif not can_manage_user_nick: errors_occurred=True; result_summary.append(f"⚠️ Nickname Skipped (Hierarchy)."); log_summary.append("Nick skipped (Hierarchy)")
     else:
@@ -8188,7 +8232,7 @@ async def test_petal_match(interaction: discord.Interaction, petal_query: str):
 
 @tree.command(name="setnickname", description="Manage your custom nickname template for super attempts.")
 @app_commands.describe(
-    template="Nickname template (e.g., \"IGN | {satt} satt\"). Uses {satt} for super attempt count. Leave blank to disable.",
+    template="Nickname template (e.g., \"IGN | {satt} satt\"). Uses {satt} for super attempt count. Omit to toggle bot management.",
     user="[Optional] Target another user (requires Manage Nicknames permission)."
 )
 async def setnickname(interaction: discord.Interaction, template: Optional[str] = None, user: Optional[discord.Member] = None):
@@ -8201,11 +8245,10 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
         return
 
     target_user = user or interaction.user
-    if not isinstance(target_user, discord.Member): # Should be ensured by type hint, but defensive
+    if not isinstance(target_user, discord.Member):
         await interaction.response.send_message("Invalid user provided.", ephemeral=True)
         return
         
-    # Permission check if targeting another user
     if user and user.id != interaction.user.id:
         if not interaction.permissions.manage_nicknames:
             await interaction.response.send_message(f"❌ You need 'Manage Nicknames' permission to set templates for others.", ephemeral=True)
@@ -8218,30 +8261,65 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
         await interaction.followup.send(f"❌ {target_user.mention} does not have an In-Game Name linked in the database. Cannot manage nickname.", ephemeral=True)
         return
 
-    manage_by_bot_new_value = False
+    manage_by_bot_new_value: bool
     template_to_store: Optional[str] = None
     response_message_parts = []
 
-    if template:
+    # Fetch current settings to toggle manage_nickname_by_bot if template is omitted
+    current_settings_resp = await run_supabase_sync(
+        lambda: supabase.table("hc_members")
+                       .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc")
+                       .eq("discord_id", str(target_user.id))
+                       .maybe_single()
+                       .execute()
+    )
+    
+    current_manage_by_bot = False
+    current_is_in_hc = False
+    if current_settings_resp and hasattr(current_settings_resp, 'data') and current_settings_resp.data:
+        current_manage_by_bot = current_settings_resp.data.get("manage_nickname_by_bot", False)
+        current_is_in_hc = current_settings_resp.data.get("is_in_hc", False)
+        # If template is not provided, current_custom_template is not directly used for setting, but for info.
+        # current_custom_template = current_settings_resp.data.get("custom_nickname_template")
+
+
+    if template is not None: # Template parameter was explicitly provided (even if empty string)
         cleaned_template = template.strip()
-        if not cleaned_template: # User provided blank string explicitly
-            manage_by_bot_new_value = False
-            template_to_store = None
-            response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
-        elif len(cleaned_template) > 200: # Arbitrary limit for template length
+        if not cleaned_template: # User provided blank string explicitly to clear template
+            manage_by_bot_new_value = True # Keep management ON but use default format
+            template_to_store = None # Store NULL for custom_template
+            response_message_parts.append(f"⚙️ Custom nickname template **cleared** for {target_user.mention}.")
+            if current_is_in_hc:
+                 response_message_parts.append(f"🤖 Bot will now use the default HC nickname format: `IGN (SATT satt)` or `IGN`.")
+            else:
+                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in HC.")
+            response_message_parts.append(f"🤖 Bot nickname management remains **enabled** (or enabled if it was off).")
+
+        elif len(cleaned_template) > 200:
             await interaction.followup.send(f"❌ Nickname template is too long (max 200 characters).", ephemeral=True)
             return
-        else:
+        else: # Valid custom template provided
             manage_by_bot_new_value = True
             template_to_store = cleaned_template
-            response_message_parts.append(f"⚙️ Nickname template for {target_user.mention} set to: `{discord.utils.escape_markdown(template_to_store)}`.")
-            response_message_parts.append(f"🤖 Bot nickname management **enabled**.")
+            response_message_parts.append(f"⚙️ Custom nickname template for {target_user.mention} set to: `{discord.utils.escape_markdown(template_to_store)}`.")
+            response_message_parts.append(f"🤖 Bot nickname management **enabled** (or enabled if it was off).")
             if "{satt}" not in template_to_store:
                 response_message_parts.append(f"⚠️ Your template does not include `{{satt}}`. The super attempt count will not be shown.")
-    else: # Template parameter was omitted (None)
-        manage_by_bot_new_value = False
-        template_to_store = None
-        response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
+    else: # Template parameter was omitted entirely (is None) -> Toggle management
+        manage_by_bot_new_value = not current_manage_by_bot # Toggle the current state
+        if manage_by_bot_new_value:
+            template_to_store = None # When turning ON by toggle, ensure custom template is NULL for default format
+            response_message_parts.append(f"🤖 Bot nickname management **enabled** for {target_user.mention}.")
+            if current_is_in_hc:
+                 response_message_parts.append(f"🤖 Bot will now use the default HC nickname format.")
+            else:
+                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in HC (if different).")
+
+        else: # Turning OFF
+            template_to_store = None # Clear template when turning off management too, for consistency
+            response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
+            response_message_parts.append(f"🏷️ Nickname will revert to IGN (if different and user is in HC) or be unmanaged.")
+
 
     try:
         await run_supabase_sync(
@@ -8251,21 +8329,25 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
                                "custom_nickname_template": template_to_store
                            })
                            .eq("discord_id", str(target_user.id))
+                           # Ensure it's for the correct IGN if user has multiple accounts (rare)
+                           # This also implicitly checks if the user is in hc_members for this IGN
+                           .eq("ingame_name", author_ign) 
                            .execute()
         )
         response_message_parts.append(f"💾 Settings saved.")
 
-        # Immediately update nickname if management is now on
-        if manage_by_bot_new_value and template_to_store:
-            all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
-            await update_custom_nickname_on_attempt(guild, target_user, author_ign, all_time_count)
-            # update_custom_nickname_on_attempt logs its own success/failure for nick change
-            # We can add a small note about the attempt to update
-            current_nick = target_user.nick # Get nick after potential update
-            if current_nick and template_to_store.replace("{satt}", str(all_time_count))[:32] == current_nick:
-                 response_message_parts.append(f"🏷️ Nickname updated to: `{discord.utils.escape_markdown(current_nick)}`")
-            else:
-                 response_message_parts.append(f"ℹ️ Nickname update attempted (check server for changes or bot logs for errors if it didn't update as expected).")
+        # Immediately update nickname based on new settings
+        all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
+        # Call update_custom_nickname_on_attempt. It will now handle:
+        # 1. Custom template if manage_by_bot_new_value is True and template_to_store is not None.
+        # 2. Default HC format if manage_by_bot_new_value is True, template_to_store is None, and is_in_hc is True.
+        # 3. Reverting to IGN if manage_by_bot_new_value is False and is_in_hc is True.
+        await update_custom_nickname_on_attempt(guild, target_user, author_ign, all_time_count)
+        
+        current_nick = target_user.nick # Get nick after potential update
+        # This confirmation is a bit trickier now due to multiple nickname outcomes.
+        # update_custom_nickname_on_attempt logs the actual change.
+        response_message_parts.append(f"ℹ️ Nickname update based on new settings has been processed. Check server for changes.")
 
 
     except Exception as e:
