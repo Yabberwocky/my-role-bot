@@ -2128,32 +2128,17 @@ class HelpPagesView(discord.ui.View):
     def __init__(self, bot_user: discord.User, is_staff_view_allowed: bool, timeout=180.0):
         super().__init__(timeout=timeout)
         self.bot_user = bot_user
-        self.current_page = "general" # "general" or "staff"
+        self.current_page = "general" 
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
-
-        # --- We will let the @discord.ui.button decorator handle the button ---
-        # --- So, NO self.toggle_button = ... or self.add_item(...) here for it ---
-        
-        # Update the appearance of the decorated button if it's going to be active.
-        # The button itself is only "active" (visible/added to children) if is_staff_view_allowed.
-        # We need to find the button instance created by the decorator to modify it.
-        # The children are populated after __init__ completes based on decorators.
-        # So, we can't modify it here directly in __init__ before it's added.
-        # Instead, the button's initial appearance can be set in its callback logic or before sending.
-        
-        # If not staff view allowed, we will remove the button before sending the view.
-        # This is done in the /nerdhelp command now.
         pass
 
-
     def _update_decorated_button_appearance(self, button_to_update: discord.ui.Button):
-        """Updates the label, emoji, and style of the button passed to it."""
         if self.current_page == "general":
             button_to_update.label = "View Staff Commands"
             button_to_update.emoji = "🛡️"
             button_to_update.style = discord.ButtonStyle.secondary
-        else: # current_page == "staff"
+        else: 
             button_to_update.label = "Back to General"
             button_to_update.emoji = "⬅️"
             button_to_update.style = discord.ButtonStyle.primary
@@ -2163,18 +2148,24 @@ class HelpPagesView(discord.ui.View):
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "Here are commands generally available to users:\n\u200B"
+        
         embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('profile')} · View your [HC1] profile and activity.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('profile')} · View your [HC1] profile, activity, and S.Attempt stats.", value="\u200B", inline=False) # MODIFIED description
+        
         embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
-        embed.add_field(name="\u200B\n💬 Messaging", value="\u200B", inline=False)
+        
+        embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False) # MODIFIED section title
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname template.", value="\u200B", inline=False) # ADDED command
+        
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
+        
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
@@ -2183,23 +2174,28 @@ class HelpPagesView(discord.ui.View):
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "These commands typically require server management permissions:\n\u200B"
+        
         embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('unverify')}  · Unverify user. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify into HC. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hconly')} · Register IGN only. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False)
+        
         embed.add_field(name="\u200B\n⏱️ Activity Tracking (Staff)", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active. `[Manage Server]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity. `[Manage Server]`", value="\u200B", inline=False)
+        
         embed.add_field(name="\u200B\n⚙️ Utilities (Staff & Owner)", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Manage Server]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list & data. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync all HC nicks. `[Manage Nicks]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicks for S.Attempts. `[Manage Nicks]`", value="\u200B", inline=False) # MODIFIED description
         embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('aiping')} · Check AI model latencies. `[Owner Only]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages. `[Owner Only]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('test_petal_match')} · Test petal name fuzzy matching. `[Owner Only]`", value="\u200B", inline=False) # ADDED (if test command is still relevant)
+
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
@@ -2208,8 +2204,6 @@ class HelpPagesView(discord.ui.View):
             return self._create_staff_embed()
         return self._create_general_embed()
 
-    # The button defined by the decorator is the one and only toggle button.
-    # Its initial label/style will be as defined in the decorator. We update it before sending the view.
     @discord.ui.button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
     async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.is_staff_view_allowed:
@@ -2221,26 +2215,74 @@ class HelpPagesView(discord.ui.View):
         else:
             self.current_page = "general"
         
-        self._update_decorated_button_appearance(button) # Pass the button instance from the callback
+        self._update_decorated_button_appearance(button) 
         current_embed = self.get_current_embed()
         
         await interaction.response.edit_message(embed=current_embed, view=self)
 
     async def on_timeout(self):
-        if self.message and self.is_staff_view_allowed: # Only if there was an interactive element
+        if self.message and self.is_staff_view_allowed: 
             try:
                 current_embed_on_timeout = self.get_current_embed()
-                current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
+                if current_embed_on_timeout.footer and current_embed_on_timeout.footer.text: # Check footer exists
+                    current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
+                else: # Fallback if no footer
+                    current_embed_on_timeout.set_footer(text="Interaction timed out")
                 
-                # Find the button and disable it
                 for item in self.children:
                     if isinstance(item, discord.ui.Button) and item.custom_id == "help_toggle_page_decorator_final":
                         item.disabled = True
                         break
-                await self.message.edit(embed=current_embed_on_timeout, view=self) # Send view with disabled button
+                await self.message.edit(embed=current_embed_on_timeout, view=self) 
             except discord.HTTPException:
                 pass
         self.stop()
+
+@tree.command(name="nerdhelp", description="Show the list of available bot commands.")
+async def nerdhelp(interaction: discord.Interaction):
+    # // --- UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+        return
+
+    if not bot or not bot.user:
+        await interaction.response.send_message("Bot is not fully ready, cannot generate help.", ephemeral=False)
+        return
+    if not command_ids:
+        print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
+    # // --- END UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
+
+    can_see_staff_commands = False
+    if isinstance(interaction.user, discord.Member): # Ensure user is a Member for permission checks
+        can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
+
+    view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
+    
+    if not can_see_staff_commands:
+        view_instance.clear_items() 
+
+    initial_embed = view_instance.get_current_embed()
+
+    # // --- UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
+    try:
+        await interaction.response.send_message(embed=initial_embed, view=view_instance, ephemeral=False)
+        view_instance.message = await interaction.original_response()
+            
+    except Exception as e:
+        print(f"Error sending nerdhelp response: {e}")
+        if isinstance(e, discord.HTTPException) and e.code == 50035:
+            print("--- TRACEBACK FOR NERDHELP 50035 ---")
+            print(traceback.format_exc())
+            print("--- END TRACEBACK ---")
+        await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
+            else: # Should have been responded to by send_message above
+                await interaction.edit_original_response(content="Failed to generate help embed.", embed=None, view=None)
+        except Exception: pass
+    # // --- END UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
 
 async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices = []
@@ -5182,19 +5224,45 @@ def get_cmd_mention(name: str) -> str:
 # --- Slash Commands ---
 
 # --- Verify Command ---
-@tree.command(name="verify", description="Verify a standard user (adds Verified, removes Unverified). Optionally link IGN.")
+@tree.command(name="verify", description="Verify a standard user or update your own IGN if already verified.")
 @app_commands.describe(
-    user="The user to verify.",
-    ingame_name="[Optional] User's Florr IGN to link/update (will NOT be set as nickname by this command)."
+    user="The user to verify (or yourself to update IGN).",
+    ingame_name="[Optional] User's Florr IGN to link/update. Required if updating your own IGN."
 )
-@app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.checks.bot_has_permissions(manage_roles=True)
+# @app_commands.checks.has_permissions(manage_roles=True) # <-- We'll handle this conditionally
+@app_commands.checks.bot_has_permissions(manage_roles=True) # Bot always needs this for role operations
 async def verify(interaction: discord.Interaction, user: discord.Member, ingame_name: Optional[str] = None):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
+    # Conditional Permission Check
+    is_self_target = interaction.user.id == user.id
+    role_verified_obj = guild.get_role(FLORRIST_ROLE_ID) # Used for self-check and main logic
+    
+    if not is_self_target: # If targeting OTHERS, original permission check applies
+        if not interaction.permissions.manage_roles:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Roles' permission to verify other users.", ephemeral=True
+            )
+            return
+    elif is_self_target and (not role_verified_obj or role_verified_obj not in interaction.user.roles):
+        # Targeting self, but NOT verified -> staff still needs to verify them
+        await interaction.response.send_message(
+            f"❌ You cannot use this command to verify yourself initially. Please ask a staff member with 'Manage Roles' permission to verify you.",
+            ephemeral=True
+        )
+        return
+    elif is_self_target and role_verified_obj and role_verified_obj in interaction.user.roles and not ingame_name:
+        # Targeting self, IS verified, but no IGN provided for update
+        await interaction.response.send_message(
+            "ℹ️ You are already verified. To update your In-Game Name, please provide it in the `ingame_name` option.",
+            ephemeral=True
+        )
+        return
+
+    # Defer after permission checks
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     if not await check_supabase_available(interaction):
@@ -5202,78 +5270,88 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
         return
 
     role_to_remove = guild.get_role(NEWBEE_ROLE_ID)
-    role_to_add = guild.get_role(FLORRIST_ROLE_ID)
+    # role_verified_obj is already defined above
     bot_member = guild.me
 
+    # Role existence checks (still important if staff is running it for role changes)
     missing_roles = []
     if NEWBEE_ROLE_ID and not role_to_remove: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
-    if FLORRIST_ROLE_ID and not role_to_add: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
-    if missing_roles:
+    if FLORRIST_ROLE_ID and not role_verified_obj: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
+    
+    if missing_roles and not (is_self_target and role_verified_obj and role_verified_obj in user.roles):
+        # If roles are missing AND it's not a self-IGN update case (where roles don't matter)
         msg = f"❌ Setup Error: Roles not found: {', '.join(missing_roles)}. Please configure the bot."
         await interaction.edit_original_response(content=msg, embed=None, view=None)
         await log_error(guild, f"Verify failed: Missing roles - {', '.join(missing_roles)}", interaction=interaction)
         return
-    if not role_to_add: # Should be caught by above, but defensive
-         msg = f"❌ Setup Error: Verified Role (ID: {FLORRIST_ROLE_ID}) not configured correctly."
-         await interaction.edit_original_response(content=msg, embed=None, view=None)
-         await log_error(guild, msg, interaction=interaction)
-         return
     
-    hierarchy_fail = False
-    hierarchy_reason = ""
-    if bot_member.top_role.position <= role_to_add.position:
-        hierarchy_fail=True
-        hierarchy_reason=f"Cannot assign the '{role_to_add.name}' role."
-    elif role_to_remove and bot_member.top_role.position <= role_to_remove.position: # Check role_to_remove exists before accessing its position
-        hierarchy_fail=True
-        hierarchy_reason=f"Cannot remove the '{role_to_remove.name}' role."
-    
-    if hierarchy_fail:
-        msg = f"❌ Hierarchy Error: {hierarchy_reason} My highest role ('{bot_member.top_role.name}') is not high enough."
-        await interaction.edit_original_response(content=msg, embed=None, view=None)
-        await log_error(guild, f"Verify failed: Bot hierarchy issue. Reason: {hierarchy_reason}", interaction=interaction)
-        return
+    # Hierarchy check (only relevant if roles are being changed, i.e., not self-IGN update)
+    if not (is_self_target and role_verified_obj and role_verified_obj in user.roles):
+        hierarchy_fail = False
+        hierarchy_reason = ""
+        if role_verified_obj and bot_member.top_role.position <= role_verified_obj.position: # Check role_verified_obj exists
+            hierarchy_fail=True
+            hierarchy_reason=f"Cannot assign the '{role_verified_obj.name}' role."
+        elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
+            hierarchy_fail=True
+            hierarchy_reason=f"Cannot remove the '{role_to_remove.name}' role."
+        
+        if hierarchy_fail:
+            msg = f"❌ Hierarchy Error: {hierarchy_reason} My highest role ('{bot_member.top_role.name}') is not high enough."
+            await interaction.edit_original_response(content=msg, embed=None, view=None)
+            await log_error(guild, f"Verify failed: Bot hierarchy issue. Reason: {hierarchy_reason}", interaction=interaction)
+            return
 
     actions_taken = []
     db_messages = [] 
-    reason = f"Verified by {interaction.user} (ID: {interaction.user.id})"
+    reason_prefix = "Self-updated IGN" if is_self_target else "Verified"
+    reason = f"{reason_prefix} by {interaction.user} (ID: {interaction.user.id})"
     modified_roles = False
-    db_changed_is_in_hc_status = False # Flag to track if is_in_hc was explicitly set/updated
-    ign_for_final_nick_update: Optional[str] = None # Store the relevant IGN for nick update
+    db_changed_is_in_hc_status = False 
+    ign_for_final_nick_update: Optional[str] = None
 
     try:
-        has_verified_role = role_to_add in user.roles
-        has_unverified_role = bool(role_to_remove and role_to_remove in user.roles)
+        # --- Role Management ---
+        # Skip role changes if user is self-targeting AND already verified
+        if is_self_target and role_verified_obj and role_verified_obj in user.roles:
+            actions_taken.append("ℹ️ You are already verified. Proceeding with IGN update only.")
+        else: # Standard role verification logic by staff
+            has_verified_role = role_verified_obj and role_verified_obj in user.roles
+            has_unverified_role = bool(role_to_remove and role_to_remove in user.roles)
 
-        roles_to_add_list = []
-        roles_to_remove_list = []
+            roles_to_add_list = []
+            roles_to_remove_list = []
 
-        if has_unverified_role and role_to_remove:
-             roles_to_remove_list.append(role_to_remove)
-        if not has_verified_role:
-             roles_to_add_list.append(role_to_add)
+            if has_unverified_role and role_to_remove:
+                 roles_to_remove_list.append(role_to_remove)
+            if not has_verified_role and role_verified_obj: # Check role_verified_obj exists
+                 roles_to_add_list.append(role_verified_obj)
 
-        if roles_to_add_list or roles_to_remove_list:
-            current_roles = user.roles
-            final_role_set = [r for r in current_roles if r not in roles_to_remove_list] + roles_to_add_list
-            final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] 
-            await user.edit(roles=final_role_set, reason=reason)
-            modified_roles = True
-            if roles_to_remove_list and role_to_remove: actions_taken.append(f"➖ Removed `{role_to_remove.name}`")
-            if roles_to_add_list: actions_taken.append(f"➕ Added `{role_to_add.name}`")
-        else:
-            actions_taken.append(f"ℹ️ Roles already correct for standard verification.")
+            if roles_to_add_list or roles_to_remove_list:
+                current_roles = user.roles
+                final_role_set = [r for r in current_roles if r not in roles_to_remove_list] + roles_to_add_list
+                final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] 
+                await user.edit(roles=final_role_set, reason=reason)
+                modified_roles = True
+                if roles_to_remove_list and role_to_remove: actions_taken.append(f"➖ Removed `{role_to_remove.name}`")
+                if roles_to_add_list and role_verified_obj: actions_taken.append(f"➕ Added `{role_verified_obj.name}`")
+            else:
+                actions_taken.append(f"ℹ️ Roles already correct for standard verification.")
             
-        # IGN Linking/Updating Logic
+        # --- IGN Linking/Updating Logic ---
         cleaned_ign: Optional[str] = None
-        if ingame_name:
+        if ingame_name: # This condition is now also true for self-update case
             cleaned_ign = ingame_name.strip()
-            ign_for_final_nick_update = cleaned_ign # Set for later nick update
+            ign_for_final_nick_update = cleaned_ign
             user_id_str = str(user.id)
             user_discord_name_tag = f"{user.name}#{user.discriminator}" if user.discriminator != '0' else user.name
 
             if not cleaned_ign:
-                db_messages.append("⚠️ IGN provided was empty, so no database update attempted for IGN.")
+                db_messages.append("⚠️ IGN provided was empty. No IGN update attempted.")
+                # If self-targeting and IGN was empty, this is an error for their intent.
+                if is_self_target:
+                     await interaction.edit_original_response(content="❌ You must provide a valid In-Game Name to update.", embed=None, view=None)
+                     return
             else:
                 try:
                     conflict_resp = await run_supabase_sync(
@@ -5290,22 +5368,47 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                         db_messages.append(f"⚠️ **IGN Conflict:** `{discord.utils.escape_markdown(cleaned_ign)}` is already linked to another user (<@{other_user_id}>). IGN not updated.")
                         await log_info(guild, f"/verify IGN conflict: User `{interaction.user}` tried to link `{cleaned_ign}` to `{user.name}`, but it's linked to ID {other_user_id}.")
                     else:
+                        # For /verify (even self-verify for IGN), is_in_hc should be FALSE unless /hcverify is used.
+                        # If they are already in DB with is_in_hc=TRUE, this command should NOT change that unless they are also being HCVerified (which this command doesn't do).
+                        # So, we need to fetch current is_in_hc if user exists, and preserve it if True, otherwise set to False.
+                        
+                        current_db_status = await run_supabase_sync(
+                            lambda: supabase.table("hc_members")
+                                           .select("is_in_hc")
+                                           .eq("discord_id", user_id_str)
+                                           .maybe_single()
+                                           .execute()
+                        )
+                        
+                        final_is_in_hc_value = False # Default for new /verify entries
+                        if current_db_status and hasattr(current_db_status, 'data') and current_db_status.data:
+                            if current_db_status.data.get("is_in_hc") is True:
+                                final_is_in_hc_value = True # Preserve if they are already marked in HC
+
                         data_to_upsert = {
                             "discord_id": user_id_str,
                             "discord_name": user_discord_name_tag,
                             "ingame_name": cleaned_ign,
-                            "is_in_hc": False # Explicitly FALSE for /verify
+                            "is_in_hc": final_is_in_hc_value 
                         }
                         await run_supabase_sync(
                             lambda: supabase.table("hc_members")
                                            .upsert(data_to_upsert, on_conflict="discord_id")
                                            .execute()
                         )
-                        db_messages.append(f"💾 IGN `{discord.utils.escape_markdown(cleaned_ign)}` linked/updated for {user.mention} (marked as standard verified, not in HC).")
-                        await log_info(guild, f"/verify: IGN `{cleaned_ign}` linked/updated for {user.mention} by `{interaction.user}` (is_in_hc=FALSE).")
-                        db_changed_is_in_hc_status = True 
-                
+                        db_messages.append(f"💾 IGN `{discord.utils.escape_markdown(cleaned_ign)}` linked/updated for {user.mention}.")
+                        log_msg_hc_status = " (is_in_hc preserved as TRUE)" if final_is_in_hc_value else " (is_in_hc set/kept as FALSE)"
+                        await log_info(guild, f"/verify: IGN `{cleaned_ign}` linked/updated for {user.mention} by `{interaction.user}`{log_msg_hc_status}.")
+                        
+                        # Only set db_changed_is_in_hc_status if the 'final_is_in_hc_value' is different from what it might have been.
+                        # This is tricky without knowing the "before" state precisely without another query.
+                        # For simplicity, let's assume if we touch the DB record, nickname might need an update if managed.
+                        # Or more accurately, if 'final_is_in_hc_value' is now FALSE and it might have been TRUE.
+                        if not final_is_in_hc_value and (not current_db_status or not current_db_status.data or current_db_status.data.get("is_in_hc") is not False):
+                            db_changed_is_in_hc_status = True
+
                 except APIError as e_db:
+                    # ... (same error handling as before for unique constraint and other API errors) ...
                     if "unique constraint" in str(e_db.message).lower() and "hc_members_ingame_name_key" in str(e_db.message).lower():
                         db_messages.append(f"⚠️ **IGN Not Linked:** `{discord.utils.escape_markdown(cleaned_ign)}` already exists (possibly unlinked). Use `/hcverify` or contact staff if this IGN should be linked for HC.")
                         await log_info(guild, f"/verify DB Error: IGN `{cleaned_ign}` unique constraint hit for user {user.mention}. User: `{interaction.user}`. Error: {e_db.message}")
@@ -5316,64 +5419,63 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                     db_messages.append(f"⚠️ An unexpected database error occurred during IGN update.")
                     await log_error(guild, f"Verify Unexpected DB Error for IGN `{cleaned_ign}` (user: {user.mention})", error=e_db_other, interaction=interaction)
         
-        elif not ingame_name: # IGN not provided by command invoker
-            # Fetch current IGN from DB if user exists, for nickname update purposes
+        elif not ingame_name and not is_self_target: 
+            # IGN not provided by staff, and not a self-update case
             ign_for_final_nick_update = await get_ign_from_user(guild, user.id)
-            # Ensure is_in_hc is False if user exists in DB
             try:
                 user_db_resp = await run_supabase_sync(
                     lambda: supabase.table("hc_members")
-                                   .select("is_in_hc, ingame_name") # Also fetch ingame_name
+                                   .select("is_in_hc, ingame_name")
                                    .eq("discord_id", str(user.id))
                                    .maybe_single()
                                    .execute()
                 )
                 if user_db_resp and hasattr(user_db_resp, 'data') and user_db_resp.data:
-                    # If ign_for_final_nick_update was None, set it from this DB fetch
                     if not ign_for_final_nick_update:
                         ign_for_final_nick_update = user_db_resp.data.get("ingame_name")
-
-                    if user_db_resp.data.get("is_in_hc") is True:
+                    if user_db_resp.data.get("is_in_hc") is True: # If they were in HC
                         await run_supabase_sync(
                             lambda: supabase.table("hc_members")
-                                           .update({"is_in_hc": False})
+                                           .update({"is_in_hc": False}) # Mark them as not in HC via /verify
                                            .eq("discord_id", str(user.id))
                                            .execute()
                         )
                         db_messages.append(f"ℹ️ {user.mention} (already in DB) now correctly marked as standard verified (not in HC guild).")
-                        await log_info(guild, f"/verify: User {user.mention} (no IGN param) found in DB with is_in_hc=TRUE, updated to FALSE.")
+                        await log_info(guild, f"/verify: User {user.mention} (no IGN param by staff) found in DB with is_in_hc=TRUE, updated to FALSE.")
                         db_changed_is_in_hc_status = True
-                    # else: No DB message if is_in_hc was already false or user not in DB.
             except Exception as e_db_check:
-                 await log_error(guild, f"Verify DB check/update (no IGN param) error for user {user.mention}", error=e_db_check, interaction=interaction)
+                 await log_error(guild, f"Verify DB check/update (no IGN param by staff) error for {user.mention}", error=e_db_check, interaction=interaction)
         
-        # After all DB operations, attempt nickname update if an IGN is associated and is_in_hc status might affect it.
-        if ign_for_final_nick_update and db_changed_is_in_hc_status: # Only if is_in_hc was potentially changed
+        # Nickname update logic
+        if ign_for_final_nick_update and (is_self_target or db_changed_is_in_hc_status):
+            # If self-target, always try to update nick with the new/existing IGN.
+            # If staff target, only update if is_in_hc status potentially changed that would affect default nick.
             current_satt_for_nick_update = await get_all_time_super_attempt_count(guild, ign_for_final_nick_update)
-            # This will apply custom template, or revert to IGN if no template and management is on (due to is_in_hc=False)
             await update_custom_nickname_on_attempt(guild, user, ign_for_final_nick_update, current_satt_for_nick_update)
-            # update_custom_nickname_on_attempt logs its own outcome.
 
+        # --- Construct Final Message ---
         final_response_parts = []
         if actions_taken: final_response_parts.extend(actions_taken)
         if db_messages: final_response_parts.extend(db_messages)
         
-        if not final_response_parts:
-            final_response_parts.append("ℹ️ No changes made (roles already correct and no IGN specified/updated).")
+        if not final_response_parts: 
+            final_response_parts.append("ℹ️ No changes made.") # Generic if nothing happened
 
-        await log_info(guild, f"`{interaction.user}` verified {user.mention}. Actions: {'; '.join(final_response_parts)}.")
+        await log_info(guild, f"`{interaction.user}` ran /verify for {user.mention}. Actions: {'; '.join(final_response_parts)}.")
         
         final_embed_desc = "\n".join(final_response_parts)
-        final_embed_title = f"✅ Verification Processed: {user.display_name}"
+        title_action = "IGN Update" if is_self_target else "Verification"
+        final_embed_title = f"✅ {title_action} Processed: {user.display_name}"
         final_color = discord.Color.green()
         if any("⚠️" in msg for msg in final_response_parts):
-            final_embed_title = f"⚠️ Verification Processed with Issues: {user.display_name}"
+            final_embed_title = f"⚠️ {title_action} Processed with Issues: {user.display_name}"
             final_color = discord.Color.orange()
         
         final_embed = create_embed(title=final_embed_title, description=final_embed_desc, color=final_color)
         await interaction.edit_original_response(embed=final_embed, view=None)
 
-        if modified_roles:
+        # Public notification only if roles were changed by staff
+        if modified_roles and not is_self_target:
             public_notif_desc = f"✅ **{user.display_name}** has been verified!"
             role_actions_for_public = [line for line in actions_taken if "Role" not in line and ("Added" in line or "Removed" in line)]
             if role_actions_for_public:
@@ -5381,7 +5483,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
             public_embed = create_embed(public_notif_desc, discord.Color.green())
             try:
                 if isinstance(interaction.channel, discord.TextChannel):
-                    # Check bot has send_messages and embed_links in the interaction channel
                     if interaction.channel.permissions_for(bot_member).send_messages and \
                        interaction.channel.permissions_for(bot_member).embed_links:
                         await interaction.channel.send(embed=public_embed)
@@ -5390,14 +5491,16 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
             except Exception as e_public:
                  await log_error(guild,"Failed to send public verify notification", error=e_public, interaction=interaction)
 
-
     except discord.Forbidden:
+        # ... (same error handling as before) ...
         await log_error(guild, "Verify failed: Bot lacks permissions (Forbidden).", interaction=interaction)
         await interaction.edit_original_response(content="❌ Failed: I don't have the necessary permissions to manage roles for this user.", embed=None, view=None)
     except discord.HTTPException as e:
+        # ... (same error handling as before) ...
         await log_error(guild, "Verify failed: Discord API error.", error=e, interaction=interaction)
         await interaction.edit_original_response(content="❌ Failed: A Discord API error occurred. Please try again later.", embed=None, view=None)
     except Exception as e:
+        # ... (same error handling as before) ...
         await log_error(guild, "Unexpected error during /verify.", error=e, interaction=interaction, ping_owner=True)
         await interaction.edit_original_response(content="❌ An unexpected error occurred.", embed=None, view=None)
 
