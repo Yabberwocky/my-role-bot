@@ -153,6 +153,30 @@ MOB_NAME_RARITIES_TO_STRIP = [
 ]
 
 AI_PROMPTS = {
+    "FLORR_GUILD_LIST_FULL_EXTRACTION": """Analyze the provided image, which is a screenshot from the game Florr.io, expected to show a guild member list.
+        Your primary task is to extract ALL In-Game Names (IGNs) visible in this list.
+
+        Known Valid In-Game Names (use this as a strong reference for correcting minor OCR errors or variations):
+        --- BEGIN KNOWN NAMES LIST ---
+        {known_igns_list_str}
+        --- END KNOWN NAMES LIST ---
+
+        **Instructions:**
+        1.  Identify the area in the screenshot that displays the guild member roster.
+        2.  Extract every player name visible within this roster. Do NOT filter by online/offline status indicators (e.g., green dots, dimming). Your goal is a complete list of names shown.
+        3.  For each name extracted, try to match it against the "Known Valid In-Game Names" list provided.
+            - If an extracted name is an exact match (case-insensitive) to a known name, output the version from the *known list*.
+            - If an extracted name is very similar (e.g., minor OCR error, slight capitalization difference) to a known name, output the version from the *known list*.
+            - If an extracted name is clearly visible but has no close match in the known list, output the name as you see it in the screenshot.
+        4.  List each unique player name on a NEW LINE.
+        5.  Output ONLY the names. Do NOT include any other text, commentary, numbering, or formatting.
+        6.  If no player names are identifiable in the image, output the exact phrase: NO_NAMES_FOUND
+
+        Example of expected output if "PlayerName1", "OfflinePlayer2", and "NewPlayerXYZ" (not in known list) were visible:
+        PlayerName1
+        OfflinePlayer2
+        NewPlayerXYZ
+        """,
     "HUMAN_SYSTEM_INSTRUCTION_V3": (
         "You are Pingslave, a chat assistant in a Discord server named '{server_name}', currently in channel '#{channel_name}'. "
         "The current UTC time is {current_time_utc}. Your primary goal is to be engaging, polite, clever, and conversational, with a slightly nerdy flair. "
@@ -178,31 +202,31 @@ AI_PROMPTS = {
         "The user's message history and any images they sent are provided below for context. Focus your response on their LATEST_USER_MESSAGE. Now, GO FORTH AND BE... {mob_name}!"
     ),
     "FLORR_IMAGE_NAME_EXTRACTION": """Analyze the provided image(s), which are screenshots from the game Florr.io, potentially showing a guild member list.
-Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
-
-Known Valid In-Game Names (use this as your reference):
---- BEGIN KNOWN NAMES LIST ---
-{known_igns_list_str}
---- END KNOWN NAMES LIST ---
-
-**Instructions for Guild Member Lists (if present in the image):**
-- Focus on identifying players who are displayed in a way that suggests they are currently online or active in the guild. Games often distinguish online members from offline ones in these lists (e.g., brighter names, different icons, or placement).
-- Use your general knowledge of game UIs to infer this online/active status from the visual presentation in the guild list.
-- If a name is visible in a guild list but appears to be offline or inactive, DO NOT extract it.
-- If the image is definitively NOT a guild member list (e.g., general gameplay, chat messages without a structured list), you may identify any names from the "Known Valid In-Game Names" list if they are clearly visible. Prioritize guild list rules if a guild list is clearly present.
-
-General Output Instructions:
-1. List each clearly identifiable player name that meets ALL criteria above on a NEW LINE.
-2. These names must, as accurately as possible, match one of the names from the "Known Valid In-Game Names" list provided.
-3. If a name from the list appears to be partially visible or has minor OCR inaccuracies but you are confident it's a match to a name in the provided list AND meets the online/active criteria for guild lists, output the name *from the list*.
-4. Output ONLY the names. Do NOT include any other text, commentary, numbering, or formatting.
-5. If the same name (meeting all criteria) appears multiple times, list it only once in the final output.
-6. If, after applying all rules, no player names (from the provided list, meeting all criteria including appearing online/active in guild lists) are clearly identifiable in any of the image(s), output the exact phrase: NO_NAMES_FOUND
-
-Example of expected output if "PlayerName1" and "PlayerName2" (both appearing online in a guild list) were in the known list and found:
-PlayerName1
-PlayerName2
-""",
+        Your task is to identify and extract In-Game Names (IGNs) of players who appear to be ONLINE or CURRENTLY ACTIVE within a guild member list context.
+        
+        Known Valid In-Game Names (use this as your reference):
+        --- BEGIN KNOWN NAMES LIST ---
+        {known_igns_list_str}
+        --- END KNOWN NAMES LIST ---
+        
+        **Instructions for Guild Member Lists (if present in the image):**
+        - Focus on identifying players who are displayed in a way that suggests they are currently online or active in the guild. Games often distinguish online members from offline ones in these lists (e.g., brighter names, different icons, or placement).
+        - Use your general knowledge of game UIs to infer this online/active status from the visual presentation in the guild list.
+        - If a name is visible in a guild list but appears to be offline or inactive, DO NOT extract it.
+        - If the image is definitively NOT a guild member list (e.g., general gameplay, chat messages without a structured list), you may identify any names from the "Known Valid In-Game Names" list if they are clearly visible. Prioritize guild list rules if a guild list is clearly present.
+        
+        General Output Instructions:
+        1. List each clearly identifiable player name that meets ALL criteria above on a NEW LINE.
+        2. These names must, as accurately as possible, match one of the names from the "Known Valid In-Game Names" list provided.
+        3. If a name from the list appears to be partially visible or has minor OCR inaccuracies but you are confident it's a match to a name in the provided list AND meets the online/active criteria for guild lists, output the name *from the list*.
+        4. Output ONLY the names. Do NOT include any other text, commentary, numbering, or formatting.
+        5. If the same name (meeting all criteria) appears multiple times, list it only once in the final output.
+        6. If, after applying all rules, no player names (from the provided list, meeting all criteria including appearing online/active in guild lists) are clearly identifiable in any of the image(s), output the exact phrase: NO_NAMES_FOUND
+        
+        Example of expected output if "PlayerName1" and "PlayerName2" (both appearing online in a guild list) were in the known list and found:
+        PlayerName1
+        PlayerName2
+        """,
     "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION": (
         "You are a helpful and slightly playful bot. A user just made the FIRST EVER discovery of your secret keyword phrase '{phrase_identifier}'.\n"
         "1. Start by warmly and enthusiastically congratulating {user_display_name} on this unique discovery!\n"
@@ -1366,54 +1390,11 @@ async def setup(bot: commands.Bot):
     run_supabase_sync_global = getattr(bot, 'run_supabase_sync_global', None)
 
     if not all([supabase_client, log_info_global, log_error_global, run_supabase_sync_global]):
-        missing_core_funcs_msg = "AI Cog CRITICAL: Missing core functions/clients from bot instance. AI Cog may not function correctly."
+        missing_core_funcs_msg = "AI Cog CRITICAL: Missing core functions/clients from bot instance. AI Cog may not function correctly. Essential dependencies (supabase_client, logging funcs) not found on bot instance."
         print(missing_core_funcs_msg)
+        # Raise an error here to ensure load_extension in bot.py knows about this critical failure
+        raise commands.ExtensionFailed(path="ai_cog", message=missing_core_funcs_msg)
 
-    async def simple_gemini_2_0_flash_test():
-      """
-      A self-contained test for the gemini-2.0-flash model.
-      Prints the response or the exact error to the console.
-      """
-      print("--- Starting simple_gemini_2_0_flash_test ---")
-      api_key = os.getenv("GEMINI_API_KEY")
-
-      if not api_key:
-          print("TEST ERROR: GEMINI_API_KEY environment variable not found.")
-          return
-
-      try:
-          genai.configure(api_key=api_key)
-
-          model_id_for_test = 'gemini-2.0-flash'
-          print(f"Test: Configuring '{model_id_for_test}' model...")
-          model = genai.GenerativeModel(model_id_for_test)
-          print(f"Test: Model '{model_id_for_test}' configured.")
-
-          test_prompt = f"Hello {model_id_for_test}! In one short sentence, what's a fun fact about Python programming?"
-          print(f"Test: Sending prompt: '{test_prompt}'")
-
-          response = await model.generate_content_async(test_prompt)
-
-          if response and response.text:
-              print(f"Test SUCCESS: {model_id_for_test} Response: '{response.text}'")
-          elif response and response.prompt_feedback:
-              block_reason_test = getattr(response.prompt_feedback, 'block_reason', 'N/A')
-              safety_ratings_test = getattr(response.prompt_feedback, 'safety_ratings', 'N/A')
-              print(f"Test WARNING: Response from {model_id_for_test} was blocked or empty. Reason: {block_reason_test}, Ratings: {safety_ratings_test}")
-          else:
-              print(f"Test WARNING: Response from {model_id_for_test} was empty or malformed, with no specific feedback.")
-
-      except google_exceptions.GoogleAPIError as e:
-          print(f"Test FAILED (GoogleAPIError): An API error occurred with {model_id_for_test}: {e}")
-          print(f"    Error Details: {getattr(e, 'message', 'No specific message attribute')}")
-          if hasattr(e, 'grpc_status_code'): print(f"    GRPC Status Code: {e.grpc_status_code}")
-          if hasattr(e, 'trailing_metadata'): print(f"    Trailing Metadata: {e.trailing_metadata}")
-      except Exception as e:
-          print(f"Test FAILED (General Exception): An unexpected error occurred with {model_id_for_test}: {e}")
-          import traceback
-          print(f"    Traceback: {traceback.format_exc()}")
-      finally:
-          print(f"--- Finished simple_gemini_2_0_flash_test for {model_id_for_test} ---")
 
     cog_instance = AICog(bot,
                          supabase_client,
@@ -1427,11 +1408,13 @@ async def setup(bot: commands.Bot):
         await bot.add_cog(cog_instance)
         print(f"AICog: SUCCESSFULLY CALLED bot.add_cog() with {cog_instance.__class__.__name__}")
     except Exception as e:
-        print(f"AICog: !!! ERROR during bot.add_cog(): {e}")
-        import traceback
+        print(f"AICog: !!! CRITICAL ERROR during bot.add_cog(): {e}") # Emphasize criticality
+        # import traceback # Already imported at the top of the file
         traceback.print_exc()
-        return
+        # Re-raise the exception so bot.load_extension() in bot.py catches it
+        # as a proper ExtensionFailed error.
+        raise  # <--- Key change: re-raise the exception
 
-    # await simple_gemini_2_0_flash_test()
-    # print("AI Cog: simple_gemini_2_0_flash_test completed after cog setup.")
+    # await simple_gemini_2_0_flash_test() # Keep commented out unless actively testing
+    # print("AI Cog: simple_gemini_2_0_flash_test completed after cog setup.") # Keep commented out
     print("AI Cog: setup function FINISHED")
