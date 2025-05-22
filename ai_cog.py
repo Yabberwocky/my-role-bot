@@ -494,24 +494,6 @@ class AICog(commands.Cog):
             try:
                 print(f"AI Cog Info (get_ai_response): Attempting generation with {model_name} (ID: {current_model_id}). Preferred ID for this call: {preferred_model_id or 'Default (gemini_2_0_flash)'}")
 
-                print(f"--- DEBUG: AI PROMPT (Multimodal Text/Image) for {model_name} ---")
-                debug_serializable_contents = []
-                for item in api_contents:
-                    serializable_item = {'role': item['role'], 'parts': []}
-                    for part_idx, part in enumerate(item['parts']):
-                        if isinstance(part, Image.Image):
-                             serializable_item['parts'].append(f"<PIL.Image {part.mode} {part.size} at part_idx {part_idx}>")
-                        elif isinstance(part, dict) and 'text' in part:
-                            serializable_item['parts'].append(part)
-                        else:
-                            serializable_item['parts'].append(f"<UNKNOWN_PART_TYPE at part_idx {part_idx}: {type(part)}>")
-                    debug_serializable_contents.append(serializable_item)
-                try:
-                    print(json.dumps(debug_serializable_contents, indent=2))
-                except Exception as e_json:
-                    print(f"Error serializing api_contents for debug: {e_json}")
-                print("--- END DEBUG ---")
-
                 response = await model_instance.generate_content_async(contents=api_contents)
 
                 if not response or not response.candidates:

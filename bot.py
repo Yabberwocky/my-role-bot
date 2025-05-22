@@ -219,7 +219,7 @@ ZORR_PRO_DESIGNATED_CHANNEL_ID = 1236340209239724115
 ZORR_PRO_AUTOMOD_KEYWORD_REGEX = r"(?:(?:z\s*[o0]\s*r(?:\s*r)*)|(?:z\s*[o0]\s*r(?:\s*r)*\s*\.\s*p\s*r\s*[o0])|(?:z\s*[o0]\s*r(?:\s*r)*\s*p\s*r\s*[o0])|(?:r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*\.\s*r(?:\s*r)*\s*[o0]\s*z)|(?:[o0]\s*r\s*p\s*r(?:\s*r)*\s*[o0]\s*z))"
 AUTOMOD_ALERT_CHANNEL_ID = 1236340209239724115
 DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE = (BOT_INSTANCE_TYPE == "TESTING")
-MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING = True # Set to True to test listener in "TESTING" instance type
+MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING = False # Set to True to test listener in "TESTING" instance type
 
 
 
@@ -4944,7 +4944,6 @@ async def on_ready():
                              command_ids[full_name] = sub_cmd.id
             else:
                 print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if command_ids: print(f"Stored command IDs: {command_ids}")
         else: print("Warning: command_ids dictionary is empty after sync.")
     except discord.HTTPException as e:
         print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
