@@ -287,25 +287,69 @@ class GuildSyncInProgressView(discord.ui.View):
 
     @discord.ui.button(label="Finalize & Generate Report", style=discord.ButtonStyle.success, custom_id="guild_sync_finalize")
     async def finalize_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True, ephemeral=False) # Public defer for report generation
+        # Defer the interaction publicly, this will show "Bot is thinking..."
+        await interaction.response.defer(thinking=True, ephemeral=False) 
 
         session_data = guild_sync_sessions.get(self.session_id)
-        if not session_data or not self.message:
-            await interaction.followup.send("❌ Your sync session was not found or the original message context is missing. Please start over.", ephemeral=True)
+        if not session_data or not self.message: # self.message is the bot's message with the buttons
+            error_content = "❌ Your sync session was not found or the original message context is missing. Please start over."
+            try:
+                # This edits the deferred "thinking..." state
+                await interaction.edit_original_response(content=error_content, embed=None, view=None)
+            except discord.HTTPException: 
+                # Fallback if edit_original_response fails (e.g., token expired too fast)
+                try: await interaction.followup.send(error_content, ephemeral=True)
+                except discord.HTTPException: pass 
             self.stop_view_and_session()
             return
 
-        # Disable buttons on the current message as we are finalizing
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
+        # Update the message that had the buttons to indicate processing
+        for item_comp in self.children: # Renamed 'item' to 'item_comp' to avoid conflict if generate_final_sync_report_embed_only has 'item'
+            if isinstance(item_comp, discord.ui.Button): item_comp.disabled = True
+        
+        status_update_content = f"{interaction.user.mention} ⏳ Finalizing report based on {len(session_data.get('screenshot_igns_collected', []))} collected IGNs..."
         try:
-            await self.message.edit(content=f"{interaction.user.mention} ⏳ Finalizing report based on {len(session_data['screenshot_igns_collected'])} collected IGNs...", view=self, embed=None)
+            # Edit the message that had the buttons
+            await self.message.edit(content=status_update_content, view=self, embed=None)
         except discord.HTTPException:
-            pass # If edit fails, proceed with report generation
+            # If this specific edit fails, it's not critical; the main report will still be attempted.
+            await log_info(interaction.guild, f"GuildSync: Minor error updating button message to '{status_update_content.split('⏳')[1][:50]}...' for user {self.original_author_id}")
 
-        await generate_final_sync_report(interaction, self.session_id, self.message) # Pass interaction and original bot message
-        self.stop_view_and_session(clear_from_global=True) # Stop view and remove session
+
+        # Generate the report embed (this function now just returns the embed)
+        report_embed = await generate_final_sync_report_embed_only(interaction.guild, interaction.user, self.session_id)
+
+        if report_embed:
+            try:
+                # Edit the deferred interaction response (which shows "Bot is thinking...") with the final report
+                await interaction.edit_original_response(content=f"{interaction.user.mention} Guild Sync Analysis FINAL REPORT:", embed=report_embed, view=None)
+                
+                # Optionally, update the original button message to confirm report is above/below or remove it
+                try:
+                    # Delete the message that had the buttons, as the report is now the interaction's response.
+                    await self.message.delete(delay=3) 
+                    await log_info(interaction.guild, f"GuildSync: Deleted old status message {self.message.id} after final report for user {self.original_author_id}.")
+                except discord.HTTPException as e_del_status:
+                    await log_info(interaction.guild, f"GuildSync: Could not delete old status message {self.message.id}. Error: {e_del_status}")
+
+
+            except discord.HTTPException as e_final_send:
+                await log_error(interaction.guild, "GuildSync: Failed to send final report via interaction.edit_original_response", error=e_final_send, interaction=interaction)
+                # Fallback: try sending report as a new message to the channel if interaction response fails
+                try:
+                    if self.message and self.message.channel: # self.message is the message that had the buttons
+                         await self.message.channel.send(content=f"{interaction.user.mention} Guild Sync Analysis FINAL REPORT (Fallback):", embed=report_embed)
+                         # Try to clean up the original status message if possible
+                         await self.message.edit(content=f"{interaction.user.mention} Report generated in a new message above/below.", embed=None, view=None)
+                except Exception as e_channel_fallback:
+                     await log_error(interaction.guild, "GuildSync: Failed to send final report as channel message fallback", error=e_channel_fallback, interaction=interaction)
+        else: # Report generation failed or returned None
+            error_content_report_fail = "❌ An error occurred while generating the final report. Please check logs or try again."
+            try:
+                await interaction.edit_original_response(content=error_content_report_fail, embed=None, view=None)
+            except discord.HTTPException: pass # If edit fails, not much more can be done here
+
+        self.stop_view_and_session(clear_from_global=True)
 
     def stop_view_and_session(self, clear_from_global: bool = True):
         self.stop()
@@ -450,23 +494,28 @@ async def process_guild_sync_batch(
         return bot_reply_msg_obj # Or None if not fetched/edited
 
 
-async def generate_final_sync_report(interaction: discord.Interaction, user_id: int, original_bot_reply: discord.Message):
-    """Generates and sends the final guild sync report."""
-    guild = interaction.guild
-    user = interaction.user # User who clicked "Finalize"
+async def generate_final_sync_report_embed_only(guild: Optional[discord.Guild], user: discord.User, user_id_session_key: int) -> Optional[discord.Embed]:
+    """Generates the final guild sync report embed. Returns Embed or None on failure or if no data."""
+    # user_id_session_key is the key for guild_sync_sessions
 
-    session_data = guild_sync_sessions.get(user_id)
-    if not session_data: # Should be caught by view's interaction check
-        await interaction.followup.send("Error: Session data not found.", ephemeral=True)
-        return
+    session_data = guild_sync_sessions.get(user_id_session_key)
+    if not session_data:
+        if guild: await log_error(guild, f"GuildSync Report Gen: Session data not found for user ID {user_id_session_key}.")
+        else: print(f"GuildSync Report Gen: Session data not found for user ID {user_id_session_key} (No guild context).")
+        return None # Cannot generate report
 
-    collected_screenshot_igns = session_data['screenshot_igns_collected']
+    collected_screenshot_igns = session_data.get('screenshot_igns_collected', set()) # Default to empty set
     
     if not collected_screenshot_igns:
-        await interaction.followup.send(f"{user.mention} No IGNs were collected from screenshots. Cannot generate a report.", ephemeral=False)
-        return
+        log_ctx = f"user {user.display_name} ({user_id_session_key})"
+        if guild: await log_info(guild, f"GuildSync Report Gen: No IGNs collected for {log_ctx}.")
+        else: print(f"GuildSync Report Gen: No IGNs collected for {log_ctx} (No guild context).")
+        return discord.Embed(title="Guild Sync Report", description="No IGNs were collected from screenshots. Cannot generate a comparison.", color=discord.Color.orange())
 
-    await log_info(guild, f"GuildSync: Finalizing report for {user.name}. {len(collected_screenshot_igns)} IGNs from screenshots.")
+    log_ctx_start = f"{user.display_name} ({user_id_session_key})"
+    if guild: await log_info(guild, f"GuildSync Report Gen: Starting for {log_ctx_start}. {len(collected_screenshot_igns)} IGNs from screenshots.")
+    else: print(f"GuildSync Report Gen: Starting for {log_ctx_start}. {len(collected_screenshot_igns)} IGNs from screenshots (No guild context).")
+
 
     db_members_with_status = await fetch_all_db_hc_members_with_status(guild)
     
@@ -475,7 +524,7 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
     db_map_lower_to_original: Dict[str, Dict[str, Any]] = {entry['ingame_name'].lower(): entry for entry in db_members_with_status}
 
     in_ss_not_in_db_at_all: List[str] = []
-    in_ss_and_db_not_hc: List[str] = [] # Screenshot IGN is in DB, but DB says is_in_hc = False
+    in_ss_and_db_not_hc: List[str] = [] 
     in_db_hc_not_in_ss: List[str] = [] 
 
     for s_ign in collected_screenshot_igns:
@@ -483,20 +532,19 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
         db_entry = db_map_lower_to_original.get(s_ign_l)
         if not db_entry:
             in_ss_not_in_db_at_all.append(s_ign)
-        elif db_entry.get('is_in_hc') is False:
+        elif db_entry.get('is_in_hc') is False: # Explicitly check for False
             in_ss_and_db_not_hc.append(s_ign)
-        # If in SS and in DB with is_in_hc=True, it's a match (implicitly handled)
+        # If in SS and in DB with is_in_hc=True or is_in_hc=None (treat None as not actively in HC for this report)
+        # it's a match or handled by other categories.
 
     for db_ign_l, db_entry_data in db_map_lower_to_original.items():
         if db_entry_data.get('is_in_hc') is True: # Only consider those marked as IN HC in DB
-            # Check if this DB HC member (lowercase) is NOT in the set of lowercase screenshot IGNs
-            if db_ign_l not in ss_igns_lower:
+            if db_ign_l not in ss_igns_lower: # Check if this DB HC member is NOT in the screenshot list
                 in_db_hc_not_in_ss.append(db_entry_data['ingame_name']) # Add original casing
 
+    # Pass the original list of dicts to find_potential_ign_typos
     potential_typos = find_potential_ign_typos(collected_screenshot_igns, db_members_with_status)
-    # Filter typos: if a screenshot IGN involved in a "typo" was already categorized as "not_in_db" or "db_not_hc",
-    # it might be redundant to show it as a typo unless the typo is with a DB member who IS in HC.
-    # For simplicity now, show all typos found by the threshold. More complex filtering could be added.
+    # --- End Detailed Comparison Logic ---
 
     # --- Build Report Embed ---
     report_embed = discord.Embed(
@@ -512,7 +560,7 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
     def format_field_value(items: List[str], max_items_display=15) -> str:
         if not items: return "None found."
         display_count = len(items)
-        items_sorted = sorted(items, key=str.lower)
+        items_sorted = sorted(items, key=str.lower) # Sort for consistent display
         lines = [f"- `{discord.utils.escape_markdown(ign)}`" for ign in items_sorted[:max_items_display]]
         value = "\n".join(lines)
         if display_count > max_items_display:
@@ -521,7 +569,7 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
 
     if in_ss_not_in_db_at_all:
         report_embed.add_field(
-            name=f"⚠️ In Screenshots, NOT IN DB ({len(in_ss_not_in_db_at_all)})",
+            name=f"️⚠️ In Screenshots, NOT IN DB ({len(in_ss_not_in_db_at_all)})",
             value=format_field_value(in_ss_not_in_db_at_all), inline=False
         )
     if in_ss_and_db_not_hc:
@@ -529,9 +577,9 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
             name=f"🟡 In Screenshots, IN DB but Marked NOT HC ({len(in_ss_and_db_not_hc)})",
             value=format_field_value(in_ss_and_db_not_hc), inline=False
         )
-    if in_db_hc_not_in_ss:
+    if in_db_hc_not_in_ss: # This now correctly lists DB members marked 'is_in_hc: True' not found in screenshots
         report_embed.add_field(
-            name=f"❓ IN DB (HC), NOT IN SCREENSHOTS ({len(in_db_hc_not_in_ss)})",
+            name=f"❓ IN DB (Active HC), NOT IN SCREENSHOTS ({len(in_db_hc_not_in_ss)})",
             value=format_field_value(in_db_hc_not_in_ss), inline=False
         )
     
@@ -539,30 +587,24 @@ async def generate_final_sync_report(interaction: discord.Interaction, user_id: 
         typo_lines = []
         for s_ign, d_ign, db_is_hc, score in potential_typos[:10]: # Show top 10 typos
             hc_status_indicator = "(HC)" if db_is_hc else "(Not HC)"
-            typo_lines.append(f"- SS: `{s_ign}` vs DB: `{d_ign}` {hc_status_indicator} ({score*100:.1f}%)")
+            typo_lines.append(f"- SS: `{discord.utils.escape_markdown(s_ign)}` vs DB: `{discord.utils.escape_markdown(d_ign)}` {hc_status_indicator} ({score*100:.1f}%)")
         
         typo_field_val = "\n".join(typo_lines)
+        if not typo_field_val: typo_field_val = "None significant found." # Message if list empty
         if len(potential_typos) > 10:
             typo_field_val += f"\n- ...and {len(potential_typos) - 10} more potential typos."
-        report_embed.add_field(name=f"🤔 Potential Typos/Capitalization ({len(potential_typos)})", value=typo_field_val or "None", inline=False)
+        report_embed.add_field(name=f"🤔 Potential Typos/Capitalization ({len(potential_typos)})", value=typo_field_val, inline=False)
 
-    if not report_embed.fields: # No discrepancies found at all
-        report_embed.description += "\n\n✅ **All Clear!** No major discrepancies identified between screenshot names and active HC database members."
+    if not report_embed.fields and (not in_ss_not_in_db_at_all and not in_ss_and_db_not_hc and not in_db_hc_not_in_ss and not potential_typos):
+        # Only add "All Clear" if all lists are empty
+        report_embed.description += "\n\n✅ **All Clear!** No major discrepancies identified between screenshot names and active HC database members based on these categories."
 
     report_embed.set_footer(text="Use /hcverify, /hcleave, /hconly to correct DB. AI extracts all names from guild list screenshots for this mode.")
+    # --- End Build Report Embed ---
     
-    try:
-        # Edit the original bot reply (which had the InProgressView) with the final report.
-        await original_bot_reply.edit(content=f"{user.mention} Guild Sync Analysis FINAL REPORT:", embed=report_embed, view=None) # Remove view
-    except discord.HTTPException as e_edit_final:
-        await log_error(guild, "GuildSync: Failed to edit original bot reply with final report.", error=e_edit_final)
-        # Fallback: send a new message if edit fails.
-        try:
-            await interaction.followup.send(content=f"{user.mention} Guild Sync Analysis FINAL REPORT:", embed=report_embed)
-        except discord.HTTPException as e_followup_final:
-            await log_error(guild, "GuildSync: Failed to send final report as followup.", error=e_followup_final)
-
-    await log_info(guild, f"GuildSync: Final report sent for user {user.name}. SS IGNs: {len(collected_screenshot_igns)}, DB HC IGNs (active): {sum(1 for m in db_members_with_status if m.get('is_in_hc'))}. Discrepancies - NotInDB: {len(in_ss_not_in_db_at_all)}, DBNotHC: {len(in_ss_and_db_not_hc)}, NotInSS: {len(in_db_hc_not_in_ss)}, Typos: {len(potential_typos)}")
+    # Logging moved to the caller after it successfully sends the report
+    # This function now just returns the embed
+    return report_embed
 
 async def fetch_all_db_hc_members_with_status(guild: Optional[discord.Guild]) -> List[Dict[str, Any]]:
     """
