@@ -255,6 +255,217 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def fetch_all_db_hc_members_for_sync(guild: Optional[discord.Guild]) -> List[str]:
+    """Fetches all In-Game Names from hc_members where is_in_hc is TRUE."""
+    if not supabase:
+        if guild: await log_error(guild, "GuildSync: Supabase unavailable for fetching DB HC members.")
+        return []
+    
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("ingame_name")
+                           .eq("is_in_hc", True)
+                           .not_.is_("ingame_name", "null") # Ensure IGN is not null
+                           .execute()
+        )
+        if resp and hasattr(resp, 'data') and resp.data:
+            return [entry['ingame_name'] for entry in resp.data if entry.get('ingame_name')]
+        return []
+    except Exception as e:
+        if guild: await log_error(guild, "GuildSync: Error fetching all HC members from DB", error=e)
+        return []
+
+def find_potential_ign_typos(screenshot_igns: Set[str], db_igns: Set[str], threshold: float = 0.85) -> List[Tuple[str, str, float]]:
+    """Compares two sets of IGNs and finds potential typos using fuzzy matching."""
+    potential_typos = []
+    # Avoid comparing an IGN to itself if it's perfectly in both lists
+    # Focus on screenshot IGNs that are NOT exact matches in DB IGNs
+    unique_screenshot_igns = screenshot_igns - db_igns 
+
+    for s_ign in unique_screenshot_igns:
+        # Find the best match(es) in db_igns for this s_ign
+        # get_close_matches returns a list of strings from db_igns
+        best_matches = difflib.get_close_matches(s_ign, db_igns, n=1, cutoff=threshold)
+        if best_matches:
+            # best_matches[0] is the closest string from db_igns
+            # Calculate the ratio again for the specific pair to store it
+            ratio = difflib.SequenceMatcher(None, s_ign, best_matches[0]).ratio()
+            if ratio >= threshold: # Double check threshold
+                 potential_typos.append((s_ign, best_matches[0], round(ratio, 3)))
+    
+    potential_typos.sort(key=lambda x: x[2], reverse=True) # Sort by score desc
+    return potential_typos
+
+
+class GuildSyncDoneView(discord.ui.View):
+    def __init__(self, original_author_id: int):
+        super().__init__(timeout=300.0) # 5 minutes timeout
+        self.original_author_id = original_author_id
+        self.message: Optional[discord.Message] = None # To store the message this view is attached to
+
+    @discord.ui.button(label="Done ✓", style=discord.ButtonStyle.success, custom_id="guild_sync_done")
+    async def done_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.original_author_id:
+            await interaction.response.send_message("❌ You are not the one who initiated this sync.", ephemeral=True)
+            return
+
+        button.disabled = True
+        button.label = "Report Acknowledged"
+        await interaction.response.edit_message(view=self)
+        # Optionally, send an ephemeral confirmation
+        await interaction.followup.send("Report interaction closed.", ephemeral=True)
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+                item.label = "Report Timed Out"
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
+
+
+async def handle_guild_sync_from_screenshots(
+    message: discord.Message,
+    valid_image_attachments: List[discord.Attachment]
+):
+    """Handles the new guild member update mode."""
+    guild = message.guild
+    user = message.author
+    processing_reply_content = f"{user.mention} ⏳ Starting Guild Member Sync Analysis for {len(valid_image_attachments)} image(s)..."
+    processing_reply: Optional[discord.Message] = None
+    try:
+        processing_reply = await message.reply(processing_reply_content, allowed_mentions=discord.AllowedMentions(users=[user]))
+    except discord.HTTPException as e_initial_reply:
+        await log_error(guild, "GuildSync: Failed to send initial processing reply", error=e_initial_reply, message_context=message)
+        return
+
+    ai_cog = bot.get_cog('AICog')
+    if not ai_cog:
+        if processing_reply: await processing_reply.edit(content=f"{user.mention} ❌ Error: AI module is not available for image processing.")
+        else: await message.channel.send(f"{user.mention} ❌ Error: AI module is not available for image processing.")
+        await log_error(guild, "GuildSync: AICog not found.", message_context=message)
+        return
+
+    screenshot_igns_set: Set[str] = set()
+    failed_ai_extractions = 0
+
+    # 1. Extract IGNs from screenshots (using existing online player extraction)
+    if processing_reply: # Check if processing_reply was successfully created
+      await processing_reply.edit(content=f"{user.mention} 🧠 Extracting names from screenshots with AI... (this may take a moment)")
+    
+    known_igns_list_for_ai = "\n".join(ai_cog.ingame_name_cache_ref) if ai_cog.ingame_name_cache_ref else "No known names provided."
+    
+    for idx, image_att in enumerate(valid_image_attachments):
+        try:
+            image_bytes = await image_att.read()
+            # Using FLORR_IMAGE_NAME_EXTRACTION (extracts *online* IGNs based on current prompt)
+            ai_extracted_text = await ai_cog.get_ai_response_with_image(
+                prompt_key="FLORR_IMAGE_NAME_EXTRACTION", 
+                image_bytes=image_bytes,
+                prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai}
+            )
+            if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
+                extracted_this_image = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
+                screenshot_igns_set.update(extracted_this_image)
+            elif not ai_extracted_text: # AI returned None or empty string
+                failed_ai_extractions +=1
+                await log_info(guild, f"GuildSync: AI returned no text for image {image_att.filename}.")
+            # If "NO_NAMES_FOUND", it's not an error, just no names.
+        except Exception as e_img_proc:
+            failed_ai_extractions +=1
+            await log_error(guild, f"GuildSync: Error processing image {image_att.filename}", error=e_img_proc, message_context=message)
+    
+    if failed_ai_extractions == len(valid_image_attachments) and not screenshot_igns_set:
+        if processing_reply: await processing_reply.edit(content=f"{user.mention} ❌ AI failed to extract names from all images, or no names were found. Cannot proceed with sync.")
+        return
+    if not screenshot_igns_set:
+        if processing_reply: await processing_reply.edit(content=f"{user.mention} ℹ️ AI did not identify any known player names from the screenshots. Sync aborted.")
+        return
+    
+    if processing_reply: # Check if processing_reply exists before editing
+        await processing_reply.edit(content=f"{user.mention} 📊 Comparing {len(screenshot_igns_set)} unique names from screenshots with the database...")
+
+    # 2. Fetch all current HC members from DB
+    db_hc_igns_list = await fetch_all_db_hc_members_for_sync(guild)
+    db_hc_igns_set = set(db_hc_igns_list) # For efficient lookup
+
+    # 3. Perform Comparisons
+    in_screenshot_not_active_in_db: List[str] = []
+    for s_ign in screenshot_igns_set:
+        s_ign_lower = s_ign.lower()
+        is_active_in_db_set = any(db_s_ign.lower() == s_ign_lower for db_s_ign in db_hc_igns_set)
+        if not is_active_in_db_set:
+            member_db_status_resp = await run_supabase_sync(
+                lambda: supabase.table("hc_members")
+                               .select("is_in_hc")
+                               .ilike("ingame_name", s_ign) 
+                               .maybe_single()
+                               .execute()
+            )
+            if member_db_status_resp and hasattr(member_db_status_resp, 'data') and member_db_status_resp.data:
+                if member_db_status_resp.data.get("is_in_hc") is False:
+                    in_screenshot_not_active_in_db.append(f"{s_ign} (DB: Not in HC)")
+                elif member_db_status_resp.data.get("is_in_hc") is True:
+                     await log_info(guild, f"GuildSync Discrepancy: {s_ign} found in DB with is_in_hc=TRUE but wasn't in initial active fetch. Possible data sync issue or case mismatch not caught by `any()`.")
+                # else: is_in_hc is null, treat as not in DB for this check
+            else: 
+                in_screenshot_not_active_in_db.append(f"{s_ign} (Not in DB at all)")
+
+    in_db_active_not_in_screenshot = list(db_hc_igns_set - {ign.lower() for ign in screenshot_igns_set})
+    # Refine in_db_active_not_in_screenshot to use original casing from db_hc_igns_list
+    temp_in_db_active_not_in_screenshot_lower = {ign.lower() for ign in in_db_active_not_in_screenshot}
+    in_db_active_not_in_screenshot = [ign for ign in db_hc_igns_list if ign.lower() in temp_in_db_active_not_in_screenshot_lower]
+
+
+    potential_typos = find_potential_ign_typos(screenshot_igns_set, db_hc_igns_set)
+
+    # 4. Format Report
+    report_embed = discord.Embed(
+        title=f"Guild Member Sync Analysis Report ({user.display_name})",
+        description=f"Analyzed {len(valid_image_attachments)} images. Found {len(screenshot_igns_set)} unique player names in screenshots (AI-identified as 'online'). Compared with {len(db_hc_igns_set)} active HC members in database.",
+        color=NERDY_YELLOW
+    )
+    report_embed.timestamp = discord.utils.utcnow()
+
+    if in_screenshot_not_active_in_db:
+        field_value = "\n".join([f"- `{discord.utils.escape_markdown(ign)}`" for ign in sorted(in_screenshot_not_active_in_db)])
+        if len(field_value) > 1020: field_value = field_value[:1017] + "..."
+        report_embed.add_field(name=f"⚠️ In Screenshots, Not Active in DB ({len(in_screenshot_not_active_in_db)})", value=field_value or "None", inline=False)
+
+    if in_db_active_not_in_screenshot:
+        field_value = "\n".join([f"- `{discord.utils.escape_markdown(ign)}`" for ign in sorted(in_db_active_not_in_screenshot)])
+        if len(field_value) > 1020: field_value = field_value[:1017] + "..."
+        report_embed.add_field(name=f"❓ In DB (Active), Not in Screenshots ({len(in_db_active_not_in_screenshot)})", value=field_value or "None", inline=False)
+
+    if potential_typos:
+        typo_lines = [f"- SS: `{discord.utils.escape_markdown(s_ign)}` vs DB: `{discord.utils.escape_markdown(d_ign)}` (Score: {score*100:.1f}%)" for s_ign, d_ign, score in potential_typos]
+        field_value = "\n".join(typo_lines)
+        if len(field_value) > 1020: field_value = field_value[:1017] + "..."
+        report_embed.add_field(name=f"🤔 Potential Typos/Capitalization ({len(potential_typos)})", value=field_value or "None", inline=False)
+
+    if not in_screenshot_not_active_in_db and not in_db_active_not_in_screenshot and not potential_typos:
+        report_embed.add_field(name="✅ All Clear!", value="No major discrepancies found based on this analysis.", inline=False)
+
+    report_embed.set_footer(text="This report is based on names AI identified as 'online' in screenshots vs. DB's 'is_in_hc=true' list.")
+
+    # 5. Send Report
+    sync_view = GuildSyncDoneView(user.id)
+    final_report_message_content = f"{user.mention} Guild Sync Analysis Complete:"
+    if processing_reply:
+        final_message = await processing_reply.edit(content=final_report_message_content, embed=report_embed, view=sync_view)
+    else: 
+        final_message = await message.channel.send(content=final_report_message_content, embed=report_embed, view=sync_view)
+    
+    sync_view.message = final_message # Link message to view for timeout handling
+
+    await log_info(guild, f"GuildSync report generated for {user.name}. SS IGNs: {len(screenshot_igns_set)}, DB HC IGNs: {len(db_hc_igns_set)}. Inconsistencies: Screenshot/NotDB: {len(in_screenshot_not_active_in_db)}, DB/NotSS: {len(in_db_active_not_in_screenshot)}, Typos: {len(potential_typos)}")
+
 async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str) -> Dict[str, Any]:
     """
     Fetches various super attempt statistics for a given IGN.
@@ -4825,192 +5036,360 @@ async def update_static_list_message(guild: discord.Guild):
 
 # --- Discord Events ---
 @bot.event
-async def on_ready():
-    print("--- on_ready event started ---")
-    global BOT_USER_ID, command_ids, STAFF_CHANNELS
-
-    if bot.user:
-        BOT_USER_ID = bot.user.id
-        print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
-        print(f"Discord.py v{discord.__version__}")
-        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") # Already uses the constant
-    else:
-        print("CRITICAL ERROR: Bot user object not found on ready.")
+async def on_message(message: discord.Message):
+    # --- Initial Checks: Ignore self, or messages without basic properties ---
+    if not message.guild or not bot.is_ready() or not bot.user or \
+       message.author.id == bot.user.id: # Ignore messages from the bot itself
         return
-# // --- UNCHANGED SECTION (on_ready C - presence, initial logs, non-AI data load, staff channels, cog setup) --- //
-    activity = discord.Activity(type=discord.ActivityType.watching, name="out for Pings | /nerdhelp")
-    await bot.change_presence(status=discord.Status.online, activity=activity)
 
-    print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-    # Note: synced_commands is defined later, so initial log message might be slightly different if it relies on len(synced_commands)
-    # For now, we'll keep the log message as is, it will use whatever value synced_commands has at that point (likely empty or from previous run if not cleared)
+    # If the message is from any other bot (not ours), generally ignore.
+    if message.author.bot:
+        return
 
-    print("--- Loading initial non-AI data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID)
-    if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0]
+    if not message.content and not message.attachments and not message.embeds:
+        if not (message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action):
+            return
 
-    await load_ign_cache(log_guild_for_data_load)
-    print("Loading profile picture choices...")
-    await load_profile_picture_choices(log_guild_for_data_load)
+    guild = message.guild
+    channel = message.channel
 
-    # --- START: Staff Channel Identification ---
-    print("Identifying staff channels in target guild...")
-    STAFF_CHANNELS.clear() # Clear previous findings
-    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
-    if target_guild_for_staff_channels:
-        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
-        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
-        everyone_role = target_guild_for_staff_channels.default_role
+    # --- AutoMod Alert Message Parsing for Zorr.pro ---
+    if message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and \
+       message.type == discord.MessageType.auto_moderation_action and \
+       message.embeds:
+        embed = message.embeds[0]
+        original_message_content = embed.description
+        original_author_member: discord.Member = message.author
+        
+        original_channel_id_from_fields: Optional[int] = None
+        rule_name_from_fields: Optional[str] = None
+        
+        for field in embed.fields:
+            if field.name == "channel_id":
+                try: original_channel_id_from_fields = int(field.value)
+                except (ValueError, TypeError):
+                    await log_error(guild, f"ZorrRedirect: Could not parse channel_id '{field.value}' from embed field.", ping_owner=True)
+                    return
+            elif field.name == "rule_name":
+                rule_name_from_fields = str(field.value).strip()
 
-        if florrist_role and hc1_role: # everyone_role always exists
-            print(f"Checking channel visibility against roles: '{florrist_role.name}', '{hc1_role.name}' in guild '{target_guild_for_staff_channels.name}'")
-            potentially_staff_channels = 0
-            actually_staff_channels = 0
-            for channel in target_guild_for_staff_channels.text_channels:
-                everyone_perms = channel.permissions_for(everyone_role)
-                if not everyone_perms.view_channel:
-                    potentially_staff_channels += 1
-                    florrist_ow = channel.overwrites_for(florrist_role)
-                    hc1_ow = channel.overwrites_for(hc1_role)
-                    florrist_can_view = florrist_ow.view_channel is True
-                    hc1_can_view = hc1_ow.view_channel is True
-                    if not florrist_can_view and not hc1_can_view:
-                        STAFF_CHANNELS.add(channel.id)
-                        actually_staff_channels += 1
-                        # print(f"  -> Identified Staff Channel: #{channel.name} ({channel.id})")
-            print(f"Staff Channel Identification Complete: Found {actually_staff_channels} staff channel(s) out of {potentially_staff_channels} potentially restricted channels.")
-        else:
-            missing_role_names = []
-            if not florrist_role: missing_role_names.append(f"Florrist Role (ID: {FLORRIST_ROLE_ID})")
-            if not hc1_role: missing_role_names.append(f"HC1 Role (ID: {HC1_ROLE_ID})")
-            print(f"WARN: Could not find required roles in target guild for staff channel identification: {', '.join(missing_role_names)}.")
-            if log_guild_for_data_load: # Log error if guild context available
-                await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
-    else:
-        print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
-    # --- END: Staff Channel Identification ---
+        is_zorr_pro_trigger = False
+        if rule_name_from_fields and "zorr.pro blocker" in rule_name_from_fields.lower():
+            is_zorr_pro_trigger = True
 
-    # --- Set bot attributes for cogs (BEFORE loading them) ---
-    print("Setting up bot attributes for cogs...")
-    bot.supabase_client = supabase # Pass the actual Supabase client instance
-    bot.log_info_global = log_info
-    bot.log_error_global = log_error
-    bot.run_supabase_sync_global = run_supabase_sync
-    
-    bot.OWNER_USER_ID_config = OWNER_USER_ID 
-    bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
-    bot.PRIVATE_SERVER_ID_config = PRIVATE_SERVER_ID
-    bot.RANDOM_SERVER_ID_config = RANDOM_SERVER_ID
-    bot.STAFF_CHANNELS_config = STAFF_CHANNELS 
-    bot.BOT_COMMANDS_ALLOWED_CHANNEL_IDS_config = BOT_COMMANDS_ALLOWED_CHANNEL_IDS
-    bot.COMMAND_PREFIX_config = COMMAND_PREFIX
-    bot.ALWAYS_ON_AI_CHANNELS_config = ALWAYS_ON_AI_CHANNELS
-    bot.UNRESTRICTED_AI_CHANNEL_ID_config = UNRESTRICTED_AI_CHANNEL_ID
-    bot.ingame_name_cache_ref_config = ingame_name_cache 
-    bot.NERDY_YELLOW_config = NERDY_YELLOW 
-    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH # Pass this to ai_cog if needed
-    bot.MOBS_FOLDER_PATH_config = os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
-    print("Bot attributes set.")
+        if not original_message_content:
+            original_message_content = "(Blocked message content was not found in the alert embed.)"
 
-    # --- Load Cogs ---
-    print("Loading cogs...")
-    try:
-        await bot.load_extension('ai_cog') 
-        print("AICog loaded successfully.")
-    except commands.ExtensionAlreadyLoaded:
-        print("AICog was already loaded.")
-    except Exception as e_cog:
-        print(f"CRITICAL: Failed to load AICog: {e_cog}\n{traceback.format_exc()}")
-        if log_guild_for_data_load:
-            await log_error(log_guild_for_data_load, "CRITICAL: Failed to load AICog.", error=e_cog, ping_owner=True)
-    # --- End Load Cogs ---
+        if original_author_member and original_channel_id_from_fields and \
+           original_message_content and is_zorr_pro_trigger:
+            if original_channel_id_from_fields == ZORR_PRO_DESIGNATED_CHANNEL_ID:
+                return # Already in designated channel
 
-# // --- END UNCHANGED SECTION (on_ready C - presence, initial logs, non-AI data load, staff channels, cog setup) --- //
-# --- Command Syncing (Keep as is) ---
-    print("Syncing application commands...")
-    synced_commands = [] # Define before use in ready log message
-    try:
-        synced_commands = await tree.sync()
-        print(f"Synced {len(synced_commands)} application commands.")
-        command_ids.clear()
-        for cmd in synced_commands:
-            if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
-                command_ids[cmd.name] = cmd.id
-                if isinstance(cmd, app_commands.Group):
-                    for sub_cmd in cmd.commands:
-                        if isinstance(sub_cmd, app_commands.Command):
-                             full_name = f"{cmd.name} {sub_cmd.name}"
-                             command_ids[full_name] = sub_cmd.id
+            original_channel_obj = guild.get_channel(original_channel_id_from_fields)
+            original_channel_name_for_log = f"#{original_channel_obj.name}" if original_channel_obj else f"ID {original_channel_id_from_fields}"
+            await log_info(guild, f"ZorrRedirect: Matched AutoMod. User: {original_author_member.name}, OrigChan: {original_channel_name_for_log}")
+
+            designated_channel = guild.get_channel(ZORR_PRO_DESIGNATED_CHANNEL_ID)
+            if not isinstance(designated_channel, discord.TextChannel):
+                await log_error(guild, f"ZorrRedirect: Designated channel {ZORR_PRO_DESIGNATED_CHANNEL_ID} invalid.", ping_owner=True)
+                return
+
+            bot_member = guild.me
+            if not bot_member: return
+            perms_in_designated = designated_channel.permissions_for(bot_member)
+            if not perms_in_designated.send_messages or not perms_in_designated.manage_webhooks:
+                await log_error(guild, f"ZorrRedirect: Bot lacks Send/ManageWebhooks in {designated_channel.mention}.", ping_owner=True)
+                return
+            
+            info_message_content = (
+                f"{original_author_member.mention}, your message related to zorr.pro was blocked in {original_channel_name_for_log}. "
+                f"Please discuss here in {designated_channel.mention}. I'll re-post your message:"
+            )
+            try: await designated_channel.send(info_message_content)
+            except discord.HTTPException as e:
+                await log_error(guild, f"ZorrRedirect: Failed to send info message to {designated_channel.mention}", error=e)
+                return
+
+            temp_webhook: Optional[discord.Webhook] = None
+            try:
+                avatar_bytes: Optional[bytes] = None
+                webhook_display_name = original_author_member.display_name[:80]
+                avatar_url_to_fetch = original_author_member.display_avatar.url if original_author_member.display_avatar else original_author_member.default_avatar.url
+                async with aiohttp.ClientSession() as session:
+                    avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch)
+                disallowed_webhook_chars = ["@", "#", ":", "```", "discord"]
+                if any(d_char in webhook_display_name.lower() for d_char in disallowed_webhook_chars) or webhook_display_name.lower() == "clyde":
+                    webhook_display_name = "Relayed Message"
+                temp_webhook = await designated_channel.create_webhook(name=webhook_display_name, avatar=avatar_bytes, reason="Zorr.pro AutoMod relay")
+                content_to_relay = original_message_content[:2000]
+                await temp_webhook.send(content=content_to_relay, wait=True)
+            except Exception as e_imitate:
+                await log_error(guild, f"ZorrRedirect: Error during imitation.", error=e_imitate, ping_owner=True)
+            finally:
+                if temp_webhook:
+                    try: await temp_webhook.delete(reason="Zorr.pro AutoMod relay cleanup")
+                    except Exception: pass
+            return # Handled AutoMod alert
+        return # Handled AutoMod alert message (even if not Zorr.pro specific)
+
+    # --- Screenshot processing block ---
+    if message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
+        valid_image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
+        
+        if valid_image_attachments:
+            if len(valid_image_attachments) == 10:
+                # Trigger new Guild Member Update Mode
+                await log_info(guild, f"Guild Sync Mode triggered by {message.author.name} with 10 images in {message.channel.mention}.")
+                asyncio.create_task(handle_guild_sync_from_screenshots(message, valid_image_attachments))
+                return # Guild sync mode handles its own replies
             else:
-                print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        else: print("Warning: command_ids dictionary is empty after sync.")
-    except discord.HTTPException as e:
-        print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
-    except Exception as e:
-        print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
+                # Proceed with existing online player activity logging for 1-9 images
+                num_images = len(valid_image_attachments)
+                processing_reply_content = f"{message.author.mention} ⏳ Analyzing {num_images} image(s) for online player names and activity updates..."
+                processing_reply: Optional[discord.Message] = None
+                try:
+                    processing_reply = await message.reply(processing_reply_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                except discord.HTTPException as e_initial_reply:
+                    await log_error(guild, "Screenshot processing: Failed to send initial processing reply", error=e_initial_reply, message_context=message)
+                    return 
 
-    # Send ready log message AFTER commands are synced
-    if log_guild_for_ready_msg:
-        try:
-             instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
-             await log_info(log_guild_for_ready_msg, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
-        except Exception as log_e:
-             print(f"Failed to send initial ready log message: {log_e}")
+                all_matched_igns_from_all_images: List[str] = []
+                all_ai_suggested_raw_names_global: Set[str] = set()
+                ai_reported_no_names_at_least_once = False
+                ai_extracted_some_text_globally = False
 
+                activity_date, date_error = get_utc_date()
+                if date_error or not activity_date:
+                    if processing_reply: await processing_reply.edit(content=f"{message.author.mention} ❌ Error: Could not determine today's date for activity logging.")
+                    else: await message.channel.send(f"{message.author.mention} ❌ Error: Could not determine today's date for activity logging.")
+                    await log_error(guild, f"Screenshot activity error: Failed to get today's date ({date_error})", message_context=message)
+                    return
 
-    # --- Start Background Tasks ---
-    print("Starting background tasks...")
-    if not check_static_view_timeout.is_running():
-        try:
-            check_static_view_timeout.start()
-            print(" Static view timeout checker task started.")
-        except RuntimeError: # Already running
-            print(" Static view timeout checker task was already running (RuntimeError).")
-        except Exception as e_task_start:
-            print(f"Failed to start static view timeout task: {e_task_start}")
-            if log_guild_for_data_load:
-                await log_error(log_guild_for_data_load, "Failed to start static view timeout task", error=e_task_start)
+                try:
+                    ai_cog = bot.get_cog('AICog')
+                    if not ai_cog:
+                        if processing_reply: await processing_reply.edit(content=f"{message.author.mention} ❌ Error: AI module is not available for image processing.")
+                        else: await message.channel.send(f"{message.author.mention} ❌ Error: AI module is not available for image processing.")
+                        await log_error(guild, "Screenshot activity error: AICog not found.", message_context=message)
+                        return
+                    
+                    known_igns_str = "\n".join(ai_cog.ingame_name_cache_ref) if ai_cog.ingame_name_cache_ref else "No known names provided."
+                    
+                    for idx, image_att in enumerate(valid_image_attachments):
+                        try:
+                            image_data = await image_att.read()
+                            ai_extracted_text_for_this_image = await ai_cog.get_ai_response_with_image(
+                                prompt_key="FLORR_IMAGE_NAME_EXTRACTION", image_bytes=image_data,
+                                prompt_kwargs={'known_igns_list_str': known_igns_str}
+                            )
+                            if ai_extracted_text_for_this_image:
+                                stripped_ai_text = ai_extracted_text_for_this_image.strip()
+                                if stripped_ai_text.upper() == "NO_NAMES_FOUND": ai_reported_no_names_at_least_once = True
+                                else:
+                                    ai_extracted_some_text_globally = True
+                                    potential_names_from_ai_this_image = [name.strip() for name in stripped_ai_text.split('\n') if name.strip()]
+                                    for raw_name in potential_names_from_ai_this_image: all_ai_suggested_raw_names_global.add(raw_name)
+                                    if ai_cog.ingame_name_cache_ref and potential_names_from_ai_this_image:
+                                        for ai_name in potential_names_from_ai_this_image:
+                                            ai_name_lower = ai_name.lower()
+                                            for cached_ign in ai_cog.ingame_name_cache_ref:
+                                                if cached_ign.lower() == ai_name_lower:
+                                                    if cached_ign not in all_matched_igns_from_all_images: all_matched_igns_from_all_images.append(cached_ign)
+                                                    break
+                        except Exception as e_single_img_proc:
+                            await log_error(guild, f"Error during single image processing (message {message.id}, attachment {image_att.filename})", error=e_single_img_proc)
+                    
+                    discarded_by_cache_check: List[str] = []
+                    if ai_extracted_some_text_globally:
+                        matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
+                        for raw_ai_name in all_ai_suggested_raw_names_global:
+                            if raw_ai_name.lower() not in matched_igns_lower: discarded_by_cache_check.append(raw_ai_name)
+                    if discarded_by_cache_check:
+                        discarded_names_str = "\n- ".join(discord.utils.escape_markdown(d_name)[:100] for d_name in discarded_by_cache_check[:20]) 
+                        if len(discarded_by_cache_check) > 20: discarded_names_str += "\n- ... (and more)"
+                        log_parts = [f"AI suggested names for msg by {message.author.mention} in {message.channel.mention}", f"(Img(s): {', '.join([a.filename for a in valid_image_attachments])})", "discarded after cache check:", f"```\n- {discarded_names_str}\n```", "Raw Suggestions:", f"```\n- {chr(10).join(discord.utils.escape_markdown(s)[:100] for s in sorted(list(all_ai_suggested_raw_names_global))[:20])}\n```", f"Matched: {all_matched_igns_from_all_images or 'None'}"]
+                        log_msg_discarded = "\n".join(log_parts); log_msg_discarded = log_msg_discarded[:3990] + "..." if len(log_msg_discarded) > 4000 else log_msg_discarded
+                        err_embed = discord.Embed(title="📝 AI Img: Discarded", description=log_msg_discarded, color=discord.Color.orange())
+                        err_embed.timestamp = discord.utils.utcnow(); err_embed.set_footer(text=f"Msg ID: {message.id} | User: {message.author.name}")
+                        await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=err_embed)
 
+                    newly_added_details: List[Dict[str, Any]] = [] ; already_active: List[str] = [] ; failed_to_add: List[str] = []
+                    activity_changed = False; final_msg_obj: Optional[discord.Message] = processing_reply
 
-    # --- Schedule Delayed Static List Update ---
-    async def delayed_update(delay_seconds: int):
-        await asyncio.sleep(delay_seconds) # Wait for the specified delay
+                    if not all_matched_igns_from_all_images:
+                        content = f"{message.author.mention} AI analysis of {num_images} image(s) complete: "
+                        if ai_reported_no_names_at_least_once and not ai_extracted_some_text_globally: content += "No online player names (from known list with green dots) clearly identified."
+                        elif not ai_extracted_some_text_globally and not ai_reported_no_names_at_least_once: content += "AI issue or no usable data from images."
+                        else: content += "Some text identified, but didn't match known online IGNs or criteria."
+                        if final_msg_obj:
+                            try: await final_msg_obj.edit(content=content, allowed_mentions=discord.AllowedMentions(users=[message.author]), embed=None, view=None)
+                            except discord.HTTPException: final_msg_obj = await message.reply(content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                        else: final_msg_obj = await message.reply(content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                    else:
+                        for ign in all_matched_igns_from_all_images:
+                            exists = await check_activity_exists(guild, ign.lower(), activity_date)
+                            if exists: already_active.append(ign)
+                            elif exists is False:
+                                success, upsert_msg = await upsert_activity_log(guild, ign, activity_date, message.author.id)
+                                if success: newly_added_details.append({'ign': ign, 'status': 'active_by_view'}); activity_changed = True
+                                else: failed_to_add.append(ign); await log_error(guild, f"SS Upsert Fail: IGN '{ign}', User {message.author.name}. DB: {upsert_msg}")
+                            else: failed_to_add.append(ign); await log_error(guild, f"SS DB Check Fail: IGN '{ign}', User {message.author.name}")
+                        
+                        ss_view = ScreenshotConfirmView(message.author.id, activity_date, newly_added_details, already_active, failed_to_add, guild, message.id)
+                        final_embed = ss_view.create_embed()
+                        reply_content = f"{message.author.mention}"
+                        if final_msg_obj:
+                            try: final_msg_obj = await final_msg_obj.edit(content=reply_content, embed=final_embed, view=ss_view, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                            except discord.HTTPException: final_msg_obj = await message.reply(content=reply_content, embed=final_embed, view=ss_view, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                        else: final_msg_obj = await message.reply(content=reply_content, embed=final_embed, view=ss_view, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                        if final_msg_obj: ss_view.message = final_msg_obj
+                        if activity_changed:
+                            await log_info(guild, f"SS by {message.author.name}: New: {len(newly_added_details)}, Already: {len(already_active)}. List update.")
+                            asyncio.create_task(update_static_list_message(guild))
+                        else: await log_info(guild, f"SS by {message.author.name}: No new activity. Already: {len(already_active)}.")
+                except Exception as e_pipeline:
+                    traceback.print_exc()
+                    await log_error(guild, "Critical SS error", error=e_pipeline, ping_owner=True, message_context=message)
+                    err_content = f"{message.author.mention} Sorry, critical error processing {num_images} image(s). Admins notified."
+                    if processing_reply:
+                        try: await processing_reply.edit(content=err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]), embed=None, view=None)
+                        except discord.HTTPException: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+                    else: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+            return # Handled screenshot
+
+    # --- Super Attempt Logging ---
+    if message.channel.id == SUPER_ATTEMPT_CHANNEL_ID:
+        if DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE and not MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING:
+            if BOT_INSTANCE_TYPE == "TESTING":
+                 print(f"Super attempt logging skipped for message {message.id} in {message.channel.mention} due to TESTING instance type and no override.")
+            return
+        msg_content = message.content.strip()
+        attempt_match = re.fullmatch(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", msg_content, re.IGNORECASE)
         
-        # --- ADDED: Check for disabling static list in TESTING instance ---
-        if DISABLE_STATIC_LIST_FOR_TESTING_INSTANCE:
-            print(f"--- Skipped delayed static list update (BOT_INSTANCE_TYPE='{BOT_INSTANCE_TYPE}') ---")
-            if bot.get_guild(CATERCORD_GUILD_ID): # Log if target guild is accessible
-                 await log_info(bot.get_guild(CATERCORD_GUILD_ID), f"Delayed static list update skipped: Bot instance type is '{BOT_INSTANCE_TYPE}'.")
-            return
-        # --- END ADDED CHECK ---
+        if attempt_match:
+            petals_lost_str = attempt_match.group("petals")
+            petal_query_str = attempt_match.group("petal_query").strip()
+            try: petals_lost = int(petals_lost_str)
+            except ValueError: return
+            if not petal_query_str: return
 
-        print(f"--- Running delayed static list update after {delay_seconds}s ---")
+            author_ign = await get_ign_from_user(guild, message.author.id)
+            if not author_ign:
+                try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Can't record this. Use `/hcverify` or `/verify` (with your IGN).")
+                except discord.HTTPException: pass
+                return
+
+            attempt_date_obj, date_error_msg = get_utc_date()
+            if date_error_msg or not attempt_date_obj:
+                try: await message.reply(f"Sorry {message.author.mention}, there was an error determining the date for this attempt.")
+                except discord.HTTPException: pass
+                await log_error(guild, f"Super Attempt Log for {author_ign}: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
+                return
+
+            if not await check_supabase_available(message.channel):
+                await log_info(guild, f"Super Attempt Log for query '{petal_query_str}': Supabase unavailable, logging skipped.")
+                return
+
+            ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
+            bot_reply_msg: Optional[discord.Message] = None
+
+            if len(ultra_candidates) == 1:
+                chosen_petal_data = ultra_candidates[0]
+                chosen_petal_name_for_db = chosen_petal_data['original_full_name']
+                display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
+                try:
+                    insert_resp = await run_supabase_sync(
+                        lambda: supabase.table("super_attempts").insert({
+                            "ingame_name": author_ign, "discord_user_id": str(message.author.id),
+                            "attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,
+                            "message_id": str(message.id), "channel_id": str(message.channel.id),
+                            "chosen_petal_name": chosen_petal_name_for_db
+                        }).execute()
+                    )
+                    attempt_db_id = None
+                    if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
+                    if not attempt_db_id:
+                        fetch_id_resp = await run_supabase_sync( lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                        if fetch_id_resp.data: attempt_db_id = fetch_id_resp.data['id']
+                    if not attempt_db_id:
+                        await log_error(guild, f"Super Attempt (single/unknown): Failed to get DB ID for {author_ign}, petal '{display_friendly_name_for_reply}'", message_context=message)
+                        try: await message.reply(f"Sorry {message.author.mention}, an error occurred while saving your attempt (could not confirm DB ID). Admin has been notified.")
+                        except discord.HTTPException: pass
+                        await _update_reactions(message, "error"); return
+                    all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                    sa_view = SuperAttemptConfirmView(target_user_id=message.author.id, attempt_db_id=attempt_db_id, petals_lost=petals_lost, petal_display_name=display_friendly_name_for_reply, author_ign=author_ign, all_time_attempt_count=all_time_attempts_count, original_user_message=message)
+                    embed = sa_view.create_embed()
+                    bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                    sa_view.message = bot_reply_msg
+                    await _update_reactions(message, "success")
+                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time attempts: {all_time_attempts_count}.")
+                    if isinstance(message.author, discord.Member): await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+                except Exception as e:
+                    await log_error(guild, f"Error logging single/unknown super attempt for {author_ign} ({display_friendly_name_for_reply})", error=e, message_context=message, ping_owner=True)
+                    try: await message.reply(f"Sorry {message.author.mention}, an error occurred while logging your attempt. Admin has been notified.")
+                    except discord.HTTPException: pass
+                    await _update_reactions(message, "error")
+            elif len(ultra_candidates) > 1:
+                disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, your query \"{discord.utils.escape_markdown(petal_query_str)}\" could refer to multiple Ultra petals. Please choose:", color=discord.Color.blue())
+                sa_disamb_view = SuperAttemptDisambiguationView(target_user_id=message.author.id, candidate_petals=ultra_candidates, petals_lost=petals_lost, original_user_message=message, author_ign=author_ign, attempt_date_obj=attempt_date_obj)
+                bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
+                sa_disamb_view.message = bot_reply_msg
+                await _update_reactions(message, "disambiguation")
+            else: # No candidates found
+                chosen_petal_name_for_db = "Unknown Ultra Petal"; display_friendly_name_for_reply = "Unknown Ultra"
+                await log_info(guild, f"Super Attempt Log: No specific Ultra petal matched query '{petal_query_str}' by {author_ign}. Logging as '{chosen_petal_name_for_db}'.")
+                try:
+                    insert_resp = await run_supabase_sync( lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id), "attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost, "message_id": str(message.id), "channel_id": str(message.channel.id), "chosen_petal_name": chosen_petal_name_for_db }).execute())
+                    attempt_db_id = None
+                    if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
+                    if not attempt_db_id:
+                        fetch_id_resp = await run_supabase_sync( lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                        if fetch_id_resp.data: attempt_db_id = fetch_id_resp.data['id']
+                    if not attempt_db_id:
+                        await log_error(guild, f"Super Attempt (Unknown Petal): Failed to get DB ID for {author_ign}", message_context=message)
+                        try: await message.reply(f"Sorry {message.author.mention}, error saving (no DB ID for unknown petal). Admin notified.")
+                        except discord.HTTPException: pass
+                        await _update_reactions(message, "error"); return
+                    all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                    sa_view = SuperAttemptConfirmView(target_user_id=message.author.id, attempt_db_id=attempt_db_id, petals_lost=petals_lost, petal_display_name=display_friendly_name_for_reply, author_ign=author_ign, all_time_attempt_count=all_time_attempts_count, original_user_message=message)
+                    embed = sa_view.create_embed()
+                    bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                    sa_view.message = bot_reply_msg
+                    await _update_reactions(message, "success")
+                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time attempts: {all_time_attempts_count}.")
+                    if isinstance(message.author, discord.Member): await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+                except Exception as e:
+                    await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True)
+                    try: await message.reply(f"Sorry {message.author.mention}, error occurred logging unknown petal. Admin notified.")
+                    except discord.HTTPException: pass
+                    await _update_reactions(message, "error")
+            return # Handled super attempt
+
+    # --- HC List Auto-Delete ---
+    if channel.id == HC_MEMBER_LIST_CHANNEL_ID:
+        is_main_list_message = False
+        active_view_data = active_static_list_views.get(HC_MEMBER_LIST_CHANNEL_ID)
+        if active_view_data and active_view_data.get('message_id') == message.id:
+            is_main_list_message = True
+
+        if not is_main_list_message and message.author.id != bot.user.id:
+            try: await message.delete(delay=AUTODELETE_DELAY_SECONDS)
+            except (discord.Forbidden, discord.NotFound): pass 
+            except Exception as e_del_user: await log_error(guild, f"Error auto-deleting user message {message.id} in HC list", error=e_del_user)
         
-        guild_for_delayed_update = bot.get_guild(CATERCORD_GUILD_ID)
-        if not guild_for_delayed_update:
-            print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed static list update.")
-            return
-            
-        if not supabase:
-            print("ERROR: Supabase client not available for delayed static list update.")
-            await log_error(guild_for_delayed_update, "Delayed static list update failed: Supabase client not available.")
-            return
-            
-        try:
-            await update_static_list_message(guild_for_delayed_update)
-        except Exception as e:
-            print(f"ERROR during delayed initial static list update: {e}\n{traceback.format_exc()}")
-            await log_error(guild_for_delayed_update, "Error during delayed initial static list update", error=e)
-        print(f"--- Delayed static list update finished ---")
+        elif not is_main_list_message and message.author.id == bot.user.id and not message.interaction:
+            try: await message.delete(delay=AUTODELETE_DELAY_SECONDS)
+            except (discord.Forbidden, discord.NotFound): pass
+            except Exception as e_del_bot_misc: await log_error(guild, f"Error auto-deleting misc bot message {message.id} in HC list", error=e_del_bot_misc)
+        return # Processed HC list channel message
 
-    if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
-        print("Scheduling delayed static list update for target guild (Catercord)...")
-        asyncio.create_task(delayed_update(delay_seconds=60)) 
-    else:
-        print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
-
-    print("--- on_ready event finished ---")
+    # --- Pass message to AI Cog for its processing (keywords, replies, always-on) ---
+    # This should be one of the last things in bot.py's on_message if no other bot-specific logic needs to run.
+    ai_cog = bot.get_cog('AICog')
+    if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
+        if not message.webhook_id: # Don't let AI process messages sent by webhooks
+            # The AICog's process_message_for_ai will contain its own on_message logic
+            await ai_cog.process_message_for_ai(message)
 
 
 @bot.event
