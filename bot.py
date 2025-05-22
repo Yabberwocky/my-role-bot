@@ -765,7 +765,6 @@ class UndoSuperAttemptButton(SuperAttemptButton):
 
 
 class SuperAttemptDisambiguationView(discord.ui.View):
-    # // --- UNCHANGED SECTION (SuperAttemptDisambiguationView.__init__) --- //
     def __init__(self, target_user_id: int, candidate_petals: List[Dict[str, Any]], 
                  petals_lost: int, original_user_message: discord.Message, 
                  author_ign: str, attempt_date_obj: datetime.date, timeout=120.0):
@@ -776,33 +775,30 @@ class SuperAttemptDisambiguationView(discord.ui.View):
         self.original_user_message = original_user_message
         self.author_ign = author_ign
         self.attempt_date_obj = attempt_date_obj
-        self.message: Optional[discord.Message] = None # Bot's reply message
+        self.message: Optional[discord.Message] = None 
 
         current_row = 0
         for i, petal_data in enumerate(candidate_petals):
-            if i > 0 and i % 4 == 0: # Max 4 choice buttons per row before cancel/next row
+            if i > 0 and i % 4 == 0: 
                 current_row +=1
-            if current_row >= 4 : # Max 4 rows of choices
-                # Add a note if too many choices for buttons
+            if current_row >= 4 :
                 print(f"SuperAttemptDisambiguationView: Too many candidates ({len(candidate_petals)}), only showing first few.")
-                # Potentially add a text component saying "Too many options..." but buttons are better
                 break 
             self.add_item(ChosenPetalButton(petal_data, petals_lost, original_user_message, author_ign, attempt_date_obj, row=current_row))
         
-        # Add Cancel button to the next available row or last row if choices filled up
-        if len(self.children) > 0 : # If there's at least one choice button
+        if len(self.children) > 0 : 
             last_button_row = self.children[-1].row if self.children[-1].row is not None else 0
             cancel_row = last_button_row + 1 if len(self.children) % 4 == 0 and current_row < 4 else current_row
-            if cancel_row >= 5 : cancel_row = 4 # Max row 4
-        else: # No choice buttons added (e.g. candidates list was empty for some reason)
+            if cancel_row >= 5 : cancel_row = 4 
+        else: 
             cancel_row = 0
 
         self.add_item(CancelButton(row=cancel_row, original_user_message_id=original_user_message.id))
-    # // --- END UNCHANGED SECTION (SuperAttemptDisambiguationView.__init__) --- //
 
     async def handle_disambiguation_choice(self, interaction: discord.Interaction, button: ChosenPetalButton):
+        # // --- UNCHANGED SECTION (handle_disambiguation_choice) --- //
         guild = interaction.guild
-        if not guild: # Should not happen if original message was in a guild
+        if not guild: 
             await interaction.followup.send("Error: Guild context lost.", ephemeral=True)
             return
             
@@ -841,16 +837,14 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                     description=f"Logged: Lost {self.petals_lost}x {button.chosen_petal_data['display_friendly_name']}.",
                     color=discord.Color.green()
                 )
-                if self.message: # Check if bot's reply message exists
+                if self.message: 
                      await self.message.edit(content=f"{interaction.user.mention}", embed=confirm_embed, view=None)
                 await _update_reactions(self.original_user_message, "success")
-                # Even if DB ID failed, try to update nickname if user is available
                 if isinstance(interaction.user, discord.Member):
                     all_time_count_after_log = await get_all_time_super_attempt_count(guild, self.author_ign)
                     await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_count_after_log)
                 return
 
-            # Get ALL-TIME attempt count for the user
             all_time_attempts_count = await get_all_time_super_attempt_count(guild, self.author_ign)
 
             confirm_view_after_choice = SuperAttemptConfirmView(
@@ -859,64 +853,59 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                 petals_lost=self.petals_lost,
                 petal_display_name=button.chosen_petal_data['display_friendly_name'],
                 author_ign=self.author_ign,
-                all_time_attempt_count=all_time_attempts_count, # MODIFIED: Pass all-time count
+                all_time_attempt_count=all_time_attempts_count, 
                 original_user_message=self.original_user_message
             )
             success_embed = confirm_view_after_choice.create_embed()
-            if self.message: # Check if bot's reply message exists
+            if self.message: 
                 await self.message.edit(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
                 confirm_view_after_choice.message = self.message 
-            else: # Fallback if self.message wasn't set (should not happen)
+            else: 
                 await interaction.edit_original_response(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
-
 
             await _update_reactions(self.original_user_message, "success")
             await log_info(guild, f"Super attempt (disambiguated choice: {button.chosen_petal_data['display_friendly_name']}) by `{self.author_ign}`: Lost {self.petals_lost}. All-time attempts: {all_time_attempts_count}.")
             
-            # Update custom nickname
-            if isinstance(interaction.user, discord.Member): # Ensure we have member object
+            if isinstance(interaction.user, discord.Member): 
                 await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_attempts_count)
 
         except Exception as e:
             await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message)
-            try: # Try to send ephemeral error if interaction not already responded
+            try: 
                 if not interaction.response.is_done():
                     await interaction.response.send_message("An error occurred while processing your choice.", ephemeral=True)
                 else:
                     await interaction.followup.send("An error occurred while processing your choice.", ephemeral=True)
-            except discord.HTTPException: pass # Ignore if sending ephemeral fails too
+            except discord.HTTPException: pass
 
             if self.message: await self.message.edit(content=f"{interaction.user.mention} An error occurred. Please try again or ask an admin.", embed=None, view=None)
             await _update_reactions(self.original_user_message, "error") 
+        # // --- END UNCHANGED SECTION (handle_disambiguation_choice) --- //
 
-    # // --- UNCHANGED SECTION (SuperAttemptDisambiguationView.handle_cancel & on_timeout) --- //
     async def handle_cancel(self, interaction: discord.Interaction):
         if self.message:
             await self.message.edit(content=f"{interaction.user.mention} Super attempt logging cancelled.", embed=None, view=None)
         await _update_reactions(self.original_user_message, "cancelled")
         self.stop()
-        if self.message: # Attempt to delete after a short delay
-            await asyncio.sleep(5) 
+        if self.message: 
+            await asyncio.sleep(AUTODELETE_DELAY_SECONDS) # Use your global constant here
             try: await self.message.delete()
-            except: pass
-
+            except discord.HTTPException: pass # Ignore if already deleted or forbidden
 
     async def on_timeout(self):
         if self.message:
             try:
                 await self.message.edit(content=f"Timed out choosing petal for super attempt. Original message by <@{self.target_user_id}>.", embed=None, view=None)
-                # Optionally remove reactions or change to neutral
                 await _update_reactions(self.original_user_message, "timeout_or_neutral")
-                await asyncio.sleep(10) # Keep visible for a bit
-                await self.message.delete()
+                await asyncio.sleep(AUTODELETE_DELAY_SECONDS) # Use your global constant here
+                await self.message.delete() # MODIFIED: Delete the message on timeout
             except discord.HTTPException:
-                pass # Message might already be gone
+                pass # Message might already be gone or bot lacks permissions
         self.stop()
-    # // --- END UNCHANGED SECTION (SuperAttemptDisambiguationView.handle_cancel & on_timeout) --- //
 
 class SuperAttemptConfirmView(discord.ui.View):
     def __init__(self, target_user_id: int, attempt_db_id: int, petals_lost: int, 
-                 petal_display_name: str, author_ign: str, all_time_attempt_count: int, # MODIFIED PARAM
+                 petal_display_name: str, author_ign: str, all_time_attempt_count: int, 
                  original_user_message: discord.Message, timeout=180.0): 
         super().__init__(timeout=timeout)
         self.target_user_id = target_user_id
@@ -924,7 +913,7 @@ class SuperAttemptConfirmView(discord.ui.View):
         self.petals_lost = petals_lost
         self.petal_display_name = petal_display_name
         self.author_ign = author_ign
-        self.all_time_attempt_count = all_time_attempt_count # MODIFIED ATTRIBUTE
+        self.all_time_attempt_count = all_time_attempt_count 
         self.original_user_message = original_user_message
         self.message: Optional[discord.Message] = None 
         self.is_undone = False
@@ -932,13 +921,13 @@ class SuperAttemptConfirmView(discord.ui.View):
         self.add_item(UndoSuperAttemptButton(attempt_db_id, original_user_message, row=0))
 
     def create_embed(self) -> discord.Embed:
+        # // --- UNCHANGED SECTION (create_embed) --- //
         if self.is_undone:
             return discord.Embed(
                 description=f"↩️ Super attempt log for {self.petals_lost}x Ultra {self.petal_display_name} (by {self.author_ign}) has been **undone**.",
                 color=discord.Color.orange()
             )
         else:
-            # MODIFIED description to use all_time_attempt_count
             return discord.Embed(
                 description=(
                     f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign} "
@@ -946,8 +935,10 @@ class SuperAttemptConfirmView(discord.ui.View):
                 ),
                 color=discord.Color.green()
             )
+        # // --- END UNCHANGED SECTION (create_embed) --- //
 
     async def handle_undo(self, interaction: discord.Interaction, attempt_db_id_from_button: int, original_user_msg_obj: discord.Message):
+        # // --- UNCHANGED SECTION (handle_undo) --- //
         guild = interaction.guild
         if self.is_undone: 
             await interaction.followup.send("This attempt has already been undone.", ephemeral=True)
@@ -967,16 +958,14 @@ class SuperAttemptConfirmView(discord.ui.View):
                     if isinstance(item, discord.ui.Button): item.disabled = True
                 
                 embed = self.create_embed()
-                if self.message: # Check if self.message is set
+                if self.message: 
                     await self.message.edit(embed=embed, view=self)
-                else: # Fallback if self.message isn't set (should not happen if view is sent correctly)
+                else: 
                     await interaction.edit_original_response(embed=embed, view=self)
 
                 await _update_reactions(original_user_msg_obj, "undone")
                 await log_info(guild, f"Super attempt ID {self.attempt_db_id} (Petal: {self.petal_display_name}, User: {self.author_ign}) undone by {interaction.user.name}.")
-                # After undoing, update the user's nickname as their attempt count changed
-                if guild and isinstance(interaction.user, discord.Member): # Ensure we have guild and Member object
-                    # Fetch new all-time count after deletion
+                if guild and isinstance(interaction.user, discord.Member): 
                     new_all_time_count = await get_all_time_super_attempt_count(guild, self.author_ign)
                     await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, new_all_time_count)
 
@@ -988,11 +977,11 @@ class SuperAttemptConfirmView(discord.ui.View):
                 if self.message: await self.message.edit(view=self)
                 elif interaction.message: await interaction.edit_original_response(view=self)
 
-
         except Exception as e:
             await log_error(guild, f"Error undoing super attempt ID {self.attempt_db_id}", error=e, message_context=self.original_user_message)
             await interaction.followup.send("An error occurred while trying to undo the attempt.", ephemeral=True)
             await _update_reactions(original_user_msg_obj, "error") 
+        # // --- END UNCHANGED SECTION (handle_undo) --- //
 
     async def on_timeout(self):
         if self.message:
@@ -1001,24 +990,14 @@ class SuperAttemptConfirmView(discord.ui.View):
                 for item in self.children:
                     if isinstance(item, discord.ui.Button):
                         item.disabled = True
-                await self.message.edit(view=self) # Edit to show disabled buttons
-                
-                # Reaction handling is now managed by _update_reactions based on self.is_undone
-                # If it was a successful log (not undone), ✅ will remain.
-                # If it was undone, ❌ will remain.
-                # We call _update_reactions with a generic timeout state ONLY if we want specific timeout reaction.
-                # For this view, if it's simply timing out, the existing state (✅ or ❌) is usually desired.
-                # However, the current _update_reactions will clear previous reactions if not handled carefully.
-                # The change in _update_reactions to preserve ✅ for "timeout_or_neutral" state handles this.
+                await self.message.edit(view=self) 
                 await _update_reactions(self.original_user_message, "timeout_or_neutral")
 
-                # Optionally, delete the bot's reply message after a longer delay if desired, or leave it with disabled buttons.
-                # For now, let's leave it with disabled buttons.
-                # await asyncio.sleep(60) # Example: Wait a minute
-                # await self.message.delete()
-
+                # MODIFIED: Delete the message after a delay
+                await asyncio.sleep(AUTODELETE_DELAY_SECONDS) # Use your global constant here
+                await self.message.delete()
             except discord.HTTPException:
-                pass
+                pass 
         self.stop()
 
 async def _update_reactions(user_message: discord.Message, state: str):
@@ -2237,52 +2216,6 @@ class HelpPagesView(discord.ui.View):
             except discord.HTTPException:
                 pass
         self.stop()
-
-@tree.command(name="nerdhelp", description="Show the list of available bot commands.")
-async def nerdhelp(interaction: discord.Interaction):
-    # // --- UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
-        return
-
-    if not bot or not bot.user:
-        await interaction.response.send_message("Bot is not fully ready, cannot generate help.", ephemeral=False)
-        return
-    if not command_ids:
-        print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
-    # // --- END UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
-
-    can_see_staff_commands = False
-    if isinstance(interaction.user, discord.Member): # Ensure user is a Member for permission checks
-        can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
-
-    view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
-    
-    if not can_see_staff_commands:
-        view_instance.clear_items() 
-
-    initial_embed = view_instance.get_current_embed()
-
-    # // --- UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
-    try:
-        await interaction.response.send_message(embed=initial_embed, view=view_instance, ephemeral=False)
-        view_instance.message = await interaction.original_response()
-            
-    except Exception as e:
-        print(f"Error sending nerdhelp response: {e}")
-        if isinstance(e, discord.HTTPException) and e.code == 50035:
-            print("--- TRACEBACK FOR NERDHELP 50035 ---")
-            print(traceback.format_exc())
-            print("--- END TRACEBACK ---")
-        await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
-            else: # Should have been responded to by send_message above
-                await interaction.edit_original_response(content="Failed to generate help embed.", embed=None, view=None)
-        except Exception: pass
-    # // --- END UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
 
 async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices = []
@@ -8070,10 +8003,9 @@ async def florr(
             try: await temp_webhook.delete(reason="Temp webhook cleanup for /florr")
             except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /florr. ID: {temp_webhook.id}", error=e_del)
    
-# --- Nerd Help Command (MODIFIED) ---
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
-# REMOVED @app_commands.check(test_bot_owner_only_check)
 async def nerdhelp(interaction: discord.Interaction):
+    # // --- UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
@@ -8084,27 +8016,21 @@ async def nerdhelp(interaction: discord.Interaction):
         return
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
+    # // --- END UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
 
     can_see_staff_commands = False
-    if isinstance(interaction.user, discord.Member):
+    if isinstance(interaction.user, discord.Member): # Ensure user is a Member for permission checks
         can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
 
-    # Create the view instance
     view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
     
-    # If the user cannot see staff commands, we effectively want no buttons.
-    # We achieve this by clearing items from the view instance if it's not allowed.
-    # The HelpPagesView's button is defined by a decorator, so it's always part of its potential children.
     if not can_see_staff_commands:
-        view_instance.clear_items() # Remove the decorated button if not allowed to use it
+        view_instance.clear_items() 
 
-    # The button's initial appearance is set by the decorator (View Staff Commands)
-    # This is correct as the initial page is 'general'.
     initial_embed = view_instance.get_current_embed()
 
-
+    # // --- UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
     try:
-        # Send the view. If view_instance.children is empty, Discord handles it as no components.
         await interaction.response.send_message(embed=initial_embed, view=view_instance, ephemeral=False)
         view_instance.message = await interaction.original_response()
             
@@ -8118,7 +8044,10 @@ async def nerdhelp(interaction: discord.Interaction):
         try:
             if interaction.response.is_done():
                 await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
+            else: # Should have been responded to by send_message above
+                await interaction.edit_original_response(content="Failed to generate help embed.", embed=None, view=None)
         except Exception: pass
+    # // --- END UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
 
 @tree.command(name="cleanup_bot_messages", description="[Owner Only] Deletes the bot's previous N messages in this channel.")
 @app_commands.describe(
