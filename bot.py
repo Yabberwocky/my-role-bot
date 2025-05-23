@@ -222,6 +222,14 @@ DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE = (BOT_INSTANCE_TYPE == "TEST
 MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING = False # Set to True to test listener in "TESTING" instance type
 guild_sync_sessions: Dict[int, Dict[str, Any]] = {} # User ID -> {'screenshot_igns_collected': Set[str], 'bot_reply_message_id': int, 'last_update_time': datetime.datetime}
 GUILD_SYNC_SESSION_TIMEOUT_SECONDS = 1800 # 30 minutes for a session to be considered stale
+DEPRECATION_MESSAGE_ACTIVITY = (
+    "ℹ️ The 'Activate Myself' feature is being phased out soon.\n\n"
+    "The screenshot system in <#{channel_id}> is a more efficient way to track activity for everyone!\n\n"
+    "**Quick Screenshot Guide:**\n"
+    "1. Press `Ctrl + Shift + S` to capture your Florr.io screen.\n"
+    "2. In Discord (in the <#{channel_id}> channel), press `Ctrl + V` to paste and send.\n\n"
+    "This method is quick and helps keep activity records accurate. Thanks for your understanding!"
+).format(channel_id=SCREENSHOTS_DROPBOX_CHANNEL_ID)
 
 
 
@@ -3189,163 +3197,21 @@ class SelfActivateButton(discord.ui.Button):
         super().__init__(label="Activate Myself Today", style=discord.ButtonStyle.success, emoji="✅", custom_id="static_activate_self", row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        view: StaticHCPagesView = self.view
-        guild = interaction.guild # Should always be the static list's guild
+        view: StaticHCPagesView = self.view # type: ignore
+        guild = interaction.guild 
 
         if not view or not guild:
             await interaction.response.send_message("❌ Cannot perform action: View or Guild context lost.", ephemeral=True)
             return
 
-        # --- Mimic /activatemyself logic ---
-        user_id = interaction.user.id
-        user_mention = interaction.user.mention
-
-        # Use check_supabase_available helper first
-        if not await check_supabase_available(interaction):
-             # Helper handles ephemeral message + logging if needed
-             return # Stop if DB down
-
-        # 1. Fetch User's IGN
-        stored_ign = await get_ign_from_user(guild, user_id)
-
-        if not stored_ign:
-            await interaction.response.send_message(
-                f"❌ {user_mention}, I couldn't find a linked In-Game Name (IGN) for you in the database. "
-                f"Use {get_cmd_mention('hcverify')} or contact an admin.",
-                ephemeral=True
-            )
-            # Don't update last interaction time for view if user can't activate
-            return
-
-        # 2. Get Today's Date
-        activity_date, date_error = get_utc_date()
-        if date_error or not activity_date:
-            await interaction.response.send_message(f"❌ Could not determine today's date.", ephemeral=True)
-            await log_error(guild, f"SelfActivateButton error: Failed to get today's date ({date_error})", interaction=interaction)
-            return
-
-        # 3. Upsert Activity Log
-        success, message = await upsert_activity_log(guild, stored_ign, activity_date, user_id)
-
-        prefix = "✅" if success else "⚠️"
-        response_msg = f"{prefix} {user_mention}, "
-        if success:
-            response_msg += f"you've been marked as active for today ({format_date_dmy(activity_date)}) with IGN `{discord.utils.escape_markdown(stored_ign)}`."
-            # Update the main view's last interaction time ONLY on success
-            view.last_interaction_time = discord.utils.utcnow()
-        else:
-            response_msg += f"failed to mark you as active: {message.split(': ', 1)[-1]}"
-
-        # Send ephemeral confirmation/error
-        await interaction.response.send_message(response_msg, ephemeral=True)
-
-        # 4. Log and Trigger Update (if successful)
-        if success:
-            await log_info(guild, f"`{interaction.user}` used SelfActivateButton. Marked IGN `{stored_ign}` active for {format_date_dmy(activity_date)}. Triggering list update.")
-            # Trigger the main list update task
-            asyncio.create_task(update_static_list_message(guild))
-            # Note: The view the user is looking at won't immediately reflect the change.
-            # The update_static_list_message task will eventually refresh the data and edit the message.
+        # Send deprecation message
+        await interaction.response.send_message(DEPRECATION_MESSAGE_ACTIVITY, ephemeral=True)
+        
+        # Log the attempt
+        await log_info(guild, f"`{interaction.user.name}` (`{interaction.user.id}`) clicked the deprecated 'Activate Myself Today' button on the static list.")
+        # IMPORTANT: Do NOT update view.last_interaction_time here to prevent view reset timer from being affected by this deprecated feature.
 
 # --- Buttons and Views for the NEW Static List ---
-
-class PingDevButton(discord.ui.Button):
-    """Button that pings the developer when clicked."""
-    def __init__(self, requesting_user: discord.User, bot_owner_id: int):
-        super().__init__(label="Notify Developer!", style=discord.ButtonStyle.success, emoji="📢")
-        self.requesting_user = requesting_user
-        self.bot_owner_id = bot_owner_id
-        self.already_clicked = False # Add a flag to prevent double processing
-
-    async def callback(self, interaction: discord.Interaction):
-        # Prevent processing if already clicked (handles potential double-clicks)
-        if self.already_clicked:
-            try:
-                # Just acknowledge the interaction if clicked again quickly
-                await interaction.response.defer()
-            except discord.InteractionResponded:
-                pass # Ignore if already responded
-            return
-        self.already_clicked = True # Set flag immediately
-
-        # --- 1. Respond to the interaction FIRST ---
-        self.disabled = True
-        self.label = "Developer Notified"
-        try:
-            # Try editing the original ephemeral message
-            await interaction.response.edit_message(view=self.view)
-            print("[PingDevButton] Successfully edited original ephemeral message.")
-        except discord.NotFound:
-            print("[PingDevButton] Original ephemeral message not found (likely dismissed by user). Skipping edit.")
-        except discord.HTTPException as e:
-             print(f"[PingDevButton] HTTP Error editing original ephemeral message: {e}. Proceeding with logging.")
-             await log_error(interaction.guild, "[PingDevButton] HTTP Error editing original ephemeral message", error=e, interaction=interaction)
-        except Exception as e:
-             print(f"[PingDevButton] Unknown Error editing original ephemeral message: {e}. Proceeding with logging.")
-             await log_error(interaction.guild, "[PingDevButton] Unknown Error editing original ephemeral message", error=e, interaction=interaction)
-
-
-        # Send the ephemeral confirmation
-        try:
-            await interaction.followup.send("✅ The developer has been notified of your interest!", ephemeral=True)
-            print("[PingDevButton] Successfully sent ephemeral confirmation.")
-        except discord.NotFound as e_followup:
-            print(f"[PingDevButton] Failed to send ephemeral followup (NotFound - Unknown Webhook): {e_followup}. Interaction likely expired.")
-            await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (NotFound/Unknown Webhook)", error=e_followup, interaction=interaction)
-            return
-        except discord.HTTPException as e_followup:
-             print(f"[PingDevButton] Failed to send ephemeral followup (HTTPException): {e_followup}.")
-             await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (HTTPException)", error=e_followup, interaction=interaction)
-        except Exception as e_followup:
-             print(f"[PingDevButton] Failed to send ephemeral followup (Unknown): {e_followup}.")
-             await log_error(interaction.guild, "[PingDevButton] Failed to send ephemeral followup (Unknown)", error=e_followup, interaction=interaction)
-
-
-        # --- 2. Perform Logging Action LAST ---
-        guild = interaction.guild
-        if not guild:
-             print("[PingDevButton] Guild object became None before logging.")
-             return
-
-        owner_mention = f"<@{self.bot_owner_id}>"
-        # --- UPDATED CHANNEL ID ---
-        notification_channel_id = 1200476682973364246 # <--- CHANGE HERE
-
-        notification_message = f"User {self.requesting_user.mention} (`{self.requesting_user.id}`) is interested in the 'My Profile' feature!"
-        notification_embed = discord.Embed(
-            title="Interest Notification: 'My Profile' Feature",
-            description=notification_message,
-            color=NERDY_YELLOW # Use bot's standard color
-        )
-        notification_embed.timestamp = discord.utils.utcnow()
-        notification_embed.set_footer(text=f"Triggered by: {self.requesting_user}")
-
-        # Call log_to_channel
-        try:
-            await log_to_channel(
-                channel_id=notification_channel_id, # Uses the updated ID
-                guild=guild,
-                embed=notification_embed,
-                ping_mention=owner_mention
-            )
-            print(f"[PingDevButton] Successfully logged notification to developer channel {notification_channel_id}.")
-        except Exception as e_log:
-            # Log failure to log
-            print(f"[PingDevButton] CRITICAL: Failed to send log notification to developer channel {notification_channel_id}: {e_log}")
-            await log_error(guild, f"[PingDevButton] CRITICAL: Failed to send log notification to developer channel {notification_channel_id}", error=e_log)
-
-
-class MyProfileWIPView(discord.ui.View):
-    """View for the ephemeral 'My Profile' WIP message."""
-    def __init__(self, requesting_user: discord.User, bot_owner_id: int, timeout: float = 180.0):
-        super().__init__(timeout=timeout)
-        self.add_item(PingDevButton(requesting_user, bot_owner_id))
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-        # We can't edit an ephemeral message after timeout easily, so just let it be.
-
 
 class InfoButton(discord.ui.Button):
     """Button to toggle the info display on the static list."""
@@ -3924,25 +3790,120 @@ class StaticHCPagesView(View):
         await self.respond_to_interaction(interaction) # Use initial response method
 
     async def show_my_profile(self, interaction: discord.Interaction):
-        """Callback for the MyProfileButton."""
-        # This sends a *new* ephemeral message, so it doesn't conflict with view edits
-        wip_message = (
-             f"👋 Hey {interaction.user.mention}!\n\n"
-             "The **My Profile** feature is still under construction 🚧.\n\n"
-             "It will eventually show your personal stats like activity history, verification date, etc.\n\n"
-             "Thanks for your interest! Click the button below if you'd like to let the developer know you're waiting eagerly for this feature."
-        )
-        wip_embed = discord.Embed(description=wip_message, color=NERDY_YELLOW)
-        wip_view = MyProfileWIPView(requesting_user=interaction.user, bot_owner_id=self.bot_owner_id)
-        # Ensure this is the first response for this specific interaction
-        if not interaction.response.is_done():
-            await interaction.response.send_message(embed=wip_embed, view=wip_view, ephemeral=True)
-        else:
-            # If somehow already responded (e.g., view timed out concurrently?), use followup
+        """Callback for the MyProfileButton. Shows the user's profile ephemerally."""
+        guild = interaction.guild # Should be the static list's guild
+        if not guild: # Should not happen if view is guild-bound
+            await interaction.response.send_message("Error: Guild context lost for profile.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        if not await check_supabase_available(interaction):
+            # check_supabase_available sends its own ephemeral message if DB is down
+            # We might need to edit the deferred response if check_supabase_available already responded.
+            # For now, assuming check_supabase_available handles the response logic.
+            # If it doesn't send a message itself, we'd use interaction.followup.send here.
+            # Let's ensure the deferred state is handled:
             try:
-                await interaction.followup.send(embed=wip_embed, view=wip_view, ephemeral=True)
-            except Exception as e_followup:
-                 print(f"[Static View] Error sending MyProfile followup: {e_followup}")
+                await interaction.edit_original_response(content="❌ Database connection unavailable. Cannot fetch profile data.", view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass # If already responded or interaction gone.
+            return
+
+        # --- Fetch data for interaction.user (self-profile) ---
+        target_user_for_display = interaction.user
+        target_discord_id_str = str(interaction.user.id)
+        
+        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
+        target_ign_from_db: Optional[str] = None
+        if hc_profile_db_data:
+            target_ign_from_db = hc_profile_db_data.get("ingame_name")
+        
+        if not target_ign_from_db:
+            await interaction.followup.send(
+                f"❌ {interaction.user.mention}, I couldn't find a linked In-Game Name (IGN) for you in the database. "
+                f"Use {get_cmd_mention('hcverify')} or {get_cmd_mention('verify')} to link your IGN.",
+                ephemeral=True
+            )
+            return
+
+        # Prepare display data for the ProfilePagesView
+        display_name_for_view: str = target_user_for_display.display_name
+        avatar_url_for_view: Optional[str] = target_user_for_display.display_avatar.url if target_user_for_display.display_avatar else target_user_for_display.default_avatar.url
+        mention_or_status_for_view: str = target_user_for_display.mention
+        actual_member_object_ref: Optional[discord.Member] = None
+        if isinstance(target_user_for_display, discord.Member):
+            actual_member_object_ref = target_user_for_display
+
+        target_user_display_data_for_view = {
+            "name": display_name_for_view,
+            "avatar_url": avatar_url_for_view,
+            "mention_or_status": mention_or_status_for_view,
+            "_member_object_ref": actual_member_object_ref,
+            "_discord_id_for_sa_management": target_discord_id_str
+        }
+
+        # Fetch Activity and Super Attempt Data
+        activity_summary_for_view: Optional[Dict[str, Any]] = None
+        initial_monthly_dates_for_view: Set[datetime.date] = set()
+        super_attempt_stats_data_for_view: Optional[Dict[str, Any]] = None
+        today_utc_obj, _ = get_utc_date()
+
+        if target_ign_from_db and today_utc_obj:
+            ign_lower = target_ign_from_db.lower()
+            
+            is_active_today = await check_activity_exists(guild, ign_lower, today_utc_obj)
+            active_today_disp = "❔ `N/A (DB Error)`"
+            if is_active_today is True: active_today_disp = "✅ `Yes`"
+            elif is_active_today is False: active_today_disp = "❌ `No`"
+            
+            all_time_summary = await fetch_activity_data(guild, [ign_lower])
+            ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
+            
+            activity_summary_for_view = {
+                "active_today_display": active_today_disp,
+                "total_days_logged": ign_all_time_data['count'],
+                "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"
+            }
+            
+            first_day_current_month = today_utc_obj.replace(day=1)
+            if today_utc_obj.month == 12:
+                first_day_next_month = first_day_current_month.replace(year=today_utc_obj.year + 1, month=1)
+            else:
+                first_day_next_month = first_day_current_month.replace(month=today_utc_obj.month + 1)
+            last_day_current_month = first_day_next_month - datetime.timedelta(days=1)
+            
+            initial_monthly_dates_for_view = await fetch_activity_dates_in_range(
+                guild, ign_lower, first_day_current_month, last_day_current_month
+            )
+            super_attempt_stats_data_for_view = await get_user_super_attempt_stats(guild, target_ign_from_db)
+        
+        if not today_utc_obj: # Should not happen if get_utc_date is robust
+            await log_error(guild, "Static List Profile: Failed to get today's date object.", interaction=interaction)
+
+        # Create and Send ProfilePagesView
+        profile_view_instance = ProfilePagesView(
+            interaction=interaction, # Pass the interaction that triggered this profile view
+            target_user_display_data=target_user_display_data_for_view,
+            hc_profile_data=hc_profile_db_data,
+            activity_summary_data=activity_summary_for_view,
+            initial_monthly_active_dates=initial_monthly_dates_for_view,
+            super_attempt_stats_data=super_attempt_stats_data_for_view,
+            today_date_obj=today_utc_obj if today_utc_obj else datetime.date.today() # Fallback for today_date_obj
+        )
+        
+        initial_profile_embed = profile_view_instance._create_main_embed()
+        
+        try:
+            # Send the profile as an ephemeral followup
+            profile_message = await interaction.followup.send(embed=initial_profile_embed, view=profile_view_instance, ephemeral=True)
+            profile_view_instance.message = profile_message # Link message to view for its own timeout handling
+        except discord.HTTPException as e_send_profile:
+            await log_error(guild, "Failed to send ephemeral profile from static list button", error=e_send_profile, interaction=interaction)
+            try: # Try to edit the original deferred response with a simpler error
+                await interaction.edit_original_response(content="❌ Error displaying your profile. Please try again later.", view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass # Original interaction might be gone
 
 
     # --- Timeout and Reset (Modify reset_view to use edit_message_object) ---
@@ -6701,59 +6662,17 @@ async def hconly(interaction: discord.Interaction, ingame_name: str):
 
 # --- Activate Myself Command ---
 @tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
-# No extra permissions needed by default, relies on user having a linked IGN
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
-    if not await check_supabase_available(interaction):
-        return
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
+    if not guild: # Should already be caught by tree if guild_only, but for safety
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
 
-    # Defer ephemerally as it's a personal action confirmation
-    await interaction.response.defer(thinking=True, ephemeral=False) # Change to False since we are not making it ephemeral
-
-    user_id = interaction.user.id
-    user_mention = interaction.user.mention
-
-    # 1. Fetch User's IGN
-    stored_ign = await get_ign_from_user(guild, user_id)
-
-    if not stored_ign:
-        await interaction.followup.send(
-            f"❌ {user_mention}, I couldn't find a linked In-Game Name (IGN) for you in the database. "
-            f"You might need to be verified with {get_cmd_mention('hcverify')} or contact an admin to link your account.",
-            ephemeral=False # Change to False since we are not making it ephemeral
-        )
-        await log_info(guild, f"{user_mention} tried /activatemyself but has no linked IGN.")
-        return
-
-    # 2. Get Today's Date
-    activity_date, date_error = get_utc_date() # No date string needed, defaults to today
-    if date_error or not activity_date:
-        await interaction.followup.send(f"❌ Could not determine today's date. Please try again later.", ephemeral=False) # Change to False since we are not making it ephemeral
-        await log_error(guild, f"/activatemyself internal error: Failed to get today's date ({date_error})", interaction=interaction)
-        return
-
-    # 3. Upsert Activity Log
-    success, message = await upsert_activity_log(guild, stored_ign, activity_date, user_id)
-
-    prefix = "✅" if success else "⚠️"
-    # Tailor the message slightly
-    response_msg = f"{prefix} {user_mention}, "
-    if success:
-        response_msg += f"you've been marked as active for today ({format_date_dmy(activity_date)}) with IGN `{discord.utils.escape_markdown(stored_ign)}`."
-    else:
-        # Provide the error message from upsert_activity_log
-        response_msg += f"failed to mark you as active: {message.split(': ', 1)[-1]}" # Get message part after "IGN `...`:" if structure is consistent
-
-    await interaction.followup.send(response_msg, ephemeral=False) # Change to False since we are not making it ephemeral
-
-    # 4. Log and Trigger Update (if successful)
-    if success:
-        await log_info(guild, f"`{interaction.user}` used /activatemyself. Marked IGN `{stored_ign}` active for {format_date_dmy(activity_date)}. Triggering list update.")
-        asyncio.create_task(update_static_list_message(guild))
-    # else: Error already logged by upsert_activity_log if it failed internally
+    # Send deprecation message
+    await interaction.response.send_message(DEPRECATION_MESSAGE_ACTIVITY, ephemeral=True)
+    
+    # Log the attempt
+    await log_info(guild, f"`{interaction.user.name}` (`{interaction.user.id}`) used the deprecated /activatemyself command.")
 
 # --- Active Command (MODIFIED: No date, Manage Server perm required) ---
 @tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.") # MODIFIED Description
