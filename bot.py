@@ -1475,27 +1475,13 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             else: 
                 await interaction.edit_original_response(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
 
-            # DB operation was successful. Now try to send confirmation and update reactions.
-            try:
-                if self.message: 
-                    await self.message.edit(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
-                    confirm_view_after_choice.message = self.message 
-                else: # Should not happen if self.message was set by the calling on_message
-                    await interaction.edit_original_response(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
-                await _update_reactions(self.original_user_message, "success")
-            except discord.HTTPException as http_err_reply:
-                await log_error(guild, f"Super Attempt (Disambiguation Choice): DB log OK, but Discord API error sending confirm view or success reaction for {self.author_ign}, choice {button.chosen_petal_data['display_friendly_name']}.", error=http_err_reply, message_context=self.original_user_message)
-                # Try to add success reaction one last time if the main reply failed
-                try: await _update_reactions(self.original_user_message, "success")
-                except discord.HTTPException as http_err_reaction_retry:
-                    await log_error(guild, f"Super Attempt (Disambiguation Choice): Failed again to add success reaction for {self.author_ign} after confirm view send failed.", error=http_err_reaction_retry, message_context=self.original_user_message)
-
+            await _update_reactions(self.original_user_message, "success")
             await log_info(guild, f"Super attempt (disambiguated choice: {button.chosen_petal_data['display_friendly_name']}) by `{self.author_ign}`: Lost {self.petals_lost}. All-time attempts: {all_time_attempts_count}.")
             
             if isinstance(interaction.user, discord.Member): 
                 await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_attempts_count)
 
-        except Exception as e: # This catches errors from the DB logging primarily
+        except Exception as e:
             await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message)
             try: 
                 if not interaction.response.is_done():
@@ -1505,7 +1491,7 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             except discord.HTTPException: pass
 
             if self.message: await self.message.edit(content=f"{interaction.user.mention} An error occurred. Please try again or ask an admin.", embed=None, view=None)
-            await _update_reactions(self.original_user_message, "error") # DB error or other critical failure before DB op.
+            await _update_reactions(self.original_user_message, "error") 
         # // --- END UNCHANGED SECTION (handle_disambiguation_choice) --- //
 
     async def handle_cancel(self, interaction: discord.Interaction):
@@ -2323,58 +2309,25 @@ class ProfilePagesView(discord.ui.View):
         if self.is_fetching_sa_log:
             embed.description = "⏳ Fetching log entries..."
             return embed
-
-        log_lines = []
-        
-        # Define column widths
-        ID_WIDTH = 6
-        DATE_WIDTH = 8 # DD/MM/YY
-        PETAL_NAME_WIDTH = 22 # Max width for petal name
-        LOST_WIDTH = 5 # e.g., "10.0"
-
-        # Header
-        header = (
-            f"{'ID':<{ID_WIDTH}} | {'Date':<{DATE_WIDTH}} | "
-            f"{'Petal Name':<{PETAL_NAME_WIDTH}} | {'Lost':>{LOST_WIDTH}}"
-        )
-        separator = (
-            f"{'-'*ID_WIDTH}-|-{'-'*DATE_WIDTH}-|-"
-            f"{'-'*PETAL_NAME_WIDTH}-|-{'-'*LOST_WIDTH}"
-        )
-
-        log_lines.append(header)
-        log_lines.append(separator)
-
+            
         if not self.current_s_attempt_log_entries:
-            log_lines.append("No super attempt log entries found.")
+            embed.description = "No super attempt log entries found."
+            if self.s_attempt_log_total_entries > 0 : # Has entries but this page is empty (should not happen if page num is managed)
+                embed.description += " (Try previous pages if available)."
         else:
-            for entry in self.current_s_attempt_log_entries:
-                db_id_str = str(entry.get('id', 'N/A'))
+            log_desc_parts = []
+            start_idx = self.s_attempt_log_current_page * self.SA_LOG_ENTRIES_PER_PAGE
+            for i, entry in enumerate(self.current_s_attempt_log_entries):
+                entry_num_on_page = i + 1
+                # overall_entry_num = start_idx + entry_num_on_page # If you want overall numbering
+                date_str = format_date_dmy(entry['attempt_date']) if entry['attempt_date'] else "Unknown Date"
+                petal_display = _get_display_friendly_petal_name(entry['chosen_petal_name']) if entry['chosen_petal_name'] else "Unknown"
+                petals_lost_str = f"{entry['petals_lost']:.1f}" # Display with 1 decimal for 2.5
                 
-                date_val = entry.get('attempt_date') # This is a datetime.date object or None
-                date_str = format_date_dmy(date_val) if date_val else "N/A"
-                # format_date_dmy returns DD/MM/YYYY, we need DD/MM/YY
-                if len(date_str) == 10 and date_str != "N/A": # DD/MM/YYYY
-                    date_str = date_str[:6] + date_str[8:] # Convert to DD/MM/YY
-
-                petal_original_name = entry.get('chosen_petal_name', "Unknown")
-                petal_display_name = _get_display_friendly_petal_name(petal_original_name)
-                
-                if len(petal_display_name) > PETAL_NAME_WIDTH:
-                    petal_display_name = petal_display_name[:PETAL_NAME_WIDTH-3] + "..."
-                
-                petals_lost_val = entry.get('petals_lost', 0.0)
-                try:
-                    petals_lost_str = f"{float(petals_lost_val):.1f}"
-                except (ValueError, TypeError):
-                    petals_lost_str = "N/A"
-
-                log_lines.append(
-                    f"{db_id_str:<{ID_WIDTH}} | {date_str:<{DATE_WIDTH}} | "
-                    f"{petal_display_name:<{PETAL_NAME_WIDTH}} | {petals_lost_str:>{LOST_WIDTH}}"
+                log_desc_parts.append(
+                    f"**{entry_num_on_page}.** Date: `{date_str}`, Petal: `{petal_display}`, Lost: `{petals_lost_str}`"
                 )
-        
-        embed.description = "```markdown\n" + "\n".join(log_lines) + "\n```"
+            embed.description = "\n".join(log_desc_parts)
 
         footer_text = f"Page {self.s_attempt_log_current_page + 1}/{self.s_attempt_log_total_pages} ({self.s_attempt_log_total_entries} total entries)"
         if self.is_fetching_sa_log: footer_text += " | Fetching..."
@@ -7851,27 +7804,12 @@ async def on_message(message: discord.Message):
                     try: await message.reply(f"Error saving (no DB ID). Admin notified.");
                     except discord.HTTPException: pass; await _update_reactions(message, "error"); return
                     all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-                    sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message); embed = sa_view.create_embed()
-                    # DB operation was successful. Now try to send confirmation and update reactions.
-                    try:
-                        bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view); sa_view.message = bot_reply_msg
-                        await _update_reactions(message, "success")
-                    except discord.HTTPException as http_err_reply:
-                        await log_error(guild, f"Super Attempt (Single Match): DB log OK, but Discord API error sending confirm view or success reaction for {author_ign}.", error=http_err_reply, message_context=message)
-                        # Try to add success reaction one last time if the main reply failed, but don't switch to error icon for this.
-                        try: await _update_reactions(message, "success") # Try adding success reaction again
-                        except discord.HTTPException as http_err_reaction_retry:
-                            await log_error(guild, f"Super Attempt (Single Match): Failed again to add success reaction for {author_ign} after confirm view send failed.", error=http_err_reaction_retry, message_context=message)
-                    
-                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
+                    sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message); embed = sa_view.create_embed(); bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view); sa_view.message = bot_reply_msg
+                    await _update_reactions(message, "success"); await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
                     if isinstance(message.author, discord.Member): await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
-                
-                except Exception as e: # This catches errors from the DB logging primarily
-                    await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_owner=True);
-                    try: await message.reply(f"Error logging attempt. Admin notified.");
-                    except discord.HTTPException: pass
-                    await _update_reactions(message, "error") # DB error, so use error reaction
-
+                except Exception as e: await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_owner=True);
+                try: await message.reply(f"Error logging attempt. Admin notified.");
+                except discord.HTTPException: pass; await _update_reactions(message, "error")
             elif len(ultra_candidates) > 1: # Disambiguation logic
                 disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
                 sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj); bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view); sa_disamb_view.message = bot_reply_msg
@@ -7885,29 +7823,14 @@ async def on_message(message: discord.Message):
                     if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
                     if not attempt_db_id: await log_error(guild, f"Super Attempt (Unknown): Failed to get DB ID for {author_ign}", message_context=message);
                     try: await message.reply(f"Error saving (no DB ID for unknown). Admin notified.");
-                    except discord.HTTPException: pass
-                    await _update_reactions(message, "error"); return # DB error, so use error reaction
-                    
+                    except discord.HTTPException: pass; await _update_reactions(message, "error"); return
                     all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-                    sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message); embed = sa_view.create_embed()
-                    # DB operation was successful. Now try to send confirmation and update reactions.
-                    try:
-                        bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view); sa_view.message = bot_reply_msg
-                        await _update_reactions(message, "success")
-                    except discord.HTTPException as http_err_reply_unknown:
-                        await log_error(guild, f"Super Attempt (Unknown Match): DB log OK, but Discord API error sending confirm view or success reaction for {author_ign}.", error=http_err_reply_unknown, message_context=message)
-                        try: await _update_reactions(message, "success")
-                        except discord.HTTPException as http_err_reaction_retry_unknown:
-                             await log_error(guild, f"Super Attempt (Unknown Match): Failed again to add success reaction for {author_ign} after confirm view send failed.", error=http_err_reaction_retry_unknown, message_context=message)
-
-                    await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
+                    sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message); embed = sa_view.create_embed(); bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view); sa_view.message = bot_reply_msg
+                    await _update_reactions(message, "success"); await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
                     if isinstance(message.author, discord.Member): await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
-
-                except Exception as e: # This catches errors from the DB logging primarily
-                    await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True);
-                    try: await message.reply(f"Error logging unknown petal. Admin notified.");
-                    except discord.HTTPException: pass
-                    await _update_reactions(message, "error") # DB error, so use error reaction
+                except Exception as e: await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True);
+                try: await message.reply(f"Error logging unknown petal. Admin notified.");
+                except discord.HTTPException: pass; await _update_reactions(message, "error")
             return # Handled super attempt
 
     # --- HC List Auto-Delete ---
