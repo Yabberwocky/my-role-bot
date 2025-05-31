@@ -596,11 +596,6 @@ class AICog(commands.Cog):
             try:
                 print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Prompt Key: {prompt_key}. Preferred ID for this call: {preferred_model_id or 'Default (gemini_2_5_flash)'}")
 
-                print(f"--- DEBUG: AI PROMPT (Single Image Task) for {model_name} ---")
-                print(f"Prompt Text:\n{final_prompt_text}")
-                print(f"Image Data: Sent (PIL Image, Mode: {img_pil.mode}, Size: {img_pil.size}, Format: {img_pil.format or 'N/A'})")
-                print("--- END DEBUG ---")
-
                 response = await model_instance.generate_content_async([final_prompt_text, img_pil])
 
                 if not response or not response.candidates:
