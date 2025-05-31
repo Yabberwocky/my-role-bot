@@ -360,14 +360,17 @@ async def setup_june_fools_webhooks(bot_instance: commands.Bot):
 async def setup_june_fools_webhooks(bot_instance: commands.Bot):
     global june_fools_target_user_avatar_bytes, june_fools_target_user_display_name, june_fools_channel_webhooks
 
-    print("JuneFools: Starting webhook setup...")
-    june_fools_channel_webhooks.clear() # Clear any previous session's webhooks
+    print("JuneFools: Initializing target user details for prank...")
+    june_fools_channel_webhooks.clear() # Ensure cache is clear on setup
 
     # 1. Fetch Target User Details from Catercord
     catercord_guild = bot_instance.get_guild(CATERCORD_GUILD_ID)
     if not catercord_guild:
-        print(f"JuneFools Error: Catercord Guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot fetch target user.")
-        await log_error(None, f"JuneFools Prank Setup Failed: Catercord Guild {CATERCORD_GUILD_ID} not found.", ping_owner=True)
+        print(f"JuneFools Error: Catercord Guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot fetch target user for prank.")
+        await log_error(None, f"JuneFools Prank Setup Failed: Catercord Guild {CATERCORD_GUILD_ID} not found. Webhooks will use fallback name/avatar.", ping_owner=True)
+        # Keep default fallback name and None avatar if guild is not found
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None
         return
 
     try:
@@ -377,54 +380,20 @@ async def setup_june_fools_webhooks(bot_instance: commands.Bot):
         async with aiohttp.ClientSession() as session:
             june_fools_target_user_avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch)
         if not june_fools_target_user_avatar_bytes:
-             print(f"JuneFools Warning: Failed to fetch avatar for target user {target_member.name}. Using default.")
-        print(f"JuneFools: Fetched target user '{june_fools_target_user_display_name}' details.")
+             print(f"JuneFools Warning: Failed to fetch avatar for target user {target_member.name}. Prank webhooks will use default avatar.")
+        print(f"JuneFools: Fetched target user '{june_fools_target_user_display_name}' details for prank webhooks.")
     except discord.NotFound:
-        print(f"JuneFools Error: Target user ID {JUNE_FOOLS_TARGET_USER_ID} not found in Catercord. Using fallback name.")
-        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
-        june_fools_target_user_avatar_bytes = None # No avatar if user not found
-        await log_error(catercord_guild, f"JuneFools Prank Setup: Target User {JUNE_FOOLS_TARGET_USER_ID} not found.", ping_owner=True)
-    except Exception as e_fetch_target:
-        print(f"JuneFools Error: Exception fetching target user {JUNE_FOOLS_TARGET_USER_ID}: {e_fetch_target}. Using fallback name.")
+        print(f"JuneFools Error: Target user ID {JUNE_FOOLS_TARGET_USER_ID} not found in Catercord. Prank webhooks will use fallback name/avatar.")
         june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
         june_fools_target_user_avatar_bytes = None
-        await log_error(catercord_guild, f"JuneFools Prank Setup: Error fetching target user {JUNE_FOOLS_TARGET_USER_ID}.", error=e_fetch_target, ping_owner=True)
-
-    # 2. Process Catercord Guild
-    print(f"JuneFools: Processing Catercord (ID: {CATERCORD_GUILD_ID})...")
-    webhooks_created_catercord = 0
-    for channel in catercord_guild.text_channels:
-        if channel.permissions_for(catercord_guild.me).manage_webhooks:
-            webhook = await cleanup_and_create_june_fools_webhook(
-                bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
-            )
-            if webhook:
-                june_fools_channel_webhooks[channel.id] = webhook
-                webhooks_created_catercord += 1
-        else:
-            print(f"JuneFools: Skipping channel #{channel.name} in Catercord (no Manage Webhooks perm).")
-    print(f"JuneFools: Finished Catercord. Created/Refreshed {webhooks_created_catercord} webhooks.")
-
-    # 3. Process Private Server Guild
-    private_server_guild = bot_instance.get_guild(PRIVATE_SERVER_ID)
-    if private_server_guild:
-        print(f"JuneFools: Processing Private Server (ID: {PRIVATE_SERVER_ID})...")
-        webhooks_created_private = 0
-        for channel in private_server_guild.text_channels:
-            if channel.permissions_for(private_server_guild.me).manage_webhooks:
-                webhook = await cleanup_and_create_june_fools_webhook(
-                    bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
-                )
-                if webhook:
-                    june_fools_channel_webhooks[channel.id] = webhook
-                    webhooks_created_private += 1
-            else:
-                print(f"JuneFools: Skipping channel #{channel.name} in Private Server (no Manage Webhooks perm).")
-        print(f"JuneFools: Finished Private Server. Created/Refreshed {webhooks_created_private} webhooks.")
-    else:
-        print(f"JuneFools Warning: Private Server (ID: {PRIVATE_SERVER_ID}) not found by bot.")
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Target User {JUNE_FOOLS_TARGET_USER_ID} not found. Webhooks will use fallback name/avatar.", ping_owner=True)
+    except Exception as e_fetch_target:
+        print(f"JuneFools Error: Exception fetching target user {JUNE_FOOLS_TARGET_USER_ID}: {e_fetch_target}. Prank webhooks will use fallback name/avatar.")
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Error fetching target user {JUNE_FOOLS_TARGET_USER_ID}. Webhooks will use fallback name/avatar.", error=e_fetch_target, ping_owner=True)
     
-    print(f"JuneFools: Webhook setup complete. Total webhooks managed: {len(june_fools_channel_webhooks)}.")
+    print("JuneFools: Target user detail fetching complete. Webhooks will be created on-demand.")
 
 # --- END JUNE FOOLS SECTION (Helper Functions) ---
 
@@ -5726,7 +5695,7 @@ async def on_ready():
         BOT_USER_ID = bot.user.id
         print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
         print(f"Discord.py v{discord.__version__}")
-        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") 
+        print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
         return
@@ -5736,9 +5705,9 @@ async def on_ready():
 
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-    
+
     print("--- Loading initial non-AI data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) 
+    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID)
     if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0]
 
 
@@ -5747,13 +5716,13 @@ async def on_ready():
     await load_profile_picture_choices(log_guild_for_data_load)
 
     print("Identifying staff channels in target guild...")
-    STAFF_CHANNELS.clear() 
+    STAFF_CHANNELS.clear()
     target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
     if target_guild_for_staff_channels:
         florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
         hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
         everyone_role = target_guild_for_staff_channels.default_role
-        if florrist_role and hc1_role: 
+        if florrist_role and hc1_role:
             potentially_staff_channels = 0; actually_staff_channels = 0
             for channel in target_guild_for_staff_channels.text_channels:
                 everyone_perms = channel.permissions_for(everyone_role)
@@ -5772,43 +5741,43 @@ async def on_ready():
             if log_guild_for_data_load: # Corrected variable name
                 await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
     else: print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
-    
+
     print("Setting up bot attributes for cogs...")
-    bot.supabase_client = supabase 
+    bot.supabase_client = supabase
     bot.log_info_global = log_info; bot.log_error_global = log_error
     bot.run_supabase_sync_global = run_supabase_sync
-    bot.OWNER_USER_ID_config = OWNER_USER_ID 
+    bot.OWNER_USER_ID_config = OWNER_USER_ID
     bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
     bot.PRIVATE_SERVER_ID_config = PRIVATE_SERVER_ID
     bot.RANDOM_SERVER_ID_config = RANDOM_SERVER_ID
-    bot.STAFF_CHANNELS_config = STAFF_CHANNELS 
+    bot.STAFF_CHANNELS_config = STAFF_CHANNELS
     bot.BOT_COMMANDS_ALLOWED_CHANNEL_IDS_config = BOT_COMMANDS_ALLOWED_CHANNEL_IDS
     bot.COMMAND_PREFIX_config = COMMAND_PREFIX
     bot.ALWAYS_ON_AI_CHANNELS_config = ALWAYS_ON_AI_CHANNELS
     bot.UNRESTRICTED_AI_CHANNEL_ID_config = UNRESTRICTED_AI_CHANNEL_ID
-    bot.ingame_name_cache_ref_config = ingame_name_cache 
-    bot.NERDY_YELLOW_config = NERDY_YELLOW 
-    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH 
+    bot.ingame_name_cache_ref_config = ingame_name_cache
+    bot.NERDY_YELLOW_config = NERDY_YELLOW
+    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH
     bot.MOBS_FOLDER_PATH_config = os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
     print("Bot attributes set.")
 
     print("Loading cogs...")
-    synced_commands = [] 
+    synced_commands = []
     try:
-        await bot.load_extension('ai_cog') 
-        print("AICog load_extension call completed.") 
+        await bot.load_extension('ai_cog')
+        print("AICog load_extension call completed.")
     except commands.ExtensionAlreadyLoaded:
         print("AICog was already loaded (ExtensionAlreadyLoaded).")
-    except commands.ExtensionFailed as e_failed: 
+    except commands.ExtensionFailed as e_failed:
         print(f"CRITICAL: AICog failed to load (ExtensionFailed): {e_failed.name} - {e_failed.original if e_failed.original else 'No original exception info'}")
         print(traceback.format_exc())
         if log_guild_for_data_load:
             await log_error(log_guild_for_data_load, f"CRITICAL: AICog failed to load (ExtensionFailed: {e_failed.name}). AI features disabled.", error=e_failed.original, ping_owner=True)
-    except Exception as e_cog: 
+    except Exception as e_cog:
         print(f"CRITICAL: Failed to load AICog (General Exception): {e_cog}\n{traceback.format_exc()}")
         if log_guild_for_data_load:
             await log_error(log_guild_for_data_load, "CRITICAL: Failed to load AICog (General Exception). AI features disabled.", error=e_cog, ping_owner=True)
-    
+
     if bot.get_cog('AICog') is None:
         print("CRITICAL VERIFICATION: AICog is None after load_extension attempt. AI features WILL BE UNAVAILABLE.")
         if log_guild_for_data_load:
@@ -5830,14 +5799,14 @@ async def on_ready():
                              full_name = f"{cmd.name} {sub_cmd.name}"
                              command_ids[full_name] = sub_cmd.id
             else: print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if not command_ids: print("Warning: command_ids dictionary is empty after sync.") 
+        if not command_ids: print("Warning: command_ids dictionary is empty after sync.")
     except discord.HTTPException as e: print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
     except Exception as e: print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
 
     # --- BEGIN JUNE FOOLS SECTION (on_ready call) ---
-    print("--- Setting up June Fools Prank Webhooks (if applicable) ---")
-    await setup_june_fools_webhooks(bot) 
-    print("--- June Fools Prank Webhooks Setup Complete ---")
+    print("--- Initializing June Fools Prank (Fetching Target User Details) ---") # MODIFIED Print
+    await setup_june_fools_webhooks(bot)
+    print("--- June Fools Prank Initialization Complete (Webhooks will be created on demand) ---") # MODIFIED Print
     # --- END JUNE FOOLS SECTION (on_ready call) ---
 
     if log_guild_for_ready_msg:
@@ -5876,7 +5845,7 @@ async def on_ready():
 
     if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
         print("Scheduling delayed static list update for target guild (Catercord)...")
-        asyncio.create_task(delayed_update(delay_seconds=60)) 
+        asyncio.create_task(delayed_update(delay_seconds=60))
     else: print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
 
     print("--- on_ready event finished ---")
@@ -7823,7 +7792,7 @@ async def on_message(message: discord.Message):
        message.author.id == bot.user.id: 
         return
 
-    if message.author.bot and not message.webhook_id: # Allow webhook messages (could be our own prank)
+    if message.author.bot and not message.webhook_id: 
         return
 
     # --- BEGIN JUNE FOOLS SECTION (on_message logic) ---
@@ -7836,39 +7805,53 @@ async def on_message(message: discord.Message):
             is_prank_active_for_guild = True 
 
         if is_prank_active_for_guild:
-            # Avoid processing webhook messages sent by our own prank webhooks
             if message.webhook_id:
-                # Check if the webhook sending the message is one of ours
-                # This is a bit indirect as we don't store webhooks by their ID, but by channel ID
-                # A simpler check: if the author name matches our target's display name, assume it's our prank.
-                # This isn't foolproof if another webhook uses the same name, but good enough for a prank.
-                # If the webhook's display_name matches the june_fools_target_user_display_name,
-                # it's highly likely our prank webhook.
-                if message.author.display_name == june_fools_target_user_display_name and message.author.bot: # message.author is the Webhook "user"
-                     # print(f"JuneFools: Ignoring message from suspected own webhook (Name: {message.author.display_name})")
-                     return # It's (probably) our own prank message, do nothing
+                # Check if the webhook author's name matches the global target display name.
+                # This is a heuristic to avoid processing messages from our own prank webhooks.
+                if message.author.display_name == june_fools_target_user_display_name and message.author.bot:
+                     return 
 
             target_webhook = june_fools_channel_webhooks.get(message.channel.id)
+            
+            # If webhook not cached for this channel, try to create/retrieve it
+            if not target_webhook and isinstance(message.channel, discord.TextChannel):
+                print(f"JuneFools: Webhook for #{message.channel.name} not cached. Attempting creation...")
+                # Ensure bot has permissions BEFORE attempting to create
+                if not message.guild.me.permissions_in(message.channel).manage_webhooks:
+                    print(f"JuneFools: Bot lacks Manage Webhooks permission in #{message.channel.name}. Skipping prank for this channel.")
+                    # Optionally log this error once per channel if desired, or let it be silent.
+                else:
+                    webhook_for_channel = await cleanup_and_create_june_fools_webhook(
+                        bot,  # Pass the main bot instance
+                        message.channel, 
+                        june_fools_target_user_display_name, 
+                        june_fools_target_user_avatar_bytes
+                    )
+                    if webhook_for_channel:
+                        june_fools_channel_webhooks[message.channel.id] = webhook_for_channel
+                        target_webhook = webhook_for_channel
+                    else:
+                        print(f"JuneFools: Failed to create/retrieve webhook for #{message.channel.name}. Prank skipped for this message.")
+                        # Error logging is handled within cleanup_and_create_june_fools_webhook
+
+            # Proceed if webhook is available (either cached or newly created)
             if target_webhook:
                 if not (message.guild.me.permissions_in(message.channel).manage_messages and \
                         message.guild.me.permissions_in(message.channel).send_messages): # Implicitly covers webhook send
+                    # This permission check is a bit late if we just created the webhook, but good as a fallback
                     await log_error(message.guild, f"JuneFools: Bot missing Manage Messages or Send Messages in #{message.channel.name}. Prank cannot proceed.", ping_owner=True)
                 else:
                     try:
                         original_content = message.content
                         original_attachments = message.attachments
                         original_stickers = message.stickers
-                        # Note: Re-sending user embeds perfectly via webhook is not feasible.
-                        # Webhooks send their own embeds. For simplicity, we'll ignore original embeds.
-
-                        # Delete the original message
+                        
                         try:
                             await message.delete()
                         except discord.Forbidden:
                             await log_error(message.guild, f"JuneFools: Forbidden to delete original message in #{message.channel.name}.")
-                            # Continue to send via webhook if deletion fails, prank will be less subtle
                         except discord.NotFound:
-                            pass # Message already gone
+                            pass 
                         except Exception as e_del:
                             await log_error(message.guild, f"JuneFools: Error deleting original message in #{message.channel.name}.", error=e_del)
                         
@@ -7886,15 +7869,20 @@ async def on_message(message: discord.Message):
                             stickers=original_stickers if original_stickers else discord.utils.MISSING,
                             allowed_mentions=discord.AllowedMentions.all() 
                         )
-                        # No specific log here per message to avoid spam, setup logs are more important
-                        return # Prank handled, stop further on_message processing
+                        return 
                     except discord.Forbidden:
                         await log_error(message.guild, f"JuneFools: Forbidden error sending via webhook in #{message.channel.name}.")
                     except discord.HTTPException as e_http:
-                        await log_error(message.guild, f"JuneFools: HTTP error sending via webhook in #{message.channel.name}.", error=e_http)
+                        if e_http.status == 404 and e_http.code == 10015: # Unknown Webhook
+                            # Webhook was likely deleted manually, try to re-create next time
+                            print(f"JuneFools: Webhook for channel {message.channel.id} (name: {target_webhook.name}) was not found (404/10015). Removing from cache.")
+                            if message.channel.id in june_fools_channel_webhooks:
+                                del june_fools_channel_webhooks[message.channel.id]
+                        else:
+                            await log_error(message.guild, f"JuneFools: HTTP error sending via webhook in #{message.channel.name}.", error=e_http)
                     except Exception as e:
                         await log_error(message.guild, f"JuneFools: General error relaying message in #{message.channel.name}.", error=e, ping_owner=True)
-            # else: No webhook configured for this channel (should be logged during setup)
+            # else: No webhook for this channel, prank skipped.
     # --- END JUNE FOOLS SECTION (on_message logic) ---
 
     # --- Existing on_message content starts here ---
@@ -7902,7 +7890,7 @@ async def on_message(message: discord.Message):
         if not (message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action):
             return
 
-    guild = message.guild # Re-assign guild as it might have been from a different scope
+    guild = message.guild 
     channel = message.channel
     user_id = message.author.id 
 
@@ -8090,7 +8078,7 @@ async def on_message(message: discord.Message):
                 try:
                     insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute()); attempt_db_id = None
                     if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
-                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None # Ensure .data before access
+                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None 
                     if not attempt_db_id: await log_error(guild, f"Super Attempt (single): Failed to get DB ID for {author_ign}", message_context=message);
                     try: await message.reply(f"Error saving (no DB ID). Admin notified.");
                     except discord.HTTPException: pass; await _update_reactions(message, "error"); return
