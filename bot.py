@@ -218,6 +218,215 @@ DEPRECATION_MESSAGE_ACTIVITY = (
     "This method is quick and helps keep activity records accurate. Thanks for your understanding!"
 ).format(channel_id=SCREENSHOTS_DROPBOX_CHANNEL_ID)
 ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage"] # Added Bubble and Powder as they are common "Ultra-like" crafting outputs
+pending_static_list_updates: Dict[int, asyncio.Task] = {} # guild_id -> update_task
+STATIC_LIST_UPDATE_DEBOUNCE_DELAY = 10 # seconds to wait before updating list after role change
+# --- BEGIN JUNE FOOLS SECTION (Globals) ---
+JUNE_FOOLS_TARGET_USER_ID = 955448447790620692
+JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK = "A Mysterious Messenger"
+JUNE_FOOLS_WEBHOOK_REASON = "June Fools Prank Webhook"
+
+june_fools_channel_webhooks: Dict[int, discord.Webhook] = {}
+june_fools_target_user_avatar_bytes: Optional[bytes] = None
+june_fools_target_user_display_name: str = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+# --- END JUNE FOOLS SECTION (Globals) ---
+
+# --- BEGIN JUNE FOOLS SECTION (Helper Functions) ---
+
+def is_june_1st_utc() -> bool:
+    """Checks if the current UTC date is June 1st."""
+    now_utc = datetime.datetime.now(pytz.utc)
+    return now_utc.month == 6 and now_utc.day == 1
+
+async def cleanup_and_create_june_fools_webhook(
+    bot_instance: commands.Bot, 
+    channel: discord.TextChannel,
+    target_name: str,  # This is june_fools_target_user_display_name
+    target_avatar_bytes: Optional[bytes]
+) -> Optional[discord.Webhook]:
+    """Cleans up old bot-created webhooks in the channel and creates a new one for the prank."""
+    if not bot_instance.user:
+        print(f"JuneFools Error: Bot user not available in cleanup_and_create_june_fools_webhook for channel {channel.id}")
+        return None
+        
+    deleted_count = 0
+    try:
+        webhooks = await channel.webhooks()
+        for wh in webhooks:
+            # Check if webhook was created by this bot
+            if wh.user == bot_instance.user:
+                # Conditions for deletion:
+                # 1. Name matches the target prank name (likely a current/previous prank webhook by this bot)
+                # OR
+                # 2. It's an older webhook created by this bot (generic cleanup for this bot's webhooks in the channel)
+                is_prank_webhook_by_name = (wh.name == target_name)
+                is_old_bot_webhook = (wh.created_at < discord.utils.utcnow() - datetime.timedelta(hours=1))
+
+                if is_prank_webhook_by_name or is_old_bot_webhook:
+                    try:
+                        await wh.delete(reason="June Fools Prank: Routine cleanup/refresh")
+                        deleted_count += 1
+                    except discord.HTTPException as e_del_wh:
+                        print(f"JuneFools: Failed to delete old webhook {wh.id} (Name: '{wh.name}') in #{channel.name}: {e_del_wh}")
+    except discord.Forbidden:
+        print(f"JuneFools: Missing 'Manage Webhooks' permission in #{channel.name} for cleanup.")
+    except discord.HTTPException as e_fetch_wh:
+        print(f"JuneFools: Error fetching webhooks for #{channel.name}: {e_fetch_wh}")
+    
+    if deleted_count > 0:
+        print(f"JuneFools: Cleaned up {deleted_count} old/prank webhook(s) in #{channel.name}.")
+
+    try:
+        new_webhook = await channel.create_webhook(
+            name=target_name[:80], 
+            avatar=target_avatar_bytes,
+            reason=JUNE_FOOLS_WEBHOOK_REASON # Reason for creation log
+        )
+        print(f"JuneFools: Created new webhook '{new_webhook.name}' (ID: {new_webhook.id}) in #{channel.name}.")
+        return new_webhook
+    except discord.Forbidden:
+        await log_error(channel.guild, f"JuneFools: Forbidden to create webhook in #{channel.name}.", ping_owner=True)
+    except discord.HTTPException as e_create_wh:
+        await log_error(channel.guild, f"JuneFools: HTTP error creating webhook in #{channel.name}.", error=e_create_wh, ping_owner=True)
+    except Exception as e_unex_wh:
+        await log_error(channel.guild, f"JuneFools: Unexpected error creating webhook in #{channel.name}.", error=e_unex_wh, ping_owner=True)
+    return None
+
+async def setup_june_fools_webhooks(bot_instance: commands.Bot):
+    global june_fools_target_user_avatar_bytes, june_fools_target_user_display_name, june_fools_channel_webhooks
+
+    print("JuneFools: Starting webhook setup...")
+    june_fools_channel_webhooks.clear() 
+
+    catercord_guild = bot_instance.get_guild(CATERCORD_GUILD_ID)
+    if not catercord_guild:
+        print(f"JuneFools Error: Catercord Guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot fetch target user.")
+        await log_error(None, f"JuneFools Prank Setup Failed: Catercord Guild {CATERCORD_GUILD_ID} not found.", ping_owner=True)
+        return
+
+    try:
+        target_member = await catercord_guild.fetch_member(JUNE_FOOLS_TARGET_USER_ID)
+        june_fools_target_user_display_name = target_member.display_name
+        avatar_url_to_fetch = target_member.display_avatar.url if target_member.display_avatar else target_member.default_avatar.url
+        async with aiohttp.ClientSession() as session:
+            june_fools_target_user_avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch)
+        if not june_fools_target_user_avatar_bytes:
+             print(f"JuneFools Warning: Failed to fetch avatar for target user {target_member.name}. Using default.")
+        print(f"JuneFools: Fetched target user '{june_fools_target_user_display_name}' details.")
+    except discord.NotFound:
+        print(f"JuneFools Error: Target user ID {JUNE_FOOLS_TARGET_USER_ID} not found in Catercord. Using fallback name.")
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None 
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Target User {JUNE_FOOLS_TARGET_USER_ID} not found.", ping_owner=True)
+    except Exception as e_fetch_target:
+        print(f"JuneFools Error: Exception fetching target user {JUNE_FOOLS_TARGET_USER_ID}: {e_fetch_target}. Using fallback name.")
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Error fetching target user {JUNE_FOOLS_TARGET_USER_ID}.", error=e_fetch_target, ping_owner=True)
+
+    print(f"JuneFools: Processing Catercord (ID: {CATERCORD_GUILD_ID})...")
+    webhooks_created_catercord = 0
+    for channel in catercord_guild.text_channels:
+        if channel.permissions_for(catercord_guild.me).manage_webhooks:
+            webhook = await cleanup_and_create_june_fools_webhook(
+                bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
+            )
+            if webhook:
+                june_fools_channel_webhooks[channel.id] = webhook
+                webhooks_created_catercord += 1
+        else:
+            print(f"JuneFools: Skipping channel #{channel.name} in Catercord (no Manage Webhooks perm).")
+    print(f"JuneFools: Finished Catercord. Created/Refreshed {webhooks_created_catercord} webhooks.")
+
+    private_server_guild = bot_instance.get_guild(PRIVATE_SERVER_ID)
+    if private_server_guild:
+        print(f"JuneFools: Processing Private Server (ID: {PRIVATE_SERVER_ID})...")
+        webhooks_created_private = 0
+        for channel in private_server_guild.text_channels:
+            if channel.permissions_for(private_server_guild.me).manage_webhooks:
+                webhook = await cleanup_and_create_june_fools_webhook(
+                    bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
+                )
+                if webhook:
+                    june_fools_channel_webhooks[channel.id] = webhook
+                    webhooks_created_private += 1
+            else:
+                print(f"JuneFools: Skipping channel #{channel.name} in Private Server (no Manage Webhooks perm).")
+        print(f"JuneFools: Finished Private Server. Created/Refreshed {webhooks_created_private} webhooks.")
+    else:
+        print(f"JuneFools Warning: Private Server (ID: {PRIVATE_SERVER_ID}) not found by bot.")
+    
+    print(f"JuneFools: Webhook setup complete. Total webhooks managed: {len(june_fools_channel_webhooks)}.")
+
+async def setup_june_fools_webhooks(bot_instance: commands.Bot):
+    global june_fools_target_user_avatar_bytes, june_fools_target_user_display_name, june_fools_channel_webhooks
+
+    print("JuneFools: Starting webhook setup...")
+    june_fools_channel_webhooks.clear() # Clear any previous session's webhooks
+
+    # 1. Fetch Target User Details from Catercord
+    catercord_guild = bot_instance.get_guild(CATERCORD_GUILD_ID)
+    if not catercord_guild:
+        print(f"JuneFools Error: Catercord Guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot fetch target user.")
+        await log_error(None, f"JuneFools Prank Setup Failed: Catercord Guild {CATERCORD_GUILD_ID} not found.", ping_owner=True)
+        return
+
+    try:
+        target_member = await catercord_guild.fetch_member(JUNE_FOOLS_TARGET_USER_ID)
+        june_fools_target_user_display_name = target_member.display_name
+        avatar_url_to_fetch = target_member.display_avatar.url if target_member.display_avatar else target_member.default_avatar.url
+        async with aiohttp.ClientSession() as session:
+            june_fools_target_user_avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch)
+        if not june_fools_target_user_avatar_bytes:
+             print(f"JuneFools Warning: Failed to fetch avatar for target user {target_member.name}. Using default.")
+        print(f"JuneFools: Fetched target user '{june_fools_target_user_display_name}' details.")
+    except discord.NotFound:
+        print(f"JuneFools Error: Target user ID {JUNE_FOOLS_TARGET_USER_ID} not found in Catercord. Using fallback name.")
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None # No avatar if user not found
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Target User {JUNE_FOOLS_TARGET_USER_ID} not found.", ping_owner=True)
+    except Exception as e_fetch_target:
+        print(f"JuneFools Error: Exception fetching target user {JUNE_FOOLS_TARGET_USER_ID}: {e_fetch_target}. Using fallback name.")
+        june_fools_target_user_display_name = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
+        june_fools_target_user_avatar_bytes = None
+        await log_error(catercord_guild, f"JuneFools Prank Setup: Error fetching target user {JUNE_FOOLS_TARGET_USER_ID}.", error=e_fetch_target, ping_owner=True)
+
+    # 2. Process Catercord Guild
+    print(f"JuneFools: Processing Catercord (ID: {CATERCORD_GUILD_ID})...")
+    webhooks_created_catercord = 0
+    for channel in catercord_guild.text_channels:
+        if channel.permissions_for(catercord_guild.me).manage_webhooks:
+            webhook = await cleanup_and_create_june_fools_webhook(
+                bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
+            )
+            if webhook:
+                june_fools_channel_webhooks[channel.id] = webhook
+                webhooks_created_catercord += 1
+        else:
+            print(f"JuneFools: Skipping channel #{channel.name} in Catercord (no Manage Webhooks perm).")
+    print(f"JuneFools: Finished Catercord. Created/Refreshed {webhooks_created_catercord} webhooks.")
+
+    # 3. Process Private Server Guild
+    private_server_guild = bot_instance.get_guild(PRIVATE_SERVER_ID)
+    if private_server_guild:
+        print(f"JuneFools: Processing Private Server (ID: {PRIVATE_SERVER_ID})...")
+        webhooks_created_private = 0
+        for channel in private_server_guild.text_channels:
+            if channel.permissions_for(private_server_guild.me).manage_webhooks:
+                webhook = await cleanup_and_create_june_fools_webhook(
+                    bot_instance, channel, june_fools_target_user_display_name, june_fools_target_user_avatar_bytes
+                )
+                if webhook:
+                    june_fools_channel_webhooks[channel.id] = webhook
+                    webhooks_created_private += 1
+            else:
+                print(f"JuneFools: Skipping channel #{channel.name} in Private Server (no Manage Webhooks perm).")
+        print(f"JuneFools: Finished Private Server. Created/Refreshed {webhooks_created_private} webhooks.")
+    else:
+        print(f"JuneFools Warning: Private Server (ID: {PRIVATE_SERVER_ID}) not found by bot.")
+    
+    print(f"JuneFools: Webhook setup complete. Total webhooks managed: {len(june_fools_channel_webhooks)}.")
+
+# --- END JUNE FOOLS SECTION (Helper Functions) ---
 
 
 
@@ -5529,7 +5738,7 @@ async def on_ready():
     log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     
     print("--- Loading initial non-AI data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) # Define this before it's used in cog loading error log
+    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) 
     if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0]
 
 
@@ -5560,7 +5769,7 @@ async def on_ready():
             if not florrist_role: missing_role_names.append(f"Florrist Role (ID: {FLORRIST_ROLE_ID})")
             if not hc1_role: missing_role_names.append(f"HC1 Role (ID: {HC1_ROLE_ID})")
             print(f"WARN: Could not find required roles for staff channel ID: {', '.join(missing_role_names)}.")
-            if log_guild_for_data_load:
+            if log_guild_for_data_load: # Corrected variable name
                 await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
     else: print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
     
@@ -5584,30 +5793,28 @@ async def on_ready():
     print("Bot attributes set.")
 
     print("Loading cogs...")
-    synced_commands = [] # Define before use in ready log message
+    synced_commands = [] 
     try:
         await bot.load_extension('ai_cog') 
-        print("AICog load_extension call completed.") # More precise wording
+        print("AICog load_extension call completed.") 
     except commands.ExtensionAlreadyLoaded:
         print("AICog was already loaded (ExtensionAlreadyLoaded).")
-    except commands.ExtensionFailed as e_failed: # Catch ExtensionFailed specifically
+    except commands.ExtensionFailed as e_failed: 
         print(f"CRITICAL: AICog failed to load (ExtensionFailed): {e_failed.name} - {e_failed.original if e_failed.original else 'No original exception info'}")
         print(traceback.format_exc())
         if log_guild_for_data_load:
             await log_error(log_guild_for_data_load, f"CRITICAL: AICog failed to load (ExtensionFailed: {e_failed.name}). AI features disabled.", error=e_failed.original, ping_owner=True)
-    except Exception as e_cog: # Catch other load_extension errors
+    except Exception as e_cog: 
         print(f"CRITICAL: Failed to load AICog (General Exception): {e_cog}\n{traceback.format_exc()}")
         if log_guild_for_data_load:
             await log_error(log_guild_for_data_load, "CRITICAL: Failed to load AICog (General Exception). AI features disabled.", error=e_cog, ping_owner=True)
     
-    # --- ADDED: Explicit Verification of AICog ---
     if bot.get_cog('AICog') is None:
         print("CRITICAL VERIFICATION: AICog is None after load_extension attempt. AI features WILL BE UNAVAILABLE.")
         if log_guild_for_data_load:
              await log_error(log_guild_for_data_load, "CRITICAL POST-LOAD CHECK: AICog FAILED TO REGISTER. AI features WILL BE UNAVAILABLE.", ping_owner=True)
     else:
         print("AICog loading verified successfully (cog instance found via bot.get_cog).")
-    # --- END ADDED VERIFICATION ---
 
     print("Syncing application commands...")
     try:
@@ -5623,9 +5830,15 @@ async def on_ready():
                              full_name = f"{cmd.name} {sub_cmd.name}"
                              command_ids[full_name] = sub_cmd.id
             else: print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if not command_ids: print("Warning: command_ids dictionary is empty after sync.") # Moved this check inside
+        if not command_ids: print("Warning: command_ids dictionary is empty after sync.") 
     except discord.HTTPException as e: print(f"Command Sync failed (HTTPException): {e.status} - {e.text}")
     except Exception as e: print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}")
+
+    # --- BEGIN JUNE FOOLS SECTION (on_ready call) ---
+    print("--- Setting up June Fools Prank Webhooks (if applicable) ---")
+    await setup_june_fools_webhooks(bot) 
+    print("--- June Fools Prank Webhooks Setup Complete ---")
+    # --- END JUNE FOOLS SECTION (on_ready call) ---
 
     if log_guild_for_ready_msg:
         try:
@@ -5674,33 +5887,58 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if after.bot or before.roles == after.roles:
         return
 
-    guild = after.guild # Define guild here
+    guild = after.guild
+    if not guild: # Should not happen if event is guild-based
+        return
+
     # If HC role isn't configured or found, no need to proceed
-    hc_role = guild.get_role(HC1_ROLE_ID) # Define hc_role here
+    hc_role = guild.get_role(HC1_ROLE_ID)
     if not hc_role:
         print(f"on_member_update ({guild.name}): HC Role {HC1_ROLE_ID} not found, cannot check role change.")
-        return # Exit early if the role doesn't exist
+        return
 
-    # Define had_hc_role and has_hc_role *after* defining hc_role
     had_hc_role = hc_role in before.roles
     has_hc_role = hc_role in after.roles
 
     # Trigger update only if the HC role status changed
     if had_hc_role != has_hc_role:
         action = "added to" if has_hc_role else "removed from"
-        # Use the correctly defined guild and hc_role variables
-        await log_info(guild, f"HC role (`{hc_role.name}`) {action} user {after.mention} (`{after.id}`). Triggering static list message update.")
-        try:
-            # --- ADDED: Check for disabling static list in TESTING instance ---
-            if DISABLE_STATIC_LIST_FOR_TESTING_INSTANCE:
-                await log_info(guild, f"Static list update skipped after role change for {after.mention}: Bot instance type is '{BOT_INSTANCE_TYPE}'.")
-                print(f"[on_member_update] Skipped static list update for {after.name} in {guild.name} due to BOT_INSTANCE_TYPE='{BOT_INSTANCE_TYPE}'.")
-            else:
-            # --- END ADDED CHECK ---
-                asyncio.create_task(update_static_list_message(guild)) # Call the new function
-        except Exception as e:
-             # Use the correctly defined guild variable
-             await log_error(guild, f"Failed to trigger static list message update after role change for {after.mention}", error=e)
+        await log_info(guild, f"HC role (`{hc_role.name}`) {action} user {after.mention} (`{after.id}`). Scheduling static list message update.")
+        
+        # Cancel any existing pending update for this guild
+        if guild.id in pending_static_list_updates and \
+           not pending_static_list_updates[guild.id].done():
+            pending_static_list_updates[guild.id].cancel()
+            print(f"[on_member_update] Cancelled previous pending static list update for guild {guild.id}")
+
+        # Schedule a new update
+        async def _delayed_update_task():
+            try:
+                await asyncio.sleep(STATIC_LIST_UPDATE_DEBOUNCE_DELAY)
+                
+                # Check if bot is still running and in the guild before proceeding
+                if bot.is_closed() or not guild.get_member(bot.user.id if bot.user else -1): # Check if bot is still in guild
+                    print(f"[on_member_update DEBOUNCED] Skipped update for guild {guild.id} (bot closed or left guild).")
+                    return
+
+                # Check if static list updates are disabled for testing instance
+                if DISABLE_STATIC_LIST_FOR_TESTING_INSTANCE:
+                    await log_info(guild, f"Static list update skipped after role change for {after.mention} (debounced): Bot instance type is '{BOT_INSTANCE_TYPE}'.")
+                    print(f"[on_member_update DEBOUNCED] Skipped static list update for {after.name} in {guild.name} due to BOT_INSTANCE_TYPE='{BOT_INSTANCE_TYPE}'.")
+                else:
+                    print(f"[on_member_update DEBOUNCED] Executing static list update for guild {guild.id}")
+                    await update_static_list_message(guild)
+
+            except asyncio.CancelledError:
+                print(f"[on_member_update DEBOUNCED] Delayed update task for guild {guild.id} was cancelled.")
+            except Exception as e_task:
+                await log_error(guild, f"Error in delayed static list update task for {after.mention}", error=e_task)
+            finally:
+                # Clean up task from dict once done or cancelled
+                if guild.id in pending_static_list_updates and pending_static_list_updates[guild.id].done():
+                    del pending_static_list_updates[guild.id]
+
+        pending_static_list_updates[guild.id] = asyncio.create_task(_delayed_update_task())
 
 # --- App Command Error Handling ---
 @tree.error
@@ -7582,26 +7820,95 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 async def on_message(message: discord.Message):
     # --- Initial Checks: Ignore self, or messages without basic properties ---
     if not message.guild or not bot.is_ready() or not bot.user or \
-       message.author.id == bot.user.id: # Ignore messages from the bot itself
+       message.author.id == bot.user.id: 
         return
 
-    if message.author.bot: # If the message is from any other bot (not ours), generally ignore.
+    if message.author.bot and not message.webhook_id: # Allow webhook messages (could be our own prank)
         return
 
+    # --- BEGIN JUNE FOOLS SECTION (on_message logic) ---
+    if message.guild and (message.guild.id == CATERCORD_GUILD_ID or message.guild.id == PRIVATE_SERVER_ID):
+        is_prank_active_for_guild = False
+        if message.guild.id == CATERCORD_GUILD_ID:
+            if is_june_1st_utc():
+                is_prank_active_for_guild = True
+        elif message.guild.id == PRIVATE_SERVER_ID:
+            is_prank_active_for_guild = True 
+
+        if is_prank_active_for_guild:
+            # Avoid processing webhook messages sent by our own prank webhooks
+            if message.webhook_id:
+                # Check if the webhook sending the message is one of ours
+                # This is a bit indirect as we don't store webhooks by their ID, but by channel ID
+                # A simpler check: if the author name matches our target's display name, assume it's our prank.
+                # This isn't foolproof if another webhook uses the same name, but good enough for a prank.
+                # If the webhook's display_name matches the june_fools_target_user_display_name,
+                # it's highly likely our prank webhook.
+                if message.author.display_name == june_fools_target_user_display_name and message.author.bot: # message.author is the Webhook "user"
+                     # print(f"JuneFools: Ignoring message from suspected own webhook (Name: {message.author.display_name})")
+                     return # It's (probably) our own prank message, do nothing
+
+            target_webhook = june_fools_channel_webhooks.get(message.channel.id)
+            if target_webhook:
+                if not (message.guild.me.permissions_in(message.channel).manage_messages and \
+                        message.guild.me.permissions_in(message.channel).send_messages): # Implicitly covers webhook send
+                    await log_error(message.guild, f"JuneFools: Bot missing Manage Messages or Send Messages in #{message.channel.name}. Prank cannot proceed.", ping_owner=True)
+                else:
+                    try:
+                        original_content = message.content
+                        original_attachments = message.attachments
+                        original_stickers = message.stickers
+                        # Note: Re-sending user embeds perfectly via webhook is not feasible.
+                        # Webhooks send their own embeds. For simplicity, we'll ignore original embeds.
+
+                        # Delete the original message
+                        try:
+                            await message.delete()
+                        except discord.Forbidden:
+                            await log_error(message.guild, f"JuneFools: Forbidden to delete original message in #{message.channel.name}.")
+                            # Continue to send via webhook if deletion fails, prank will be less subtle
+                        except discord.NotFound:
+                            pass # Message already gone
+                        except Exception as e_del:
+                            await log_error(message.guild, f"JuneFools: Error deleting original message in #{message.channel.name}.", error=e_del)
+                        
+                        files_to_send = []
+                        if original_attachments:
+                            for att in original_attachments:
+                                try:
+                                    files_to_send.append(await att.to_file())
+                                except Exception as e_att:
+                                    await log_error(message.guild, f"JuneFools: Error converting attachment {att.filename}", error=e_att)
+
+                        await target_webhook.send(
+                            content=original_content if original_content else discord.utils.MISSING,
+                            files=files_to_send if files_to_send else discord.utils.MISSING,
+                            stickers=original_stickers if original_stickers else discord.utils.MISSING,
+                            allowed_mentions=discord.AllowedMentions.all() 
+                        )
+                        # No specific log here per message to avoid spam, setup logs are more important
+                        return # Prank handled, stop further on_message processing
+                    except discord.Forbidden:
+                        await log_error(message.guild, f"JuneFools: Forbidden error sending via webhook in #{message.channel.name}.")
+                    except discord.HTTPException as e_http:
+                        await log_error(message.guild, f"JuneFools: HTTP error sending via webhook in #{message.channel.name}.", error=e_http)
+                    except Exception as e:
+                        await log_error(message.guild, f"JuneFools: General error relaying message in #{message.channel.name}.", error=e, ping_owner=True)
+            # else: No webhook configured for this channel (should be logged during setup)
+    # --- END JUNE FOOLS SECTION (on_message logic) ---
+
+    # --- Existing on_message content starts here ---
     if not message.content and not message.attachments and not message.embeds:
         if not (message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action):
             return
 
-    guild = message.guild
+    guild = message.guild # Re-assign guild as it might have been from a different scope
     channel = message.channel
-    user_id = message.author.id # For session checking
+    user_id = message.author.id 
 
-    # --- AutoMod Alert Message Parsing for Zorr.pro ---
-    # (This section remains unchanged from your previous correct version)
     if message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and \
        message.type == discord.MessageType.auto_moderation_action and \
        message.embeds:
-        # ... (full Zorr.pro handling logic as previously provided) ...
         embed = message.embeds[0]
         original_message_content = embed.description
         original_author_member: discord.Member = message.author
@@ -7649,15 +7956,12 @@ async def on_message(message: discord.Message):
             return
         return
 
-    # --- Screenshot processing block ---
     if message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
         valid_image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
         
         if valid_image_attachments:
-            # --- Guild Sync Mode Logic ---
             active_session_data = guild_sync_sessions.get(user_id)
             
-            # Clean up stale sessions implicitly if a new 10-image message arrives from a user with an old session
             if active_session_data and (discord.utils.utcnow() - active_session_data['last_update_time']).total_seconds() > GUILD_SYNC_SESSION_TIMEOUT_SECONDS:
                 await log_info(guild, f"GuildSync: Stale session found for user {user_id} and cleaned up upon new message.")
                 del guild_sync_sessions[user_id]
@@ -7665,29 +7969,23 @@ async def on_message(message: discord.Message):
 
             if len(valid_image_attachments) == 10:
                 if active_session_data:
-                    # User sent 10 images while a session is active - assume it's an "add more" batch
                     await log_info(guild, f"GuildSync Mode: Adding new batch of 10 images from {message.author.name} to existing session.")
                     asyncio.create_task(process_guild_sync_batch(message, valid_image_attachments, is_new_session=False))
                 else:
-                    # User sent 10 images and no session active - start new session
                     await log_info(guild, f"GuildSync Mode: Starting new session for {message.author.name} with 10 images.")
                     asyncio.create_task(process_guild_sync_batch(message, valid_image_attachments, is_new_session=True))
-                return # Guild sync mode handles its own replies/updates
+                return 
             elif active_session_data:
-                # User sent a message with <10 images while a session is active.
-                # Inform them they need to send exactly 10 for "add more" or use buttons.
                 try:
                     await message.reply(
                         f"{message.author.mention} You have an active guild sync session. "
                         f"To add more screenshots, please send a message with exactly 10 images. "
                         f"Alternatively, use the buttons on my previous reply to finalize the report.",
-                        delete_after=30.0 # Make it self-deleting
+                        delete_after=30.0 
                     )
                 except discord.HTTPException: pass
                 return
-            else: # 1-9 images and no active sync session - proceed with normal activity logging
-                # (This is the start of your existing single-batch activity screenshot processing logic)
-                # ... (Full existing logic for 1-9 images for activity logging) ...
+            else: 
                 num_images = len(valid_image_attachments)
                 processing_reply_content = f"{message.author.mention} ⏳ Analyzing {num_images} image(s) for online player names and activity updates..."
                 processing_reply: Optional[discord.Message] = None
@@ -7731,7 +8029,7 @@ async def on_message(message: discord.Message):
                         matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
                         for raw_ai_name in all_ai_suggested_raw_names_global:
                             if raw_ai_name.lower() not in matched_igns_lower: discarded_by_cache_check.append(raw_ai_name)
-                    if discarded_by_cache_check: # Logging for discarded names logic remains
+                    if discarded_by_cache_check: 
                         discarded_names_str = "\n- ".join(discord.utils.escape_markdown(d_name)[:100] for d_name in discarded_by_cache_check[:20]); log_parts = [f"AI suggested names for msg by {message.author.mention} in {message.channel.mention}", f"(Img(s): {', '.join([a.filename for a in valid_image_attachments])})", "discarded after cache check:", f"```\n- {discarded_names_str}\n```", "Raw Suggestions:", f"```\n- {chr(10).join(discord.utils.escape_markdown(s)[:100] for s in sorted(list(all_ai_suggested_raw_names_global))[:20])}\n```", f"Matched: {all_matched_igns_from_all_images or 'None'}"]; log_msg_discarded = "\n".join(log_parts); err_embed = discord.Embed(title="📝 AI Img: Discarded", description=log_msg_discarded[:4000], color=discord.Color.orange()); err_embed.timestamp = discord.utils.utcnow(); err_embed.set_footer(text=f"Msg ID: {message.id} | User: {message.author.name}"); await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=err_embed)
                     newly_added_details: List[Dict[str, Any]] = []; already_active: List[str] = []; failed_to_add: List[str] = []
                     activity_changed = False; final_msg_obj: Optional[discord.Message] = processing_reply
@@ -7765,12 +8063,9 @@ async def on_message(message: discord.Message):
                         try: await processing_reply.edit(content=err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]), embed=None, view=None)
                         except discord.HTTPException: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
                     else: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
-            return # Handled screenshot processing (either sync or activity)
+            return 
 
-    # --- Super Attempt Logging ---
-    # (This section remains unchanged from your previous correct version)
     if message.channel.id == SUPER_ATTEMPT_CHANNEL_ID:
-        # ... (full super attempt logging logic as previously provided) ...
         if DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE and not MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING:
             if BOT_INSTANCE_TYPE == "TESTING": print(f"Super attempt logging skipped for message {message.id} due to TESTING instance type."); return
         msg_content = message.content.strip(); attempt_match = re.fullmatch(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", msg_content, re.IGNORECASE)
@@ -7788,14 +8083,14 @@ async def on_message(message: discord.Message):
             if date_error_msg or not attempt_date_obj:
                 try: await message.reply(f"Sorry, error determining date.");
                 except discord.HTTPException: pass; await log_error(guild, f"Super Attempt Log: Failed to get UTC date. Error: {date_error_msg}", message_context=message); return
-            if not await check_supabase_available(message.channel): await log_info(guild, f"Super Attempt Log for '{petal_query_str}': Supabase unavailable."); return
+            if not await check_supabase_available(message.channel): await log_info(guild, f"Super Attempt Log for '{petal_query_str}': Supabase unavailable."); return # type: ignore
             ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild); bot_reply_msg: Optional[discord.Message] = None
-            if len(ultra_candidates) == 1: # Single match logic
+            if len(ultra_candidates) == 1: 
                 chosen_petal_data = ultra_candidates[0]; chosen_petal_name_for_db = chosen_petal_data['original_full_name']; display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
                 try:
                     insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute()); attempt_db_id = None
                     if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
-                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
+                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None # Ensure .data before access
                     if not attempt_db_id: await log_error(guild, f"Super Attempt (single): Failed to get DB ID for {author_ign}", message_context=message);
                     try: await message.reply(f"Error saving (no DB ID). Admin notified.");
                     except discord.HTTPException: pass; await _update_reactions(message, "error"); return
@@ -7806,17 +8101,17 @@ async def on_message(message: discord.Message):
                 except Exception as e: await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_owner=True);
                 try: await message.reply(f"Error logging attempt. Admin notified.");
                 except discord.HTTPException: pass; await _update_reactions(message, "error")
-            elif len(ultra_candidates) > 1: # Disambiguation logic
+            elif len(ultra_candidates) > 1: 
                 disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
                 sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj); bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view); sa_disamb_view.message = bot_reply_msg
                 await _update_reactions(message, "disambiguation")
-            else: # No candidates, log as Unknown
+            else: 
                 chosen_petal_name_for_db = "Unknown Ultra Petal"; display_friendly_name_for_reply = "Unknown Ultra"
                 await log_info(guild, f"Super Attempt: No Ultra match for '{petal_query_str}' by {author_ign}. Logging as Unknown.")
-                try: # Duplicate of single match logic, for Unknown
+                try: 
                     insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute()); attempt_db_id = None
                     if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
-                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
+                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
                     if not attempt_db_id: await log_error(guild, f"Super Attempt (Unknown): Failed to get DB ID for {author_ign}", message_context=message);
                     try: await message.reply(f"Error saving (no DB ID for unknown). Admin notified.");
                     except discord.HTTPException: pass; await _update_reactions(message, "error"); return
@@ -7827,12 +8122,9 @@ async def on_message(message: discord.Message):
                 except Exception as e: await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True);
                 try: await message.reply(f"Error logging unknown petal. Admin notified.");
                 except discord.HTTPException: pass; await _update_reactions(message, "error")
-            return # Handled super attempt
+            return 
 
-    # --- HC List Auto-Delete ---
-    # (This section remains unchanged from your previous correct version)
     if channel.id == HC_MEMBER_LIST_CHANNEL_ID:
-        # ... (full HC list auto-delete logic as previously provided) ...
         is_main_list_message = False; active_view_data = active_static_list_views.get(HC_MEMBER_LIST_CHANNEL_ID)
         if active_view_data and active_view_data.get('message_id') == message.id: is_main_list_message = True
         if not is_main_list_message and message.author.id != bot.user.id:
@@ -7845,11 +8137,9 @@ async def on_message(message: discord.Message):
             except Exception as e_del_bot_misc: await log_error(guild, f"Error auto-deleting misc bot message {message.id} in HC list", error=e_del_bot_misc)
         return
 
-    # --- Pass message to AI Cog for its processing ---
-    # This call should be at the end of bot.py's on_message if no other handlers returned.
     ai_cog = bot.get_cog('AICog')
     if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
-        if not message.webhook_id: # Don't let AI process messages sent by webhooks
+        if not message.webhook_id: 
             await ai_cog.process_message_for_ai(message)
 
 @tree.command(name="message", description="Send a message as the bot, optionally using AI.")
