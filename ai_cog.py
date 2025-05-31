@@ -594,8 +594,6 @@ class AICog(commands.Cog):
         for model_info in models_to_try:
             model_instance, model_name, current_model_id = model_info['instance'], model_info['name'], model_info['id']
             try:
-                print(f"AI Cog Info (Image): Attempting generation with {model_name} (ID: {current_model_id}). Prompt Key: {prompt_key}. Preferred ID for this call: {preferred_model_id or 'Default (gemini_2_5_flash)'}")
-
                 response = await model_instance.generate_content_async([final_prompt_text, img_pil])
 
                 if not response or not response.candidates:
