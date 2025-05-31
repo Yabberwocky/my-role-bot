@@ -9,20 +9,7 @@
 #     - This helps ensure accuracy and minimizes integration errors.
 #
 # 2.  **HANDLING VERY LONG FUNCTIONS WITH MINOR CHANGES:**
-#     - If a function is exceptionally long (e.g., over 150-200 lines) and only
-#       a small, clearly definable portion is changed:
-#       1.  Mark the beginning and end of significant *unchanged* blocks of code
-#           within that function using comments like:
-#           ```python
-#           # // --- UNCHANGED SECTION (A) --- //
-#           # <original, unchanged code block>
-#           # // --- END UNCHANGED SECTION (A) --- //
-#           ```
-#       2.  In your narrative, *explicitly state* that "SECTION (A) (and B, C, etc.)
-#           remains unchanged."
-#       3.  Provide the rest of the function's code (the parts that *are* new or modified,
-#           plus the surrounding structure) in full.
-#     - **Use this method sparingly.** Prefer providing the whole function if the
+#     - Always provide the whole function if the
 #       changes are complex or spread out, even if it's long. The goal is clarity
 #       and ease of integration.
 #
@@ -230,6 +217,7 @@ DEPRECATION_MESSAGE_ACTIVITY = (
     "2. In Discord (in the <#{channel_id}> channel), press `Ctrl + V` to paste and send.\n\n"
     "This method is quick and helps keep activity records accurate. Thanks for your understanding!"
 ).format(channel_id=SCREENSHOTS_DROPBOX_CHANNEL_ID)
+ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage"] # Added Bubble and Powder as they are common "Ultra-like" crafting outputs
 
 
 
@@ -1238,70 +1226,66 @@ async def get_all_time_super_attempt_count(guild: Optional[discord.Guild], autho
 async def update_custom_nickname_on_attempt(
     guild: discord.Guild,
     user: discord.Member,
-    author_ign: str, # IGN of the user
-    all_time_attempt_count: Optional[int] = None # Can be pre-fetched
+    author_ign: str,
+    all_time_attempt_count: Optional[int] = None
 ):
-    """
-    Updates a user's nickname if they have bot management enabled.
-    Uses custom template if provided, otherwise a default HC format.
-    Uses the provided all_time_attempt_count or fetches it if None.
-    """
-    if not supabase or not guild or not user or not author_ign: # Added author_ign check
+    if not supabase or not guild or not user or not author_ign:
         return
 
     try:
         settings_resp = await run_supabase_sync(
             lambda: supabase.table("hc_members")
-                           .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc") # Fetch is_in_hc
+                           .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc")
                            .eq("discord_id", str(user.id))
-                           .eq("ingame_name", author_ign) # Ensure we're updating for the correct IGN if user has multiple (though not typical)
+                           .eq("ingame_name", author_ign)
                            .maybe_single()
                            .execute()
         )
 
         if not (settings_resp and hasattr(settings_resp, 'data') and settings_resp.data):
+            # No DB record for this user/IGN combination, or error. Do nothing.
             return
 
         settings = settings_resp.data
         manage_by_bot = settings.get("manage_nickname_by_bot", False)
-        is_in_hc = settings.get("is_in_hc", False) # Check if user is actually in HC
+        is_in_hc = settings.get("is_in_hc", False)
         custom_template = settings.get("custom_nickname_template")
 
         if not manage_by_bot:
-            # If management is off, but they are IN HC, we might want to revert their nick to just IGN
-            # This ensures if they turn management off, the SATT part is removed.
+            # Nickname management is OFF.
+            # If they are IN HC, ensure their nickname is just their IGN.
             if is_in_hc and user.nick != author_ign:
-                 # Check bot permissions before trying to revert
                 bot_member = guild.me
                 if bot_member.top_role > user.top_role and bot_member.guild_permissions.manage_nicknames:
                     try:
-                        await user.edit(nick=author_ign[:32], reason="Nickname management disabled, reverting to IGN")
-                        await log_info(guild, f"Reverted nickname for {user.mention} to '{author_ign[:32]}' as management was disabled.")
+                        await user.edit(nick=author_ign[:32], reason="Nickname management disabled by user, reverting to IGN")
+                        await log_info(guild, f"Reverted nickname for {user.mention} to '{author_ign[:32]}' as management was disabled (was in HC).")
                     except Exception as e_revert:
-                        await log_error(guild, f"Error reverting nickname for {user.mention} after disabling management", error=e_revert)
-            return # Nickname management not enabled by user choice
+                        await log_error(guild, f"Error reverting nickname for {user.mention} (management off, in HC)", error=e_revert)
+            # If not in HC and management is off, bot does nothing to their nickname.
+            return
 
-        # Fetch all-time attempt count if not provided
+        # Nickname management is ON.
         if all_time_attempt_count is None:
             current_all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
         else:
             current_all_time_count = all_time_attempt_count
             
         new_nickname_unprocessed: str
+        log_reason_nick_type: str
+
         if custom_template: # User has a specific template
             new_nickname_unprocessed = custom_template.replace("{satt}", str(current_all_time_count))
-        elif is_in_hc: # User is in HC, management is ON, but NO custom template -> Apply default HC format
-            if current_all_time_count > 0:
-                new_nickname_unprocessed = f"{author_ign} ({current_all_time_count} satt)"
-            else:
-                new_nickname_unprocessed = author_ign # Just IGN if 0 SATT
-        else: # Not in HC, but management somehow ON without template (should be rare) -> Just IGN
-            new_nickname_unprocessed = author_ign
-
+            log_reason_nick_type = "custom template"
+        else: # No custom template, use default formats
+            satt_str = f" ({current_all_time_count} satt)" if current_all_time_count > 0 else ""
+            new_nickname_unprocessed = f"{author_ign}{satt_str}" # Base is always author_ign for bot-managed defaults
+            log_reason_nick_type = "default format (HC)" if is_in_hc else "default format (Non-HC)"
+        
         new_nickname = new_nickname_unprocessed[:32]
         
         if user.nick == new_nickname:
-            return
+            return # No change needed
 
         bot_member = guild.me
         if bot_member.top_role <= user.top_role:
@@ -1312,7 +1296,6 @@ async def update_custom_nickname_on_attempt(
             return
 
         await user.edit(nick=new_nickname, reason=f"Automatic nickname update (S.Attempts: {current_all_time_count})")
-        log_reason_nick_type = "custom template" if custom_template else ("default HC format" if is_in_hc else "IGN default")
         await log_info(guild, f"Updated nickname for {user.mention} to '{new_nickname}' ({log_reason_nick_type}).")
 
     except Exception as e:
@@ -1408,60 +1391,83 @@ class SuperAttemptDisambiguationView(discord.ui.View):
         self.add_item(CancelButton(row=cancel_row, original_user_message_id=original_user_message.id))
 
     async def handle_disambiguation_choice(self, interaction: discord.Interaction, button: ChosenPetalButton):
-        # // --- UNCHANGED SECTION (handle_disambiguation_choice) --- //
         guild = interaction.guild
         if not guild: 
             await interaction.followup.send("Error: Guild context lost.", ephemeral=True)
             return
             
         try:
+            insert_payload = {
+                "ingame_name": self.author_ign,
+                "discord_user_id": str(self.target_user_id),
+                "attempt_date": self.attempt_date_obj.isoformat(),
+                "petals_lost": self.petals_lost,
+                "message_id": str(self.original_user_message.id),
+                "channel_id": str(self.original_user_message.channel.id),
+                "chosen_petal_name": button.chosen_petal_data['original_full_name'] 
+            }
+            # Attempt to insert and get the inserted row back
             insert_resp = await run_supabase_sync(
-                lambda: supabase.table("super_attempts").insert({
-                    "ingame_name": self.author_ign,
-                    "discord_user_id": str(self.target_user_id),
-                    "attempt_date": self.attempt_date_obj.isoformat(),
-                    "petals_lost": self.petals_lost,
-                    "message_id": str(self.original_user_message.id),
-                    "channel_id": str(self.original_user_message.channel.id),
-                    "chosen_petal_name": button.chosen_petal_data['original_full_name'] 
-                }).execute()
+                lambda: supabase.table("super_attempts").insert(insert_payload).execute() # Add returning='representation' if client supports
             )
             
             new_attempt_db_id = None
-            if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
+            # Try to get ID from insert response first
+            if insert_resp and hasattr(insert_resp, 'data') and insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
                 new_attempt_db_id = insert_resp.data[0]['id']
-            else: 
-                fetch_id_resp = await run_supabase_sync(
-                    lambda: supabase.table("super_attempts")
-                                .select("id")
-                                .eq("message_id", str(self.original_user_message.id))
-                                .eq("ingame_name", self.author_ign)
-                                .eq("chosen_petal_name", button.chosen_petal_data['original_full_name'])
-                                .order("recorded_at", desc=True)
-                                .limit(1).maybe_single().execute()
-                )
-                if fetch_id_resp.data: new_attempt_db_id = fetch_id_resp.data['id']
+                print(f"SuperAttempt Log: Got DB ID {new_attempt_db_id} directly from insert response.")
+            else:
+                # Fallback: query for the latest record by this user for this original message
+                # This is less specific but more robust if insert doesn't return ID or chosen_petal_name has subtle issues
+                await log_info(guild, f"SuperAttempt Log: Insert for {self.author_ign} did not return ID. Falling back to query by message_id/user_id.")
+                fallback_query_attempts = 0
+                while new_attempt_db_id is None and fallback_query_attempts < 3: # Retry fallback query a few times
+                    await asyncio.sleep(0.5 + fallback_query_attempts) # Small delay, increasing
+                    fetch_id_resp = await run_supabase_sync(
+                        lambda: supabase.table("super_attempts")
+                                    .select("id")
+                                    .eq("message_id", str(self.original_user_message.id))
+                                    .eq("discord_user_id", str(self.target_user_id)) # Added discord_user_id for better specificity
+                                    .order("recorded_at", desc=True) # Get the most recent one
+                                    .limit(1).maybe_single().execute()
+                    )
+                    if fetch_id_resp and hasattr(fetch_id_resp, 'data') and fetch_id_resp.data and 'id' in fetch_id_resp.data:
+                        new_attempt_db_id = fetch_id_resp.data['id']
+                        print(f"SuperAttempt Log: Got DB ID {new_attempt_db_id} via fallback query (Attempt {fallback_query_attempts + 1}).")
+                        break
+                    fallback_query_attempts += 1
+                
+                if new_attempt_db_id is None:
+                    await log_error(guild, f"SuperAttempt Log: Fallback query also failed to retrieve ID for {self.author_ign}, msg_id {self.original_user_message.id}.", ping_owner=True)
+
 
             if not new_attempt_db_id:
-                await interaction.followup.send("Error: Could not confirm database ID for the logged attempt. Undo might not work.", ephemeral=True)
-                await log_error(guild, f"Super Attempt Disambiguation: Failed to get DB ID after insert for {self.author_ign}, chosen {button.chosen_petal_data['display_friendly_name']}", message_context=self.original_user_message)
+                # This is where the "Error: Could not confirm database ID..." comes from.
+                # If it reaches here, it means both insert return and fallback query failed.
+                error_message = "Error: Could not confirm database ID for the logged attempt. Undo might not work. Please report this."
+                await interaction.followup.send(error_message, ephemeral=True)
+                await log_error(guild, f"Super Attempt Disambiguation: Failed to get DB ID after insert and fallback for {self.author_ign}, chosen {button.chosen_petal_data['display_friendly_name']}", message_context=self.original_user_message, ping_owner=True)
+                
+                # Send a simplified success message without the Undo button, as we don't have the ID.
                 confirm_embed = discord.Embed(
-                    description=f"Logged: Lost {self.petals_lost}x {button.chosen_petal_data['display_friendly_name']}.",
-                    color=discord.Color.green()
+                    description=f"Logged: Lost {self.petals_lost}x {button.chosen_petal_data['display_friendly_name']}.\n*(Note: Undo feature may be unavailable for this entry due to an ID confirmation issue.)*",
+                    color=discord.Color.orange() # Orange to indicate a potential issue
                 )
                 if self.message: 
-                     await self.message.edit(content=f"{interaction.user.mention}", embed=confirm_embed, view=None)
-                await _update_reactions(self.original_user_message, "success")
+                    await self.message.edit(content=f"{interaction.user.mention}", embed=confirm_embed, view=None) # No view (no UndoButton)
+                await _update_reactions(self.original_user_message, "success") # Mark as success but with caveat
+                # Still update nickname if possible
                 if isinstance(interaction.user, discord.Member):
                     all_time_count_after_log = await get_all_time_super_attempt_count(guild, self.author_ign)
                     await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_count_after_log)
                 return
 
+            # Proceed with creating confirm view if ID was obtained
             all_time_attempts_count = await get_all_time_super_attempt_count(guild, self.author_ign)
 
             confirm_view_after_choice = SuperAttemptConfirmView(
                 target_user_id=self.target_user_id,
-                attempt_db_id=new_attempt_db_id,
+                attempt_db_id=new_attempt_db_id, # This is now more reliably fetched
                 petals_lost=self.petals_lost,
                 petal_display_name=button.chosen_petal_data['display_friendly_name'],
                 author_ign=self.author_ign,
@@ -1472,7 +1478,7 @@ class SuperAttemptDisambiguationView(discord.ui.View):
             if self.message: 
                 await self.message.edit(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
                 confirm_view_after_choice.message = self.message 
-            else: 
+            else: # Should not happen if message was sent for disambiguation
                 await interaction.edit_original_response(content=f"{interaction.user.mention}", embed=success_embed, view=confirm_view_after_choice)
 
             await _update_reactions(self.original_user_message, "success")
@@ -1482,17 +1488,16 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                 await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_attempts_count)
 
         except Exception as e:
-            await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message)
+            await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message, ping_owner=True) # Ping owner on critical errors
             try: 
                 if not interaction.response.is_done():
-                    await interaction.response.send_message("An error occurred while processing your choice.", ephemeral=True)
+                    await interaction.response.send_message("An error occurred while processing your choice. Admins notified.", ephemeral=True)
                 else:
-                    await interaction.followup.send("An error occurred while processing your choice.", ephemeral=True)
+                    await interaction.followup.send("An error occurred while processing your choice. Admins notified.", ephemeral=True)
             except discord.HTTPException: pass
 
             if self.message: await self.message.edit(content=f"{interaction.user.mention} An error occurred. Please try again or ask an admin.", embed=None, view=None)
-            await _update_reactions(self.original_user_message, "error") 
-        # // --- END UNCHANGED SECTION (handle_disambiguation_choice) --- //
+            await _update_reactions(self.original_user_message, "error")
 
     async def handle_cancel(self, interaction: discord.Interaction):
         if self.message:
@@ -1676,52 +1681,170 @@ async def _update_reactions(user_message: discord.Message, state: str):
         print(f"Reaction Error: Unexpected error: {e}")
 
 async def find_ultra_petal_candidates_for_query(petal_query_str: str, guild_for_log: Optional[discord.Guild]) -> List[Dict[str, str]]:
-    """
-    Finds all "Ultra" petal candidates from the cache that could match a user's query.
-    1. Uses fuzzy_match_petal_name to get a primary base name match.
-    2. Searches cache for all Ultra petals whose own base name matches this primary base name.
-
-    Returns:
-        List of dicts, each: {'original_full_name': "Ultra...", 
-                               'display_friendly_name': "Ultra Display Name...",
-                               'base_name_for_db': "processed_base_name_of_the_ultra_petal"}
-    """
     candidates = []
-    if not available_profile_pics_cache:
-        if guild_for_log: await log_error(guild_for_log, "find_ultra_petal_candidates: Cache not ready.")
+    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES: # Check both
+        if guild_for_log: await log_error(guild_for_log, "find_ultra_petal_candidates: Cache and additional names list are empty.")
         return candidates
 
-    # Step 1: Get the best fuzzy match for the user's query to determine the target base name.
-    # The current fuzzy_match_petal_name is designed to return ONE best base name.
-    # If it returns 'ambiguous' at this stage, we might need to handle that differently,
-    # but for now, let's assume it gives one primary target.
     primary_match_result = await fuzzy_match_petal_name(petal_query_str)
     
     if primary_match_result.get("status") != "success":
-        # print(f"[FIND ULTRA CANDIDATES] Fuzzy match for query '{petal_query_str}' was not 'success': {primary_match_result.get('status')}")
-        return candidates # No base name to work with
+        return candidates 
 
-    target_base_name = primary_match_result.get("base_name_matched") # e.g., "egg", "lotus"
+    target_base_name = primary_match_result.get("base_name_matched")
     if not target_base_name:
-        # print(f"[FIND ULTRA CANDIDATES] Fuzzy match success, but no 'base_name_matched' for query '{petal_query_str}'.")
         return candidates
 
-    # print(f"[FIND ULTRA CANDIDATES] Target base name from fuzzy match: '{target_base_name}' for query '{petal_query_str}'")
-
-    # Step 2: Iterate through the full cache to find all Ultra petals whose base name matches target_base_name.
-    for original_full_name_cache, folder_id, _ in available_profile_pics_cache:
-        if folder_id == PETALS_FOLDER_NAME and original_full_name_cache.lower().startswith("ultra "):
-            base_name_of_this_ultra = _preprocess_petal_name_for_search(original_full_name_cache)
-            if base_name_of_this_ultra == target_base_name:
-                display_friendly_version = _get_display_friendly_petal_name(original_full_name_cache)
+    # Check from image cache
+    if available_profile_pics_cache:
+        for original_full_name_cache, folder_id, _ in available_profile_pics_cache:
+            if folder_id == PETALS_FOLDER_NAME and original_full_name_cache.lower().startswith("ultra "):
+                base_name_of_this_ultra = _preprocess_petal_name_for_search(original_full_name_cache)
+                if base_name_of_this_ultra == target_base_name:
+                    display_friendly_version = _get_display_friendly_petal_name(original_full_name_cache)
+                    candidates.append({
+                        'original_full_name': original_full_name_cache,
+                        'display_friendly_name': display_friendly_version,
+                        'base_name_for_db': base_name_of_this_ultra 
+                    })
+    
+    # Check from additional names list (treat them as "Ultra" for candidacy)
+    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
+        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
+        if base_name_of_additional == target_base_name:
+            # Ensure we don't add duplicates if it was already found via image cache (unlikely but possible if names overlap)
+            if not any(c['original_full_name'].lower() == f"ultra {additional_petal_name.lower()}" or c['original_full_name'].lower() == additional_petal_name.lower() for c in candidates):
                 candidates.append({
-                    'original_full_name': original_full_name_cache,
-                    'display_friendly_name': display_friendly_version,
-                    'base_name_for_db': base_name_of_this_ultra # Store the consistent base name
+                    'original_full_name': f"Ultra {additional_petal_name.title()}", # Store with "Ultra" prefix for DB consistency if that's the intent
+                    'display_friendly_name': f"Ultra {additional_petal_name.title()}", # Display as "Ultra Name"
+                    'base_name_for_db': base_name_of_additional
                 })
     
-    # print(f"[FIND ULTRA CANDIDATES] Found {len(candidates)} Ultra candidates for base '{target_base_name}'.")
     return candidates
+
+async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str]:
+    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
+        print("[CHECK ULTRA] Cache and additional names list empty.")
+        return None
+
+    normalized_base_to_find = base_petal_name_to_find.lower().strip()
+
+    # Check image cache first
+    if available_profile_pics_cache:
+        for original_full_name, folder_id, _ in available_profile_pics_cache:
+            if folder_id == PETALS_FOLDER_NAME and original_full_name.lower().startswith("ultra "):
+                base_name_of_this_cached_ultra = _preprocess_petal_name_for_search(original_full_name)
+                if base_name_of_this_cached_ultra == normalized_base_to_find:
+                    return original_full_name 
+    
+    # Check additional names list
+    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
+        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
+        if base_name_of_additional == normalized_base_to_find:
+            # Return a consistent "Ultra" formatted name
+            return f"Ultra {additional_petal_name.title()}" 
+    
+    return None
+
+async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict[str, Any]:
+    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
+        return {'status': 'cache_not_ready'}
+
+    unique_base_petal_data_map: Dict[str, Dict[str, Any]] = {}
+
+    if available_profile_pics_cache:
+        for display_name_orig, folder_id, _ in available_profile_pics_cache:
+            if folder_id == PETALS_FOLDER_NAME:
+                base_search_name = _preprocess_petal_name_for_search(display_name_orig)
+                if base_search_name and base_search_name not in unique_base_petal_data_map:
+                    display_friendly = _get_display_friendly_petal_name(display_name_orig)
+                    unique_base_petal_data_map[base_search_name] = {
+                        'display_friendly_name': display_friendly,
+                    }
+    
+    # Add additional petal names to the searchable map
+    for additional_name in ADDITIONAL_SUPER_PETAL_NAMES:
+        base_search_name = _preprocess_petal_name_for_search(additional_name)
+        if base_search_name and base_search_name not in unique_base_petal_data_map:
+            # For display, treat them as "Ultra Name" if that's how they should appear in disambiguation
+            # The _get_display_friendly_petal_name expects a name potentially starting with "Ultra ",
+            # so we construct one for it.
+            display_friendly = _get_display_friendly_petal_name(f"Ultra {additional_name.title()}")
+            unique_base_petal_data_map[base_search_name] = {
+                'display_friendly_name': display_friendly,
+            }
+    
+    if not unique_base_petal_data_map:
+        return {'status': 'no_searchable_petals'}
+
+    processed_query_for_match = _preprocess_query_for_search(query_string)
+
+    if not processed_query_for_match:
+        return {'status': 'empty_query_after_processing', 'original_query': query_string}
+
+    searchable_base_names_pool = list(unique_base_petal_data_map.keys())
+    
+    matches_from_difflib = difflib.get_close_matches(
+        processed_query_for_match, searchable_base_names_pool, n=3, cutoff=cutoff
+    )
+
+    if not matches_from_difflib:
+        return {
+            'status': 'not_found', 
+            'original_query': query_string, 
+            'processed_query': processed_query_for_match
+        }
+
+    scored_matches: List[Dict[str, Any]] = []
+    for matched_base_name_str in matches_from_difflib:
+        score = difflib.SequenceMatcher(None, processed_query_for_match, matched_base_name_str).ratio()
+        base_petal_entry_data = unique_base_petal_data_map.get(matched_base_name_str)
+        if base_petal_entry_data:
+            scored_matches.append({
+                'base_name_matched': matched_base_name_str,
+                'display_friendly_name': base_petal_entry_data['display_friendly_name'],
+                'score': score
+            })
+    
+    if not scored_matches:
+         return { 'status': 'not_found', 'original_query': query_string, 'processed_query': processed_query_for_match }
+
+    scored_matches.sort(key=lambda x: x['score'], reverse=True)
+    best_match = scored_matches[0]
+    
+    if len(scored_matches) > 1:
+        second_match = scored_matches[1]
+        is_ambiguous = (
+            best_match['score'] > 0.70 and 
+            second_match['score'] > 0.65 and
+            (best_match['score'] - second_match['score']) < 0.1 
+        )
+        if len(processed_query_for_match) <= 3 and best_match['score'] < 0.85 :
+            if (best_match['score'] - second_match['score']) < 0.15 and second_match['score'] > 0.60:
+                 is_ambiguous = True
+
+        if is_ambiguous:
+            ambiguous_display_names_set = set()
+            for m in scored_matches[:min(3, len(scored_matches))]:
+                if m['score'] > 0.60:
+                    ambiguous_display_names_set.add(m['display_friendly_name'])
+            
+            unique_ambiguous_options = list(ambiguous_display_names_set)
+            if len(unique_ambiguous_options) > 1:
+                return {
+                    'status': 'ambiguous',
+                    'original_query': query_string,
+                    'processed_query': processed_query_for_match,
+                    'ambiguous_display_names': unique_ambiguous_options 
+                }
+
+    return {
+        'status': 'success',
+        'original_query': query_string,
+        'processed_query': processed_query_for_match,
+        'base_name_matched': best_match['base_name_matched'],
+        'display_friendly_name': best_match['display_friendly_name']
+    }
 
 async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str]:
     """
@@ -2722,17 +2845,26 @@ class HelpPagesView(discord.ui.View):
         self.current_page = "general" 
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
-        pass
+        # Initialize button directly if staff view is not allowed
+        if self.is_staff_view_allowed:
+            self.toggle_page_button = discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
+            self.toggle_page_button.callback = self.toggle_page_button_callback
+            self.add_item(self.toggle_page_button)
+        else:
+            self.toggle_page_button = None # No button if not allowed
 
-    def _update_decorated_button_appearance(self, button_to_update: discord.ui.Button):
+
+    def _update_decorated_button_appearance(self): # Renamed from _update_decorated_button_appearance(self, button_to_update)
+        if not self.toggle_page_button: return # No button to update
+
         if self.current_page == "general":
-            button_to_update.label = "View Staff Commands"
-            button_to_update.emoji = "🛡️"
-            button_to_update.style = discord.ButtonStyle.secondary
+            self.toggle_page_button.label = "View Staff Commands"
+            self.toggle_page_button.emoji = "🛡️"
+            self.toggle_page_button.style = discord.ButtonStyle.secondary
         else: 
-            button_to_update.label = "Back to General"
-            button_to_update.emoji = "⬅️"
-            button_to_update.style = discord.ButtonStyle.primary
+            self.toggle_page_button.label = "Back to General"
+            self.toggle_page_button.emoji = "⬅️"
+            self.toggle_page_button.style = discord.ButtonStyle.primary
 
     def _create_general_embed(self) -> discord.Embed:
         embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
@@ -2742,16 +2874,16 @@ class HelpPagesView(discord.ui.View):
         
         embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active for today.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('profile')} · View your [HC1] profile, activity, and S.Attempt stats.", value="\u200B", inline=False) # MODIFIED description
+        embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active (deprecated).", value="\u200B", inline=False) # Updated description
+        embed.add_field(name=f"{get_cmd_mention('profile')} · View [HC1] profile, activity, and S.Attempt stats.", value="\u200B", inline=False)
         
         embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
         
-        embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False) # MODIFIED section title
+        embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname template.", value="\u200B", inline=False) # ADDED command
+        embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname.", value="\u200B", inline=False)
         
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
@@ -2767,25 +2899,24 @@ class HelpPagesView(discord.ui.View):
         embed.description = "These commands typically require server management permissions:\n\u200B"
         
         embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user/update own IGN. `[Manage Roles]`", value="\u200B", inline=False) # Updated
         embed.add_field(name=f"{get_cmd_mention('unverify')}  · Unverify user. `[Manage Roles]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify into HC. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hconly')} · Register IGN only. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hconly')} · Register HC IGN only. `[Manage Roles]`", value="\u200B", inline=False) # Updated
+        embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False) # Updated
         
         embed.add_field(name="\u200B\n⏱️ Activity Tracking (Staff)", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active. `[Manage Server]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity. `[Manage Server]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active today. `[Manage Server]`", value="\u200B", inline=False) # Updated
+        embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity record. `[Manage Server]`", value="\u200B", inline=False) # Updated
         
         embed.add_field(name="\u200B\n⚙️ Utilities (Staff & Owner)", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Manage Server]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list & data. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('syncnicknames')}  · Sync HC nicks for S.Attempts. `[Manage Nicks]`", value="\u200B", inline=False) # MODIFIED description
+        embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list, data, sync nicks. `[Manage Roles]`", value="\u200B", inline=False) # Updated
         embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('aiping')} · Check AI model latencies. `[Owner Only]`", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages. `[Owner Only]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('test_petal_match')} · Test petal name fuzzy matching. `[Owner Only]`", value="\u200B", inline=False) # ADDED (if test command is still relevant)
+        embed.add_field(name=f"{get_cmd_mention('test_petal_match')} · Test petal name fuzzy matching. `[Owner Only]`", value="\u200B", inline=False)
 
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
@@ -2795,9 +2926,9 @@ class HelpPagesView(discord.ui.View):
             return self._create_staff_embed()
         return self._create_general_embed()
 
-    @discord.ui.button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
-    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_staff_view_allowed:
+    # This is the callback for the button added in __init__
+    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button): # button param is passed by d.py
+        if not self.is_staff_view_allowed: # Redundant check, button shouldn't exist if not allowed
             await interaction.response.send_message("This action is not available.", ephemeral=True, delete_after=5)
             return
 
@@ -2806,24 +2937,21 @@ class HelpPagesView(discord.ui.View):
         else:
             self.current_page = "general"
         
-        self._update_decorated_button_appearance(button) 
+        self._update_decorated_button_appearance() 
         current_embed = self.get_current_embed()
         
         await interaction.response.edit_message(embed=current_embed, view=self)
 
     async def on_timeout(self):
-        if self.message and self.is_staff_view_allowed: 
+        if self.message and self.toggle_page_button: # Check if button exists
             try:
                 current_embed_on_timeout = self.get_current_embed()
-                if current_embed_on_timeout.footer and current_embed_on_timeout.footer.text: # Check footer exists
+                if current_embed_on_timeout.footer and current_embed_on_timeout.footer.text:
                     current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
-                else: # Fallback if no footer
+                else:
                     current_embed_on_timeout.set_footer(text="Interaction timed out")
                 
-                for item in self.children:
-                    if isinstance(item, discord.ui.Button) and item.custom_id == "help_toggle_page_decorator_final":
-                        item.disabled = True
-                        break
+                self.toggle_page_button.disabled = True # Disable the specific button
                 await self.message.edit(embed=current_embed_on_timeout, view=self) 
             except discord.HTTPException:
                 pass
@@ -5688,72 +5816,63 @@ def get_cmd_mention(name: str) -> str:
     user="The user to verify (or yourself to update IGN).",
     ingame_name="[Optional] User's Florr IGN to link/update. Required if updating your own IGN."
 )
-# @app_commands.checks.has_permissions(manage_roles=True) # <-- We'll handle this conditionally
-@app_commands.checks.bot_has_permissions(manage_roles=True) # Bot always needs this for role operations
+@app_commands.checks.bot_has_permissions(manage_roles=True)
 async def verify(interaction: discord.Interaction, user: discord.Member, ingame_name: Optional[str] = None):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
         return
 
-    # Conditional Permission Check
     is_self_target = interaction.user.id == user.id
-    role_verified_obj = guild.get_role(FLORRIST_ROLE_ID) # Used for self-check and main logic
+    role_verified_obj = guild.get_role(FLORRIST_ROLE_ID)
     
-    if not is_self_target: # If targeting OTHERS, original permission check applies
+    if not is_self_target:
         if not interaction.permissions.manage_roles:
             await interaction.response.send_message(
                 "❌ You need 'Manage Roles' permission to verify other users.", ephemeral=True
             )
             return
     elif is_self_target and (not role_verified_obj or role_verified_obj not in interaction.user.roles):
-        # Targeting self, but NOT verified -> staff still needs to verify them
         await interaction.response.send_message(
             f"❌ You cannot use this command to verify yourself initially. Please ask a staff member with 'Manage Roles' permission to verify you.",
             ephemeral=True
         )
         return
     elif is_self_target and role_verified_obj and role_verified_obj in interaction.user.roles and not ingame_name:
-        # Targeting self, IS verified, but no IGN provided for update
         await interaction.response.send_message(
             "ℹ️ You are already verified. To update your In-Game Name, please provide it in the `ingame_name` option.",
             ephemeral=True
         )
         return
 
-    # Defer after permission checks
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     if not await check_supabase_available(interaction):
         await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
         return
 
-    role_to_remove = guild.get_role(NEWBEE_ROLE_ID)
-    # role_verified_obj is already defined above
+    role_to_remove_newbee = guild.get_role(NEWBEE_ROLE_ID)
     bot_member = guild.me
 
-    # Role existence checks (still important if staff is running it for role changes)
     missing_roles = []
-    if NEWBEE_ROLE_ID and not role_to_remove: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
+    if NEWBEE_ROLE_ID and not role_to_remove_newbee: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
     if FLORRIST_ROLE_ID and not role_verified_obj: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
     
     if missing_roles and not (is_self_target and role_verified_obj and role_verified_obj in user.roles):
-        # If roles are missing AND it's not a self-IGN update case (where roles don't matter)
         msg = f"❌ Setup Error: Roles not found: {', '.join(missing_roles)}. Please configure the bot."
         await interaction.edit_original_response(content=msg, embed=None, view=None)
         await log_error(guild, f"Verify failed: Missing roles - {', '.join(missing_roles)}", interaction=interaction)
         return
     
-    # Hierarchy check (only relevant if roles are being changed, i.e., not self-IGN update)
     if not (is_self_target and role_verified_obj and role_verified_obj in user.roles):
         hierarchy_fail = False
         hierarchy_reason = ""
-        if role_verified_obj and bot_member.top_role.position <= role_verified_obj.position: # Check role_verified_obj exists
+        if role_verified_obj and bot_member.top_role.position <= role_verified_obj.position:
             hierarchy_fail=True
             hierarchy_reason=f"Cannot assign the '{role_verified_obj.name}' role."
-        elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
+        elif role_to_remove_newbee and bot_member.top_role.position <= role_to_remove_newbee.position:
             hierarchy_fail=True
-            hierarchy_reason=f"Cannot remove the '{role_to_remove.name}' role."
+            hierarchy_reason=f"Cannot remove the '{role_to_remove_newbee.name}' role."
         
         if hierarchy_fail:
             msg = f"❌ Hierarchy Error: {hierarchy_reason} My highest role ('{bot_member.top_role.name}') is not high enough."
@@ -5765,25 +5884,20 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
     db_messages = [] 
     reason_prefix = "Self-updated IGN" if is_self_target else "Verified"
     reason = f"{reason_prefix} by {interaction.user} (ID: {interaction.user.id})"
-    modified_roles = False
+    actual_roles_changed_in_operation = False # Flag to track if roles were ACTUALLY changed
     db_changed_is_in_hc_status = False 
     ign_for_final_nick_update: Optional[str] = None
 
     try:
-        # --- Role Management ---
-        # Skip role changes if user is self-targeting AND already verified
         if is_self_target and role_verified_obj and role_verified_obj in user.roles:
             actions_taken.append("ℹ️ You are already verified. Proceeding with IGN update only.")
-        else: # Standard role verification logic by staff
-            has_verified_role = role_verified_obj and role_verified_obj in user.roles
-            has_unverified_role = bool(role_to_remove and role_to_remove in user.roles)
-
+        else:
             roles_to_add_list = []
             roles_to_remove_list = []
 
-            if has_unverified_role and role_to_remove:
-                 roles_to_remove_list.append(role_to_remove)
-            if not has_verified_role and role_verified_obj: # Check role_verified_obj exists
+            if role_to_remove_newbee and role_to_remove_newbee in user.roles:
+                 roles_to_remove_list.append(role_to_remove_newbee)
+            if role_verified_obj and role_verified_obj not in user.roles:
                  roles_to_add_list.append(role_verified_obj)
 
             if roles_to_add_list or roles_to_remove_list:
@@ -5791,15 +5905,14 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                 final_role_set = [r for r in current_roles if r not in roles_to_remove_list] + roles_to_add_list
                 final_role_set = [r for r in final_role_set if r.id != guild.default_role.id] 
                 await user.edit(roles=final_role_set, reason=reason)
-                modified_roles = True
-                if roles_to_remove_list and role_to_remove: actions_taken.append(f"➖ Removed `{role_to_remove.name}`")
-                if roles_to_add_list and role_verified_obj: actions_taken.append(f"➕ Added `{role_verified_obj.name}`")
+                actual_roles_changed_in_operation = True # Roles were programmatically changed
+                if role_to_remove_newbee in roles_to_remove_list: actions_taken.append(f"➖ Removed `{role_to_remove_newbee.name}`")
+                if role_verified_obj in roles_to_add_list: actions_taken.append(f"➕ Added `{role_verified_obj.name}`")
             else:
                 actions_taken.append(f"ℹ️ Roles already correct for standard verification.")
             
-        # --- IGN Linking/Updating Logic ---
         cleaned_ign: Optional[str] = None
-        if ingame_name: # This condition is now also true for self-update case
+        if ingame_name:
             cleaned_ign = ingame_name.strip()
             ign_for_final_nick_update = cleaned_ign
             user_id_str = str(user.id)
@@ -5807,7 +5920,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
 
             if not cleaned_ign:
                 db_messages.append("⚠️ IGN provided was empty. No IGN update attempted.")
-                # If self-targeting and IGN was empty, this is an error for their intent.
                 if is_self_target:
                      await interaction.edit_original_response(content="❌ You must provide a valid In-Game Name to update.", embed=None, view=None)
                      return
@@ -5827,10 +5939,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                         db_messages.append(f"⚠️ **IGN Conflict:** `{discord.utils.escape_markdown(cleaned_ign)}` is already linked to another user (<@{other_user_id}>). IGN not updated.")
                         await log_info(guild, f"/verify IGN conflict: User `{interaction.user}` tried to link `{cleaned_ign}` to `{user.name}`, but it's linked to ID {other_user_id}.")
                     else:
-                        # For /verify (even self-verify for IGN), is_in_hc should be FALSE unless /hcverify is used.
-                        # If they are already in DB with is_in_hc=TRUE, this command should NOT change that unless they are also being HCVerified (which this command doesn't do).
-                        # So, we need to fetch current is_in_hc if user exists, and preserve it if True, otherwise set to False.
-                        
                         current_db_status = await run_supabase_sync(
                             lambda: supabase.table("hc_members")
                                            .select("is_in_hc")
@@ -5839,10 +5947,10 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                                            .execute()
                         )
                         
-                        final_is_in_hc_value = False # Default for new /verify entries
+                        final_is_in_hc_value = False
                         if current_db_status and hasattr(current_db_status, 'data') and current_db_status.data:
                             if current_db_status.data.get("is_in_hc") is True:
-                                final_is_in_hc_value = True # Preserve if they are already marked in HC
+                                final_is_in_hc_value = True
 
                         data_to_upsert = {
                             "discord_id": user_id_str,
@@ -5859,15 +5967,10 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                         log_msg_hc_status = " (is_in_hc preserved as TRUE)" if final_is_in_hc_value else " (is_in_hc set/kept as FALSE)"
                         await log_info(guild, f"/verify: IGN `{cleaned_ign}` linked/updated for {user.mention} by `{interaction.user}`{log_msg_hc_status}.")
                         
-                        # Only set db_changed_is_in_hc_status if the 'final_is_in_hc_value' is different from what it might have been.
-                        # This is tricky without knowing the "before" state precisely without another query.
-                        # For simplicity, let's assume if we touch the DB record, nickname might need an update if managed.
-                        # Or more accurately, if 'final_is_in_hc_value' is now FALSE and it might have been TRUE.
                         if not final_is_in_hc_value and (not current_db_status or not current_db_status.data or current_db_status.data.get("is_in_hc") is not False):
                             db_changed_is_in_hc_status = True
 
                 except APIError as e_db:
-                    # ... (same error handling as before for unique constraint and other API errors) ...
                     if "unique constraint" in str(e_db.message).lower() and "hc_members_ingame_name_key" in str(e_db.message).lower():
                         db_messages.append(f"⚠️ **IGN Not Linked:** `{discord.utils.escape_markdown(cleaned_ign)}` already exists (possibly unlinked). Use `/hcverify` or contact staff if this IGN should be linked for HC.")
                         await log_info(guild, f"/verify DB Error: IGN `{cleaned_ign}` unique constraint hit for user {user.mention}. User: `{interaction.user}`. Error: {e_db.message}")
@@ -5879,7 +5982,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                     await log_error(guild, f"Verify Unexpected DB Error for IGN `{cleaned_ign}` (user: {user.mention})", error=e_db_other, interaction=interaction)
         
         elif not ingame_name and not is_self_target: 
-            # IGN not provided by staff, and not a self-update case
             ign_for_final_nick_update = await get_ign_from_user(guild, user.id)
             try:
                 user_db_resp = await run_supabase_sync(
@@ -5892,10 +5994,10 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                 if user_db_resp and hasattr(user_db_resp, 'data') and user_db_resp.data:
                     if not ign_for_final_nick_update:
                         ign_for_final_nick_update = user_db_resp.data.get("ingame_name")
-                    if user_db_resp.data.get("is_in_hc") is True: # If they were in HC
+                    if user_db_resp.data.get("is_in_hc") is True:
                         await run_supabase_sync(
                             lambda: supabase.table("hc_members")
-                                           .update({"is_in_hc": False}) # Mark them as not in HC via /verify
+                                           .update({"is_in_hc": False})
                                            .eq("discord_id", str(user.id))
                                            .execute()
                         )
@@ -5905,20 +6007,16 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
             except Exception as e_db_check:
                  await log_error(guild, f"Verify DB check/update (no IGN param by staff) error for {user.mention}", error=e_db_check, interaction=interaction)
         
-        # Nickname update logic
         if ign_for_final_nick_update and (is_self_target or db_changed_is_in_hc_status):
-            # If self-target, always try to update nick with the new/existing IGN.
-            # If staff target, only update if is_in_hc status potentially changed that would affect default nick.
             current_satt_for_nick_update = await get_all_time_super_attempt_count(guild, ign_for_final_nick_update)
             await update_custom_nickname_on_attempt(guild, user, ign_for_final_nick_update, current_satt_for_nick_update)
 
-        # --- Construct Final Message ---
         final_response_parts = []
         if actions_taken: final_response_parts.extend(actions_taken)
         if db_messages: final_response_parts.extend(db_messages)
         
         if not final_response_parts: 
-            final_response_parts.append("ℹ️ No changes made.") # Generic if nothing happened
+            final_response_parts.append("ℹ️ No changes made.")
 
         await log_info(guild, f"`{interaction.user}` ran /verify for {user.mention}. Actions: {'; '.join(final_response_parts)}.")
         
@@ -5933,12 +6031,14 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
         final_embed = create_embed(title=final_embed_title, description=final_embed_desc, color=final_color)
         await interaction.edit_original_response(embed=final_embed, view=None)
 
-        # Public notification only if roles were changed by staff
-        if modified_roles and not is_self_target:
+        # Send public notification ONLY if roles were ACTUALLY changed by staff
+        if actual_roles_changed_in_operation and not is_self_target:
             public_notif_desc = f"✅ **{user.display_name}** has been verified!"
-            role_actions_for_public = [line for line in actions_taken if "Role" not in line and ("Added" in line or "Removed" in line)]
+            # Filter for actual role change messages in actions_taken
+            role_actions_for_public = [line for line in actions_taken if "Added `" in line or "Removed `" in line]
             if role_actions_for_public:
                 public_notif_desc += "\n" + "\n".join(role_actions_for_public)
+            
             public_embed = create_embed(public_notif_desc, discord.Color.green())
             try:
                 if isinstance(interaction.channel, discord.TextChannel):
@@ -5951,15 +6051,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
                  await log_error(guild,"Failed to send public verify notification", error=e_public, interaction=interaction)
 
     except discord.Forbidden:
-        # ... (same error handling as before) ...
         await log_error(guild, "Verify failed: Bot lacks permissions (Forbidden).", interaction=interaction)
         await interaction.edit_original_response(content="❌ Failed: I don't have the necessary permissions to manage roles for this user.", embed=None, view=None)
     except discord.HTTPException as e:
-        # ... (same error handling as before) ...
         await log_error(guild, "Verify failed: Discord API error.", error=e, interaction=interaction)
         await interaction.edit_original_response(content="❌ Failed: A Discord API error occurred. Please try again later.", embed=None, view=None)
     except Exception as e:
-        # ... (same error handling as before) ...
         await log_error(guild, "Unexpected error during /verify.", error=e, interaction=interaction, ping_owner=True)
         await interaction.edit_original_response(content="❌ An unexpected error occurred.", embed=None, view=None)
 
@@ -7090,246 +7187,145 @@ async def profile(interaction: discord.Interaction,
             await interaction.edit_original_response(content="❌ Error displaying profile. Please try again.", embed=None, view=None)
         except: pass
 
-@tree.command(name="refresh", description="Manually refresh the interactive [HC1] list message AND reload keyword data.")
-@app_commands.checks.has_permissions(manage_roles=True)
+@tree.command(name="refresh", description="Manually refresh static list, IGN cache, keyword data, profile pics, and sync managed nicknames.") # MODIFIED description
+@app_commands.checks.has_permissions(manage_roles=True) # manage_roles implies general staff access
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
     if not await check_supabase_available(interaction):
-        return
+        return # check_supabase_available handles ephemeral response
     if guild.id != CATERCORD_GUILD_ID:
-        await interaction.response.send_message("List refresh commands can only be used in the target server.", ephemeral=True)
+        await interaction.response.send_message("Refresh commands can only be used in the target server.", ephemeral=True)
         return
     
     list_channel = guild.get_channel(HC_MEMBER_LIST_CHANNEL_ID)
     if not isinstance(list_channel, discord.TextChannel):
-        await interaction.response.send_message(f"❌ Configuration Error: Static list channel (ID: {HC_MEMBER_LIST_CHANNEL_ID}) not found or invalid.", ephemeral=True)
+        await interaction.response.send_message(f"❌ Config Error: Static list channel (ID: {HC_MEMBER_LIST_CHANNEL_ID}) not found.", ephemeral=True)
         await log_error(guild, f"/refresh failed: Static list channel invalid.", interaction=interaction)
         return
 
     await interaction.response.defer(thinking=True, ephemeral=False)
-    feedback_msg = (
-        f"⏳ Starting refresh...\n"
-        f"- Reloading keyword data from Supabase.\n"
-        f"- Reloading profile picture choices from local files.\n" # <--- ADDED THIS LINE
-        f"- Updating interactive list in {list_channel.mention}."
-    )
+    feedback_msg_parts = [
+        f"⏳ Starting refresh for {guild.name}...",
+        f"- Reloading keyword data from Supabase.",
+        f"- Reloading profile picture choices from local files.",
+        f"- Updating interactive list in {list_channel.mention}.",
+        f"- Syncing all bot-managed nicknames." # ADDED
+    ]
     
     try:
-        await interaction.followup.send(feedback_msg, ephemeral=False)
+        await interaction.followup.send("\n".join(feedback_msg_parts), ephemeral=False)
     except Exception as e_followup:
         await log_error(guild, "Failed initial /refresh followup send", error=e_followup, interaction=interaction)
         try: await interaction.edit_original_response(content="⏳ Starting refresh...", embed=None, view=None)
         except Exception: pass
 
     keyword_load_success = False
-    profile_pics_load_success = False # <--- ADDED THIS
+    profile_pics_load_success = False
     list_update_success = False
+    nickname_sync_success = False # ADDED
+    nickname_sync_counts = {} # ADDED
     error_details = ""
     ai_cog = bot.get_cog('AICog') 
 
     try:
-        # 1. Reload Keyword Data (via AI Cog)
+        # 1. Reload Keyword Data
         if ai_cog:
-            await log_info(guild, f"Manual keyword data reload initiated by `{interaction.user}` via /refresh.")
+            await log_info(guild, f"Keyword data reload initiated by `{interaction.user}` via /refresh.")
             await ai_cog.load_keyword_data(guild) 
             keyword_load_success = True
-            print(f"Keyword reload complete (via cog). Cache size in cog: {len(ai_cog.keyword_data_cache)}")
         else:
-            await log_info(guild, "AI Cog not found during /refresh. Keyword data not reloaded.") # Changed to log_info
-            error_details += " AI module not loaded, keyword data not reloaded."
+            await log_info(guild, "AI Cog not found during /refresh. Keyword data not reloaded.")
+            error_details += " AI module not loaded (keywords skipped)."
 
-        # 2. Reload Profile Picture Choices <--- NEW SECTION
-        await log_info(guild, f"Manual profile picture choices reload initiated by `{interaction.user}` via /refresh.")
-        await load_profile_picture_choices(guild) # Pass guild for logging
+        # 2. Reload Profile Picture Choices
+        await log_info(guild, f"Profile picture choices reload initiated by `{interaction.user}` via /refresh.")
+        await load_profile_picture_choices(guild)
         profile_pics_load_success = True
-        print(f"Profile picture choices reloaded. Cache size: {len(available_profile_pics_cache)}.")
-        # load_profile_picture_choices logs its own errors if any.
+        
+        # 3. Sync Nicknames (NEW PART)
+        await log_info(guild, f"Nickname sync initiated by `{interaction.user}` via /refresh.")
+        if not guild.me.guild_permissions.manage_nicknames:
+            await log_info(guild, "Nickname sync skipped: Bot lacks 'Manage Nicknames' permission.")
+            error_details += " Bot lacks Manage Nicknames permission (nick sync skipped)."
+        else:
+            # Fetch users with manage_nickname_by_bot = TRUE
+            users_to_sync_nicks_resp = await run_supabase_sync(
+                lambda: supabase.table("hc_members")
+                               .select("discord_id, ingame_name, custom_nickname_template, is_in_hc") # is_in_hc needed for default format
+                               .eq("manage_nickname_by_bot", True)
+                               .execute()
+            )
+            users_for_nick_sync = users_to_sync_nicks_resp.data if users_to_sync_nicks_resp and hasattr(users_to_sync_nicks_resp, 'data') else []
+            
+            synced_count = 0
+            failed_nick_sync_count = 0
+            if users_for_nick_sync:
+                await log_info(guild, f"Found {len(users_for_nick_sync)} users for nickname sync.")
+                for user_data in users_for_nick_sync:
+                    d_id = user_data.get("discord_id")
+                    ign = user_data.get("ingame_name")
+                    if not d_id or not ign: continue
+                    
+                    member_obj = guild.get_member(int(d_id))
+                    if member_obj:
+                        try:
+                            # update_custom_nickname_on_attempt will use its internal logic
+                            # including fetching SATT count.
+                            await update_custom_nickname_on_attempt(guild, member_obj, ign) # Pass None for SATT count to force fetch
+                            synced_count += 1
+                            await asyncio.sleep(0.2) # Be gentle
+                        except Exception as e_nick_sync:
+                            await log_error(guild, f"Error syncing nickname for {member_obj.mention} ({ign}) during /refresh", error=e_nick_sync)
+                            failed_nick_sync_count += 1
+                    # else: user not in guild, skip
+                nickname_sync_success = True
+                nickname_sync_counts = {'synced': synced_count, 'failed': failed_nick_sync_count, 'total_managed': len(users_for_nick_sync)}
+            else:
+                await log_info(guild, "No users found with bot-managed nicknames for sync.")
+                nickname_sync_success = True # Success in the sense that there was nothing to do.
+                nickname_sync_counts = {'synced': 0, 'failed': 0, 'total_managed': 0}
 
-        # 3. Update Static List Message
-        await log_info(guild, f"Manual interactive static list refresh initiated by `{interaction.user}` via /refresh.")
-        await update_static_list_message(guild)
+
+        # 4. Update Static List Message (includes IGN cache refresh)
+        await log_info(guild, f"Interactive static list refresh initiated by `{interaction.user}` via /refresh.")
+        await update_static_list_message(guild) # This calls load_ign_cache internally
         list_update_success = True
-        print(f"Static list update triggered.")
 
-        completion_msg = f"✅ Refresh complete!\n"
-        if ai_cog and keyword_load_success:
-            completion_msg += f"- Keyword data reloaded ({len(ai_cog.keyword_data_cache)} rules).\n"
-        elif not ai_cog:
-            completion_msg += f"- Keyword data skipped (AI module not loaded).\n"
+        # --- Construct final message ---
+        completion_parts = ["✅ Refresh complete!"]
+        if ai_cog and keyword_load_success: completion_parts.append(f"- Keyword data reloaded ({len(ai_cog.keyword_data_cache)} rules).")
+        elif not ai_cog : completion_parts.append(f"- Keyword data skipped (AI module not loaded).")
         
-        if profile_pics_load_success: # <--- ADDED THIS
-            completion_msg += f"- Profile picture choices reloaded ({len(available_profile_pics_cache)} available).\n"
-        else: # Should not happen if load_profile_picture_choices is robust, but for completeness
-            completion_msg += f"- Profile picture choices reload failed or skipped.\n"
+        if profile_pics_load_success: completion_parts.append(f"- Profile picture choices reloaded ({len(available_profile_pics_cache)} available).")
+        
+        if nickname_sync_success:
+            completion_parts.append(f"- Nicknames synced: {nickname_sync_counts.get('synced',0)} successful, {nickname_sync_counts.get('failed',0)} failed (out of {nickname_sync_counts.get('total_managed',0)}).")
+        elif "nick sync skipped" in error_details:
+             completion_parts.append(f"- Nickname sync skipped (Bot permission issue).")
+        
+        completion_parts.append(f"- Interactive list & IGN cache update triggered in {list_channel.mention}.")
+        
+        if error_details: completion_parts.append(f"\n**Notes/Skips:**{error_details}")
 
-        completion_msg += f"- Interactive list update triggered in {list_channel.mention}."
-        
-        await interaction.edit_original_response(content=completion_msg, embed=None, view=None)
-        await log_info(guild, f"/refresh command confirmed complete for user {interaction.user}.")
+        await interaction.edit_original_response(content="\n".join(completion_parts), embed=None, view=None)
+        await log_info(guild, f"/refresh command completed by {interaction.user}. Details in followup ephemeral or above notes.")
 
     except Exception as e:
         action = "processing refresh" # General action
-        if not keyword_load_success and ai_cog : action = "keyword loading (via cog)"
-        elif not profile_pics_load_success and not list_update_success: action = "profile pic loading"
-        elif not list_update_success: action = "list updating"
+        # Determine more specific action if possible
+        if not keyword_load_success and ai_cog : action = "keyword loading"
+        elif not profile_pics_load_success : action = "profile pic loading"
+        elif not nickname_sync_success and "nick sync skipped" not in error_details : action = "nickname syncing"
+        elif not list_update_success : action = "list updating"
         
         error_details += f" An error occurred during {action}."
-        await log_error(guild, f"Error during /refresh process execution ({action})", error=e, interaction=interaction)
+        await log_error(guild, f"Error during /refresh process execution ({action})", error=e, interaction=interaction, ping_owner=True)
         try:
             await interaction.edit_original_response(content=f"❌ Refresh failed.{error_details}", embed=None, view=None)
         except Exception: pass
-
-
-
-# --- Sync Nicknames Command (Optimized DB Query) ---
-@tree.command(name="syncnicknames", description="Sync nicknames for users with bot-managed nickname templates.") # MODIFIED DESCRIPTION
-@app_commands.checks.has_permissions(manage_nicknames=True) 
-@app_commands.checks.bot_has_permissions(manage_nicknames=True) 
-async def syncnicknames(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    if not supabase:
-        await interaction.edit_original_response(content="❌ Database connection unavailable.")
-        await log_error(guild, "/syncnicknames failed: Supabase unavailable.", interaction=interaction)
-        return
-
-    start_time = discord.utils.utcnow()
-    await log_info(guild, f"Custom Nickname Sync initiated by `{interaction.user}`.")
-    loading_emoji = "🔄" 
-    await interaction.edit_original_response(content=f"{loading_emoji} Fetching users with managed nicknames...")
-
-    users_to_update: List[Dict[str, Any]] = []
-    try:
-        # Fetch users who have manage_nickname_by_bot = TRUE and a non-null template
-        resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
-                           .select("discord_id, ingame_name, custom_nickname_template")
-                           .eq("manage_nickname_by_bot", True)
-                           .not_.is_("custom_nickname_template", "null")
-                           .execute()
-        )
-        if resp and hasattr(resp, 'data') and resp.data:
-            users_to_update = resp.data
-        
-        total_users_to_process = len(users_to_update)
-        print(f"SyncNickCustom ({guild.name}): Found {total_users_to_process} users with bot-managed nicknames.")
-
-    except Exception as e:
-        await log_error(guild, "SyncNickCustom: Database fetch failed for managed users", error=e, interaction=interaction)
-        await interaction.edit_original_response(content="❌ Database fetch for managed users failed. Cannot proceed.")
-        return
-
-    if total_users_to_process == 0:
-        await interaction.edit_original_response(content=f"ℹ️ No users found with bot-managed nickname templates. Nothing to sync.")
-        return
-
-    await interaction.edit_original_response(content=f"{loading_emoji} Syncing {total_users_to_process} custom nicknames...")
-    
-    counts = {'proc': 0, 'upd_ok': 0, 'upd_fail_perm': 0, 'upd_fail_hier': 0, 'upd_fail_other': 0, 'no_member': 0, 'no_ign': 0}
-    bot_member = guild.me
-    bot_pos = bot_member.top_role.position
-    bot_can_manage_nicks_globally = bot_member.guild_permissions.manage_nicknames
-
-    last_prog_update_time = asyncio.get_event_loop().time()
-    update_interval = 5.0
-
-    for user_data in users_to_update:
-        counts['proc'] += 1
-        discord_id_str = user_data.get("discord_id")
-        author_ign = user_data.get("ingame_name")
-        template = user_data.get("custom_nickname_template")
-
-        if not discord_id_str or not author_ign or not template:
-            counts['no_ign'] +=1 # Or some other specific count for bad data
-            continue
-
-        member = guild.get_member(int(discord_id_str))
-        if not member:
-            counts['no_member'] += 1
-            continue
-        
-        if not bot_can_manage_nicks_globally: # Global check, stop if bot loses perm mid-sync
-            counts['upd_fail_perm'] += (total_users_to_process - counts['proc'] + 1) # Mark rest as failed
-            await log_error(guild, "SyncNickCustom: Bot lost Manage Nicknames permission mid-sync.", interaction=interaction)
-            break 
-        
-        if bot_pos <= member.top_role.position:
-            counts['upd_fail_hier'] += 1
-            continue
-        
-        try:
-            all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
-            new_nickname_unprocessed = template.replace("{satt}", str(all_time_count))
-            new_nickname = new_nickname_unprocessed[:32]
-
-            if member.nick == new_nickname:
-                # counts['upd_ok'] += 1 # Optionally count "already correct" as success
-                continue 
-
-            await member.edit(nick=new_nickname, reason=f"Custom Nickname Sync ({interaction.user.id})")
-            counts['upd_ok'] += 1
-            await asyncio.sleep(0.2) # Be gentle with API
-        except discord.Forbidden:
-            counts['upd_fail_perm'] += 1
-        except discord.HTTPException as e_http:
-            counts['upd_fail_other'] += 1 # Group HTTP with other for this summary
-            if e_http.status == 429: print(f"SyncNickCustom ({guild.name}): Rate limit hit!")
-        except Exception as e_other_nick:
-            counts['upd_fail_other'] += 1
-            await log_error(guild, f"SyncNickCustom: Unexpected error updating nick for {member.mention}", error=e_other_nick, interaction=interaction)
-
-        now = asyncio.get_event_loop().time()
-        if (now - last_prog_update_time > update_interval) or (counts['proc'] == total_users_to_process):
-             if interaction.is_expired():
-                  print(f"SyncNickCustom ({guild.name}): Interaction expired, cannot update progress.")
-                  last_prog_update_time = now + 999 
-                  continue
-             try:
-                await interaction.edit_original_response(content=f"{loading_emoji} Syncing custom nicknames... ({counts['proc']}/{total_users_to_process})")
-                last_prog_update_time = now
-             except (discord.NotFound, discord.HTTPException):
-                print(f"SyncNickCustom ({guild.name}): Progress update failed. Continuing sync...")
-                last_prog_update_time = now + 999
-
-
-    end_time = discord.utils.utcnow()
-    duration = (end_time - start_time).total_seconds()
-
-    summary_embed = discord.Embed(title="✅ Custom Nickname Sync Complete!", color=NERDY_YELLOW)
-    
-    summary_lines = [
-        f"⏱️ **Duration:** {duration:.2f} seconds",
-        f"👥 **Users with Managed Nicknames Found:** {total_users_to_process}",
-        f"📊 **Users Processed:** {counts['proc']}",
-        f"✅ **Nicknames Updated/Correct:** {counts['upd_ok']}",
-        f"ℹ️ **Skipped (No Member/IGN):** {counts['no_member'] + counts['no_ign']}",
-        f"❌ **Failed Updates:** {counts['upd_fail_perm'] + counts['upd_fail_hier'] + counts['upd_fail_other']}",
-        f"   - Permissions Error: {counts['upd_fail_perm']}",
-        f"   - Bot Hierarchy Too Low: {counts['upd_fail_hier']}",
-        f"   - Other Errors: {counts['upd_fail_other']}"
-    ]
-    summary_embed.description = "\n".join(summary_lines)
-    summary_embed.set_footer(text=f"Completed: {get_formatted_utc_now()}")
-
-    try:
-        if not interaction.is_expired():
-            await interaction.edit_original_response(content=None, embed=summary_embed)
-        else:
-            await interaction.followup.send(embed=summary_embed, ephemeral=False)
-    except Exception as e_final_send:
-        await log_error(guild, "SyncNickCustom: Could not send final summary.", error=e_final_send, embed=summary_embed, interaction=interaction)
-
-    log_embed = discord.Embed(title="Custom Nickname Sync Finished", description="\n".join(summary_lines), color=NERDY_YELLOW)
-    log_embed.set_footer(text=f"Initiated by {interaction.user} | Completed: {get_formatted_utc_now()}")
-    await log_info(guild, "", embed=log_embed)
 
 
 # --- Wither Command ---

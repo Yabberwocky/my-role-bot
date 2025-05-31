@@ -9,20 +9,7 @@
 #     - This helps ensure accuracy and minimizes integration errors.
 #
 # 2.  **HANDLING VERY LONG FUNCTIONS WITH MINOR CHANGES:**
-#     - If a function is exceptionally long (e.g., over 150-200 lines) and only
-#       a small, clearly definable portion is changed:
-#       1.  Mark the beginning and end of significant *unchanged* blocks of code
-#           within that function using comments like:
-#           ```python
-#           # // --- UNCHANGED SECTION (A) --- //
-#           # <original, unchanged code block>
-#           # // --- END UNCHANGED SECTION (A) --- //
-#           ```
-#       2.  In your narrative, *explicitly state* that "SECTION (A) (and B, C, etc.)
-#           remains unchanged."
-#       3.  Provide the rest of the function's code (the parts that *are* new or modified,
-#           plus the surrounding structure) in full.
-#     - **Use this method sparingly.** Prefer providing the whole function if the
+#     - Always provide the whole function if the
 #       changes are complex or spread out, even if it's long. The goal is clarity
 #       and ease of integration.
 #
