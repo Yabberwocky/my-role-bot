@@ -7789,10 +7789,10 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 async def on_message(message: discord.Message):
     # --- Initial Checks: Ignore self, or messages without basic properties ---
     if not message.guild or not bot.is_ready() or not bot.user or \
-       message.author.id == bot.user.id: 
+       message.author.id == bot.user.id:
         return
 
-    if message.author.bot and not message.webhook_id: 
+    if message.author.bot and not message.webhook_id:
         return
 
     # --- BEGIN JUNE FOOLS SECTION (on_message logic) ---
@@ -7802,29 +7802,24 @@ async def on_message(message: discord.Message):
             if is_june_1st_utc():
                 is_prank_active_for_guild = True
         elif message.guild.id == PRIVATE_SERVER_ID:
-            is_prank_active_for_guild = True 
+            is_prank_active_for_guild = True
 
         if is_prank_active_for_guild:
             if message.webhook_id:
-                # Check if the webhook author's name matches the global target display name.
-                # This is a heuristic to avoid processing messages from our own prank webhooks.
                 if message.author.display_name == june_fools_target_user_display_name and message.author.bot:
-                     return 
+                     return
 
             target_webhook = june_fools_channel_webhooks.get(message.channel.id)
-            
-            # If webhook not cached for this channel, try to create/retrieve it
+
             if not target_webhook and isinstance(message.channel, discord.TextChannel):
                 print(f"JuneFools: Webhook for #{message.channel.name} not cached. Attempting creation...")
-                # Ensure bot has permissions BEFORE attempting to create
-                if not message.guild.me.permissions_in(message.channel).manage_webhooks:
+                if not message.channel.permissions_for(message.guild.me).manage_webhooks:
                     print(f"JuneFools: Bot lacks Manage Webhooks permission in #{message.channel.name}. Skipping prank for this channel.")
-                    # Optionally log this error once per channel if desired, or let it be silent.
                 else:
                     webhook_for_channel = await cleanup_and_create_june_fools_webhook(
-                        bot,  # Pass the main bot instance
-                        message.channel, 
-                        june_fools_target_user_display_name, 
+                        bot,
+                        message.channel,
+                        june_fools_target_user_display_name,
                         june_fools_target_user_avatar_bytes
                     )
                     if webhook_for_channel:
@@ -7832,29 +7827,27 @@ async def on_message(message: discord.Message):
                         target_webhook = webhook_for_channel
                     else:
                         print(f"JuneFools: Failed to create/retrieve webhook for #{message.channel.name}. Prank skipped for this message.")
-                        # Error logging is handled within cleanup_and_create_june_fools_webhook
 
-            # Proceed if webhook is available (either cached or newly created)
             if target_webhook:
-                if not (message.guild.me.permissions_in(message.channel).manage_messages and \
-                        message.guild.me.permissions_in(message.channel).send_messages): # Implicitly covers webhook send
-                    # This permission check is a bit late if we just created the webhook, but good as a fallback
+                channel_perms_for_bot = message.channel.permissions_for(message.guild.me)
+                if not (channel_perms_for_bot.manage_messages and channel_perms_for_bot.send_messages):
                     await log_error(message.guild, f"JuneFools: Bot missing Manage Messages or Send Messages in #{message.channel.name}. Prank cannot proceed.", ping_owner=True)
                 else:
                     try:
                         original_content = message.content
                         original_attachments = message.attachments
-                        original_stickers = message.stickers
-                        
+                        # Stickers are part of content if they are default, or attachments if custom.
+                        # We will not explicitly try to resend stickers via a 'stickers' param.
+
                         try:
                             await message.delete()
                         except discord.Forbidden:
                             await log_error(message.guild, f"JuneFools: Forbidden to delete original message in #{message.channel.name}.")
                         except discord.NotFound:
-                            pass 
+                            pass
                         except Exception as e_del:
                             await log_error(message.guild, f"JuneFools: Error deleting original message in #{message.channel.name}.", error=e_del)
-                        
+
                         files_to_send = []
                         if original_attachments:
                             for att in original_attachments:
@@ -7862,19 +7855,41 @@ async def on_message(message: discord.Message):
                                     files_to_send.append(await att.to_file())
                                 except Exception as e_att:
                                     await log_error(message.guild, f"JuneFools: Error converting attachment {att.filename}", error=e_att)
+                        
+                        # If user sent only stickers (message.stickers is not empty, content might be empty)
+                        # and they are custom, they won't be relayed directly.
+                        # If they are default stickers, they are part of message.content.
+                        # For custom stickers, message.stickers will have items.
+                        # The current approach will send content and attachments.
+                        # If only a custom sticker was sent, original_content will be empty,
+                        # and original_attachments will be empty. The webhook would send nothing.
+                        # To relay custom stickers, we'd need to download them as images and send as files.
+                        # This adds complexity. For now, we stick to content and attachments.
+                        # If message.stickers is not empty, we can append a note.
+                        
+                        final_content_to_send = original_content
+                        if message.stickers and not original_content and not files_to_send:
+                            # User sent only stickers, and they weren't converted to files (e.g. custom stickers)
+                            # We can add a placeholder or try to get sticker name if default
+                            # For simplicity, let's just indicate a sticker was sent if content is otherwise empty
+                            sticker_names = [s.name for s in message.stickers]
+                            if sticker_names:
+                                final_content_to_send = f"(Sent sticker(s): {', '.join(sticker_names)})"
+                                if original_content: # Append if there was also text
+                                     final_content_to_send = f"{original_content}\n{final_content_to_send}"
+
 
                         await target_webhook.send(
-                            content=original_content if original_content else discord.utils.MISSING,
+                            content=final_content_to_send if final_content_to_send else discord.utils.MISSING,
                             files=files_to_send if files_to_send else discord.utils.MISSING,
-                            stickers=original_stickers if original_stickers else discord.utils.MISSING,
-                            allowed_mentions=discord.AllowedMentions.all() 
+                            # REMOVED: stickers=original_stickers if original_stickers else discord.utils.MISSING,
+                            allowed_mentions=discord.AllowedMentions.all()
                         )
-                        return 
+                        return
                     except discord.Forbidden:
                         await log_error(message.guild, f"JuneFools: Forbidden error sending via webhook in #{message.channel.name}.")
                     except discord.HTTPException as e_http:
-                        if e_http.status == 404 and e_http.code == 10015: # Unknown Webhook
-                            # Webhook was likely deleted manually, try to re-create next time
+                        if e_http.status == 404 and e_http.code == 10015:
                             print(f"JuneFools: Webhook for channel {message.channel.id} (name: {target_webhook.name}) was not found (404/10015). Removing from cache.")
                             if message.channel.id in june_fools_channel_webhooks:
                                 del june_fools_channel_webhooks[message.channel.id]
@@ -7882,54 +7897,66 @@ async def on_message(message: discord.Message):
                             await log_error(message.guild, f"JuneFools: HTTP error sending via webhook in #{message.channel.name}.", error=e_http)
                     except Exception as e:
                         await log_error(message.guild, f"JuneFools: General error relaying message in #{message.channel.name}.", error=e, ping_owner=True)
-            # else: No webhook for this channel, prank skipped.
     # --- END JUNE FOOLS SECTION (on_message logic) ---
 
     # --- Existing on_message content starts here ---
+    # (The rest of your on_message function remains unchanged)
     if not message.content and not message.attachments and not message.embeds:
         if not (message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action):
             return
 
-    guild = message.guild 
+    guild = message.guild
     channel = message.channel
-    user_id = message.author.id 
+    user_id = message.author.id
 
     if message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and \
        message.type == discord.MessageType.auto_moderation_action and \
        message.embeds:
         embed = message.embeds[0]
         original_message_content = embed.description
-        original_author_member: discord.Member = message.author
+        # original_author_member: discord.Member = message.author # This is the bot sending the automod alert
+        # We need to get the user ID from the embed fields to identify the actual user who triggered automod
+        user_id_from_field: Optional[int] = None
         original_channel_id_from_fields: Optional[int] = None
         rule_name_from_fields: Optional[str] = None
+
         for field in embed.fields:
-            if field.name == "channel_id":
+            if field.name == "user_id": # The field name for the user who triggered it
+                 try: user_id_from_field = int(field.value)
+                 except (ValueError, TypeError): pass
+            elif field.name == "channel_id":
                 try: original_channel_id_from_fields = int(field.value)
                 except (ValueError, TypeError):
                     await log_error(guild, f"ZorrRedirect: Could not parse channel_id '{field.value}' from embed field.", ping_owner=True); return
             elif field.name == "rule_name":
                 rule_name_from_fields = str(field.value).strip()
+        
+        actual_message_author: Optional[discord.Member] = None
+        if user_id_from_field and guild: # Ensure guild context for get_member
+            actual_message_author = guild.get_member(user_id_from_field)
+
         is_zorr_pro_trigger = False
         if rule_name_from_fields and "zorr.pro blocker" in rule_name_from_fields.lower(): is_zorr_pro_trigger = True
         if not original_message_content: original_message_content = "(Blocked message content was not found in the alert embed.)"
-        if original_author_member and original_channel_id_from_fields and original_message_content and is_zorr_pro_trigger:
+        
+        if actual_message_author and original_channel_id_from_fields and original_message_content and is_zorr_pro_trigger:
             if original_channel_id_from_fields == ZORR_PRO_DESIGNATED_CHANNEL_ID: return
-            original_channel_obj = guild.get_channel(original_channel_id_from_fields)
+            original_channel_obj = guild.get_channel(original_channel_id_from_fields) if guild else None
             original_channel_name_for_log = f"#{original_channel_obj.name}" if original_channel_obj else f"ID {original_channel_id_from_fields}"
-            await log_info(guild, f"ZorrRedirect: Matched AutoMod. User: {original_author_member.name}, OrigChan: {original_channel_name_for_log}")
-            designated_channel = guild.get_channel(ZORR_PRO_DESIGNATED_CHANNEL_ID)
+            await log_info(guild, f"ZorrRedirect: Matched AutoMod. User: {actual_message_author.name}, OrigChan: {original_channel_name_for_log}") # Log actual author
+            designated_channel = guild.get_channel(ZORR_PRO_DESIGNATED_CHANNEL_ID) if guild else None
             if not isinstance(designated_channel, discord.TextChannel): await log_error(guild, f"ZorrRedirect: Designated channel {ZORR_PRO_DESIGNATED_CHANNEL_ID} invalid.", ping_owner=True); return
-            bot_member = guild.me
+            bot_member = guild.me if guild else None
             if not bot_member: return
             perms_in_designated = designated_channel.permissions_for(bot_member)
             if not perms_in_designated.send_messages or not perms_in_designated.manage_webhooks: await log_error(guild, f"ZorrRedirect: Bot lacks Send/ManageWebhooks in {designated_channel.mention}.", ping_owner=True); return
-            info_message_content = (f"{original_author_member.mention}, your message related to zorr.pro was blocked in {original_channel_name_for_log}. Please discuss here in {designated_channel.mention}. I'll re-post your message:")
+            info_message_content = (f"{actual_message_author.mention}, your message related to zorr.pro was blocked in {original_channel_name_for_log}. Please discuss here in {designated_channel.mention}. I'll re-post your message:") # Mention actual author
             try: await designated_channel.send(info_message_content)
             except discord.HTTPException as e: await log_error(guild, f"ZorrRedirect: Failed to send info message to {designated_channel.mention}", error=e); return
             temp_webhook: Optional[discord.Webhook] = None
             try:
-                avatar_bytes: Optional[bytes] = None; webhook_display_name = original_author_member.display_name[:80]
-                avatar_url_to_fetch = original_author_member.display_avatar.url if original_author_member.display_avatar else original_author_member.default_avatar.url
+                avatar_bytes: Optional[bytes] = None; webhook_display_name = actual_message_author.display_name[:80] # Use actual author's name
+                avatar_url_to_fetch = actual_message_author.display_avatar.url if actual_message_author.display_avatar else actual_message_author.default_avatar.url # Use actual author's avatar
                 async with aiohttp.ClientSession() as session: avatar_bytes = await fetch_avatar_bytes(session, avatar_url_to_fetch)
                 disallowed_webhook_chars = ["@", "#", ":", "```", "discord"]
                 if any(d_char in webhook_display_name.lower() for d_char in disallowed_webhook_chars) or webhook_display_name.lower() == "clyde": webhook_display_name = "Relayed Message"
@@ -7946,10 +7973,10 @@ async def on_message(message: discord.Message):
 
     if message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
         valid_image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
-        
+
         if valid_image_attachments:
             active_session_data = guild_sync_sessions.get(user_id)
-            
+
             if active_session_data and (discord.utils.utcnow() - active_session_data['last_update_time']).total_seconds() > GUILD_SYNC_SESSION_TIMEOUT_SECONDS:
                 await log_info(guild, f"GuildSync: Stale session found for user {user_id} and cleaned up upon new message.")
                 del guild_sync_sessions[user_id]
@@ -7962,18 +7989,18 @@ async def on_message(message: discord.Message):
                 else:
                     await log_info(guild, f"GuildSync Mode: Starting new session for {message.author.name} with 10 images.")
                     asyncio.create_task(process_guild_sync_batch(message, valid_image_attachments, is_new_session=True))
-                return 
+                return
             elif active_session_data:
                 try:
                     await message.reply(
                         f"{message.author.mention} You have an active guild sync session. "
                         f"To add more screenshots, please send a message with exactly 10 images. "
                         f"Alternatively, use the buttons on my previous reply to finalize the report.",
-                        delete_after=30.0 
+                        delete_after=30.0
                     )
                 except discord.HTTPException: pass
                 return
-            else: 
+            else:
                 num_images = len(valid_image_attachments)
                 processing_reply_content = f"{message.author.mention} ⏳ Analyzing {num_images} image(s) for online player names and activity updates..."
                 processing_reply: Optional[discord.Message] = None
@@ -8017,7 +8044,7 @@ async def on_message(message: discord.Message):
                         matched_igns_lower = {ign.lower() for ign in all_matched_igns_from_all_images}
                         for raw_ai_name in all_ai_suggested_raw_names_global:
                             if raw_ai_name.lower() not in matched_igns_lower: discarded_by_cache_check.append(raw_ai_name)
-                    if discarded_by_cache_check: 
+                    if discarded_by_cache_check:
                         discarded_names_str = "\n- ".join(discord.utils.escape_markdown(d_name)[:100] for d_name in discarded_by_cache_check[:20]); log_parts = [f"AI suggested names for msg by {message.author.mention} in {message.channel.mention}", f"(Img(s): {', '.join([a.filename for a in valid_image_attachments])})", "discarded after cache check:", f"```\n- {discarded_names_str}\n```", "Raw Suggestions:", f"```\n- {chr(10).join(discord.utils.escape_markdown(s)[:100] for s in sorted(list(all_ai_suggested_raw_names_global))[:20])}\n```", f"Matched: {all_matched_igns_from_all_images or 'None'}"]; log_msg_discarded = "\n".join(log_parts); err_embed = discord.Embed(title="📝 AI Img: Discarded", description=log_msg_discarded[:4000], color=discord.Color.orange()); err_embed.timestamp = discord.utils.utcnow(); err_embed.set_footer(text=f"Msg ID: {message.id} | User: {message.author.name}"); await log_to_channel(EXTRAORDINARY_LOGS_CHANNEL_ID, guild, embed=err_embed)
                     newly_added_details: List[Dict[str, Any]] = []; already_active: List[str] = []; failed_to_add: List[str] = []
                     activity_changed = False; final_msg_obj: Optional[discord.Message] = processing_reply
@@ -8051,7 +8078,7 @@ async def on_message(message: discord.Message):
                         try: await processing_reply.edit(content=err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]), embed=None, view=None)
                         except discord.HTTPException: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
                     else: await message.reply(err_content, allowed_mentions=discord.AllowedMentions(users=[message.author]))
-            return 
+            return
 
     if message.channel.id == SUPER_ATTEMPT_CHANNEL_ID:
         if DISABLE_SUPER_ATTEMPT_LOGGING_FOR_TESTING_INSTANCE and not MANUAL_OVERRIDE_SUPER_ATTEMPT_LOGGING_IN_TESTING:
@@ -8073,12 +8100,12 @@ async def on_message(message: discord.Message):
                 except discord.HTTPException: pass; await log_error(guild, f"Super Attempt Log: Failed to get UTC date. Error: {date_error_msg}", message_context=message); return
             if not await check_supabase_available(message.channel): await log_info(guild, f"Super Attempt Log for '{petal_query_str}': Supabase unavailable."); return # type: ignore
             ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild); bot_reply_msg: Optional[discord.Message] = None
-            if len(ultra_candidates) == 1: 
+            if len(ultra_candidates) == 1:
                 chosen_petal_data = ultra_candidates[0]; chosen_petal_name_for_db = chosen_petal_data['original_full_name']; display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
                 try:
                     insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute()); attempt_db_id = None
                     if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
-                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None 
+                    if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
                     if not attempt_db_id: await log_error(guild, f"Super Attempt (single): Failed to get DB ID for {author_ign}", message_context=message);
                     try: await message.reply(f"Error saving (no DB ID). Admin notified.");
                     except discord.HTTPException: pass; await _update_reactions(message, "error"); return
@@ -8089,14 +8116,14 @@ async def on_message(message: discord.Message):
                 except Exception as e: await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_owner=True);
                 try: await message.reply(f"Error logging attempt. Admin notified.");
                 except discord.HTTPException: pass; await _update_reactions(message, "error")
-            elif len(ultra_candidates) > 1: 
+            elif len(ultra_candidates) > 1:
                 disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
                 sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj); bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view); sa_disamb_view.message = bot_reply_msg
                 await _update_reactions(message, "disambiguation")
-            else: 
+            else:
                 chosen_petal_name_for_db = "Unknown Ultra Petal"; display_friendly_name_for_reply = "Unknown Ultra"
                 await log_info(guild, f"Super Attempt: No Ultra match for '{petal_query_str}' by {author_ign}. Logging as Unknown.")
-                try: 
+                try:
                     insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute()); attempt_db_id = None
                     if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]: attempt_db_id = insert_resp.data[0]['id']
                     if not attempt_db_id: fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute()); attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
@@ -8110,14 +8137,14 @@ async def on_message(message: discord.Message):
                 except Exception as e: await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True);
                 try: await message.reply(f"Error logging unknown petal. Admin notified.");
                 except discord.HTTPException: pass; await _update_reactions(message, "error")
-            return 
+            return
 
     if channel.id == HC_MEMBER_LIST_CHANNEL_ID:
         is_main_list_message = False; active_view_data = active_static_list_views.get(HC_MEMBER_LIST_CHANNEL_ID)
         if active_view_data and active_view_data.get('message_id') == message.id: is_main_list_message = True
         if not is_main_list_message and message.author.id != bot.user.id:
             try: await message.delete(delay=AUTODELETE_DELAY_SECONDS)
-            except (discord.Forbidden, discord.NotFound): pass 
+            except (discord.Forbidden, discord.NotFound): pass
             except Exception as e_del_user: await log_error(guild, f"Error auto-deleting user message {message.id} in HC list", error=e_del_user)
         elif not is_main_list_message and message.author.id == bot.user.id and not message.interaction:
             try: await message.delete(delay=AUTODELETE_DELAY_SECONDS)
@@ -8127,7 +8154,7 @@ async def on_message(message: discord.Message):
 
     ai_cog = bot.get_cog('AICog')
     if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
-        if not message.webhook_id: 
+        if not message.webhook_id:
             await ai_cog.process_message_for_ai(message)
 
 @tree.command(name="message", description="Send a message as the bot, optionally using AI.")
