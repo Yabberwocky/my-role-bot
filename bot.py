@@ -7992,7 +7992,7 @@ async def on_message(message: discord.Message):
                                 except discord.HTTPException as e_http:
                                     if e_http.status == 404:
                                         # This is the "asset not found" error. Log as info and skip.
-                                        await log_info(message.guild, f"JuneFools: Skipping attachment {att.filename} (Asset Not Found).", message_context=message)
+                                        await log_info(message.guild, f"JuneFools: Skipping attachment {att.filename} (Asset Not Found).")
                                     else:
                                         # Other HTTP errors (e.g., rate limits, forbidden). Log as error.
                                         await log_error(message.guild, f"JuneFools: HTTP error converting attachment {att.filename}", error=e_http, message_context=message)
