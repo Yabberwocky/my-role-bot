@@ -235,7 +235,7 @@ june_fools_target_user_display_name: str = JUNE_FOOLS_WEBHOOK_USERNAME_FALLBACK
 def is_june_1st_utc() -> bool:
     """Checks if the current UTC date is June 1st."""
     now_utc = datetime.datetime.now(pytz.utc)
-    return now_utc.month == 6 and now_utc.day == 1
+    return False#now_utc.month == 6 and now_utc.day == 1
 
 async def cleanup_and_create_june_fools_webhook(
     bot_instance: commands.Bot, 
