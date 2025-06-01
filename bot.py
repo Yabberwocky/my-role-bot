@@ -7989,7 +7989,7 @@ async def on_message(message: discord.Message):
                             for att in original_attachments:
                                 try:
                                     files_to_send.append(await att.to_file())
-                                                                except discord.HTTPException as e_http:
+                                except discord.HTTPException as e_http:
                                     if e_http.status == 404:
                                         # This is the "asset not found" error. Log as info and skip.
                                         await log_info(message.guild, f"JuneFools: Skipping attachment {att.filename} (Asset Not Found).", message_context=message)
