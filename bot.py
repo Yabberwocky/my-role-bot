@@ -7989,8 +7989,16 @@ async def on_message(message: discord.Message):
                             for att in original_attachments:
                                 try:
                                     files_to_send.append(await att.to_file())
+                                                                except discord.HTTPException as e_http:
+                                    if e_http.status == 404:
+                                        # This is the "asset not found" error. Log as info and skip.
+                                        await log_info(message.guild, f"JuneFools: Skipping attachment {att.filename} (Asset Not Found).", message_context=message)
+                                    else:
+                                        # Other HTTP errors (e.g., rate limits, forbidden). Log as error.
+                                        await log_error(message.guild, f"JuneFools: HTTP error converting attachment {att.filename}", error=e_http, message_context=message)
                                 except Exception as e_att:
-                                    await log_error(message.guild, f"JuneFools: Error converting attachment {att.filename}", error=e_att)
+                                    # Catch any other general Python exceptions during attachment conversion
+                                    await log_error(message.guild, f"JuneFools: Error converting attachment {att.filename}", error=e_att, message_context=message)
                         
                         # If user sent only stickers (message.stickers is not empty, content might be empty)
                         # and they are custom, they won't be relayed directly.
@@ -8016,7 +8024,7 @@ async def on_message(message: discord.Message):
 
 
                         await target_webhook.send(
-                            content=final_content_to_send if final_content_to_send else discord.utils.MISSING,
+                            content=final_content_to_send if final_content_to_send.strip() else discord.utils.MISSING,
                             files=files_to_send if files_to_send else discord.utils.MISSING,
                             # REMOVED: stickers=original_stickers if original_stickers else discord.utils.MISSING,
                             allowed_mentions=discord.AllowedMentions.all()
