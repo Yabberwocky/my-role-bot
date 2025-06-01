@@ -1424,8 +1424,8 @@ class AddUnknownAttemptsModal(discord.ui.Modal, title="Add Unknown Super Attempt
         
         try:
             num_to_add = int(self.num_attempts_input.value)
-            if not (1 <= num_to_add <= 100): # Sensible limit
-                await interaction.followup.send("❌ Please enter a number between 1 and 100.", ephemeral=True)
+            if not (1 <= num_to_add <= 1000): # Sensible limit
+                await interaction.followup.send("❌ Please enter a number between 1 and 1000.", ephemeral=True)
                 return
         except ValueError:
             await interaction.followup.send("❌ Invalid number entered.", ephemeral=True)
