@@ -509,21 +509,19 @@ async def yabberwocky(interaction: discord.Interaction, action: str):
             continue
 
         current_nick = member.nick # Get current nickname
-        # Determine the nickname we *want* it to be for comparison/setting
-        desired_nick_for_comparison: Optional[str]
+        
+        # --- MODIFIED SKIP LOGIC ---
         if action == "yabberwocky":
-            desired_nick_for_comparison = target_nickname_value
-        else: # action == "reset"
-            # If resetting, the desired state is no nickname, which means their display_name
-            desired_nick_for_comparison = member.display_name # Discord's display_name property
-
-        # Skip if nickname is already the desired state (or cannot be changed)
-        if (current_nick == desired_nick_for_comparison) or \
-           (action == "reset" and current_nick is None and desired_nick_for_comparison == member.name):
-            # Special case for reset: if current_nick is None, and member.display_name is just member.name (no custom nickname set),
-            # then it's already "reset", so skip.
-            skipped_count += 1
-            continue
+            # If the current nickname is already 'yabberwocky', skip.
+            if current_nick == target_nickname_value:
+                skipped_count += 1
+                continue
+        elif action == "reset":
+            # If the current nickname is already None (meaning it's reset to default), skip.
+            if current_nick is None:
+                skipped_count += 1
+                continue
+        # --- END MODIFIED SKIP LOGIC ---
 
         # Check bot's hierarchy against the member
         # A bot cannot change the server owner's nickname unless the bot itself is the owner.
