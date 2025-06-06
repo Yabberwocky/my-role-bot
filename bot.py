@@ -254,6 +254,140 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+@tree.command(name="yabberwocky", description="Owner-only command to manage all server nicknames.")
+@app_commands.describe(action="Specify 'yabberwocky' to set all nicknames, or 'reset' to revert them.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Set all nicknames to 'yabberwocky'", value="yabberwocky"),
+    app_commands.Choice(name="Reset all nicknames to display names", value="reset")
+])
+async def yabberwocky(interaction: discord.Interaction, action: str):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    # Owner check
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    # Defer publicly as this will take time
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    # Bot's own member object in this guild
+    bot_member = guild.me
+
+    # Ensure bot has manage_nicknames permission
+    if not bot_member.guild_permissions.manage_nicknames:
+        await interaction.edit_original_response(
+            content="❌ I lack the `Manage Nicknames` permission to perform this action.",
+            embed=None, view=None
+        )
+        await log_error(guild, "Yabberwocky command failed: Bot missing Manage Nicknames permission.", interaction=interaction)
+        return
+
+    # Fetch all members to ensure cache is up-to-date for large guilds
+    try:
+        # Await chunking only if guild is not already chunked (e.g., if member_count > 1000)
+        # Or you can force it for consistency regardless of size for this command
+        if not guild.chunked:
+            await guild.chunk(cache=True) # Ensure cache is populated
+    except Exception as e:
+        # Log this but continue, as we'll iterate through available members
+        await interaction.edit_original_response(
+            content="⚠️ Failed to fetch all members (chunking error). Proceeding with cached members, list might be incomplete.",
+            embed=None, view=None
+        )
+        await log_error(guild, f"Yabberwocky command: Failed to chunk guild {guild.name}.", error=e, interaction=interaction)
+
+    success_count = 0
+    skipped_count = 0  # For members whose nicknames were already correct or is owner
+    failed_count = 0
+    skipped_hierarchy_count = 0 # For members whose roles are too high for the bot
+    total_members_attempted = 0
+
+    target_nickname_value: Optional[str] = None
+    action_description: str
+
+    if action == "yabberwocky":
+        target_nickname_value = "yabberwocky"
+        action_description = f"Setting all nicknames to '{target_nickname_value}'"
+    elif action == "reset":
+        target_nickname_value = None # Setting nick to None clears it, reverting to display name
+        action_description = "Resetting all nicknames to display names"
+    else:
+        await interaction.edit_original_response(
+            content="❌ Invalid action specified. Please choose 'yabberwocky' or 'reset'.",
+            embed=None, view=None
+        )
+        return
+
+    await interaction.edit_original_response(content=f"⏳ {action_description} for all members... This may take some time.")
+    await log_info(guild, f"Yabberwocky command initiated by {interaction.user.name} ({interaction.user.id}): {action_description}.")
+
+    # Iterate through all members in the guild
+    for member in guild.members:
+        # Skip other bots (but allow editing bot's own nickname)
+        if member.bot and member.id != bot_member.id:
+            continue
+
+        current_nick = member.nick # Get current nickname
+        
+        # --- MODIFIED SKIP LOGIC ---
+        if action == "yabberwocky":
+            # If the current nickname is already 'yabberwocky', skip.
+            if current_nick == target_nickname_value:
+                skipped_count += 1
+                continue
+        elif action == "reset":
+            # If the current nickname is already None (meaning it's reset to default), skip.
+            if current_nick is None:
+                skipped_count += 1
+                continue
+        # --- END MODIFIED SKIP LOGIC ---
+
+        # Check bot's hierarchy against the member
+        # A bot cannot change the server owner's nickname unless the bot itself is the owner.
+        # A bot cannot change the nickname of someone with a role higher or equal to its highest role.
+        if (member.id == guild.owner_id) or \
+           (bot_member.top_role.position <= member.top_role.position):
+            skipped_hierarchy_count += 1
+            continue
+
+        total_members_attempted += 1
+        try:
+            edit_reason = f"Command '/yabberwocky {action}' by {interaction.user.name}"
+            # Perform the nickname edit
+            await member.edit(nick=target_nickname_value, reason=edit_reason)
+            success_count += 1
+            await asyncio.sleep(0.5) # Pause to respect Discord's rate limits (0.5 seconds per user)
+        except discord.Forbidden:
+            failed_count += 1
+            await log_error(guild, f"Yabberwocky: Forbidden to change nickname for {member.name} ({member.id}).", interaction=interaction)
+        except discord.HTTPException as e:
+            failed_count += 1
+            if e.status == 429: # Rate limit hit
+                await interaction.followup.send(f"⚠️ Rate limit hit during nickname changes. Stopping to avoid further issues. {success_count} nicknames changed so far.", ephemeral=False)
+                await log_error(guild, f"Yabberwocky: Rate limit hit (429) during nickname changes. Total changed: {success_count}.", error=e, interaction=interaction)
+                break # Exit loop on rate limit
+            else:
+                await log_error(guild, f"Yabberwocky: HTTP error changing nickname for {member.name} ({member.id}).", error=e, interaction=interaction)
+        except Exception as e:
+            failed_count += 1
+            await log_error(guild, f"Yabberwocky: Unexpected error changing nickname for {member.name} ({member.id}).", error=e, interaction=interaction, ping_owner=True)
+            
+    final_summary_content = f"✅ Yabberwocky command `{action}` completed.\n\n"
+    final_summary_content += f"- **Attempted changes:** {total_members_attempted}\n"
+    final_summary_content += f"- **Successful changes:** {success_count}\n"
+    final_summary_content += f"- **Skipped (already correct):** {skipped_count}\n"
+    if skipped_hierarchy_count > 0:
+        final_summary_content += f"- **Skipped (bot hierarchy too low or owner):** {skipped_hierarchy_count}\n"
+    if failed_count > 0:
+        final_summary_content += f"- **Failed (see logs):** {failed_count}"
+
+    await interaction.edit_original_response(content=final_summary_content, embed=None, view=None)
+    await log_info(guild, f"Yabberwocky command `{action}` completed for {interaction.user.name}: Success={success_count}, Skipped={skipped_count}, Hierarchy_Skipped={skipped_hierarchy_count}, Failed={failed_count}.")
+
 class GuildSyncInProgressView(discord.ui.View):
     def __init__(self, original_author_id: int, session_id: int): # session_id is user_id
         super().__init__(timeout=GUILD_SYNC_SESSION_TIMEOUT_SECONDS)
@@ -1111,8 +1245,8 @@ class AddUnknownAttemptsModal(discord.ui.Modal, title="Add Unknown Super Attempt
         
         try:
             num_to_add = int(self.num_attempts_input.value)
-            if not (1 <= num_to_add <= 100): # Sensible limit
-                await interaction.followup.send("❌ Please enter a number between 1 and 100.", ephemeral=True)
+            if not (1 <= num_to_add <= 1000): # Sensible limit
+                await interaction.followup.send("❌ Please enter a number between 1 and 1000.", ephemeral=True)
                 return
         except ValueError:
             await interaction.followup.send("❌ Invalid number entered.", ephemeral=True)
