@@ -8824,7 +8824,7 @@ async def process_super_crafts(interaction: discord.Interaction):
     TARGET_CHANNEL_ID = 1258879589430591539
     TARGET_WEBHOOK_ID = 1258879706447745084
     try:
-        start_date = datetime.datetime(2025, 3, 14, 0, 0, 0, tzinfo=pytz.utc)
+        start_date = datetime.datetime(2025, 4, 30, 0, 0, 0, tzinfo=pytz.utc)
     except Exception as e:
         await interaction.response.send_message(f"❌ Internal error creating start date: {e}", ephemeral=True)
         return
