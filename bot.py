@@ -1857,30 +1857,6 @@ async def find_ultra_petal_candidates_for_query(petal_query_str: str, guild_for_
     
     return candidates
 
-async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str]:
-    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
-        print("[CHECK ULTRA] Cache and additional names list empty.")
-        return None
-
-    normalized_base_to_find = base_petal_name_to_find.lower().strip()
-
-    # Check image cache first
-    if available_profile_pics_cache:
-        for original_full_name, folder_id, _ in available_profile_pics_cache:
-            if folder_id == PETALS_FOLDER_NAME and original_full_name.lower().startswith("ultra "):
-                base_name_of_this_cached_ultra = _preprocess_petal_name_for_search(original_full_name)
-                if base_name_of_this_cached_ultra == normalized_base_to_find:
-                    return original_full_name 
-    
-    # Check additional names list
-    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
-        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
-        if base_name_of_additional == normalized_base_to_find:
-            # Return a consistent "Ultra" formatted name
-            return f"Ultra {additional_petal_name.title()}" 
-    
-    return None
-
 async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict[str, Any]:
     if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
         return {'status': 'cache_not_ready'}
@@ -1992,11 +1968,10 @@ async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str
     Returns:
         The original_full_name (e.g., "Ultra Lotus Petal") from the cache if an Ultra version
         of the base_petal_name_to_find is found, otherwise None.
-    """
-    if not available_profile_pics_cache:
+    """ # MODIFIED
+    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES: # MODIFIED
         print("[CHECK ULTRA] Cache not ready for check_ultra_petal_exists.")
         return None
-
     normalized_base_to_find = base_petal_name_to_find.lower().strip()
 
     for original_full_name, folder_id, _ in available_profile_pics_cache:
@@ -2009,7 +1984,14 @@ async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str
                 if base_name_of_this_cached_ultra == normalized_base_to_find:
                     print(f"[CHECK ULTRA] Found Ultra for base '{normalized_base_to_find}': '{original_full_name}'")
                     return original_full_name # Return the full name from cache, e.g., "Ultra Lotus Petal"
-    
+
+    # MODIFIED: Check additional names list if not found in cache
+    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
+        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
+        if base_name_of_additional == normalized_base_to_find:
+            # Return a consistent "Ultra" formatted name
+            return f"Ultra {additional_petal_name.title()}"
+            
     print(f"[CHECK ULTRA] No Ultra version found in cache for base name: '{normalized_base_to_find}'")
     return None
 
@@ -8810,7 +8792,6 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
         # update_custom_nickname_on_attempt logs the actual change.
         response_message_parts.append(f"ℹ️ Nickname update based on new settings has been processed. Check server for changes.")
 
-
     except Exception as e:
         await log_error(guild, f"Error saving nickname settings for {target_user.mention}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An error occurred while saving your nickname settings.", ephemeral=True)
@@ -8818,6 +8799,172 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
 
     await interaction.followup.send("\n".join(response_message_parts), ephemeral=True)
     await log_info(guild, f"`{interaction.user}` used /setnickname for {target_user.mention}. Manage: {manage_by_bot_new_value}, Template: '{template_to_store}'.")
+
+@tree.command(name="process_super_crafts", description="[Owner Only] One-time command to process historical super crafts.")
+async def process_super_crafts(interaction: discord.Interaction):
+    """
+    Processes historical messages for successful super petal crafts,
+    extracts the data, and stores it in the `super_craft_logs` table.
+    This is a temporary, owner-only command for a one-time data migration.
+    """
+    # 1. Owner and Environment Check
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if not guild or guild.id != CATERCORD_GUILD_ID:
+        await interaction.response.send_message("❌ This command must be run in the Catercord server.", ephemeral=True)
+        return
+
+    if not await check_supabase_available(interaction):
+        return
+
+    # 2. Hardcoded Configuration
+    TARGET_CHANNEL_ID = 1258879589430591539
+    TARGET_WEBHOOK_ID = 1258879706447745084
+    try:
+        start_date = datetime.datetime(2025, 3, 14, 0, 0, 0, tzinfo=pytz.utc)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Internal error creating start date: {e}", ephemeral=True)
+        return
+
+    target_channel = guild.get_channel(TARGET_CHANNEL_ID)
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message(f"❌ Cannot find the target channel (ID: {TARGET_CHANNEL_ID}).", ephemeral=True)
+        return
+
+    # 3. Initial Deferral and User Feedback
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    initial_message = (
+        f"✅ Roger that. Starting the new, more robust process.\n"
+        f"I will scan all messages in {target_channel.mention} created after **{start_date.strftime('%d %B %Y at %H:%M UTC')}**.\n"
+        f"I will now **skip any message I have already reacted to with '✅'**.\n\n"
+        f"This will take a while. I'll update you here with progress and print detailed logs to the console."
+    )
+    await interaction.edit_original_response(content=initial_message)
+    print(f"--- Starting Super Craft Processing. Will fetch messages after {start_date.isoformat()} ---")
+
+    # 4. Processing Logic
+    processed_count = 0
+    skipped_author_count = 0
+    skipped_format_count = 0
+    skipped_duplicate_count = 0
+    skipped_checkmark_count = 0 # New counter
+    failed_db_count = 0
+    total_messages_scanned = 0
+    
+    craft_pattern = re.compile(r"A (.+?) has been crafted by ([a-zA-Z0-9_]+)", re.IGNORECASE)
+
+    try:
+        async for message in target_channel.history(limit=None, after=start_date, oldest_first=True):
+            total_messages_scanned += 1
+            print(f"\n[SCANNING] Msg ID: {message.id} | Date: {message.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')} | Author: {message.author.id}")
+
+            # --- NEW: Check for existing bot '✅' reaction ---
+            has_bot_checkmark = False
+            for reaction in message.reactions:
+                if str(reaction.emoji) == '✅' and reaction.me:
+                    has_bot_checkmark = True
+                    break
+            
+            if has_bot_checkmark:
+                skipped_checkmark_count += 1
+                print(f"  [SKIP] Reason: Already processed (bot has '✅' reaction).")
+                continue
+            # --- END NEW CHECK ---
+
+            if message.author.id != TARGET_WEBHOOK_ID:
+                skipped_author_count += 1
+                print(f"  [SKIP] Reason: Author ID {message.author.id} does not match target webhook {TARGET_WEBHOOK_ID}.")
+                continue
+
+            match = craft_pattern.search(message.content)
+            if not match:
+                skipped_format_count += 1
+                print(f"  [SKIP] Reason: Format mismatch. Content: \"{message.content[:100]}\"")
+                continue
+
+            super_petal_name = match.group(1).strip()
+            player_ign = match.group(2).strip()
+            craft_date = message.created_at.date()
+
+            print(f"  [MATCH] Petal: '{super_petal_name}', Player: '{player_ign}'. Attempting to log...")
+
+            data_to_insert = {
+                "player_ign": player_ign,
+                "super_petal_name": super_petal_name,
+                "craft_date": craft_date.isoformat(),
+                "original_message_id": str(message.id),
+                "processed_by_id": str(interaction.user.id)
+            }
+
+            try:
+                await run_supabase_sync(
+                    lambda: supabase.table("super_craft_logs").insert(data_to_insert).execute()
+                )
+                processed_count += 1
+                print(f"    [SUCCESS] Logged to database.")
+
+                try:
+                    await message.add_reaction('✅')
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+            except APIError as e:
+                if "duplicate key value violates unique constraint" in str(e.message):
+                    skipped_duplicate_count += 1
+                    print(f"    [SKIP] Reason: Duplicate entry (message already processed in DB).")
+                else:
+                    failed_db_count += 1
+                    print(f"    [FAIL] Reason: Database API Error! Message: {e.message}")
+                    await log_error(guild, f"Super Craft Processor DB Error on msg {message.id}: {e.message}", error=e)
+            except Exception as e:
+                failed_db_count += 1
+                print(f"    [FAIL] Reason: Unknown database error! Type: {type(e).__name__}")
+                await log_error(guild, f"Super Craft Processor Unknown DB Error on msg {message.id}", error=e)
+            
+            if total_messages_scanned % 100 == 0:
+                progress_content = (
+                    f"⏳ **In Progress...**\n"
+                    f"- Messages Scanned: `{total_messages_scanned}`\n"
+                    f"- Crafts Logged: `{processed_count}`\n"
+                    f"- Skipped (Already ✓): `{skipped_checkmark_count}`\n"
+                    f"- Skipped (Wrong Author): `{skipped_author_count}`\n"
+                    f"- Skipped (Wrong Format): `{skipped_format_count}`\n"
+                    f"- Skipped (Duplicate in DB): `{skipped_duplicate_count}`\n"
+                    f"- DB Fails: `{failed_db_count}`"
+                )
+                await interaction.edit_original_response(content=progress_content)
+                await asyncio.sleep(0.5)
+
+        # 5. Final Report
+        print("\n--- Finished Super Craft Processing ---")
+        final_embed = discord.Embed(
+            title="✅ Super Craft Processing Complete",
+            color=NERDY_YELLOW,
+            timestamp=discord.utils.utcnow()
+        )
+        final_embed.add_field(name="Total Messages Scanned", value=f"`{total_messages_scanned}`", inline=False)
+        final_embed.add_field(name="✅ New Crafts Logged", value=f"`{processed_count}`", inline=True)
+        final_embed.add_field(name="ℹ️ Skipped (Already ✓)", value=f"`{skipped_checkmark_count}`", inline=True)
+        final_embed.add_field(name="ℹ️ Skipped (Wrong Author)", value=f"`{skipped_author_count}`", inline=True)
+        final_embed.add_field(name="ℹ️ Skipped (Wrong Format)", value=f"`{skipped_format_count}`", inline=True)
+        final_embed.add_field(name="ℹ️ Skipped (Duplicate in DB)", value=f"`{skipped_duplicate_count}`", inline=True)
+        
+        if failed_db_count > 0:
+            final_embed.add_field(name="❌ DB/Insert Failures", value=f"`{failed_db_count}` (check logs)", inline=True)
+            final_embed.color = discord.Color.orange()
+
+        await interaction.edit_original_response(content="Processing finished! Here is the final report:", embed=final_embed)
+        await log_info(guild, f"Super Craft Processing command finished. Final counts: Scanned={total_messages_scanned}, Logged={processed_count}, Skipped(✓)={skipped_checkmark_count}, Skipped(Author)={skipped_author_count}, Skipped(Format)={skipped_format_count}, Skipped(Dup)={skipped_duplicate_count}, Failed={failed_db_count}")
+
+    except Exception as e:
+        await log_error(guild, "A critical error occurred during the /process_super_crafts command.", error=e, interaction=interaction, ping_owner=True)
+        await interaction.edit_original_response(
+            content=f"❌ A critical error stopped the process: `{type(e).__name__}`. Please check the bot logs.",
+            embed=None
+        )
 
 # --- Bot Startup ---
 if __name__ == "__main__":
