@@ -243,6 +243,7 @@ M28_SERVER_TIMEOUT_SECONDS = 300
 M28_API_HEADERS = {'User-Agent': 'TheNerdsPingslave/1.0 (DiscordBot)'}
 SERVER_CONFIGS_TABLE_NAME = "server_configs"
 ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
+m28_scrape_counter = 0
 
 
 # --- Supabase Client ---
@@ -503,24 +504,28 @@ class ServerCodeView(discord.ui.View):
 async def scrape_and_clean_m28_servers():
     """
     Scrapes all map endpoints for server data and updates the global list.
-    This function is called by the background task.
     """
     global m28_server_list
 
-    map_ids_to_query = range(8)  # Maps 0 through 7
+    map_ids_to_query = range(8)
     tasks = []
 
     try:
         async with aiohttp.ClientSession(headers=M28_API_HEADERS) as session:
             for map_id in map_ids_to_query:
-                tasks.append(query_m28_map_endpoint(session, map_id))
-            
+                # Pass the session and map_id to the query function
+                task = asyncio.create_task(query_m28_map_endpoint(session, map_id))
+                tasks.append(task)
+                
+                # --- ADD THIS DELAY ---
+                # Add a small delay between starting each API call to be gentler.
+                await asyncio.sleep(1) 
+                # ---------------------
+
             await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
-        # Log error if the entire session or gather fails
         print(f"M28 Scraper: Main scraping session failed: {e}")
-        # Use log_error if a guild context is available, otherwise just print
         if bot.guilds:
             await log_error(bot.get_guild(CATERCORD_GUILD_ID), "M28 Scraper: Main scraping session failed.", error=e)
 
@@ -555,21 +560,52 @@ async def query_m28_map_endpoint(session: aiohttp.ClientSession, map_id: int):
     except Exception as e:
         print(f"M28 Scraper: Error processing map {map_id}: {e}")
 
-@tasks.loop(seconds=30)
+@tasks.loop(minutes=1.0) # Run this check every minute
 async def m28_server_scraper():
-    """Background task to periodically scrape servers and clean up stale entries."""
-    global m28_server_list
+    """
+    Background task to periodically scrape servers.
+    Scrapes Ant Hell every minute and all other maps every 5 minutes.
+    """
+    global m28_server_list, m28_scrape_counter
     
     await bot.wait_until_ready()
-    print("M28 Scraper: Running periodic server scrape and cleanup...")
+    print("M28 Scraper: Running periodic server scrape check...")
     
-    await scrape_and_clean_m28_servers()
+    ant_hell_map_id = 4 # The ID for Ant Hell from ServerCodeView.MAP_ID_MAP
+    map_ids_to_query = []
 
-    # --- Cleanup Stale Servers ---
+    # The counter increments each minute.
+    # On the first run (0) and every 5th run, scrape all maps.
+    if m28_scrape_counter % 5 == 0:
+        print("M28 Scraper: Performing full scrape (all maps).")
+        map_ids_to_query = range(8) # All maps from 0 to 7
+    else:
+        # On other minutes, only scrape Ant Hell.
+        print(f"M28 Scraper: Performing partial scrape (Ant Hell only).")
+        map_ids_to_query = [ant_hell_map_id]
+
+    # --- Scrape the selected maps ---
+    tasks = []
+    try:
+        async with aiohttp.ClientSession(headers=M28_API_HEADERS) as session:
+            for map_id in map_ids_to_query:
+                tasks.append(asyncio.create_task(query_m28_map_endpoint(session, map_id)))
+                await asyncio.sleep(0.5) # Gentle delay between each request
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    except Exception as e:
+        print(f"M28 Scraper: Main scraping session failed: {e}")
+        if bot.guilds:
+            await log_error(bot.get_guild(CATERCORD_GUILD_ID), "M28 Scraper: Main scraping session failed.", error=e)
+            
+    # Increment the counter for the next run
+    m28_scrape_counter += 1
+
+    # --- Cleanup Stale Servers (runs every minute regardless of which maps were scraped) ---
     stale_servers = []
     current_time = discord.utils.utcnow().timestamp()
     
-    # It's safer to not modify the dict while iterating over it.
     async with m28_server_list_lock:
         for server_id, details in m28_server_list.items():
             if (current_time - details.get("timestamp", 0)) > M28_SERVER_TIMEOUT_SECONDS:
@@ -581,7 +617,7 @@ async def m28_server_scraper():
                 if server_id in m28_server_list:
                     del m28_server_list[server_id]
                     
-    print(f"M28 Scraper: Scrape complete. Total servers tracked: {len(m28_server_list)}")
+    print(f"M28 Scraper: Scrape check complete. Total servers tracked: {len(m28_server_list)}")
 
 async def handle_zorr_pro_automod(message: discord.Message):
     """Handles the zorr.pro automod alert by relaying the message."""
@@ -5168,32 +5204,16 @@ async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], messag
 
 # --- REVISED log_info ---
 async def log_info(guild: Optional[discord.Guild], message: str, embed: Optional[discord.Embed] = None):
-    """Logs an info message. Sends to Discord channel only if in the target guild, otherwise prints to console."""
-    is_target = guild and guild.id == CATERCORD_GUILD_ID
-
+    """
+    Logs an info message. Prints to console ONLY. Discord logging is disabled.
+    """
     log_prefix = f"[{guild.name if guild else 'No Guild'}] INFO:"
-    if not is_target:
-        log_prefix = f"[Console Log Only - Non-Target Guild] INFO:"
-
-    # Print to console regardless
+    
+    # Always print to console
     print(f"{log_prefix} {message}")
-    if embed:
-        # Basic console representation of embed title/desc if printing only
-        embed_title = getattr(embed, 'title', None)
-        embed_desc = getattr(embed, 'description', None)
-        if embed_title: print(f"{log_prefix} Embed Title: {embed_title}")
-        if embed_desc: print(f"{log_prefix} Embed Desc: {embed_desc[:200]}{'...' if len(embed_desc) > 200 else ''}")
-
-    # Only attempt Discord channel logging if in the target guild
-    if is_target and guild: # Ensure guild object exists for log_to_channel
-        if not embed:
-            embed = discord.Embed(description=message, color=NERDY_YELLOW)
-            embed.timestamp = discord.utils.utcnow()
-        # Use log_to_channel but target INFO channel and no ping
-        await log_to_channel(ORDINARY_LOGS_CHANNEL_ID, guild, embed=embed, ping_mention=None)
-    # else:
-    #     print(f"[Skipping Discord log - Non-Target Guild or No Guild] INFO: {message}") # Optional extra console print
-
+    
+    # The Discord channel logging part has been completely removed.
+    
 # --- REVISED log_error ---
 async def log_error(
     guild: Optional[discord.Guild], 
