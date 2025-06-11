@@ -250,6 +250,18 @@ if SUPABASE_URL and SUPABASE_ADMIN_KEY:
     try: supabase = create_client(SUPABASE_URL, SUPABASE_ADMIN_KEY); print("Supabase client created successfully.")
     except Exception as e: print(f"CRITICAL: Failed Supabase client creation: {e}"); supabase = None
 else: print("CRITICAL: Supabase credentials missing."); supabase = None
+FLORR_ANNOUNCEMENT_TEMPLATES = {
+    "Rarities": {
+        "Common": {"Name": "Common", "ArticleUpper": "A"}, "Uncommon": {"Name": "Uncommon", "ArticleUpper": "An"},
+        "Rare": {"Name": "Rare", "ArticleUpper": "A"}, "Epic": {"Name": "Epic", "ArticleUpper": "An"},
+        "Legendary": {"Name": "Legendary", "ArticleUpper": "A"}, "Mythic": {"Name": "Mythic", "ArticleUpper": "A"},
+        "Ultra": {"Name": "Ultra", "ArticleUpper": "An"}, "Super": {"Name": "Super", "ArticleUpper": "A"},
+        "Unique": {"Name": "Unique", "ArticleUpper": "A"}
+    },
+    "Chat": {
+        "MobDefeated": "A {rarity} {mob} has been defeated by {players}!"
+    }
+}
 
 # --- Discord Setup ---
 intents = discord.Intents.default()
@@ -275,6 +287,49 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def _format_announcement(data: Dict[str, Any]) -> str:
+    """Formats an announcement string based on classified data and templates."""
+    category = data.get('category')
+    
+    if category == 'super_craft':
+        rarity_info = FLORR_ANNOUNCEMENT_TEMPLATES["Rarities"].get(data.get('rarity', ''), {})
+        article = rarity_info.get("ArticleUpper", "A")
+        rarity_name = rarity_info.get("Name", data.get('rarity'))
+        petal_name = data.get('petal', 'Unknown Petal')
+        player = data.get('player')
+        
+        if data.get('rarity') == "Unique":
+            return f"The Unique {petal_name} has been forged by {player}!" if player else f"The Unique {petal_name} has been forged!"
+        else:
+            return f"{article} {rarity_name} {petal_name} has been crafted by {player}!" if player else f"{article} {rarity_name} {petal_name} has been crafted!"
+
+    elif category == 'super_spawn':
+        rarity_info = FLORR_ANNOUNCEMENT_TEMPLATES["Rarities"].get(data.get('rarity', ''), {})
+        article = rarity_info.get("ArticleUpper", "A")
+        rarity_name = rarity_info.get("Name", data.get('rarity'))
+        mob_name = data.get('mob', 'Unknown Mob').replace('_', ' ').title()
+        return f"{article} {rarity_name} {mob_name} has spawned!"
+
+    elif category == 'super_defeat':
+        rarity_info = FLORR_ANNOUNCEMENT_TEMPLATES["Rarities"].get(data.get('rarity', ''), {})
+        article = rarity_info.get("ArticleUpper", "A")
+        rarity_name = rarity_info.get("Name", data.get('rarity'))
+        mob_name = data.get('mob', 'Unknown Mob').replace('_', ' ').title()
+        players = data.get('players', [])
+        
+        if not players:
+            return f"{article} {rarity_name} {mob_name} has been defeated!"
+        elif len(players) == 1:
+            player_str = players[0]
+        elif len(players) == 2:
+            player_str = f"{players[0]} and {players[1]}"
+        else:
+            player_str = ", ".join(players[:-1]) + f", and {players[-1]}"
+            
+        return FLORR_ANNOUNCEMENT_TEMPLATES["Chat"]["MobDefeated"].format(rarity=rarity_name, mob=mob_name, players=player_str)
+        
+    return "Could not format announcement."
 
 async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Member):
     """Syncs a single user's roles based on their database state."""
@@ -1091,67 +1146,56 @@ async def process_self_bot_messages():
         item = self_bot_queue.get_nowait()
         category = item.get('category')
         
+        # --- Console Logging ---
         print("\n--- [Self-Bot Processor] ---")
+        print(f"✅ Classified as: {category}")
+        for key, value in item.items():
+            if key != 'category':
+                print(f"   - {key.replace('_', ' ').title()}: {value}")
         
+        # --- Channel Logging for Crafts ---
         if category == 'super_craft':
-            player_ign = item.get('player')
-            petal_name = item.get('petal')
-            rarity = item.get('rarity')
-            message_id = item.get('original_message_id')
-            timestamp_str = item.get('timestamp')
-            
-            print(f"✅ Classified as: Super Petal Craft")
-            print(f"   - Rarity: {rarity}")
-            print(f"   - Petal: {petal_name}")
-            print(f"   - Player: {player_ign}")
-
-            try:
-                craft_date = date_parse(timestamp_str).date()
-            except (ValueError, TypeError):
-                print(f"   [DB LOG FAIL] Could not parse date from timestamp: {timestamp_str}")
-                await log_error(None, f"Self-bot DB log failed for craft event: Cannot parse date. Timestamp: {timestamp_str}")
+            CRAFT_NOTIFY_GUILD_ID = 1332980983003349012
+            CRAFT_NOTIFY_CHANNEL_ID = 1382246434513879091
+            target_guild = bot.get_guild(CRAFT_NOTIFY_GUILD_ID)
+            if not target_guild:
+                print("   [LOG FAIL] Craft log guild not found.")
+                self_bot_queue.task_done()
                 return
 
-            data_to_insert = {
-                "player_ign": player_ign,
-                "super_petal_name": f"{rarity} {petal_name}",
-                "craft_date": craft_date.isoformat(),
-                "original_message_id": message_id,
-                "processed_by_id": str(BOT_USER_ID) if BOT_USER_ID else None
-            }
+            target_channel = target_guild.get_channel(CRAFT_NOTIFY_CHANNEL_ID)
+            if not isinstance(target_channel, discord.TextChannel):
+                print("   [LOG FAIL] Craft log channel not found or invalid.")
+                self_bot_queue.task_done()
+                return
 
-            try:
-                print(f"   -> Attempting to log to 'super_craft_logs' table for {player_ign}...")
-                await run_supabase_sync(
-                    lambda: supabase.table("super_craft_logs").insert(data_to_insert).execute()
-                )
-                print("   [DB LOG SUCCESS] Craft successfully logged to the database.")
-            except APIError as e:
-                if "duplicate key value violates unique constraint" in e.message and "super_craft_logs_original_message_id_key" in e.message:
-                    print(f"   [DB LOG INFO] Skipped duplicate craft entry (Message ID: {message_id}).")
-                else:
-                    print(f"   [DB LOG FAIL] Error inserting super craft log: {e}")
-                    await log_error(None, f"Failed to log super craft for IGN '{player_ign}'", error=e)
-            except Exception as e:
-                print(f"   [DB LOG FAIL] Error inserting super craft log: {e}")
-                await log_error(None, f"Failed to log super craft for IGN '{player_ign}'", error=e)
+            formatted_text = await _format_announcement(item)
+            server_info = f" (Server: {item.get('server')})" if item.get('server') else ""
+            final_message = f"**Craft Announcement{server_info}:**\n> {formatted_text}"
+            
+            print(f"   -> Formatted Message: {final_message}")
 
-        elif category == 'super_spawn':
-            print(f"✅ Classified as: Super Mob Spawn")
-            print(f"   - Mob: {item.get('mob')}")
-
-        elif category == 'super_defeat':
-            print(f"✅ Classified as: Super Mob Defeat")
-            print(f"   - Mob: {item.get('mob')}")
-            print(f"   - Players: {', '.join(item.get('players', []))}")
+            webhook = await get_or_create_webhook(target_channel, "craft_notify", "Florr Crafts", bot.user.display_avatar.url if bot.user else None)
+            if webhook:
+                try:
+                    await webhook.send(final_message)
+                    print("   [LOG SUCCESS] Craft notification sent to channel.")
+                except Exception as e:
+                    print(f"   [LOG FAIL] Webhook send failed: {e}")
+            else:
+                 print("   [LOG FAIL] Could not get webhook for craft notifications.")
 
         elif category == 'unclassified':
-            print(f"⚠️ Could not be classified.")
-            print(f"   - Full Text: \"{item.get('text')}\"")
-        
-        else:
-            print(f"❌ Unknown category received: {item}")
-        
+             print("   [ACTION] This event could not be classified. Logging to extraordinary logs.")
+             embed = discord.Embed(
+                 title="🕵️ Unclassified Self-Bot Event",
+                 description=f"The listener could not classify the following event text:\n```\n{item.get('text', 'No text found.')}\n```",
+                 color=discord.Color.orange()
+             )
+             embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
+             embed.set_footer(text="Please review the listener's classification logic.")
+             await log_error(None, "Unclassified Self-Bot Event", embed=embed)
+
         print("----------------------------\n")
         self_bot_queue.task_done()
 
