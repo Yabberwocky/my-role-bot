@@ -8220,6 +8220,10 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
 @bot.event
 async def on_message(message: discord.Message):
+
+    # --- THIS IS THE NEW ONE-LINE CHANGE ---
+    if BOT_INSTANCE_TYPE == "TESTING" and message.guild and message.guild.id == 1379818967417491466: message.guild.id = CATERCORD_GUILD_ID
+
     if not message.guild or not bot.is_ready() or not bot.user or \
        message.author.id == bot.user.id or (message.author.bot and not message.webhook_id):
         return
@@ -9088,87 +9092,83 @@ class CustomiseGroup(app_commands.Group):
 
         embed = discord.Embed(title=f"⚙️ Current Settings for {interaction.guild.name}", color=NERDY_YELLOW)
         
-        # Toggles
+        # --- Toggles Field ---
         kw_status = "✅ Enabled" if config.get('keywords_enabled', True) else "❌ Disabled"
         wither_status = "✅ Enabled" if config.get('wither_command_enabled', True) else "❌ Disabled"
         profile_status = "✅ Enabled" if config.get('profile_command_enabled', True) else "❌ Disabled"
         servercodes_status = "✅ Enabled" if config.get('servercodes_command_enabled', True) else "❌ Disabled"
-        embed.add_field(name="Feature Toggles", value=f"Keywords: {kw_status}\nWither Cmd: {wither_status}\nProfile Cmd: {profile_status}\nServerCodes Cmd: {servercodes_status}", inline=False)
+        toggles_val = (
+            f"Keywords: {kw_status}\n"
+            f"Wither Cmd: {wither_status}\n"
+            f"Profile Cmd: {profile_status}\n"
+            f"ServerCodes Cmd: {servercodes_status}\n"
+            f"*(Manage with {get_cmd_mention('customise toggle_feature')})*"
+        )
+        embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
 
-        # Channels
+        # --- Channels Field ---
         ss_chan = interaction.guild.get_channel(config.get('screenshots_dropbox_channel_id')) if config.get('screenshots_dropbox_channel_id') else None
         satt_chan = interaction.guild.get_channel(config.get('super_attempts_channel_id')) if config.get('super_attempts_channel_id') else None
         ai_chans_ids = config.get('always_on_ai_channels', [])
         ai_chans_mentions = [f"<#{cid}>" for cid in ai_chans_ids] if ai_chans_ids else ["`None Set`"]
-        embed.add_field(name="Channel Config", value=f"Screenshot Dropbox: {ss_chan.mention if ss_chan else '`Not Set`'}\nSuper Attempts: {satt_chan.mention if satt_chan else '`Not Set`'}\nAlways-On AI: {', '.join(ai_chans_mentions)}", inline=False)
-
-        # Permissions
+        channels_val = (
+            f"Screenshot Dropbox: {ss_chan.mention if ss_chan else '`Not Set`'}\n"
+            f"Super Attempts: {satt_chan.mention if satt_chan else '`Not Set`'}\n"
+            f"Always-On AI: {', '.join(ai_chans_mentions)}\n"
+            f"*(Manage with {get_cmd_mention('customise set_channel')} and {get_cmd_mention('customise set_ai_channels')})*"
+        )
+        embed.add_field(name="Channel Config", value=channels_val, inline=False)
+        
+        # --- Permissions Field ---
         florr_role = interaction.guild.get_role(config.get('florr_command_role_id')) if config.get('florr_command_role_id') else None
         imitate_role = interaction.guild.get_role(config.get('imitate_command_role_id')) if config.get('imitate_command_role_id') else None
-        embed.add_field(name="Command Permissions", value=f"/florr Role: {florr_role.mention if florr_role else '`Staff Only`'}\n/imitate Role: {imitate_role.mention if imitate_role else '`Staff Only`'}", inline=False)
+        perms_val = (
+            f"/florr Role: {florr_role.mention if florr_role else '`Staff Only`'}\n"
+            f"/imitate Role: {imitate_role.mention if imitate_role else '`Staff Only`'}\n"
+            f"*(Manage with {get_cmd_mention('customise set_permission')})*"
+        )
+        embed.add_field(name="Command Permissions", value=perms_val, inline=False)
         
-        # Tracked Guilds
+        # --- Tracked Guilds Field ---
         tracked_guilds = config.get('tracked_guilds', {})
         if not tracked_guilds:
-            embed.add_field(name="Tracked Florr Guilds", value="`None`", inline=False)
+            tracked_val = f"`None`\n*(Manage with {get_cmd_mention('customise tracked_guild add')})*"
+            embed.add_field(name="Tracked Florr Guilds", value=tracked_val, inline=False)
         else:
             tg_lines = []
             for tag, data in tracked_guilds.items():
                 role = interaction.guild.get_role(data.get('discord_role_id'))
                 chan = interaction.guild.get_channel(data.get('member_list_channel_id'))
                 tg_lines.append(f"**{tag}**: Role: {role.mention if role else '`Not Set`'}, List Chan: {chan.mention if chan else '`Not Set`'}")
+            tg_lines.append(f"*(Manage with {get_cmd_mention('customise tracked_guild')})*")
             embed.add_field(name=f"Tracked Florr Guilds ({len(tracked_guilds)})", value="\n".join(tg_lines), inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="toggle_keywords", description="[Admin] Enable or disable AI keyword-triggered responses.")
-    @app_commands.describe(enabled="Set to 'True' to enable keywords, 'False' to disable.")
+    @app_commands.command(name="toggle_feature", description="[Admin] Enable or disable a specific bot feature.")
+    @app_commands.describe(
+        feature="The feature to enable or disable.",
+        enabled="Set to 'True' to enable, 'False' to disable."
+    )
+    @app_commands.choices(feature=[
+        app_commands.Choice(name="AI Keyword Responses", value="keywords_enabled"),
+        app_commands.Choice(name="Wither Command", value="wither_command_enabled"),
+        app_commands.Choice(name="Profile Command", value="profile_command_enabled"),
+        app_commands.Choice(name="ServerCodes Command", value="servercodes_command_enabled"),
+    ])
     @app_commands.check(is_admin_or_owner)
-    async def toggle_keywords(self, interaction: discord.Interaction, enabled: bool):
+    async def toggle_feature(self, interaction: discord.Interaction, feature: str, enabled: bool):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'keywords_enabled': enabled}).execute())
+        
+        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, feature: enabled}).execute())
         config = await load_server_config(interaction.guild.id)
-        config['keywords_enabled'] = enabled
+        config[feature] = enabled
+        
+        feature_name = feature.replace('_', ' ').replace(' enabled', '').title()
         status = "✅ Enabled" if enabled else "❌ Disabled"
-        await interaction.followup.send(f"✅ AI Keyword-triggered responses are now **{status}**.")
-        await log_info(interaction.guild, f"AI Keywords status set to `{status}` by {interaction.user.name}.")
-
-    @app_commands.command(name="toggle_wither", description="[Admin] Enable or disable the /wither command.")
-    @app_commands.describe(enabled="Set to 'True' to enable the command, 'False' to disable.")
-    @app_commands.check(is_admin_or_owner)
-    async def toggle_wither(self, interaction: discord.Interaction, enabled: bool):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'wither_command_enabled': enabled}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['wither_command_enabled'] = enabled
-        status = "✅ Enabled" if enabled else "❌ Disabled"
-        await interaction.followup.send(f"✅ The `/wither` command is now **{status}**.")
-
-    @app_commands.command(name="toggle_profile", description="[Admin] Enable or disable the /profile command.")
-    @app_commands.describe(enabled="Set to 'True' to enable the command, 'False' to disable.")
-    @app_commands.check(is_admin_or_owner)
-    async def toggle_profile(self, interaction: discord.Interaction, enabled: bool):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'profile_command_enabled': enabled}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['profile_command_enabled'] = enabled
-        status = "✅ Enabled" if enabled else "❌ Disabled"
-        await interaction.followup.send(f"✅ The `/profile` command is now **{status}**.")
-
-    @app_commands.command(name="toggle_servercodes", description="[Admin] Enable or disable the /servercodes command.")
-    @app_commands.describe(enabled="Set to 'True' to enable the command, 'False' to disable.")
-    @app_commands.check(is_admin_or_owner)
-    async def toggle_servercodes(self, interaction: discord.Interaction, enabled: bool):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'servercodes_command_enabled': enabled}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['servercodes_command_enabled'] = enabled
-        status = "✅ Enabled" if enabled else "❌ Disabled"
-        await interaction.followup.send(f"✅ The `/servercodes` command is now **{status}**.")
+        await interaction.followup.send(f"✅ The **{feature_name}** feature is now **{status}**.")
+        await log_info(interaction.guild, f"Feature '{feature_name}' status set to `{status}` by {interaction.user.name}.")
 
     @app_commands.command(name="set_channel", description="[Admin] Set a designated channel for a bot feature.")
     @app_commands.describe(feature="The feature to configure.", channel="The text channel to set. Omit to clear.")
@@ -9180,10 +9180,12 @@ class CustomiseGroup(app_commands.Group):
     async def set_channel(self, interaction: discord.Interaction, feature: str, channel: Optional[discord.TextChannel] = None):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
+        
         channel_id = channel.id if channel else None
         await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, feature: channel_id}).execute())
         config = await load_server_config(interaction.guild.id)
         config[feature] = channel_id
+        
         feature_name = feature.replace('_', ' ').replace(' id', '').title()
         if channel:
             await interaction.followup.send(f"✅ The **{feature_name}** channel has been set to {channel.mention}.")
@@ -9191,66 +9193,43 @@ class CustomiseGroup(app_commands.Group):
             await interaction.followup.send(f"✅ The **{feature_name}** channel has been cleared.")
 
     @app_commands.command(name="set_ai_channels", description="[Admin] Set channels where the AI is always on. Overwrites previous list.")
-    @app_commands.describe(channels="Up to 5 channels where the AI will respond to every message.")
+    @app_commands.describe(channels="A comma or space-separated list of channel mentions or IDs.")
     @app_commands.check(is_admin_or_owner)
     async def set_ai_channels(self, interaction: discord.Interaction, channels: str):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
+        
         channel_ids = [int(c.strip()) for c in re.findall(r'\d+', channels)]
-        if len(channel_ids) > 5:
-            await interaction.followup.send("❌ You can specify a maximum of 5 channels.", ephemeral=True)
-            return
         await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'always_on_ai_channels': channel_ids}).execute())
         config = await load_server_config(interaction.guild.id)
         config['always_on_ai_channels'] = channel_ids
+        
         mentions = [f"<#{cid}>" for cid in channel_ids]
         await interaction.followup.send(f"✅ Always-On AI Channels set to: {', '.join(mentions) if mentions else 'None'}.")
 
-    florr_perms_group = app_commands.Group(name="florr_permission", description="Set permissions for the /florr command.")
-    imitate_perms_group = app_commands.Group(name="imitate_permission", description="Set permissions for the /imitate command.")
-
-    @florr_perms_group.command(name="set", description="[Admin] Set a specific role required to use /florr.")
-    @app_commands.describe(role="The role that can use the command.")
+    @app_commands.command(name="set_permission", description="[Admin] Set a specific role required to use a command.")
+    @app_commands.describe(command_name="The command to configure permissions for.", role="The role that can use the command. Omit to revert to staff-only.")
+    @app_commands.choices(command_name=[
+        app_commands.Choice(name="/florr Command", value="florr_command_role_id"),
+        app_commands.Choice(name="/imitate Command", value="imitate_command_role_id"),
+    ])
     @app_commands.check(is_admin_or_owner)
-    async def set_florr_perm(self, interaction: discord.Interaction, role: discord.Role):
+    async def set_permission(self, interaction: discord.Interaction, command_name: str, role: Optional[discord.Role] = None):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'florr_command_role_id': role.id}).execute())
+        
+        role_id = role.id if role else None
+        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, command_name: role_id}).execute())
         config = await load_server_config(interaction.guild.id)
-        config['florr_command_role_id'] = role.id
-        await interaction.followup.send(f"✅ Users with the {role.mention} role can now use `/florr`.")
+        config[command_name] = role_id
+        
+        cmd_display_name = f"`/{command_name.split('_')[0]}`"
+        if role:
+            await interaction.followup.send(f"✅ Users with the {role.mention} role can now use {cmd_display_name}.")
+        else:
+            await interaction.followup.send(f"✅ Cleared specific role for {cmd_display_name}. It is now staff-only.")
 
-    @florr_perms_group.command(name="clear", description="[Admin] Clear the specific role requirement for /florr (reverts to staff-only).")
-    @app_commands.check(is_admin_or_owner)
-    async def clear_florr_perm(self, interaction: discord.Interaction):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'florr_command_role_id': None}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['florr_command_role_id'] = None
-        await interaction.followup.send("✅ Cleared specific role for `/florr`. It is now staff-only.")
-
-    @imitate_perms_group.command(name="set", description="[Admin] Set a specific role required to use /imitate.")
-    @app_commands.describe(role="The role that can use the command.")
-    @app_commands.check(is_admin_or_owner)
-    async def set_imitate_perm(self, interaction: discord.Interaction, role: discord.Role):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'imitate_command_role_id': role.id}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['imitate_command_role_id'] = role.id
-        await interaction.followup.send(f"✅ Users with the {role.mention} role can now use `/imitate`.")
-
-    @imitate_perms_group.command(name="clear", description="[Admin] Clear the specific role requirement for /imitate (reverts to staff-only).")
-    @app_commands.check(is_admin_or_owner)
-    async def clear_imitate_perm(self, interaction: discord.Interaction):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'imitate_command_role_id': None}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['imitate_command_role_id'] = None
-        await interaction.followup.send("✅ Cleared specific role for `/imitate`. It is now staff-only.")
-
+    # --- Tracked Guild Sub-Group ---
     tracked_guild_group = app_commands.Group(name="tracked_guild", description="Manage Florr.io guilds tracked in this server.")
 
     @tracked_guild_group.command(name="add", description="[Admin] Add or update a Florr.io guild to track.")
@@ -9270,15 +9249,9 @@ class CustomiseGroup(app_commands.Group):
             "discord_role_id": discord_role.id,
             "member_list_channel_id": member_list_channel.id if member_list_channel else None
         }
-
-        await run_supabase_sync(
-            lambda: supabase.table("tracked_florr_guilds")
-                           .upsert(data_to_upsert, on_conflict="discord_guild_id, florr_guild_tag")
-                           .execute()
-        )
+        await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").upsert(data_to_upsert, on_conflict="discord_guild_id, florr_guild_tag").execute())
         
-        # Refresh config cache
-        await load_server_config(interaction.guild.id)
+        await load_server_config(interaction.guild.id) # Refresh cache
         await interaction.followup.send(f"✅ Successfully added or updated tracking for Florr guild **{florr_guild_tag.strip()}**.")
 
     @tracked_guild_group.command(name="remove", description="[Admin] Stop tracking a Florr.io guild in this server.")
@@ -9288,16 +9261,9 @@ class CustomiseGroup(app_commands.Group):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
 
-        resp = await run_supabase_sync(
-            lambda: supabase.table("tracked_florr_guilds")
-                           .delete()
-                           .eq("discord_guild_id", interaction.guild.id)
-                           .eq("florr_guild_tag", florr_guild_tag.strip())
-                           .execute()
-        )
-
-        # Refresh config cache
-        await load_server_config(interaction.guild.id)
+        resp = await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", interaction.guild.id).eq("florr_guild_tag", florr_guild_tag.strip()).execute())
+        
+        await load_server_config(interaction.guild.id) # Refresh cache
         
         if resp.data:
             await interaction.followup.send(f"✅ Successfully removed tracking for Florr guild **{florr_guild_tag.strip()}**.")
