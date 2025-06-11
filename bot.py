@@ -242,6 +242,9 @@ M28_API_HEADERS = {'User-Agent': 'TheNerdsPingslave/1.0 (DiscordBot)'}
 SERVER_CONFIGS_TABLE_NAME = "server_configs"
 ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
 m28_scrape_counter = 0
+spawn_defeat_queue = asyncio.Queue()
+last_spawn_defeat_post_time = 0.0
+NOTIFICATION_COOLDOWN_SECONDS = 60.0
 
 
 # --- Supabase Client ---
@@ -1137,73 +1140,134 @@ async def handle_super_attempt_message(message: discord.Message):
                 pass
             await _update_reactions(message, "error")
 
-# --- REPLACE THE ENTIRE process_self_bot_messages FUNCTION in bot.py ---
+@tasks.loop(seconds=5.0) # Check the queue every 5 seconds
+async def process_spawn_defeat_messages():
+    """
+    Processes Super Spawn/Defeat notifications with a 1-minute rate limit.
+    Bundles notifications received during the cooldown into a single message.
+    """
+    await bot.wait_until_ready()
+    global last_spawn_defeat_post_time
+
+    current_time = asyncio.get_running_loop().time()
+    if (current_time - last_spawn_defeat_post_time) < NOTIFICATION_COOLDOWN_SECONDS:
+        return # It's not time to post yet.
+
+    if spawn_defeat_queue.empty():
+        return # Nothing to do.
+
+    items_to_post = []
+    while not spawn_defeat_queue.empty():
+        try:
+            items_to_post.append(spawn_defeat_queue.get_nowait())
+            spawn_defeat_queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+
+    if not items_to_post:
+        return
+
+    SPAWN_DEFEAT_GUILD_ID = 1332980983003349012
+    SPAWN_DEFEAT_CHANNEL_ID = 1382360376204853381
+    target_guild = bot.get_guild(SPAWN_DEFEAT_GUILD_ID)
+    if not target_guild:
+        print("[Spawn/Defeat LOG FAIL] Target guild not found.")
+        return
+
+    target_channel = target_guild.get_channel(SPAWN_DEFEAT_CHANNEL_ID)
+    if not isinstance(target_channel, discord.TextChannel):
+        print("[Spawn/Defeat LOG FAIL] Target channel not found or invalid.")
+        return
+
+    webhook = await get_or_create_webhook(target_channel, "spawn_defeat_notify", "Spawn/Defeat Notify")
+    if not webhook:
+        print("[Spawn/Defeat LOG FAIL] Could not get webhook.")
+        return
+
+    # Create one JSON file for the entire batch
+    batch_payload = []
+    for item in items_to_post:
+        # Exclude timestamp from each item in the batch
+        batch_payload.append({k: v for k, v in item.items() if k != 'timestamp'})
+    
+    json_payload_str = json.dumps(batch_payload, indent=4)
+    filename = "spawn_defeat_events_batch.json" if len(batch_payload) > 1 else "spawn_defeat_event.json"
+    json_file = discord.File(io.BytesIO(json_payload_str.encode('utf-8')), filename=filename)
+
+    try:
+        await webhook.send(f"New Spawn/Defeat Event(s):", file=json_file)
+        print(f"[Spawn/Defeat LOG SUCCESS] Sent batch of {len(items_to_post)} event(s) to channel.")
+        last_spawn_defeat_post_time = current_time # Update the post time on success
+    except Exception as e:
+        print(f"[Spawn/Defeat LOG FAIL] Webhook send failed: {e}")
 
 @tasks.loop(seconds=1.0)
 async def process_self_bot_messages():
+    """
+    Processes ONLY Super Craft notifications from the self-bot queue.
+    Sends the data as a JSON file to a designated channel via webhook.
+    """
     await bot.wait_until_ready()
     try:
         item = self_bot_queue.get_nowait()
         category = item.get('category')
         
-        # --- Console Logging ---
-        print("\n--- [Self-Bot Processor] ---")
-        print(f"✅ Classified as: {category}")
+        if category != 'super_craft':
+            # This queue is now only for crafts. Other items might be mis-queued.
+            if category: # If it's another known category, put it in the correct queue
+                if category in ['super_spawn', 'super_defeat']:
+                    await spawn_defeat_queue.put(item)
+                else: # Unclassified
+                    # Log unclassified from here as well.
+                    embed = discord.Embed(title="🕵️ Unclassified Self-Bot Event (Craft Queue)", description=f"```\n{item.get('text', 'No text found.')}\n```", color=discord.Color.orange())
+                    embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
+                    await log_error(None, "Unclassified Self-Bot Event", embed=embed)
+            self_bot_queue.task_done()
+            return
+
+        # --- Console Logging for Crafts ---
+        print("\n--- [Self-Bot Processor - CRAFT] ---")
         for key, value in item.items():
-            if key != 'category':
-                print(f"   - {key.replace('_', ' ').title()}: {value}")
+            print(f"   - {key.replace('_', ' ').title()}: {value}")
         
         # --- Channel Logging for Crafts ---
-        if category == 'super_craft':
-            CRAFT_NOTIFY_GUILD_ID = 1332980983003349012
-            CRAFT_NOTIFY_CHANNEL_ID = 1382246434513879091
-            target_guild = bot.get_guild(CRAFT_NOTIFY_GUILD_ID)
-            if not target_guild:
-                print("   [LOG FAIL] Craft log guild not found.")
-                self_bot_queue.task_done()
-                return
+        CRAFT_NOTIFY_GUILD_ID = 1332980983003349012
+        CRAFT_NOTIFY_CHANNEL_ID = 1382246434513879091
+        target_guild = bot.get_guild(CRAFT_NOTIFY_GUILD_ID)
+        if not target_guild:
+            print("   [LOG FAIL] Craft log guild not found.")
+            self_bot_queue.task_done()
+            return
 
-            target_channel = target_guild.get_channel(CRAFT_NOTIFY_CHANNEL_ID)
-            if not isinstance(target_channel, discord.TextChannel):
-                print("   [LOG FAIL] Craft log channel not found or invalid.")
-                self_bot_queue.task_done()
-                return
+        target_channel = target_guild.get_channel(CRAFT_NOTIFY_CHANNEL_ID)
+        if not isinstance(target_channel, discord.TextChannel):
+            print("   [LOG FAIL] Craft log channel not found or invalid.")
+            self_bot_queue.task_done()
+            return
 
-            formatted_text = await _format_announcement(item)
-            server_info = f" (Server: {item.get('server')})" if item.get('server') else ""
-            final_message = f"**Craft Announcement{server_info}:**\n> {formatted_text}"
-            
-            print(f"   -> Formatted Message: {final_message}")
+        # Prepare JSON payload, excluding the timestamp
+        json_payload_data = {k: v for k, v in item.items() if k != 'timestamp'}
+        json_payload_str = json.dumps(json_payload_data, indent=4)
+        
+        webhook = await get_or_create_webhook(target_channel, "craft_notify", "Craft Notify")
+        if webhook:
+            try:
+                json_file = discord.File(io.BytesIO(json_payload_str.encode('utf-8')), filename="craft_event.json")
+                await webhook.send(f"New Craft Event:", file=json_file)
+                print("   [LOG SUCCESS] Craft JSON notification sent to channel.")
+            except Exception as e:
+                print(f"   [LOG FAIL] Webhook send for craft failed: {e}")
+        else:
+            print("   [LOG FAIL] Could not get webhook for craft notifications.")
 
-            webhook = await get_or_create_webhook(target_channel, "craft_notify", "Florr Crafts", bot.user.display_avatar.url if bot.user else None)
-            if webhook:
-                try:
-                    await webhook.send(final_message)
-                    print("   [LOG SUCCESS] Craft notification sent to channel.")
-                except Exception as e:
-                    print(f"   [LOG FAIL] Webhook send failed: {e}")
-            else:
-                 print("   [LOG FAIL] Could not get webhook for craft notifications.")
-
-        elif category == 'unclassified':
-             print("   [ACTION] This event could not be classified. Logging to extraordinary logs.")
-             embed = discord.Embed(
-                 title="🕵️ Unclassified Self-Bot Event",
-                 description=f"The listener could not classify the following event text:\n```\n{item.get('text', 'No text found.')}\n```",
-                 color=discord.Color.orange()
-             )
-             embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
-             embed.set_footer(text="Please review the listener's classification logic.")
-             await log_error(None, "Unclassified Self-Bot Event", embed=embed)
-
-        print("----------------------------\n")
+        print("------------------------------------\n")
         self_bot_queue.task_done()
 
     except asyncio.QueueEmpty:
         pass
     except Exception as e:
-        print(f"Error in self-bot processing loop: {e}")
-        await log_error(None, "Critical error in process_self_bot_messages loop", error=e)
+        print(f"Error in craft processing loop: {e}")
+        await log_error(None, "Critical error in process_self_bot_messages (craft) loop", error=e)
 
 class GuildSyncInProgressView(discord.ui.View):
     def __init__(self, original_author_id: int, session_id: int): # session_id is user_id
@@ -6085,9 +6149,15 @@ async def on_ready():
 
         if not process_self_bot_messages.is_running():
             process_self_bot_messages.start()
-            print("Self-Bot message processing task started.")
+            print("Self-Bot message processing task (Crafts) started.")
         else:
-            print("Self-Bot message processing task was already running.")
+            print("Self-Bot message processing task (Crafts) was already running.")
+
+        if not process_spawn_defeat_messages.is_running():
+            process_spawn_defeat_messages.start()
+            print("Self-Bot message processing task (Spawn/Defeat) started.")
+        else:
+            print("Self-Bot message processing task (Spawn/Defeat) was already running.")
     else:
         print("SELF_DISCORD_TOKEN not found. Self-bot integration will be skipped.")
     
