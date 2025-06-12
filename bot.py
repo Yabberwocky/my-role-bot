@@ -6587,24 +6587,52 @@ async def hcverify(interaction: discord.Interaction, user: discord.Member, florr
         return
 
     try:
+        # Step 1: Check for IGN conflict on a DIFFERENT user before attempting to upsert.
+        # This prevents the most common APIError before it happens.
+        conflict_resp = await run_supabase_sync(
+            lambda: supabase.table("hc_members")
+                           .select("discord_id")
+                           .eq("ingame_name", cleaned_ign)
+                           .not_.eq("discord_id", str(user.id)) # Check for this IGN on other users
+                           .maybe_single()
+                           .execute()
+        )
+        if conflict_resp and conflict_resp.data and conflict_resp.data.get("discord_id"):
+            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already linked to another Discord user (<@{conflict_resp.data['discord_id']}>).", ephemeral=False)
+            return
+        elif conflict_resp is None:
+            await interaction.followup.send("❌ A database error occurred while checking for IGN conflicts.", ephemeral=False)
+            return
+
+        # Step 2: Upsert the data. This is now much less likely to fail due to a unique constraint.
+        # It will create a new record or update the existing one for this discord_id.
         data_to_upsert = { "discord_id": str(user.id), "discord_name": str(user), "ingame_name": cleaned_ign, "florr_guild_tag": normalized_tag }
-        await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
+        upsert_resp = await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
         
+        if upsert_resp is None:
+            await interaction.followup.send("❌ A database error occurred while saving verification data.", ephemeral=False)
+            return
+
+        # If we reach here, the database operation was successful.
         await interaction.followup.send(f"✅ Database updated: {user.mention} is now verified in guild **{normalized_tag}** with IGN `{cleaned_ign}`.", ephemeral=False)
         await log_info(guild, f"`{interaction.user}` verified {user.mention} into {normalized_tag} with IGN `{cleaned_ign}`.")
         
-        # After DB update, sync this user's roles
+        # Now that the DB is the source of truth, sync this user's roles.
         await refresh_roles_for_single_user(guild, user)
+        
+        # And trigger a refresh of all guild lists.
         asyncio.create_task(refresh_all_guild_lists(guild))
 
     except APIError as e:
+        # This block will now correctly catch any other unexpected APIErrors from the upsert.
+        # The most likely one is still the ingame_name key if two people try to verify at the exact same time (race condition).
         if "unique constraint" in str(e.message) and "hc_members_ingame_name_key" in str(e.message):
-            await interaction.followup.send(f"❌ Failed: The IGN `{cleaned_ign}` is already linked to another Discord account.", ephemeral=False)
+            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already in use by another account. This might be a race condition, please try again.", ephemeral=False)
         else:
-            await log_error(guild, f"Error during /hcverify for {user.mention}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database error occurred.", ephemeral=False)
+            await log_error(guild, f"An unexpected API Error occurred during /hcverify for {user.mention}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred. Please check the logs for details.", ephemeral=False)
     except Exception as e:
-        await log_error(guild, f"Error during /hcverify for {user.mention}", error=e, interaction=interaction)
+        await log_error(guild, f"A general error occurred during /hcverify for {user.mention}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
 
 # --- New HCLeave Command (MODIFIED: Sets is_in_hc=FALSE, includes Role Changes) ---
