@@ -48,7 +48,7 @@ class SelfBotListener:
 
     def _extract_server(self, footer_text: Optional[str]) -> Optional[str]:
         if not footer_text: return None
-        match = re.search(r"\((AS|EU|US)\)", footer_text, re.IGNORECASE)
+        match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
         return match.group(1).upper() if match else None
 
     def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
