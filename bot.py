@@ -195,7 +195,6 @@ AUTODELETE_DELAY_SECONDS = 5.0
 BOT_USER_ID: Optional[int] = None
 ingame_name_cache: List[str] = []
 command_ids: Dict[str, int] = {}
-self_bot_queue = asyncio.Queue()
 server_settings_cache: Dict[int, Dict[str, Any]] = {}
 active_static_list_views: Dict[int, Dict[str, Any]] = {}
 pending_static_list_updates: Dict[int, asyncio.Task] = {}
@@ -241,10 +240,13 @@ M28_SERVER_TIMEOUT_SECONDS = 300
 M28_API_HEADERS = {'User-Agent': 'TheNerdsPingslave/1.0 (DiscordBot)'}
 SERVER_CONFIGS_TABLE_NAME = "server_configs"
 ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
-m28_scrape_counter = 0
+self_bot_queue = asyncio.Queue()
+craft_queue = asyncio.Queue()
 spawn_defeat_queue = asyncio.Queue()
+m28_scrape_counter = 0
+last_craft_post_time = 0.0
 last_spawn_defeat_post_time = 0.0
-NOTIFICATION_COOLDOWN_SECONDS = 60.0
+NOTIFICATION_COOLDOWN_SECONDS = 120.0
 
 
 # --- Supabase Client ---
@@ -290,6 +292,318 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def _create_ping_embed(item: Dict[str, Any]) -> Optional[discord.Embed]:
+    """Creates a human-friendly embed for a game event notification."""
+    category = item.get('category')
+    rarity = item.get('rarity')
+    server = item.get('server')
+    
+    embed: Optional[discord.Embed] = None
+
+    if category == 'super_craft':
+        petal = item.get('petal')
+        player = item.get('player')
+        embed = discord.Embed(
+            title=f"✨ Petal Crafted!",
+            description=f"**{player or 'Someone'}** just crafted a **{rarity} {petal}**!",
+            color=discord.Color.from_rgb(255, 215, 0) # Gold
+        )
+        if player:
+            embed.add_field(name="Crafter", value=f"`{player}`", inline=True)
+        embed.add_field(name="Petal", value=f"`{rarity} {petal}`", inline=True)
+
+    elif category == 'super_spawn':
+        mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
+        embed = discord.Embed(
+            title=f"⚔️ Mob Spawned!",
+            description=f"A **{rarity} {mob}** has appeared!",
+            color=discord.Color.from_rgb(255, 69, 58) # Red
+        )
+        embed.add_field(name="Mob", value=f"`{rarity} {mob}`", inline=True)
+
+    elif category == 'super_defeat':
+        mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
+        players = item.get('players', [])
+        player_str = ", ".join(f"`{p}`" for p in players) if players else "`Unknown`"
+        embed = discord.Embed(
+            title=f"🏆 Mob Defeated!",
+            description=f"The **{rarity} {mob}** has been defeated!",
+            color=discord.Color.from_rgb(88, 101, 242) # Blurple
+        )
+        embed.add_field(name="Mob", value=f"`{rarity} {mob}`", inline=True)
+        embed.add_field(name=f"Defeated By ({len(players)})", value=player_str, inline=True)
+
+    if embed and server:
+        embed.set_footer(text=f"Server Region: {server}")
+    
+    if embed:
+        embed.timestamp = discord.utils.utcnow()
+        
+    return embed
+
+async def _handle_self_bot_event(item: Dict[str, Any]):
+    """
+    This coroutine runs in the main bot's event loop. It dispatches an event
+    to TWO systems:
+    1. The rate-limited JSON logging system (via queues).
+    2. The new instantaneous, human-friendly ping system (direct webhook send).
+    """
+    category = item.get('category')
+    print(f"\n--- [Self-Bot Handler] ---")
+    print(f"⚡ Received event: {category}")
+    
+    # --- 1. Dispatch to JSON logging queues (existing system) ---
+    if category == 'super_craft':
+        await craft_queue.put(item)
+    elif category in ['super_spawn', 'super_defeat']:
+        await spawn_defeat_queue.put(item)
+    elif category == 'unclassified':
+        print("   [ACTION] This event could not be classified. Logging to extraordinary logs.")
+        embed = discord.Embed(title="🕵️ Unclassified Self-Bot Event", description=f"```\n{item.get('text', 'No text found.')}\n```", color=discord.Color.orange())
+        embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
+        await log_error(None, "Unclassified Self-Bot Event", embed=embed)
+    
+    # --- 2. Dispatch to new instantaneous ping system (NEW system) ---
+    if category in ['super_craft', 'super_spawn', 'super_defeat']:
+        ping_embed = await _create_ping_embed(item)
+        if not ping_embed:
+            print("   [PING FAIL] Could not generate ping embed.")
+            return
+
+        config_key_map = {
+            'super_craft': 'craft_ping_channel_id',
+            'super_spawn': 'spawn_ping_channel_id',
+            'super_defeat': 'defeat_ping_channel_id',
+        }
+        webhook_purpose_map = {
+            'super_craft': 'craft_pings',
+            'super_spawn': 'spawn_pings',
+            'super_defeat': 'defeat_pings',
+        }
+        webhook_name_map = {
+            'super_craft': 'Craft Pings',
+            'super_spawn': 'Spawn Pings',
+            'super_defeat': 'Defeat Pings',
+        }
+        
+        config_key = config_key_map.get(category)
+        if not config_key: return
+
+        # Iterate through all servers the bot is in to check for configured ping channels
+        for guild in bot.guilds:
+            config = await load_server_config(guild.id)
+            channel_id = config.get(config_key)
+            if channel_id:
+                channel = guild.get_channel(channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
+                    if webhook:
+                        try:
+                            await webhook.send(embed=ping_embed)
+                            print(f"   [PING SUCCESS] Sent '{category}' ping to #{channel.name} in {guild.name}.")
+                        except Exception as e:
+                            print(f"   [PING FAIL] Failed to send webhook to #{channel.name} in {guild.name}: {e}")
+    
+    print("--------------------------\n")
+
+@tasks.loop(seconds=5.0)
+async def aperiodic_craft_poster():
+    """
+    Aperiodically checks the craft queue. If the cooldown has passed and
+    items exist, it posts them all in a single batch.
+    """
+    await bot.wait_until_ready()
+    global last_craft_post_time
+
+    current_time = bot.loop.time()
+    # Only post if the cooldown has passed AND there's something to post.
+    if craft_queue.empty() or (current_time - last_craft_post_time) < NOTIFICATION_COOLDOWN_SECONDS:
+        return
+
+    items_to_post = []
+    while not craft_queue.empty():
+        items_to_post.append(await craft_queue.get())
+
+    if not items_to_post: return
+
+    CRAFT_NOTIFY_GUILD_ID, CRAFT_NOTIFY_CHANNEL_ID = 1332980983003349012, 1382246434513879091
+    target_guild = bot.get_guild(CRAFT_NOTIFY_GUILD_ID)
+    if not target_guild: return
+    
+    target_channel = target_guild.get_channel(CRAFT_NOTIFY_CHANNEL_ID)
+    if not isinstance(target_channel, discord.TextChannel): return
+
+    webhook = await get_or_create_webhook(target_channel, "craft_notify", "Craft Notify")
+    if not webhook: return
+    
+    # Exclude category from the final JSON output
+    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k != 'category'}, indent=4)}\n```" for item in items_to_post]
+    full_message = "\n".join(message_content)
+    if len(full_message) > 2000: full_message = full_message[:1990] + "\n...```"
+        
+    try:
+        # Send without a custom avatar to use the webhook's default (which is blank if we don't set one)
+        await webhook.send(full_message)
+        print(f"[Craft Poster] Sent batch of {len(items_to_post)} craft event(s).")
+        last_craft_post_time = current_time
+    except Exception as e: 
+        print(f"[Craft Poster] Webhook send failed: {e}")
+        # Re-queue items on failure to avoid losing them
+        for item in items_to_post:
+            await craft_queue.put(item)
+
+@tasks.loop(seconds=5.0)
+async def aperiodic_spawn_defeat_poster():
+    """
+    Aperiodically checks the spawn/defeat queue. If the cooldown has passed and
+    items exist, it posts them all in a single batch.
+    """
+    await bot.wait_until_ready()
+    global last_spawn_defeat_post_time
+
+    current_time = bot.loop.time()
+    if spawn_defeat_queue.empty() or (current_time - last_spawn_defeat_post_time) < NOTIFICATION_COOLDOWN_SECONDS:
+        return
+
+    items_to_post = []
+    while not spawn_defeat_queue.empty():
+        items_to_post.append(await spawn_defeat_queue.get())
+        
+    if not items_to_post: return
+
+    SPAWN_DEFEAT_GUILD_ID, SPAWN_DEFEAT_CHANNEL_ID = 1332980983003349012, 1382360376204853381
+    target_guild = bot.get_guild(SPAWN_DEFEAT_GUILD_ID)
+    if not target_guild: return
+
+    target_channel = target_guild.get_channel(SPAWN_DEFEAT_CHANNEL_ID)
+    if not isinstance(target_channel, discord.TextChannel): return
+
+    webhook = await get_or_create_webhook(target_channel, "spawn_defeat_notify", "Spawn Notify")
+    if not webhook: return
+
+    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k != 'category'}, indent=4)}\n```" for item in items_to_post]
+    full_message = "\n".join(message_content)
+    if len(full_message) > 2000: full_message = full_message[:1990] + "\n...```"
+            
+    try:
+        await webhook.send(full_message)
+        print(f"[Spawn/Defeat Poster] Sent batch of {len(items_to_post)} event(s).")
+        last_spawn_defeat_post_time = current_time
+    except Exception as e: 
+        print(f"[Spawn/Defeat Poster] Webhook send failed: {e}")
+        # Re-queue items on failure
+        for item in items_to_post:
+            await spawn_defeat_queue.put(item)
+
+async def _initialize_data_caches(bot: commands.Bot):
+    """Loads all initial data from database and filesystem."""
+    print("--- Loading all server configurations into cache ---")
+    if supabase:
+        for guild in bot.guilds:
+            await load_server_config(guild.id)
+    print(f"--- Finished loading configs for {len(server_settings_cache)} guild(s) ---")
+
+    print("--- Loading initial non-AI data ---")
+    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+
+    await load_ign_cache(log_guild_for_data_load)
+    print("Loading profile picture choices...")
+    await load_profile_picture_choices(log_guild_for_data_load)
+
+    print("Identifying staff channels in target guild...")
+    STAFF_CHANNELS.clear()
+    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
+    if target_guild_for_staff_channels:
+        # This logic is specific to Catercord and can remain here
+        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
+        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
+        if florrist_role and hc1_role:
+            for channel in target_guild_for_staff_channels.text_channels:
+                if not channel.permissions_for(target_guild_for_staff_channels.default_role).view_channel:
+                    if not channel.overwrites_for(florrist_role).view_channel and not channel.overwrites_for(hc1_role).view_channel:
+                        STAFF_CHANNELS.add(channel.id)
+            print(f"Staff Channel Identification Complete: Found {len(STAFF_CHANNELS)} staff channel(s).")
+    else:
+        print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
+
+
+async def _setup_and_load_cogs(bot: commands.Bot):
+    """Sets up bot attributes for cogs and loads extensions."""
+    print("Setting up bot attributes for cogs...")
+    bot.supabase_client = supabase
+    bot.log_info_global = log_info
+    bot.log_error_global = log_error
+    bot.run_supabase_sync_global = run_supabase_sync
+    bot._handle_self_bot_event = _handle_self_bot_event # Important for listener
+    
+    # Pass config values
+    bot.OWNER_USER_ID_config = OWNER_USER_ID
+    bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
+    bot.ingame_name_cache_ref_config = ingame_name_cache
+    bot.NERDY_YELLOW_config = NERDY_YELLOW
+    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH
+    bot.MOBS_FOLDER_PATH_config = os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
+    bot.server_settings_cache_ref_config = server_settings_cache
+    print("Bot attributes set.")
+
+    print("Loading cogs...")
+    log_guild_for_cog_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    try:
+        await bot.load_extension('ai_cog')
+        print("AICog load_extension call completed.")
+        if bot.get_cog('AICog') is None:
+             raise commands.ExtensionFailed("ai_cog", "Cog is None after load attempt.")
+        print("AICog loading verified successfully.")
+    except Exception as e_cog:
+        print(f"CRITICAL: Failed to load AICog: {e_cog}\n{traceback.format_exc()}")
+        if log_guild_for_cog_load:
+            await log_error(log_guild_for_cog_load, "CRITICAL: Failed to load AICog. AI features will be unavailable.", error=e_cog, ping_owner=True)
+
+
+async def _sync_app_commands(bot: commands.Bot) -> list:
+    """Syncs application commands and populates the command_ids dictionary."""
+    print("Syncing application commands...")
+    synced_commands = []
+    try:
+        synced_commands = await bot.tree.sync()
+        print(f"Synced {len(synced_commands)} application commands.")
+        command_ids.clear()
+        for cmd in synced_commands:
+            command_ids[cmd.name] = cmd.id
+            if isinstance(cmd, app_commands.Group):
+                for sub_cmd in cmd.commands:
+                    command_ids[f"{cmd.name} {sub_cmd.name}"] = sub_cmd.id
+    except Exception as e:
+        print(f"Command Sync failed: {e}\n{traceback.format_exc()}")
+    return synced_commands
+
+
+async def _start_background_tasks(bot: commands.Bot):
+    """Initializes and starts all background tasks and listeners."""
+    print("Starting background tasks...")
+
+    # Standard discord.py tasks
+    if not check_static_view_timeout.is_running(): check_static_view_timeout.start()
+    if not m28_server_scraper.is_running(): m28_server_scraper.start()
+    if not aperiodic_craft_poster.is_running(): aperiodic_craft_poster.start()
+    if not aperiodic_spawn_defeat_poster.is_running(): aperiodic_spawn_defeat_poster.start()
+    print("Started periodic tasks: view timeout, m28 scraper, aperiodic posters.")
+    
+    # Self-Bot Integration
+    print("--- Starting Self-Bot Integration ---")
+    if SELF_DISCORD_TOKEN:
+        print("SELF_DISCORD_TOKEN found. Initializing listener...")
+        listener = SelfBotListener(token=SELF_DISCORD_TOKEN, channel_id=SUPER_CRAFT_CHANNEL_ID, bot_instance=bot)
+        
+        def run_listener_in_thread():
+            asyncio.run(listener.run())
+
+        listener_thread = threading.Thread(target=run_listener_in_thread, daemon=True)
+        listener_thread.start()
+        print("Self-Bot listener thread started.")
+    else:
+        print("SELF_DISCORD_TOKEN not found. Self-bot integration will be skipped.")
 
 async def _format_announcement(data: Dict[str, Any]) -> str:
     """Formats an announcement string based on classified data and templates."""
@@ -1139,135 +1453,6 @@ async def handle_super_attempt_message(message: discord.Message):
             except discord.HTTPException:
                 pass
             await _update_reactions(message, "error")
-
-@tasks.loop(seconds=5.0) # Check the queue every 5 seconds
-async def process_spawn_defeat_messages():
-    """
-    Processes Super Spawn/Defeat notifications with a 1-minute rate limit.
-    Bundles notifications received during the cooldown into a single message.
-    """
-    await bot.wait_until_ready()
-    global last_spawn_defeat_post_time
-
-    current_time = asyncio.get_running_loop().time()
-    if (current_time - last_spawn_defeat_post_time) < NOTIFICATION_COOLDOWN_SECONDS:
-        return # It's not time to post yet.
-
-    if spawn_defeat_queue.empty():
-        return # Nothing to do.
-
-    items_to_post = []
-    while not spawn_defeat_queue.empty():
-        try:
-            items_to_post.append(spawn_defeat_queue.get_nowait())
-            spawn_defeat_queue.task_done()
-        except asyncio.QueueEmpty:
-            break
-
-    if not items_to_post:
-        return
-
-    SPAWN_DEFEAT_GUILD_ID = 1332980983003349012
-    SPAWN_DEFEAT_CHANNEL_ID = 1382360376204853381
-    target_guild = bot.get_guild(SPAWN_DEFEAT_GUILD_ID)
-    if not target_guild:
-        print("[Spawn/Defeat LOG FAIL] Target guild not found.")
-        return
-
-    target_channel = target_guild.get_channel(SPAWN_DEFEAT_CHANNEL_ID)
-    if not isinstance(target_channel, discord.TextChannel):
-        print("[Spawn/Defeat LOG FAIL] Target channel not found or invalid.")
-        return
-
-    webhook = await get_or_create_webhook(target_channel, "spawn_defeat_notify", "Spawn/Defeat Notify")
-    if not webhook:
-        print("[Spawn/Defeat LOG FAIL] Could not get webhook.")
-        return
-
-    # Create one JSON file for the entire batch
-    batch_payload = []
-    for item in items_to_post:
-        # Exclude timestamp from each item in the batch
-        batch_payload.append({k: v for k, v in item.items() if k != 'timestamp'})
-    
-    json_payload_str = json.dumps(batch_payload, indent=4)
-    filename = "spawn_defeat_events_batch.json" if len(batch_payload) > 1 else "spawn_defeat_event.json"
-    json_file = discord.File(io.BytesIO(json_payload_str.encode('utf-8')), filename=filename)
-
-    try:
-        await webhook.send(f"New Spawn/Defeat Event(s):", file=json_file)
-        print(f"[Spawn/Defeat LOG SUCCESS] Sent batch of {len(items_to_post)} event(s) to channel.")
-        last_spawn_defeat_post_time = current_time # Update the post time on success
-    except Exception as e:
-        print(f"[Spawn/Defeat LOG FAIL] Webhook send failed: {e}")
-
-@tasks.loop(seconds=1.0)
-async def process_self_bot_messages():
-    """
-    Processes ONLY Super Craft notifications from the self-bot queue.
-    Sends the data as a JSON file to a designated channel via webhook.
-    """
-    await bot.wait_until_ready()
-    try:
-        item = self_bot_queue.get_nowait()
-        category = item.get('category')
-        
-        if category != 'super_craft':
-            # This queue is now only for crafts. Other items might be mis-queued.
-            if category: # If it's another known category, put it in the correct queue
-                if category in ['super_spawn', 'super_defeat']:
-                    await spawn_defeat_queue.put(item)
-                else: # Unclassified
-                    # Log unclassified from here as well.
-                    embed = discord.Embed(title="🕵️ Unclassified Self-Bot Event (Craft Queue)", description=f"```\n{item.get('text', 'No text found.')}\n```", color=discord.Color.orange())
-                    embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
-                    await log_error(None, "Unclassified Self-Bot Event", embed=embed)
-            self_bot_queue.task_done()
-            return
-
-        # --- Console Logging for Crafts ---
-        print("\n--- [Self-Bot Processor - CRAFT] ---")
-        for key, value in item.items():
-            print(f"   - {key.replace('_', ' ').title()}: {value}")
-        
-        # --- Channel Logging for Crafts ---
-        CRAFT_NOTIFY_GUILD_ID = 1332980983003349012
-        CRAFT_NOTIFY_CHANNEL_ID = 1382246434513879091
-        target_guild = bot.get_guild(CRAFT_NOTIFY_GUILD_ID)
-        if not target_guild:
-            print("   [LOG FAIL] Craft log guild not found.")
-            self_bot_queue.task_done()
-            return
-
-        target_channel = target_guild.get_channel(CRAFT_NOTIFY_CHANNEL_ID)
-        if not isinstance(target_channel, discord.TextChannel):
-            print("   [LOG FAIL] Craft log channel not found or invalid.")
-            self_bot_queue.task_done()
-            return
-
-        # Prepare JSON payload, excluding the timestamp
-        json_payload_data = {k: v for k, v in item.items() if k != 'timestamp'}
-        json_payload_str = json.dumps(json_payload_data, indent=4)
-        
-        webhook = await get_or_create_webhook(target_channel, "craft_notify", "Craft Notify")
-        if webhook:
-            try:
-                json_file = discord.File(io.BytesIO(json_payload_str.encode('utf-8')), filename="craft_event.json")
-                await webhook.send(f"New Craft Event:", file=json_file)
-                print("   [LOG SUCCESS] Craft JSON notification sent to channel.")
-            except Exception as e:
-                print(f"   [LOG FAIL] Webhook send for craft failed: {e}")
-        else:
-            print("   [LOG FAIL] Could not get webhook for craft notifications.")
-
-        print("------------------------------------\n")
-        self_bot_queue.task_done()
-
-    except asyncio.QueueEmpty:
-        pass
-    except Exception as e:
-        print(f"Error in craft processing loop: {e}")
-        await log_error(None, "Critical error in process_self_bot_messages (craft) loop", error=e)
 
 class GuildSyncInProgressView(discord.ui.View):
     def __init__(self, original_author_id: int, session_id: int): # session_id is user_id
@@ -5318,11 +5503,24 @@ async def check_supabase_available(interaction: discord.Interaction) -> bool:
         return False # Indicate Supabase is not available
 
 async def run_supabase_sync(func):
-    """Runs sync Supabase func in executor."""
-    if not supabase: raise ConnectionError("Supabase client unavailable.")
-    try: loop = asyncio.get_running_loop(); return await loop.run_in_executor(None, func)
-    except APIError as e: print(f"Supabase API Error: {e}"); raise
-    except Exception as e: print(f"Supabase executor Error: {e}"); raise
+    """Runs sync Supabase func in executor, now with more robust error handling."""
+    if not supabase:
+        print("Supabase Error: Client is not available.")
+        return None # Return None if client is not initialized
+
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func)
+    except APIError as e:
+        # This is a controlled error from the DB (e.g., policy violation, bad data)
+        print(f"Supabase API Error: {e}")
+        # We re-raise this because some command logic specifically checks for APIError types.
+        raise
+    except Exception as e:
+        # This catches other errors like connection issues, timeouts, etc.
+        print(f"Supabase Executor/Connection Error: {e}\n{traceback.format_exc()}")
+        # Return None to signal a general failure to the calling function.
+        return None
 
 # --- Logging ---
 async def log_to_channel(channel_id: int, guild: Optional[discord.Guild], message: Optional[str] = None, embed: Optional[discord.Embed] = None, ping_mention: Optional[str] = None):
@@ -5981,7 +6179,7 @@ async def update_static_list_message(guild: discord.Guild):
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
-    global BOT_USER_ID, command_ids, STAFF_CHANNELS, server_settings_cache
+    global BOT_USER_ID, command_ids
 
     if bot.user:
         BOT_USER_ID = bot.user.id
@@ -5999,171 +6197,18 @@ async def on_ready():
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
-    log_guild_for_ready_msg = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-
-    print("--- Loading all server configurations into cache ---")
-    if supabase:
-        for guild in bot.guilds:
-            await load_server_config(guild.id)
-    print(f"--- Finished loading configs for {len(server_settings_cache)} guild(s) ---")
-
-    print("--- Loading initial non-AI data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID)
-    if not log_guild_for_data_load and bot.guilds: log_guild_for_data_load = bot.guilds[0]
-
-    await load_ign_cache(log_guild_for_data_load)
-    print("Loading profile picture choices...")
-    await load_profile_picture_choices(log_guild_for_data_load)
-
-    print("Identifying staff channels in target guild...")
-    STAFF_CHANNELS.clear()
-    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
-    if target_guild_for_staff_channels:
-        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
-        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
-        everyone_role = target_guild_for_staff_channels.default_role
-        if florrist_role and hc1_role:
-            potentially_staff_channels = 0; actually_staff_channels = 0
-            for channel in target_guild_for_staff_channels.text_channels:
-                everyone_perms = channel.permissions_for(everyone_role)
-                if not everyone_perms.view_channel:
-                    potentially_staff_channels += 1
-                    florrist_ow = channel.overwrites_for(florrist_role); hc1_ow = channel.overwrites_for(hc1_role)
-                    florrist_can_view = florrist_ow.view_channel is True; hc1_can_view = hc1_ow.view_channel is True
-                    if not florrist_can_view and not hc1_can_view:
-                        STAFF_CHANNELS.add(channel.id); actually_staff_channels += 1
-            print(f"Staff Channel Identification Complete: Found {actually_staff_channels} staff channel(s) out of {potentially_staff_channels} potentially restricted channels.")
-        else:
-            missing_role_names = []
-            if not florrist_role: missing_role_names.append(f"Florrist Role (ID: {FLORRIST_ROLE_ID})")
-            if not hc1_role: missing_role_names.append(f"HC1 Role (ID: {HC1_ROLE_ID})")
-            if log_guild_for_data_load:
-                await log_error(target_guild_for_staff_channels, f"Failed to identify staff channels: Roles not found: {', '.join(missing_role_names)}.", ping_owner=True)
-    else: print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
-
-    print("Setting up bot attributes for cogs...")
-    bot.supabase_client = supabase
-    bot.log_info_global = log_info; bot.log_error_global = log_error
-    bot.run_supabase_sync_global = run_supabase_sync
-    bot.OWNER_USER_ID_config = OWNER_USER_ID
-    bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
-    bot.ingame_name_cache_ref_config = ingame_name_cache
-    bot.NERDY_YELLOW_config = NERDY_YELLOW
-    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH
-    bot.MOBS_FOLDER_PATH_config = os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
-    bot.server_settings_cache_ref_config = server_settings_cache
-
-    print("Bot attributes set.")
-
-    print("Loading cogs...")
-    synced_commands = []
-    try:
-        await bot.load_extension('ai_cog')
-        print("AICog load_extension call completed.")
-    except commands.ExtensionAlreadyLoaded:
-        print("AICog was already loaded (ExtensionAlreadyLoaded).")
-    except commands.ExtensionFailed as e_failed:
-        print(f"CRITICAL: AICog failed to load (ExtensionFailed): {e_failed.name} - {e_failed.original if e_failed.original else 'No original exception info'}")
-        print(traceback.format_exc())
-        if log_guild_for_data_load:
-            await log_error(log_guild_for_data_load, f"CRITICAL: AICog failed to load (ExtensionFailed: {e_failed.name}). AI features disabled.", error=e_failed.original, ping_owner=True)
-    except Exception as e_cog:
-        print(f"CRITICAL: Failed to load AICog (General Exception): {e_cog}\n{traceback.format_exc()}")
-        if log_guild_for_data_load:
-            await log_error(log_guild_for_data_load, "CRITICAL: Failed to load AICog (General Exception). AI features disabled.", error=e_cog, ping_owner=True)
-
-    if bot.get_cog('AICog') is None:
-        print("CRITICAL VERIFICATION: AICog is None after load_extension attempt. AI features WILL BE UNAVAILABLE.")
-        if log_guild_for_data_load:
-             await log_error(log_guild_for_data_load, "CRITICAL POST-LOAD CHECK: AICog FAILED TO REGISTER. AI features WILL BE UNAVAILABLE.", ping_owner=True)
-    else:
-        print("AICog loading verified successfully (cog instance found via bot.get_cog).")
-
-    print("Syncing application commands...")
-    try:
-        synced_commands = await tree.sync()
-        print(f"Synced {len(synced_commands)} application commands.")
-        command_ids.clear()
-        for cmd in synced_commands:
-            if hasattr(cmd, 'name') and hasattr(cmd, 'id'):
-                command_ids[cmd.name] = cmd.id
-                if isinstance(cmd, app_commands.Group):
-                    for sub_cmd in cmd.commands:
-                        if isinstance(sub_cmd, app_commands.Command):
-                             full_name = f"{cmd.name} {sub_cmd.name}"
-                             command_ids[full_name] = sub_cmd.id
-            else: print(f"  Skipped storing ID during sync for an item (type: {type(cmd)}, name: {getattr(cmd, 'name', 'N/A')})")
-        if not command_ids: print("Warning: command_ids dictionary is empty after sync.")
-    except discord.HTTPException as e: print(f"Command Sync failed (HTTPException): {e.status} - {e.text}") # type: ignore
-    except Exception as e: print(f"Command Sync failed (Unexpected Error): {e}\n{traceback.format_exc()}") # type: ignore
-
-    if log_guild_for_ready_msg:
-        try:
-             instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
-             await log_info(log_guild_for_ready_msg, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
-        except Exception as log_e: print(f"Failed to send initial ready log message: {log_e}")
-
-    print("Starting background tasks...")
-    if not check_static_view_timeout.is_running():
-        try: check_static_view_timeout.start(); print(" Static view timeout checker task started.")
-        except RuntimeError: print(" Static view timeout checker task was already running (RuntimeError).")
-        except Exception as e_task_start:
-            print(f"Failed to start static view timeout task: {e_task_start}")
-            if log_guild_for_data_load: await log_error(log_guild_for_data_load, "Failed to start static view timeout task", error=e_task_start)
-
-    async def delayed_update(delay_seconds: int):
-        await asyncio.sleep(delay_seconds)
-        print(f"--- Running delayed static list update after {delay_seconds}s ---")
-        guild_for_delayed_update = bot.get_guild(CATERCORD_GUILD_ID)
-        if not guild_for_delayed_update:
-            print(f"ERROR: Could not find target guild {CATERCORD_GUILD_ID} for delayed static list update."); return
-        if not supabase:
-            print("ERROR: Supabase client not available for delayed static list update.")
-            await log_error(guild_for_delayed_update, "Delayed static list update failed: Supabase client not available."); return
-        try: await update_static_list_message(guild_for_delayed_update)
-        except Exception as e:
-            print(f"ERROR during delayed initial static list update: {e}\n{traceback.format_exc()}")
-            await log_error(guild_for_delayed_update, "Error during delayed initial static list update", error=e)
-        print(f"--- Delayed static list update update finished ---")
-
-    if bot.is_ready() and any(g.id == CATERCORD_GUILD_ID for g in bot.guilds):
-        print("Scheduling delayed static list update for target guild (Catercord)...")
-        asyncio.create_task(delayed_update(delay_seconds=60))
-    else: print("Skipping delayed static list update (Bot not fully ready or not in target guild).")
-
-    print("--- Starting Self-Bot Integration ---")
-    if SELF_DISCORD_TOKEN:
-        print("SELF_DISCORD_TOKEN found. Initializing listener...")
-        listener = SelfBotListener(
-            token=SELF_DISCORD_TOKEN,
-            channel_id=SUPER_CRAFT_CHANNEL_ID,
-            queue=self_bot_queue
-        )
-
-        def run_listener_in_thread():
-            asyncio.run(listener.run())
-
-        listener_thread = threading.Thread(target=run_listener_in_thread, daemon=True)
-        listener_thread.start()
-        print("Self-Bot listener thread started.")
-
-        if not process_self_bot_messages.is_running():
-            process_self_bot_messages.start()
-            print("Self-Bot message processing task (Crafts) started.")
-        else:
-            print("Self-Bot message processing task (Crafts) was already running.")
-
-        if not process_spawn_defeat_messages.is_running():
-            process_spawn_defeat_messages.start()
-            print("Self-Bot message processing task (Spawn/Defeat) started.")
-        else:
-            print("Self-Bot message processing task (Spawn/Defeat) was already running.")
-    else:
-        print("SELF_DISCORD_TOKEN not found. Self-bot integration will be skipped.")
     
-    if not m28_server_scraper.is_running():
-        m28_server_scraper.start()
-        print("M28 server scraper task started.")
+    # Call helper functions for startup sequence
+    await _initialize_data_caches(bot)
+    await _setup_and_load_cogs(bot)
+    synced_commands = await _sync_app_commands(bot)
+    await _start_background_tasks(bot)
+
+    # Final "Ready" log message
+    log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    if log_guild:
+        instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
+        await log_info(log_guild, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
     
     print("--- on_ready event finished ---")
 
@@ -6177,7 +6222,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     tracked_roles = {data['discord_role_id']: tag for tag, data in config.get('tracked_guilds', {}).items() if data.get('discord_role_id')}
     
     if not tracked_roles:
-        return # No tracked roles in this server to check
+        return
 
     added_roles = set(after.roles) - set(before.roles)
     removed_roles = set(before.roles) - set(after.roles)
@@ -6200,11 +6245,15 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if not changed_tracked_role or not action:
         return
 
-    # A tracked role was changed. Now check the database.
     if not supabase: return
 
     user_db_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("florr_guild_tag").eq("discord_id", str(after.id)).maybe_single().execute())
-    db_guild_tag = user_db_resp.data.get('florr_guild_tag') if user_db_resp and user_db_resp.data else None
+    # Add check for None response
+    if user_db_resp is None:
+        await log_error(guild, f"DB error checking user {after.mention} during on_member_update.")
+        return
+        
+    db_guild_tag = user_db_resp.data.get('florr_guild_tag') if user_db_resp.data else None
     
     role_guild_tag = tracked_roles.get(changed_tracked_role.id)
     discrepancy = False
@@ -6217,17 +6266,12 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         reason = f"The `{changed_tracked_role.name}` role was manually removed from the user, but their database record indicates they should be in `{db_guild_tag}`."
 
     if discrepancy:
-        embed = discord.Embed(
-            title="Manual Role Discrepancy Detected",
-            description=reason,
-            color=discord.Color.orange()
-        )
+        embed = discord.Embed(title="Manual Role Discrepancy Detected", description=reason, color=discord.Color.orange())
         embed.add_field(name="User", value=f"{after.mention} (`{after.id}`)", inline=True)
         embed.add_field(name="Role", value=f"{changed_tracked_role.mention} (`{changed_tracked_role.id}`)", inline=True)
         embed.add_field(name="Action", value=f"Role was manually **{action.upper()}**.", inline=True)
         embed.add_field(name="Recommendation", value=f"Use bot commands (`/hcverify`, `/hcleave`) or run `/refresh` to sync roles with the database.", inline=False)
         embed.set_footer(text="This log indicates a potential inconsistency between Discord roles and the database.")
-        
         await log_error(guild, "Manual Role Discrepancy", embed=embed)
 
 # --- App Command Error Handling ---
@@ -6365,19 +6409,28 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
     try:
         # Check for IGN conflict BEFORE upserting
         conflict_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("ingame_name", cleaned_ign).not_.eq("discord_id", str(user.id)).maybe_single().execute())
-        if conflict_resp.data and conflict_resp.data.get("discord_id"):
+        
+        # --- THIS IS THE FIX ---
+        # Check if the response object is not None before accessing its data.
+        if conflict_resp and conflict_resp.data and conflict_resp.data.get("discord_id"):
             await interaction.followup.send(f"❌ **IGN Conflict:** `{cleaned_ign}` is already linked to another user (<@{conflict_resp.data['discord_id']}>).", ephemeral=False)
             return
+        elif conflict_resp is None:
+            # This means run_supabase_sync failed.
+            await interaction.followup.send("❌ A database error occurred while checking for IGN conflicts. Please try again later.", ephemeral=False)
+            return
+        # --- END OF FIX ---
 
         # Use upsert to create or update the user's record.
-        # This will set the IGN but critically leaves florr_guild_tag untouched if the user already exists.
-        # If it's a new user, florr_guild_tag will be NULL by default.
         data_to_upsert = { "discord_id": str(user.id), "discord_name": str(user), "ingame_name": cleaned_ign }
-        await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
+        upsert_resp = await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
+        
+        if upsert_resp is None:
+            await interaction.followup.send("❌ A database error occurred while saving the verification data. Please try again later.", ephemeral=False)
+            return
 
         await interaction.followup.send(f"✅ Database updated: {user.mention}'s IGN is now set to `{cleaned_ign}`.", ephemeral=False)
         
-        # Role management (simplified)
         role_verified = guild.get_role(FLORRIST_ROLE_ID)
         if role_verified and role_verified not in user.roles and guild.me.top_role > role_verified:
             await user.add_roles(role_verified, reason=f"Verified by {interaction.user}")
@@ -6385,6 +6438,12 @@ async def verify(interaction: discord.Interaction, user: discord.Member, ingame_
 
         await refresh_roles_for_single_user(guild, user)
 
+    except APIError as e: # Catch specific API errors for unique constraints etc.
+        if "unique constraint" in str(e.message) and "hc_members_ingame_name_key" in str(e.message):
+            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already linked to another user.", ephemeral=False)
+        else:
+            await log_error(guild, f"API Error during /verify for {user.mention}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database API error occurred.", ephemeral=False)
     except Exception as e:
         await log_error(guild, f"Error during /verify for {user.mention}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
@@ -6563,11 +6622,19 @@ async def hcleave(interaction: discord.Interaction, ingame_name: str):
     try:
         user_data_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("ingame_name", ingame_name).maybe_single().execute())
         
-        if not user_data_resp or not user_data_resp.data:
+        if user_data_resp is None:
+            await interaction.followup.send("❌ A database error occurred while fetching player data.", ephemeral=False)
+            return
+
+        if not user_data_resp.data:
             await interaction.followup.send(f"ℹ️ No player found with the IGN `{ingame_name}`.", ephemeral=False)
             return
 
-        await run_supabase_sync(lambda: supabase.table("hc_members").update({"florr_guild_tag": None}).eq("ingame_name", ingame_name).execute())
+        update_resp = await run_supabase_sync(lambda: supabase.table("hc_members").update({"florr_guild_tag": None}).eq("ingame_name", ingame_name).execute())
+        if update_resp is None:
+            await interaction.followup.send("❌ A database error occurred while updating the player's guild status.", ephemeral=False)
+            return
+
         await interaction.followup.send(f"✅ Database updated: Player `{ingame_name}` is no longer marked as in a guild.", ephemeral=False)
 
         discord_id = user_data_resp.data.get("discord_id")
@@ -8374,6 +8441,40 @@ class CustomiseGroup(app_commands.Group):
             await interaction.followup.send(f"✅ Successfully removed tracking for Florr guild **{florr_guild_tag.strip()}**.")
         else:
             await interaction.followup.send(f"ℹ️ No tracked Florr guild with the tag **{florr_guild_tag.strip()}** was found to remove.")
+
+    @app_commands.command(name="set_ping_channel", description="[Owner Only] Set a channel for real-time embed notifications.")
+    @app_commands.describe(
+        notification_type="The type of notification to configure.",
+        channel="The channel for these pings. Omit to clear the setting."
+    )
+    @app_commands.choices(notification_type=[
+        app_commands.Choice(name="Craft Pings", value="craft_ping_channel_id"),
+        app_commands.Choice(name="Spawn Pings", value="spawn_ping_channel_id"),
+        app_commands.Choice(name="Defeat Pings", value="defeat_ping_channel_id"),
+    ])
+    async def set_ping_channel(self, interaction: discord.Interaction, notification_type: str, channel: Optional[discord.TextChannel] = None):
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+            return
+        if not interaction.guild: return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        channel_id = channel.id if channel else None
+        
+        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, notification_type: channel_id}).execute())
+        
+        # Refresh local cache
+        config = await load_server_config(interaction.guild.id)
+        config[notification_type] = channel_id
+        
+        feature_name = notification_type.replace('_', ' ').replace(' id', '').title()
+        if channel:
+            await interaction.followup.send(f"✅ The **{feature_name}** channel has been set to {channel.mention}.")
+            await log_info(interaction.guild, f"Owner set '{feature_name}' channel to #{channel.name}.")
+        else:
+            await interaction.followup.send(f"✅ The **{feature_name}** channel setting has been cleared.")
+            await log_info(interaction.guild, f"Owner cleared '{feature_name}' channel setting.")
 
 # Add the group to the command tree at the end of the file
 tree.add_command(CustomiseGroup())
