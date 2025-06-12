@@ -66,11 +66,11 @@
 #     service (like Uptime Robot) hitting the Flask endpoint.
 #   - Environment Variables: DISCORD_BOT_MAIN_TOKEN, SUPABASE_URL, SUPABASE_ADMIN_KEY, GEMINI_API_KEY are set in Render.
 # Database: Supabase (PostgreSQL) used for:
-#   - `hc_members`: Stores HC member IGNs linked to Discord IDs and names.
+#   - `florr_players`: Stores HC member IGNs linked to Discord IDs and names.
 #   - `activity_log`: Tracks daily member activity.
 #   - `keyword_phrases`: Stores configurations for AI keyword-triggered responses (managed by `ai_cog.py`).
 # Key Features (not exhaustive, check `/nerdhelp` in code for command list):
-#   - Verification & HC Management: `/verify`, `/unverify`, `/hcverify`, `/hconly`, `/hcleave`.
+#   - Verification & HC Management: `/verify`, `/unverify`, `/guild`, `/hconly`, `/hcleave`.
 #   - Listing & Activity: Interactive static list in `HC_MEMBER_LIST_CHANNEL_ID` (updated by `update_static_list_message`),
 #     `/hcmembers`, `/active`, `/inactive`, `/activatemyself`, screenshot processing for activity.
 #   - Utilities: `/syncnicknames`, `/wither`, `/message` (optional AI), `/florr` (custom avatar msg), `/refresh`.
@@ -649,43 +649,68 @@ async def _format_announcement(data: Dict[str, Any]) -> str:
     return "Could not format announcement."
 
 async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Member):
-    """Syncs a single user's roles based on their database state."""
-    if not supabase or not guild.me.guild_permissions.manage_roles: return
+    """Syncs a single user's roles based on their database state (connection and guild tag)."""
+    if not supabase or not guild.me.guild_permissions.manage_roles:
+        return
 
     config = await load_server_config(guild.id)
-    tracked_roles = {tag: data.get('discord_role_id') for tag, data in config.get('tracked_guilds', {}).items()}
-    if not tracked_roles: return
-
-    user_db_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("florr_guild_tag").eq("discord_id", str(member.id)).maybe_single().execute())
-    db_guild_tag = user_db_resp.data.get('florr_guild_tag') if user_db_resp and user_db_resp.data else None
-
+    verified_role_id = config.get('verified_role_id')
+    unverified_role_id = config.get('unverified_role_id')
+    tracked_guilds_config = config.get('tracked_guilds', {})
+    
     roles_to_add = []
     roles_to_remove = []
 
-    # Determine required role based on DB
-    required_role_id = tracked_roles.get(db_guild_tag) if db_guild_tag else None
-    
-    # Check roles to add
-    if required_role_id:
-        role_obj = guild.get_role(required_role_id)
-        if role_obj and role_obj not in member.roles and guild.me.top_role > role_obj:
-            roles_to_add.append(role_obj)
+    try:
+        user_db_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id, florr_guild_tag").eq("discord_id", str(member.id)).maybe_single().execute())
+        
+        db_data = user_db_resp.data if user_db_resp and user_db_resp.data else {}
+        is_connected = bool(db_data)
+        db_guild_tag = db_data.get('florr_guild_tag') if is_connected else None
+        
+        # 1. Handle Verified/Unverified Roles
+        verified_role = guild.get_role(verified_role_id) if verified_role_id else None
+        unverified_role = guild.get_role(unverified_role_id) if unverified_role_id else None
 
-    # Check roles to remove
-    for role_id in tracked_roles.values():
-        if role_id and role_id != required_role_id:
-            role_obj = guild.get_role(role_id)
-            if role_obj and role_obj in member.roles and guild.me.top_role > role_obj:
-                roles_to_remove.append(role_obj)
-    
-    if roles_to_add or roles_to_remove:
-        try:
+        if is_connected:
+            if verified_role and verified_role not in member.roles and guild.me.top_role > verified_role:
+                roles_to_add.append(verified_role)
+            if unverified_role and unverified_role in member.roles and guild.me.top_role > unverified_role:
+                roles_to_remove.append(unverified_role)
+        else: # Not connected to any IGN
+            if unverified_role and unverified_role not in member.roles and guild.me.top_role > unverified_role:
+                roles_to_add.append(unverified_role)
+            if verified_role and verified_role in member.roles and guild.me.top_role > verified_role:
+                roles_to_remove.append(verified_role)
+        
+        # 2. Handle Tracked Guild Roles
+        required_guild_role_id = None
+        if db_guild_tag and db_guild_tag in tracked_guilds_config:
+            required_guild_role_id = tracked_guilds_config[db_guild_tag].get('discord_role_id')
+        
+        if required_guild_role_id:
+            role_obj = guild.get_role(required_guild_role_id)
+            if role_obj and role_obj not in member.roles and guild.me.top_role > role_obj:
+                roles_to_add.append(role_obj)
+        
+        for tracked_tag, tracked_data in tracked_guilds_config.items():
+            role_id = tracked_data.get('discord_role_id')
+            if role_id and role_id != required_guild_role_id:
+                role_obj = guild.get_role(role_id)
+                if role_obj and role_obj in member.roles and guild.me.top_role > role_obj:
+                    roles_to_remove.append(role_obj)
+        
+        # 3. Apply changes
+        if roles_to_add or roles_to_remove:
             current_roles = list(member.roles)
             final_roles = [r for r in current_roles if r not in roles_to_remove] + roles_to_add
             await member.edit(roles=final_roles, reason="Automatic role sync with database")
-            await log_info(guild, f"Synced roles for {member.mention}. Added: {[r.name for r in roles_to_add]}. Removed: {[r.name for r in roles_to_remove]}.")
-        except Exception as e:
-            await log_error(guild, f"Failed to sync roles for {member.mention}", error=e)
+            add_names = [r.name for r in roles_to_add]
+            rem_names = [r.name for r in roles_to_remove]
+            await log_info(guild, f"Synced roles for {member.mention}. Added: {add_names or 'None'}. Removed: {rem_names or 'None'}.")
+
+    except Exception as e:
+        await log_error(guild, f"Failed to sync roles for {member.mention}", error=e)
 
 async def refresh_all_guild_lists(guild: discord.Guild):
     """Iterates through all configured tracked guilds and updates their static lists."""
@@ -710,7 +735,7 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
     db_members_data = []
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("discord_id, ingame_name, discord_name, florr_guild_tag")
                            .eq("florr_guild_tag", florr_guild_tag)
                            .execute()
@@ -1349,7 +1374,7 @@ async def handle_super_attempt_message(message: discord.Message):
     author_ign = await get_ign_from_user(guild, message.author.id)
     if not author_ign:
         try:
-            await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/hcverify` or `/verify`.")
+            await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
         except discord.HTTPException:
             pass
         return
@@ -1771,7 +1796,7 @@ async def fetch_all_db_members_with_guild_tag(guild: Optional[discord.Guild]) ->
     
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name, discord_id, florr_guild_tag")
                            .not_.is_("ingame_name", "null")
                            .execute()
@@ -1803,7 +1828,7 @@ def find_potential_ign_typos(screenshot_igns: Set[str], db_members: List[Dict[st
     potential_typos.sort(key=lambda x: x[3], reverse=True)
     return potential_typos
 
-async def fetch_all_db_hc_members_with_status(guild: Optional[discord.Guild]) -> List[Dict[str, Any]]:
+async def fetch_all_db_florr_players_with_status(guild: Optional[discord.Guild]) -> List[Dict[str, Any]]:
     """
     Fetches all HC members from Supabase, including their ingame_name, discord_id, and is_in_hc status.
     Returns a list of dicts, e.g., {'ingame_name': 'Player1', 'discord_id': '123...', 'is_in_hc': True}
@@ -1814,7 +1839,7 @@ async def fetch_all_db_hc_members_with_status(guild: Optional[discord.Guild]) ->
     
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name, discord_id, is_in_hc")
                            # .eq("is_in_hc", True) # Fetch ALL members to check their status, not just active ones
                            .not_.is_("ingame_name", "null")
@@ -1834,15 +1859,15 @@ async def fetch_all_db_hc_members_with_status(guild: Optional[discord.Guild]) ->
         if guild: await log_error(guild, "GuildSync: Error fetching all HC members with status from DB", error=e)
         return []
 
-async def fetch_all_db_hc_members_for_sync(guild: Optional[discord.Guild]) -> List[str]:
-    """Fetches all In-Game Names from hc_members where is_in_hc is TRUE."""
+async def fetch_all_db_florr_players_for_sync(guild: Optional[discord.Guild]) -> List[str]:
+    """Fetches all In-Game Names from florr_players where is_in_hc is TRUE."""
     if not supabase:
         if guild: await log_error(guild, "GuildSync: Supabase unavailable for fetching DB HC members.")
         return []
     
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name")
                            .eq("is_in_hc", True)
                            .not_.is_("ingame_name", "null") # Ensure IGN is not null
@@ -2402,7 +2427,7 @@ async def update_custom_nickname_on_attempt(
 
     try:
         settings_resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("manage_nickname_by_bot, custom_nickname_template, florr_guild_tag")
                            .eq("discord_id", str(user.id))
                            .eq("ingame_name", author_ign)
@@ -3808,7 +3833,7 @@ class ProfilePagesView(discord.ui.View):
 
 async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign: str) -> Optional[Dict[str, Any]]:
     """
-    Fetches core profile data for a given In-Game Name from hc_members.
+    Fetches core profile data for a given In-Game Name from florr_players.
     Performs a case-insensitive search for the IGN.
     Returns a dict {'ingame_name': str (actual case from DB), 
                     'discord_id': str | None, 
@@ -3827,7 +3852,7 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
         # For now, a simple .eq() and then checking a lowercase version (if needed) or direct .ilike()
         # Let's try .ilike() as it's simpler for case-insensitivity directly in query
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name, discord_id, is_in_hc, discord_name")
                            .ilike("ingame_name", input_ign) # Case-insensitive match
                            .maybe_single() # Expecting at most one due to unique constraint on ingame_name
@@ -3855,7 +3880,7 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
 
 async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_id_str: str) -> Optional[Dict[str, Any]]:
     """
-    Fetches core profile data (IGN, is_in_hc) for a given Discord ID from hc_members.
+    Fetches core profile data (IGN, is_in_hc) for a given Discord ID from florr_players.
     Returns a dict {'ingame_name': str, 'is_in_hc': bool, 'discord_name': str | None} or None if not found.
     """
     if not supabase:
@@ -3863,7 +3888,7 @@ async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_i
         return None
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name, is_in_hc, discord_name")
                            .eq("discord_id", discord_id_str)
                            .maybe_single()
@@ -3995,53 +4020,46 @@ class HelpPagesView(discord.ui.View):
     def __init__(self, bot_user: discord.User, is_staff_view_allowed: bool, timeout=180.0):
         super().__init__(timeout=timeout)
         self.bot_user = bot_user
-        self.current_page = "general" 
+        self.current_page = "general"
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
-        # Initialize button directly if staff view is not allowed
         if self.is_staff_view_allowed:
             self.toggle_page_button = discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
             self.toggle_page_button.callback = self.toggle_page_button_callback
             self.add_item(self.toggle_page_button)
         else:
-            self.toggle_page_button = None # No button if not allowed
+            self.toggle_page_button = None
 
-
-    def _update_decorated_button_appearance(self): # Renamed from _update_decorated_button_appearance(self, button_to_update)
-        if not self.toggle_page_button: return # No button to update
-
+    def _update_decorated_button_appearance(self):
+        if not self.toggle_page_button: return
         if self.current_page == "general":
-            self.toggle_page_button.label = "View Staff Commands"
-            self.toggle_page_button.emoji = "🛡️"
-            self.toggle_page_button.style = discord.ButtonStyle.secondary
-        else: 
-            self.toggle_page_button.label = "Back to General"
-            self.toggle_page_button.emoji = "⬅️"
-            self.toggle_page_button.style = discord.ButtonStyle.primary
+            self.toggle_page_button.label = "View Staff Commands"; self.toggle_page_button.emoji = "🛡️"; self.toggle_page_button.style = discord.ButtonStyle.secondary
+        else:
+            self.toggle_page_button.label = "Back to General"; self.toggle_page_button.emoji = "⬅️"; self.toggle_page_button.style = discord.ButtonStyle.primary
 
     def _create_general_embed(self) -> discord.Embed:
         embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "Here are commands generally available to users:\n\u200B"
-        
-        embed.add_field(name="📊 [HC1] Guild & Activity", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hcmembers')}  · Show interactive HC member list.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('activatemyself')} · Mark *yourself* as active (deprecated).", value="\u200B", inline=False) # Updated description
-        embed.add_field(name=f"{get_cmd_mention('profile')} · View [HC1] profile, activity, and S.Attempt stats.", value="\u200B", inline=False)
-        
-        embed.add_field(name="\u200B\n🕵️ Secret Phrase Discovery", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret phrase discovery progress.", value="\u200B", inline=False)
-        
+
+        embed.add_field(name="✨ Main Commands", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('profile')} · View a player's profile and stats.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('connect')} · Link your Discord to an IGN.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('disconnect')} · Unlink your Discord from your IGN.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hcmembers')} · Show interactive list of guild members.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('servercodes')} · Browse Florr.io server codes.", value="\u200B", inline=False)
+
         embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname.", value="\u200B", inline=False)
-        
+
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret AI phrase discovery progress.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-        
+
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
@@ -4049,65 +4067,53 @@ class HelpPagesView(discord.ui.View):
         embed = discord.Embed(title="🛡️ Pingslave Bot - Staff Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "These commands typically require server management permissions:\n\u200B"
-        
-        embed.add_field(name="🔑 Verification & HC Management", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('verify')}  · Verify user/update own IGN. `[Manage Roles]`", value="\u200B", inline=False) # Updated
-        embed.add_field(name=f"{get_cmd_mention('unverify')}  · Unverify user. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hcverify')}  · Verify into HC. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hconly')} · Register HC IGN only. `[Manage Roles]`", value="\u200B", inline=False) # Updated
-        embed.add_field(name=f"{get_cmd_mention('hcleave')} · Remove from HC. `[Manage Roles]`", value="\u200B", inline=False) # Updated
-        
-        embed.add_field(name="\u200B\n⏱️ Activity Tracking (Staff)", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('active')}  · Mark member active today. `[Manage Server]`", value="\u200B", inline=False) # Updated
-        embed.add_field(name=f"{get_cmd_mention('inactive')}  · Remove activity record. `[Manage Server]`", value="\u200B", inline=False) # Updated
-        
-        embed.add_field(name="\u200B\n⚙️ Utilities (Staff & Owner)", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Manage Server]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('refresh')}  · Refresh list, data, sync nicks. `[Manage Roles]`", value="\u200B", inline=False) # Updated
-        embed.add_field(name=f"{get_cmd_mention('wither')}  · Temp role removal. `[Special]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add keyword rule. `[Owner Only]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('aiping')} · Check AI model latencies. `[Owner Only]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages. `[Owner Only]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('test_petal_match')} · Test petal name fuzzy matching. `[Owner Only]`", value="\u200B", inline=False)
+        embed.description = "These commands require server management permissions:\n\u200B"
+
+        embed.add_field(name="🔑 Guild & Member Management", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setguild')} · Set a user's Florr guild. `[Manage Roles]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('verify')} · Manually manage verified/unverified roles. `[Manage Roles]`", value="\u200B", inline=False)
+
+        embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('active')} · Mark member active today. `[Manage Server]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('inactive')} · Remove activity record. `[Manage Server]`", value="\u200B", inline=False)
+
+        embed.add_field(name="\u200B\n⚙️ Server & Bot Customisation", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('customise')} · View/edit bot settings for this server. `[Admin]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Admin]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('wither')} · Temp role removal. `[Admin]`", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('refresh')} · Sync all roles, refresh data. `[Manage Server]`", value="\u200B", inline=False)
+
+        embed.add_field(name="\u200B\n👑 Owner Only", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add AI keyword rule.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages.", value="\u200B", inline=False)
 
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
     def get_current_embed(self) -> discord.Embed:
-        if self.current_page == "staff":
-            return self._create_staff_embed()
+        if self.current_page == "staff": return self._create_staff_embed()
         return self._create_general_embed()
 
-    # This is the callback for the button added in __init__
-    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button): # button param is passed by d.py
-        if not self.is_staff_view_allowed: # Redundant check, button shouldn't exist if not allowed
+    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.is_staff_view_allowed:
             await interaction.response.send_message("This action is not available.", ephemeral=True, delete_after=5)
             return
-
-        if self.current_page == "general":
-            self.current_page = "staff"
-        else:
-            self.current_page = "general"
-        
-        self._update_decorated_button_appearance() 
-        current_embed = self.get_current_embed()
-        
-        await interaction.response.edit_message(embed=current_embed, view=self)
+        self.current_page = "staff" if self.current_page == "general" else "general"
+        self._update_decorated_button_appearance()
+        await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
     async def on_timeout(self):
-        if self.message and self.toggle_page_button: # Check if button exists
+        if self.message and self.toggle_page_button:
             try:
                 current_embed_on_timeout = self.get_current_embed()
                 if current_embed_on_timeout.footer and current_embed_on_timeout.footer.text:
                     current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
                 else:
                     current_embed_on_timeout.set_footer(text="Interaction timed out")
-                
-                self.toggle_page_button.disabled = True # Disable the specific button
-                await self.message.edit(embed=current_embed_on_timeout, view=self) 
-            except discord.HTTPException:
-                pass
+                self.toggle_page_button.disabled = True
+                await self.message.edit(embed=current_embed_on_timeout, view=self)
+            except discord.HTTPException: pass
         self.stop()
 
 async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -4422,38 +4428,37 @@ class ScreenshotConfirmView(View):
         self.stop()
 
 async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
-    """Loads all In-Game Names from Supabase into cache for players who are in ANY tracked guild."""
+    """Loads all In-Game Names from Supabase into cache."""
     global ingame_name_cache
     if not supabase:
         await log_error(guild_for_log, "IGN Cache loading failed: Supabase unavailable.", ping_owner=True)
         ingame_name_cache = []
         return
 
-    print("Loading IGN cache from Supabase (players in any guild)...")
+    print("Loading all IGNs from florr_players into cache...")
     try:
-        # Fetch ingame_name for entries where florr_guild_tag is not null
+        # Fetch all non-null ingame_names from the database
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name")
-                           .not_.is_("florr_guild_tag", "null")
                            .not_.is_("ingame_name", "null")
                            .execute()
         )
 
         if not resp or not hasattr(resp, 'data') or not resp.data:
-            await log_info(guild_for_log, "No IGN data found for players in guilds. IGN cache will be empty.")
+            await log_info(guild_for_log, "No IGN data found in the database. IGN cache will be empty.")
             ingame_name_cache = []
             return
 
         temp_igns = {str(entry["ingame_name"]) for entry in resp.data if entry.get("ingame_name")}
         ingame_name_cache = sorted(list(temp_igns), key=str.lower)
 
-        print(f"Loaded {len(ingame_name_cache)} unique In-Game Names (in any guild) into cache.")
-        await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs (in any guild) into local cache.")
+        print(f"Loaded {len(ingame_name_cache)} unique In-Game Names into cache.")
+        await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs into local cache.")
 
     except (APIError, ConnectionError, Exception) as e:
         await log_error(guild_for_log, "Failed to load IGN cache from Supabase", error=e, ping_owner=True)
-        ingame_name_cache = [] # Clear cache on error
+        ingame_name_cache = [] # Clear cache on error # Clear cache on error
 
 
 
@@ -4912,7 +4917,7 @@ class StaticHCPagesView(View):
         hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
         target_ign_from_db: Optional[str] = hc_profile_db_data.get("ingame_name") if hc_profile_db_data else None
         if not target_ign_from_db:
-            await interaction.followup.send(f"❌ {interaction.user.mention}, I couldn't find a linked In-Game Name (IGN) for you. Use {get_cmd_mention('hcverify')} or {get_cmd_mention('verify')}.", ephemeral=True)
+            await interaction.followup.send(f"❌ {interaction.user.mention}, I couldn't find a linked In-Game Name (IGN) for you. Use {get_cmd_mention('guild')} or {get_cmd_mention('verify')}.", ephemeral=True)
             return
         display_name_for_view: str = target_user_for_display.display_name
         avatar_url_for_view: Optional[str] = target_user_for_display.display_avatar.url if target_user_for_display.display_avatar else target_user_for_display.default_avatar.url
@@ -5093,30 +5098,30 @@ async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> 
         await log_error(guild_for_log, "fetch_all_supabase_hc_data failed: Supabase client unavailable.", ping_owner=True)
         return [], 0
 
-    # 1. Fetch members from hc_members table where is_in_hc is TRUE
-    active_hc_members_data = []
+    # 1. Fetch members from florr_players table where is_in_hc is TRUE
+    active_florr_players_data = []
     try:
-        print("Fetch All Supabase Data: Fetching from hc_members where is_in_hc = TRUE...")
+        print("Fetch All Supabase Data: Fetching from florr_players where is_in_hc = TRUE...")
         resp_members = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("discord_id, discord_name, ingame_name, is_in_hc") # Added is_in_hc
                            .eq("is_in_hc", True)  # <-- ADDED THIS FILTER
                            .execute()
         )
         if resp_members and hasattr(resp_members, 'data') and resp_members.data:
-            active_hc_members_data = resp_members.data
-            print(f"Fetch All Supabase Data: Found {len(active_hc_members_data)} entries in hc_members with is_in_hc = TRUE.")
+            active_florr_players_data = resp_members.data
+            print(f"Fetch All Supabase Data: Found {len(active_florr_players_data)} entries in florr_players with is_in_hc = TRUE.")
         else:
-            print("Fetch All Supabase Data: No data returned from hc_members (is_in_hc=TRUE).")
+            print("Fetch All Supabase Data: No data returned from florr_players (is_in_hc=TRUE).")
             return [], 0
 
     except (ConnectionError, APIError, Exception) as e:
-        await log_error(guild_for_log, "Failed to fetch data from Supabase hc_members (is_in_hc=TRUE)", error=e, ping_owner=True)
+        await log_error(guild_for_log, "Failed to fetch data from Supabase florr_players (is_in_hc=TRUE)", error=e, ping_owner=True)
         return [], 0
 
     # 2. Fetch all activity data (for the IGNs found)
     activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
-    all_igns_in_db = [entry['ingame_name'] for entry in active_hc_members_data if entry.get('ingame_name')]
+    all_igns_in_db = [entry['ingame_name'] for entry in active_florr_players_data if entry.get('ingame_name')]
 
     if not all_igns_in_db:
          print("Fetch All Supabase Data: No IGNs found in fetched member data (is_in_hc=TRUE). Skipping activity fetch.")
@@ -5130,7 +5135,7 @@ async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> 
 
     # 3. Combine Member and Activity Data
     final_data: List[Dict[str, Any]] = []
-    for member_entry in active_hc_members_data:
+    for member_entry in active_florr_players_data:
         ign = member_entry.get("ingame_name")
         if not ign: continue
 
@@ -5254,7 +5259,7 @@ async def check_activity_exists(guild: discord.Guild, ign_lower: str, activity_d
         return None # Indicate error
                 
 async def ign_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocompletes In-Game Names from the local cache or hc_members table."""
+    """Autocompletes In-Game Names from the local cache or florr_players table."""
     choices = []
     limit = 25 # Max choices Discord allows for autocomplete
 
@@ -5287,7 +5292,7 @@ async def ign_autocomplete(interaction: discord.Interaction, current: str) -> Li
     try:
         # Use ilike for case-insensitive matching, % for wildcard
         # Select distinct IGNs to avoid duplicates if schema allows multiple entries per IGN
-        query = supabase.table("hc_members").select("ingame_name", count='exact').ilike("ingame_name", f"%{current}%").not_.is_("ingame_name", "null").limit(limit)
+        query = supabase.table("florr_players").select("ingame_name", count='exact').ilike("ingame_name", f"%{current}%").not_.is_("ingame_name", "null").limit(limit)
         resp = await run_supabase_sync(lambda: query.execute())
 
         if resp and hasattr(resp, 'data') and resp.data:
@@ -5374,11 +5379,11 @@ def format_date_dmy(date_obj: Optional[datetime.date]) -> str:
     return "N/A"
 
 async def get_ign_from_user(guild: discord.Guild, user_id: int) -> Optional[str]:
-    """Fetches the stored IGN for a given Discord user ID from hc_members."""
+    """Fetches the stored IGN for a given Discord user ID from florr_players."""
     if not supabase: return None
     try:
         resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .select("ingame_name")
                            .eq("discord_id", str(user_id))
                            .maybe_single() # Fetch single record or None
@@ -6247,8 +6252,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     if not supabase: return
 
-    user_db_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("florr_guild_tag").eq("discord_id", str(after.id)).maybe_single().execute())
-    # Add check for None response
+    user_db_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("florr_guild_tag").eq("discord_id", str(after.id)).maybe_single().execute())
     if user_db_resp is None:
         await log_error(guild, f"DB error checking user {after.mention} during on_member_update.")
         return
@@ -6270,7 +6274,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         embed.add_field(name="User", value=f"{after.mention} (`{after.id}`)", inline=True)
         embed.add_field(name="Role", value=f"{changed_tracked_role.mention} (`{changed_tracked_role.id}`)", inline=True)
         embed.add_field(name="Action", value=f"Role was manually **{action.upper()}**.", inline=True)
-        embed.add_field(name="Recommendation", value=f"Use bot commands (`/hcverify`, `/hcleave`) or run `/refresh` to sync roles with the database.", inline=False)
+        embed.add_field(name="Recommendation", value=f"Use bot commands (`/setguild`) or run `/refresh` to sync roles with the database.", inline=False)
         embed.set_footer(text="This log indicates a potential inconsistency between Discord roles and the database.")
         await log_error(guild, "Manual Role Discrepancy", embed=embed)
 
@@ -6383,337 +6387,170 @@ def get_cmd_mention(name: str) -> str:
 # --- Slash Commands ---
 
 # --- Verify Command ---
-@tree.command(name="verify", description="Verify a standard user or update your own IGN if already verified.")
-@app_commands.describe(
-    user="The user to verify (or yourself to update IGN).",
-    ingame_name="User's Florr IGN to link/update. Required if self-updating or verifying a new user."
-)
-@app_commands.checks.bot_has_permissions(manage_roles=True)
-async def verify(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
-    guild = interaction.guild
-    if not guild: return
-
-    is_self_target = interaction.user.id == user.id
-    if not is_self_target and not interaction.permissions.manage_roles:
-        await interaction.response.send_message("❌ You need 'Manage Roles' permission to verify others.", ephemeral=True)
-        return
-
-    if not await check_supabase_available(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    cleaned_ign = ingame_name.strip()
-    if not cleaned_ign:
-        await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=False)
-        return
-
-    try:
-        # Check for IGN conflict BEFORE upserting
-        conflict_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("ingame_name", cleaned_ign).not_.eq("discord_id", str(user.id)).maybe_single().execute())
-        
-        # --- THIS IS THE FIX ---
-        # Check if the response object is not None before accessing its data.
-        if conflict_resp and conflict_resp.data and conflict_resp.data.get("discord_id"):
-            await interaction.followup.send(f"❌ **IGN Conflict:** `{cleaned_ign}` is already linked to another user (<@{conflict_resp.data['discord_id']}>).", ephemeral=False)
-            return
-        elif conflict_resp is None:
-            # This means run_supabase_sync failed.
-            await interaction.followup.send("❌ A database error occurred while checking for IGN conflicts. Please try again later.", ephemeral=False)
-            return
-        # --- END OF FIX ---
-
-        # Use upsert to create or update the user's record.
-        data_to_upsert = { "discord_id": str(user.id), "discord_name": str(user), "ingame_name": cleaned_ign }
-        upsert_resp = await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
-        
-        if upsert_resp is None:
-            await interaction.followup.send("❌ A database error occurred while saving the verification data. Please try again later.", ephemeral=False)
-            return
-
-        await interaction.followup.send(f"✅ Database updated: {user.mention}'s IGN is now set to `{cleaned_ign}`.", ephemeral=False)
-        
-        role_verified = guild.get_role(FLORRIST_ROLE_ID)
-        if role_verified and role_verified not in user.roles and guild.me.top_role > role_verified:
-            await user.add_roles(role_verified, reason=f"Verified by {interaction.user}")
-            await interaction.channel.send(f"➕ Added `{role_verified.name}` role to {user.mention}.")
-
-        await refresh_roles_for_single_user(guild, user)
-
-    except APIError as e: # Catch specific API errors for unique constraints etc.
-        if "unique constraint" in str(e.message) and "hc_members_ingame_name_key" in str(e.message):
-            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already linked to another user.", ephemeral=False)
-        else:
-            await log_error(guild, f"API Error during /verify for {user.mention}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database API error occurred.", ephemeral=False)
-    except Exception as e:
-        await log_error(guild, f"Error during /verify for {user.mention}", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
-
-
-# --- Unverify Command ---
-@tree.command(name="unverify", description="Revert user to Unverified (adds Unverified, removes Verified).")
-@app_commands.describe(user="The user to unverify.")
+@tree.command(name="verify", description="[Staff Only] Manually sets a user's verification roles.")
+@app_commands.describe(user="The user to manage roles for.")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
-async def unverify(interaction: discord.Interaction, user: discord.Member):
+async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=False)
-        return
-
-    role_to_add = guild.get_role(NEWBEE_ROLE_ID) # Role to ADD is 'Unverified'
-    role_to_remove = guild.get_role(FLORRIST_ROLE_ID) # Role to REMOVE is 'Verified'
-
-    # Role existence checks
-    missing_roles = []
-    if NEWBEE_ROLE_ID and not role_to_add: missing_roles.append(f"Unverified Role (ID: {NEWBEE_ROLE_ID})")
-    if FLORRIST_ROLE_ID and not role_to_remove: missing_roles.append(f"Verified Role (ID: {FLORRIST_ROLE_ID})")
-    if missing_roles:
-        msg = f"❌ Setup Error: Roles not found: {', '.join(missing_roles)}. Please configure the bot."
-        await interaction.response.send_message(msg, ephemeral=False)
-        await log_error(guild, f"Unverify failed: Missing roles - {', '.join(missing_roles)}", interaction=interaction)
-        return
-    # We definitely need the 'Unverified' role to add it
-    if not role_to_add:
-         msg = f"❌ Setup Error: Unverified Role (ID: {NEWBEE_ROLE_ID}) not configured correctly."
-         await interaction.response.send_message(msg, ephemeral=False)
-         await log_error(guild, msg, interaction=interaction)
-         return
-
-    # Hierarchy checks
-    bot_member = guild.me
-    hierarchy_fail = False
-    hierarchy_reason = ""
-    # Check if bot can assign the 'Unverified' role
-    if bot_member.top_role.position <= role_to_add.position:
-        hierarchy_fail=True
-        hierarchy_reason=f"Cannot assign the '{role_to_add.name}' role."
-    # Check if bot can remove the 'Verified' role (if it exists and is configured)
-    elif role_to_remove and bot_member.top_role.position <= role_to_remove.position:
-        hierarchy_fail=True
-        hierarchy_reason=f"Cannot remove the '{role_to_remove.name}' role."
-
-    if hierarchy_fail:
-         msg = f"❌ Hierarchy Error: {hierarchy_reason} My highest role ('{bot_member.top_role.name}') is not high enough."
-         await interaction.response.send_message(msg, ephemeral=False)
-         await log_error(guild, f"Unverify failed: Bot hierarchy issue. Reason: {hierarchy_reason}", interaction=interaction)
-         return
-
-    # Defer ephemerally
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    actions_taken = []
-    reason = f"Unverified by {interaction.user} (ID: {interaction.user.id})"
-    modified = False
-
-    try:
-        # Check current roles
-        has_unverified = role_to_add in user.roles
-        # Check if verified role exists and user has it
-        has_verified = bool(role_to_remove and role_to_remove in user.roles)
-
-        # If already correctly unverified, inform user
-        if has_unverified and not has_verified:
-            await interaction.followup.send(f"ℹ️ {user.mention} is already Unverified (has '{role_to_add.name}' and not '{role_to_remove.name if role_to_remove else ''}').", ephemeral=False)
-            return
-
-        roles_to_add_list = []
-        roles_to_remove_list = []
-
-        # Determine changes needed
-        if has_verified and role_to_remove: # Ensure role_to_remove exists
-             roles_to_remove_list.append(role_to_remove)
-             actions_taken.append(f"➖ Removed `{role_to_remove.name}`")
-             modified = True
-        if not has_unverified:
-             roles_to_add_list.append(role_to_add)
-             actions_taken.append(f"➕ Added `{role_to_add.name}`")
-             modified = True
-
-        # Apply changes if any
-        if modified:
-            if roles_to_add_list: await user.add_roles(*roles_to_add_list, reason=reason)
-            if roles_to_remove_list: await user.remove_roles(*roles_to_remove_list, reason=reason)
-
-            await log_info(guild, f"`{interaction.user}` unverified {user.mention}. Actions: {', '.join(actions_taken)}.")
-            await interaction.followup.send(f"✅ Successfully unverified {user.mention}.", ephemeral=False)
-
-            # Send public notification (optional)
-            public_embed = create_embed(f"↩️ **{user.display_name}** has been unverified.\n" + "\n".join(actions_taken), discord.Color.orange())
-            try:
-                 if isinstance(interaction.channel, discord.TextChannel):
-                     await interaction.channel.send(embed=public_embed)
-                 else:
-                     await log_info(guild, f"Skipped public unverify notification for {user.mention} (non-text channel).")
-            except (discord.Forbidden, discord.HTTPException) as e:
-                 await log_error(guild, "Failed to send public unverify notification", error=e, interaction=interaction)
-
-        else:
-             await interaction.followup.send("ℹ️ No role changes were needed.", ephemeral=False)
-
-    except discord.Forbidden:
-        await log_error(guild, "Unverify failed: Bot lacks permissions (Forbidden).", interaction=interaction)
-        await interaction.followup.send("❌ Failed: I don't have the necessary permissions to manage roles for this user.", ephemeral=False)
-    except discord.HTTPException as e:
-        await log_error(guild, "Unverify failed: Discord API error.", error=e, interaction=interaction)
-        await interaction.followup.send("❌ Failed: A Discord API error occurred. Please try again later.", ephemeral=False)
-    except Exception as e:
-        await log_error(guild, "Unexpected error during /unverify.", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
-
-
-# --- REFINED HC Verify Command (Handles existing IGN-only entries, EX_MEMBER_ROLE_ID removal) ---
-@tree.command(name="hcverify", description="Verify a user into a tracked Florr guild, linking their IGN and managing roles.")
-@app_commands.describe(
-    user="The user to verify.",
-    florr_guild_tag="The guild tag to verify them into (e.g., HC1).",
-    ingame_name="The user's Florr IGN."
-)
-@app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.checks.bot_has_permissions(manage_roles=True)
-async def hcverify(interaction: discord.Interaction, user: discord.Member, florr_guild_tag: str, ingame_name: str):
-    if not await check_supabase_available(interaction): return
-    
-    guild = interaction.guild
-    await interaction.response.defer(thinking=True, ephemeral=False)
-    
-    normalized_tag = _normalize_guild_tag(florr_guild_tag)
-    cleaned_ign = ingame_name.strip()
+    await interaction.response.defer(ephemeral=True)
 
     config = await load_server_config(guild.id)
-    tracked_guild_config = config.get('tracked_guilds', {}).get(normalized_tag)
+    verified_role_id = config.get('verified_role_id')
+    unverified_role_id = config.get('unverified_role_id')
 
-    if not tracked_guild_config or not tracked_guild_config.get('discord_role_id'):
-        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not configured with a role in this server. Use `/customise tracked_guild add` first.", ephemeral=False)
+    if not verified_role_id or not unverified_role_id:
+        await interaction.followup.send("❌ This server has not configured a `Verified` and `Unverified` role. Use `/customise set_role`.", ephemeral=True)
+        return
+
+    verified_role = guild.get_role(verified_role_id)
+    unverified_role = guild.get_role(unverified_role_id)
+
+    if not verified_role or not unverified_role:
+        await interaction.followup.send("❌ The configured `Verified` or `Unverified` role was not found in this server.", ephemeral=True)
         return
 
     try:
-        # Step 1: Check for IGN conflict on a DIFFERENT user before attempting to upsert.
-        # This prevents the most common APIError before it happens.
-        conflict_resp = await run_supabase_sync(
-            lambda: supabase.table("hc_members")
-                           .select("discord_id")
-                           .eq("ingame_name", cleaned_ign)
-                           .not_.eq("discord_id", str(user.id)) # Check for this IGN on other users
-                           .maybe_single()
-                           .execute()
-        )
-        if conflict_resp and conflict_resp.data and conflict_resp.data.get("discord_id"):
-            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already linked to another Discord user (<@{conflict_resp.data['discord_id']}>).", ephemeral=False)
-            return
-        elif conflict_resp is None:
-            await interaction.followup.send("❌ A database error occurred while checking for IGN conflicts.", ephemeral=False)
-            return
-
-        # Step 2: Upsert the data. This is now much less likely to fail due to a unique constraint.
-        # It will create a new record or update the existing one for this discord_id.
-        data_to_upsert = { "discord_id": str(user.id), "discord_name": str(user), "ingame_name": cleaned_ign, "florr_guild_tag": normalized_tag }
-        upsert_resp = await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="discord_id").execute())
+        if verified_role not in user.roles:
+            await user.add_roles(verified_role, reason=f"Manually verified by {interaction.user}")
+        if unverified_role in user.roles:
+            await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
         
-        if upsert_resp is None:
-            await interaction.followup.send("❌ A database error occurred while saving verification data.", ephemeral=False)
-            return
-
-        # If we reach here, the database operation was successful.
-        await interaction.followup.send(f"✅ Database updated: {user.mention} is now verified in guild **{normalized_tag}** with IGN `{cleaned_ign}`.", ephemeral=False)
-        await log_info(guild, f"`{interaction.user}` verified {user.mention} into {normalized_tag} with IGN `{cleaned_ign}`.")
-        
-        # Now that the DB is the source of truth, sync this user's roles.
-        await refresh_roles_for_single_user(guild, user)
-        
-        # And trigger a refresh of all guild lists.
-        asyncio.create_task(refresh_all_guild_lists(guild))
-
-    except APIError as e:
-        # This block will now correctly catch any other unexpected APIErrors from the upsert.
-        # The most likely one is still the ingame_name key if two people try to verify at the exact same time (race condition).
-        if "unique constraint" in str(e.message) and "hc_members_ingame_name_key" in str(e.message):
-            await interaction.followup.send(f"❌ **IGN Conflict:** The IGN `{cleaned_ign}` is already in use by another account. This might be a race condition, please try again.", ephemeral=False)
-        else:
-            await log_error(guild, f"An unexpected API Error occurred during /hcverify for {user.mention}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database error occurred. Please check the logs for details.", ephemeral=False)
+        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state (added `{verified_role.name}`, removed `{unverified_role.name}`).", ephemeral=True)
+        await log_info(guild, f"{interaction.user.name} manually verified {user.name} using /verify.")
     except Exception as e:
-        await log_error(guild, f"A general error occurred during /hcverify for {user.mention}", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
+        await log_error(guild, "Error during manual /verify", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An error occurred while managing roles.", ephemeral=True)
 
-# --- New HCLeave Command (MODIFIED: Sets is_in_hc=FALSE, includes Role Changes) ---
-@tree.command(name="hcleave", description="Remove a player from their tracked guild in the database.")
-@app_commands.describe(ingame_name="The IGN of the player to remove from their guild.")
-@app_commands.autocomplete(ingame_name=ign_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.checks.bot_has_permissions(manage_roles=True)
-async def hcleave(interaction: discord.Interaction, ingame_name: str):
-    if not await check_supabase_available(interaction): return
-    
-    guild = interaction.guild
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    try:
-        user_data_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id").eq("ingame_name", ingame_name).maybe_single().execute())
-        
-        if user_data_resp is None:
-            await interaction.followup.send("❌ A database error occurred while fetching player data.", ephemeral=False)
-            return
-
-        if not user_data_resp.data:
-            await interaction.followup.send(f"ℹ️ No player found with the IGN `{ingame_name}`.", ephemeral=False)
-            return
-
-        update_resp = await run_supabase_sync(lambda: supabase.table("hc_members").update({"florr_guild_tag": None}).eq("ingame_name", ingame_name).execute())
-        if update_resp is None:
-            await interaction.followup.send("❌ A database error occurred while updating the player's guild status.", ephemeral=False)
-            return
-
-        await interaction.followup.send(f"✅ Database updated: Player `{ingame_name}` is no longer marked as in a guild.", ephemeral=False)
-
-        discord_id = user_data_resp.data.get("discord_id")
-        if discord_id:
-            member = guild.get_member(int(discord_id))
-            if member:
-                await refresh_roles_for_single_user(guild, member)
-        
-        asyncio.create_task(refresh_all_guild_lists(guild))
-
-    except Exception as e:
-        await log_error(guild, f"Error during /hcleave for IGN `{ingame_name}`", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=False)
-
-@tree.command(name="hconly", description="Register an HC member by IGN and guild tag only (no Discord link).")
+@tree.command(name="connect", description="Connect your Discord account to your Florr IGN.")
 @app_commands.describe(
-    florr_guild_tag="The player's guild tag (e.g., HC1).",
-    ingame_name="The player's unique in-game name."
+    ingame_name="Your exact in-game name.",
+    user="[Staff Only] The user to connect."
 )
-@app_commands.checks.has_permissions(manage_roles=True)
-async def hconly(interaction: discord.Interaction, florr_guild_tag: str, ingame_name: str):
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+async def connect(interaction: discord.Interaction, ingame_name: str, user: Optional[discord.Member] = None):
     if not await check_supabase_available(interaction): return
-    
     guild = interaction.guild
-    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    target_user = user or interaction.user
+    if user and interaction.user.id != user.id and not await is_admin_or_owner(interaction):
+        await interaction.response.send_message("❌ You need to be a server admin to connect another user's account.", ephemeral=True)
+        return
+    if not isinstance(target_user, discord.Member):
+        await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
 
     cleaned_ign = ingame_name.strip()
-    normalized_tag = _normalize_guild_tag(florr_guild_tag)
-
-    if not cleaned_ign:
-        await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=False)
-        return
-
     try:
-        existing_entry_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("florr_guild_tag, discord_id").eq("ingame_name", cleaned_ign).maybe_single().execute())
-        existing_entry = existing_entry_resp.data if existing_entry_resp and existing_entry_resp.data else None
+        # Check if the IGN exists in the database
+        ign_check_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id").eq("ingame_name", cleaned_ign).maybe_single().execute())
+        if ign_check_resp is None:
+            await interaction.followup.send("❌ DB error while checking IGN. Please try again.", ephemeral=True); return
+        
+        if not ign_check_resp.data:
+            await interaction.followup.send(f"❌ The IGN `{cleaned_ign}` is not registered in the database. An admin must add it first with `/nerd_admin add_ign`.", ephemeral=True); return
 
-        if existing_entry and existing_entry.get("discord_id"):
-            await interaction.followup.send(f"❌ Failed: IGN `{cleaned_ign}` is already linked to a Discord user (<@{existing_entry['discord_id']}>). Use `/hcleave` first if needed.", ephemeral=False)
-            return
-            
-        data_to_upsert = { "ingame_name": cleaned_ign, "florr_guild_tag": normalized_tag, "discord_id": None, "discord_name": None }
-        await run_supabase_sync(lambda: supabase.table("hc_members").upsert(data_to_upsert, on_conflict="ingame_name").execute())
+        if ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
+            await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{ign_check_resp.data['discord_id']}>).", ephemeral=True); return
 
-        await interaction.followup.send(f"✅ Successfully registered `{cleaned_ign}` to guild **{normalized_tag}** (IGN only).", ephemeral=False)
-        if guild: await log_info(guild, f"`{interaction.user}` used /hconly to register IGN `{cleaned_ign}` to tag {normalized_tag}.")
-        asyncio.create_task(refresh_all_guild_lists(interaction.guild))
+        # Perform the update
+        await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": str(target_user.id), "discord_name": str(target_user)}).eq("ingame_name", cleaned_ign).execute())
+        
+        await refresh_roles_for_single_user(guild, target_user)
+        await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
+        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`.")
 
     except Exception as e:
-        await log_error(guild, f"Error during /hconly for IGN `{cleaned_ign}`", error=e, interaction=interaction)
-        await interaction.followup.send("❌ An unexpected database error occurred.", ephemeral=False)
+        await log_error(guild, f"Error during /connect for {target_user.name}", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
+
+@tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
+@app_commands.describe(user="[Staff Only] The user to disconnect.")
+async def disconnect(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    if not await check_supabase_available(interaction): return
+    guild = interaction.guild
+
+    target_user = user or interaction.user
+    if user and interaction.user.id != user.id and not await is_admin_or_owner(interaction):
+        await interaction.response.send_message("❌ You need to be a server admin to disconnect another user's account.", ephemeral=True)
+        return
+    if not isinstance(target_user, discord.Member):
+        await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # Find the record by discord_id and set discord_id/name to NULL
+        update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(target_user.id)).execute())
+
+        if not update_resp.data:
+            await interaction.followup.send(f"ℹ️ {target_user.mention} was not connected to any IGN in the database.", ephemeral=True); return
+        
+        await refresh_roles_for_single_user(guild, target_user)
+        ign_disconnected = update_resp.data[0].get('ingame_name', 'an IGN')
+        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`.", ephemeral=True)
+        await log_info(guild, f"`{interaction.user.name}` disconnected `{target_user.name}`.")
+
+    except Exception as e:
+        await log_error(guild, f"Error during /disconnect for {target_user.name}", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
+
+async def setguild_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    choices = [app_commands.Choice(name="None (Remove from guild)", value="--NONE--")]
+    if not interaction.guild: return choices
+    
+    config = await load_server_config(interaction.guild.id)
+    tracked_guilds = config.get('tracked_guilds', {})
+    
+    for tag in tracked_guilds.keys():
+        if len(choices) >= 25: break
+        if not current or current.lower() in tag.lower():
+            choices.append(app_commands.Choice(name=tag, value=tag))
+    return choices
+
+@tree.command(name="setguild", description="[Staff Only] Set a user's tracked Florr guild.")
+@app_commands.describe(user="The user to modify.", guild_tag="The guild to assign them to, or 'None' to remove.")
+@app_commands.autocomplete(guild_tag=setguild_autocomplete)
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.checks.bot_has_permissions(manage_roles=True)
+async def setguild(interaction: discord.Interaction, user: discord.Member, guild_tag: str):
+    if not await check_supabase_available(interaction): return
+    guild = interaction.guild
+    
+    await interaction.response.defer(ephemeral=True)
+
+    normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
+    
+    config = await load_server_config(guild.id)
+    if normalized_tag and normalized_tag not in config.get('tracked_guilds', {}):
+        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not a tracked guild in this server.", ephemeral=True)
+        return
+        
+    try:
+        update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
+        
+        if not update_resp.data:
+            await interaction.followup.send(f"❌ Could not find a connected database record for {user.mention}. Use `/connect` first.", ephemeral=True)
+            return
+            
+        await refresh_roles_for_single_user(guild, user)
+        ign = update_resp.data[0].get('ingame_name', 'N/A')
+        
+        if normalized_tag:
+            await interaction.followup.send(f"✅ Set `{ign}` ({user.mention})'s guild to **{normalized_tag}**. Roles are being updated.", ephemeral=True)
+            await log_info(guild, f"`{interaction.user.name}` set `{user.name}`'s guild to {normalized_tag}.")
+        else:
+            await interaction.followup.send(f"✅ Removed `{ign}` ({user.mention}) from any tracked guild. Roles are being updated.", ephemeral=True)
+            await log_info(guild, f"`{interaction.user.name}` removed `{user.name}` from their guild.")
+            
+        asyncio.create_task(refresh_all_guild_lists(guild))
+
+    except Exception as e:
+        await log_error(guild, f"Error during /setguild for {user.name}", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 # --- Activate Myself Command ---
 @tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
@@ -7130,7 +6967,7 @@ async def refresh(interaction: discord.Interaction):
         action_log.append("⏳ Syncing all member roles with the database... (this may take a while)")
         await interaction.edit_original_response(content="\n".join(feedback_parts + action_log))
         
-        all_db_users_resp = await run_supabase_sync(lambda: supabase.table("hc_members").select("discord_id, florr_guild_tag").execute())
+        all_db_users_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id, florr_guild_tag").execute())
         db_user_map = {entry['discord_id']: entry['florr_guild_tag'] for entry in all_db_users_resp.data if entry.get('discord_id')}
         
         roles_to_check = {data['discord_role_id'] for data in tracked_guilds.values() if data.get('discord_role_id')}
@@ -7175,119 +7012,78 @@ async def refresh(interaction: discord.Interaction):
 )
 async def wither(interaction: discord.Interaction, user: discord.Member, time: app_commands.Range[float, 0.1, 10.0] = 2.0):
     guild = interaction.guild
-    invoker = interaction.user # Member object of the user running the command
+    invoker = interaction.user
 
-    # Pre-checks
     if not guild:
         await interaction.response.send_message("This command cannot be used outside a server.", ephemeral=False)
         return
 
-    bot_member = guild.me # Bot's member object in the guild
+    config = await load_server_config(guild.id)
+    if not config.get('wither_command_enabled', True) and interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ This command is currently disabled in this server.", ephemeral=True)
+        return
+
+    bot_member = guild.me
 
     async def fail_check(log_reason: str, user_message: str):
-        """Helper to send failure message and log error."""
         send_method = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         try:
             await send_method(embed=create_embed(user_message, discord.Color.red()), ephemeral=False)
-        except (discord.NotFound, discord.InteractionResponded, discord.HTTPException) as e:
-            print(f"Wither Check Fail Send Error: {type(e).__name__} - {e}")
-        except Exception as e:
-            print(f"Wither Check Fail Send Error (Unknown): {e}")
+        except (discord.NotFound, discord.InteractionResponded, discord.HTTPException): pass
         await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
 
-    # 1. Permission Check (Invoker)
-    invoker_can_wither = False
-    permission_denied_message = "❌ You do not have permission to use this command." # Default
-
-    if guild.id == CATERCORD_GUILD_ID:
-        if invoker.id in ALLOWED_WITHERER_IDS:
-            invoker_can_wither = True
-    elif guild.id == RANDOM_SERVER_ID:
-        if invoker.id in ALLOWED_WITHERER_IDS or (isinstance(invoker, discord.Member) and invoker.guild_permissions.administrator):
-            invoker_can_wither = True
-        else:
-            permission_denied_message = "❌ In this server, only whitelisted users or Administrators can use this command."
-    else: # Any other server
-        if isinstance(invoker, discord.Member) and invoker.guild_permissions.administrator:
-            invoker_can_wither = True
-        else:
-            permission_denied_message = "❌ In this server, only Administrators can use this command."
-
-    if not invoker_can_wither:
-        if not interaction.response.is_done():
-            try: await interaction.response.defer(ephemeral=False)
-            except discord.InteractionResponded: pass
-        await fail_check("Invoker permission denied.", permission_denied_message)
+    if not await is_admin_or_owner(interaction):
+        await fail_check("Invoker permission denied.", "❌ You need to be a server administrator to use this command.")
         return
-
-    # 2. Defer Publicly (thinking state visible)
+        
     if not interaction.response.is_done():
-        try:
-            await interaction.response.defer(thinking=True, ephemeral=False)
-        except discord.InteractionResponded:
-            print(f"Warning: Interaction {interaction.id} was already responded to before public defer in wither.")
-            pass
+        try: await interaction.response.defer(thinking=True, ephemeral=False)
+        except discord.InteractionResponded: pass
 
-    # 3. Target Checks (Self, Protected, Bot, Bot Hierarchy)
     if user.id == invoker.id: await fail_check("Target self.", "🤨 You cannot wither yourself."); return
     if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>)."); return
     if user.id == BOT_USER_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
     if user.bot: await fail_check("Target other bot.", "🤖 You cannot wither other bots."); return
     if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target guild owner.", f"👑 You cannot wither the server owner (<@{guild.owner_id}>)."); return
-    # Bot hierarchy check (Bot must be able to manage target's roles)
     if bot_member.top_role.position <= user.top_role.position: await fail_check("Bot hierarchy low.", f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles."); return
-    # --- Invoker hierarchy check REMOVED ---
-    # if invoker.id != guild.owner_id and isinstance(invoker, discord.Member) and invoker.top_role.position <= user.top_role.position: await fail_check("Invoker hierarchy low.", f"❌ Your highest role ('{invoker.top_role.name}') is not high enough to wither {user.mention}."); return
-    
-    # Bot permissions check
     if not bot_member.guild_permissions.manage_roles: await fail_check("Bot missing manage_roles perm.", "❌ I lack the `Manage Roles` permission needed for this command."); return
 
-
-    # 4. Get Original Roles (excluding @everyone)
     original_roles = [r for r in user.roles if r.id != guild.default_role.id]
-    if not original_roles and guild.id != RANDOM_SERVER_ID: # If no roles AND not random server (where we might just add the special role)
+    if not original_roles:
         await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles (other than @everyone) to remove.", discord.Color.orange()), ephemeral=False)
         return
 
-    # --- Start of Main Wither Logic (Outer Try Block) ---
     try:
         wither_seconds = min(max(1, int(time * 60)), int(MAX_WITHER_SECONDS or 600))
         actual_minutes = wither_seconds / 60.0
         reason_wither = f"Withered by {invoker.name} ({invoker.id}) for {actual_minutes:.1f}m."
 
-        # --- Role Removal ---
         roles_to_remove_actually = [r for r in original_roles if bot_member.top_role.position > r.position]
         skipped_roles_remove = [r for r in original_roles if r not in roles_to_remove_actually]
 
-        if not roles_to_remove_actually and guild.id != RANDOM_SERVER_ID: # If no manageable roles AND not random server
+        if not roles_to_remove_actually:
              await interaction.followup.send(embed=create_embed(f"ℹ️ Cannot wither {user.display_name}: None of their roles are below my highest role.", color=discord.Color.orange()), ephemeral=False)
              await log_info(guild, f"Wither attempt on {user.name} by {invoker.name} failed: No manageable roles.")
              return
 
-        everyone_role = guild.default_role
-        roles_to_set_during_wither = [everyone_role]
+        roles_to_set_during_wither = [guild.default_role]
+        withered_role_obj = guild.get_role(config.get('withered_role_id')) if config.get('withered_role_id') else None
+        
         special_wither_role_added_msg_part = ""
-
-        if guild.id == RANDOM_SERVER_ID:
-            withered_role_random_obj = guild.get_role(WITHERED_ROLE_ID_RANDOM_SERVER)
-            if withered_role_random_obj:
-                if bot_member.top_role.position > withered_role_random_obj.position:
-                    roles_to_set_during_wither.append(withered_role_random_obj)
-                    special_wither_role_added_msg_part = f"\n**Special Role Added:** `{withered_role_random_obj.name}`"
-                else:
-                    special_wither_role_added_msg_part = f"\n*(Note: Could not add special withered role '{withered_role_random_obj.name}' due to hierarchy.)*"
+        if withered_role_obj:
+            if bot_member.top_role > withered_role_obj:
+                roles_to_set_during_wither.append(withered_role_obj)
+                special_wither_role_added_msg_part = f"\n**Special Role Added:** `{withered_role_obj.name}`"
             else:
-                special_wither_role_added_msg_part = f"\n*(Note: Special withered role (ID: {WITHERED_ROLE_ID_RANDOM_SERVER}) for this server not found/configured.)*"
-                await log_error(guild, f"Wither: Special role {WITHERED_ROLE_ID_RANDOM_SERVER} not found in guild {guild.id} ({RANDOM_SERVER_ID})")
+                special_wither_role_added_msg_part = f"\n*(Note: Could not add withered role '{withered_role_obj.name}' due to hierarchy.)*"
 
         await user.edit(roles=roles_to_set_during_wither, reason=reason_wither)
 
-        # --- Send Confirmation ---
-        roles_removed_names = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually) or ('None' if not roles_to_remove_actually and guild.id != RANDOM_SERVER_ID else 'All existing manageable roles'))
+        roles_removed_names = (', '.join(f"`{r.name}`" for r in roles_to_remove_actually) or 'None')
         if len(roles_removed_names) > 850: roles_removed_names = roles_removed_names[:847] + "..."
 
         wither_desc = f"{user.mention} has been withered by {invoker.mention} for **{actual_minutes:.1f} minutes**!\n\n**Roles Removed:** {roles_removed_names}"
-        wither_desc += special_wither_role_added_msg_part # Add info about the special role if applicable
+        wither_desc += special_wither_role_added_msg_part
         if skipped_roles_remove:
             skipped_names = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))
             if len(skipped_names) > 100: skipped_names = skipped_names[:97] + "..."
@@ -7295,124 +7091,20 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
 
         await interaction.followup.send(embed=create_embed(title="🌪️ Wither Cast! 🌪️", description=wither_desc, color=discord.Color.dark_purple()), ephemeral=False)
 
-        log_msg = f"`{user.name}` ({user.id}) withered by `{invoker.name}` ({invoker.id}) for {actual_minutes:.1f}m. Roles removed: {', '.join(r.name for r in roles_to_remove_actually) or 'N/A'}."
-        if guild.id == RANDOM_SERVER_ID and any(role.id == WITHERED_ROLE_ID_RANDOM_SERVER for role in roles_to_set_during_wither):
-            log_msg += f" Special role {WITHERED_ROLE_ID_RANDOM_SERVER} added."
-        if skipped_roles_remove: log_msg += f" Skipped (hierarchy): {', '.join(r.name for r in skipped_roles_remove)}."
-        await log_info(guild, log_msg)
-
-        # --- Wait Period ---
         await asyncio.sleep(wither_seconds)
 
-        # --- Role Restore (Inner Try Block) ---
         try:
             member_after = await guild.fetch_member(user.id)
-            bot_member_after = await guild.fetch_member(bot.user.id) if bot.user else await guild.fetch_me()
-            reason_restore = f"Wither expired after {actual_minutes:.1f}m. Restoring roles."
-
-            if not bot_member_after.guild_permissions.manage_roles:
-                await log_error(guild, f"Wither restore fail for {member_after.mention}: Bot lost `Manage Roles` permission.")
-                if interaction.channel: await interaction.channel.send(f"⚠️ Failed to restore roles for {member_after.mention}: Bot permissions missing.")
-                return
-            if bot_member_after.top_role.position <= member_after.top_role.position:
-                await log_error(guild, f"Wither restore fail: Bot hierarchy now too low for {member_after.mention}.")
-                if interaction.channel: await interaction.channel.send(f"⚠️ Failed to restore roles for {member_after.mention}: Hierarchy issue.")
-                return
-
-            valid_restore_roles = []
-            skipped_deleted_names = []
-            skipped_hierarchy_names = []
-            original_role_ids = {r.id for r in original_roles}
-            current_valid_roles = {r.id: r for r in guild.roles}
-
-            for role_id in original_role_ids:
-                role_obj = current_valid_roles.get(role_id)
-                if not role_obj:
-                    original_name = next((r.name for r in original_roles if r.id == role_id), f"ID {role_id}")
-                    skipped_deleted_names.append(original_name)
-                elif bot_member_after.top_role.position > role_obj.position:
-                    valid_restore_roles.append(role_obj)
-                else:
-                    skipped_hierarchy_names.append(role_obj.name)
-
-            if skipped_deleted_names: await log_info(guild, f"Wither restore notice for {member_after.name}: Roles seem deleted: {', '.join(skipped_deleted_names)}.")
-            if skipped_hierarchy_names: await log_info(guild, f"Wither restore notice for {member_after.name}: Roles skipped (hierarchy): {', '.join(skipped_hierarchy_names)}.")
-
-            if not valid_restore_roles and guild.id != RANDOM_SERVER_ID: # If no roles to restore AND not random server (where we only need to remove the special role)
-                await log_info(guild, f"Wither restore: No valid roles left to restore for {member_after.name}.")
-                if interaction.channel: await interaction.channel.send(f"ℹ️ Wither ended for {member_after.mention}, but no valid roles could be restored (deleted or hierarchy issues).")
-                # Still proceed to remove special role if in RANDOM_SERVER_ID
-                if guild.id != RANDOM_SERVER_ID: return
-
-            final_roles_to_set = valid_restore_roles + [guild.default_role]
-            special_wither_role_removed_msg_part = ""
-
-            if guild.id == RANDOM_SERVER_ID:
-                withered_role_random_obj = guild.get_role(WITHERED_ROLE_ID_RANDOM_SERVER)
-                if withered_role_random_obj and withered_role_random_obj in member_after.roles:
-                    if bot_member_after.top_role.position > withered_role_random_obj.position:
-                         special_wither_role_removed_msg_part = f"\n*(Special withered role `{withered_role_random_obj.name}` removed.)*"
-                         await log_info(guild, f"Wither Restore: Removing special role {withered_role_random_obj.name} from {member_after.name} in {RANDOM_SERVER_ID}.")
-                    else:
-                         special_wither_role_removed_msg_part = f"\n*(Could not remove special withered role `{withered_role_random_obj.name}` due to hierarchy.)*"
-                         await log_error(guild, f"Wither Restore: Could not remove special role {withered_role_random_obj.name} from {member_after.name} in {RANDOM_SERVER_ID} due to hierarchy.")
-
-
-            await member_after.edit(roles=final_roles_to_set, reason=reason_restore)
-
-            restored_names = (', '.join(f"`{r.name}`" for r in valid_restore_roles) or 'None')
+            await member_after.edit(roles=[guild.default_role] + original_roles, reason=f"Wither expired after {actual_minutes:.1f}m.")
+            
             restore_msg = f"✨ {member_after.mention}'s roles have been restored!"
-            restore_msg += special_wither_role_removed_msg_part # Add info about special role removal
-            if skipped_deleted_names or skipped_hierarchy_names:
-                restore_msg += "\n*(Some original roles were not restored due to being deleted or hierarchy issues.)*"
-
-            try:
-                 await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
-            except (discord.NotFound, discord.HTTPException) as e_followup:
-                print(f"Wither restore followup failed ({e_followup}), attempting to send to channel.")
-                if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                    try: await interaction.channel.send(embed=create_embed(restore_msg, color=NERDY_YELLOW))
-                    except Exception as e_chan_send: await log_error(guild, "Wither failed channel send after followup fail", error=e_chan_send)
-                else: await log_info(guild, f"Wither restore OK for {member_after.mention}, but couldn't send followup or channel message.")
-
-            log_restore_details = f"Restored roles for `{member_after.name}` ({member_after.id}). Roles: {', '.join(r.name for r in valid_restore_roles)}"
-            if guild.id == RANDOM_SERVER_ID and "removed" in special_wither_role_removed_msg_part.lower():
-                log_restore_details += f". Special role {WITHERED_ROLE_ID_RANDOM_SERVER} also handled."
-            await log_info(guild, log_restore_details)
-
+            await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
         except discord.NotFound:
             await log_info(guild, f"Wither restore skipped: User `{user.name}` ({user.id}) left the server.")
-            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                try: await interaction.channel.send(f"ℹ️ Wither ended for {user.display_name}, but they have left the server.")
-                except Exception: pass
-        except discord.Forbidden:
-            await log_error(guild, f"Wither restore failed: Forbidden error for {user.name} ({user.id}).")
-            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name}: Permissions error.")
-                except Exception: pass
-        except discord.HTTPException as e:
-            await log_error(guild, f"Wither restore failed: API error for {user.name} ({user.id}).", error=e)
-            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                try: await interaction.channel.send(f"⚠️ Failed to restore roles for {user.display_name}: Discord API error.")
-                except Exception: pass
-        except Exception as e:
-            await log_error(guild, f"Wither restore failed: Unexpected error for {user.name} ({user.id}).", error=e)
-            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                try: await interaction.channel.send(f"⚠️ An unexpected error occurred trying to restore roles for {user.display_name}.")
-                except Exception: pass
-
-    except discord.Forbidden:
-        await log_error(guild, f"Wither initial remove failed: Forbidden for {user.name} ({user.id}).", interaction=interaction)
-        try: await interaction.edit_original_response(content=f"❌ Failed to remove roles for {user.display_name}: Permissions error.", embed=None, view=None)
-        except Exception: pass
-    except discord.HTTPException as e:
-        await log_error(guild, f"Wither initial remove failed: API error for {user.name} ({user.id}).", error=e, interaction=interaction)
-        try: await interaction.edit_original_response(content=f"❌ Failed to remove roles for {user.display_name}: Discord API error.", embed=None, view=None)
-        except Exception: pass
+        except Exception as e_restore:
+            await log_error(guild, f"Wither restore failed for {user.name} ({user.id}).", error=e_restore)
     except Exception as e:
         await log_error(guild, f"Wither initial remove failed: Unexpected error for {user.name} ({user.id}).", error=e, interaction=interaction)
-        try: await interaction.edit_original_response(content=f"❌ An unexpected error occurred trying to wither {user.display_name}.", embed=None, view=None)
-        except Exception: pass
 
 
 
@@ -7894,7 +7586,6 @@ async def florr(
    
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
-    # // --- UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
@@ -7905,11 +7596,8 @@ async def nerdhelp(interaction: discord.Interaction):
         return
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
-    # // --- END UNCHANGED SECTION (nerdhelp beginning - guild check, bot ready, command_ids check) --- //
 
-    can_see_staff_commands = False
-    if isinstance(interaction.user, discord.Member): # Ensure user is a Member for permission checks
-        can_see_staff_commands = await can_manage_guild_or_is_bypass_user(interaction)
+    can_see_staff_commands = await is_admin_or_owner(interaction)
 
     view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
     
@@ -7918,24 +7606,11 @@ async def nerdhelp(interaction: discord.Interaction):
 
     initial_embed = view_instance.get_current_embed()
 
-    # // --- UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
     try:
         await interaction.response.send_message(embed=initial_embed, view=view_instance, ephemeral=False)
         view_instance.message = await interaction.original_response()
-            
     except Exception as e:
-        print(f"Error sending nerdhelp response: {e}")
-        if isinstance(e, discord.HTTPException) and e.code == 50035:
-            print("--- TRACEBACK FOR NERDHELP 50035 ---")
-            print(traceback.format_exc())
-            print("--- END TRACEBACK ---")
         await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send("Failed to generate help embed.", ephemeral=False)
-            else: # Should have been responded to by send_message above
-                await interaction.edit_original_response(content="Failed to generate help embed.", embed=None, view=None)
-        except Exception: pass
     # // --- END UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
 
 @tree.command(name="cleanup_bot_messages", description="[Owner Only] Deletes the bot's previous N messages in this channel.")
@@ -8188,7 +7863,7 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
 
     # Fetch current settings to toggle manage_nickname_by_bot if template is omitted
     current_settings_resp = await run_supabase_sync(
-        lambda: supabase.table("hc_members")
+        lambda: supabase.table("florr_players")
                        .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc")
                        .eq("discord_id", str(target_user.id))
                        .maybe_single()
@@ -8244,14 +7919,14 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
 
     try:
         await run_supabase_sync(
-            lambda: supabase.table("hc_members")
+            lambda: supabase.table("florr_players")
                            .update({
                                "manage_nickname_by_bot": manage_by_bot_new_value,
                                "custom_nickname_template": template_to_store
                            })
                            .eq("discord_id", str(target_user.id))
                            # Ensure it's for the correct IGN if user has multiple accounts (rare)
-                           # This also implicitly checks if the user is in hc_members for this IGN
+                           # This also implicitly checks if the user is in florr_players for this IGN
                            .eq("ingame_name", author_ign) 
                            .execute()
         )
@@ -8283,7 +7958,7 @@ class CustomiseGroup(app_commands.Group):
     def __init__(self):
         super().__init__(name="customise", description="Customise bot settings for this server.")
 
-    @app_commands.command(name="settings", description="View the current custom settings for this server.")
+    @app_commands.command(name="settings", description="[Admin] View the current custom settings for this server.")
     @app_commands.check(is_admin_or_owner)
     async def view_settings(self, interaction: discord.Interaction):
         if not interaction.guild: return
@@ -8292,220 +7967,154 @@ class CustomiseGroup(app_commands.Group):
 
         embed = discord.Embed(title=f"⚙️ Current Settings for {interaction.guild.name}", color=NERDY_YELLOW)
         
-        # --- Toggles Field ---
-        kw_status = "✅ Enabled" if config.get('keywords_enabled', True) else "❌ Disabled"
-        wither_status = "✅ Enabled" if config.get('wither_command_enabled', True) else "❌ Disabled"
-        profile_status = "✅ Enabled" if config.get('profile_command_enabled', True) else "❌ Disabled"
-        servercodes_status = "✅ Enabled" if config.get('servercodes_command_enabled', True) else "❌ Disabled"
-        toggles_val = (
-            f"Keywords: {kw_status}\n"
-            f"Wither Cmd: {wither_status}\n"
-            f"Profile Cmd: {profile_status}\n"
-            f"ServerCodes Cmd: {servercodes_status}\n"
-            f"*(Manage with {get_cmd_mention('customise toggle_feature')})*"
+        # --- Role Settings ---
+        ver_role = interaction.guild.get_role(config.get('verified_role_id'))
+        unver_role = interaction.guild.get_role(config.get('unverified_role_id'))
+        wither_role = interaction.guild.get_role(config.get('withered_role_id'))
+        roles_val = (
+            f"Verified Role: {ver_role.mention if ver_role else '`Not Set`'}\n"
+            f"Unverified Role: {unver_role.mention if unver_role else '`Not Set`'}\n"
+            f"Withered Role: {wither_role.mention if wither_role else '`Not Set`'}\n"
+            f"*(Manage with {get_cmd_mention('customise set_role')})*"
         )
-        embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
+        embed.add_field(name="Role Configuration", value=roles_val, inline=False)
 
-        # --- Channels Field ---
-        ss_chan = interaction.guild.get_channel(config.get('screenshots_dropbox_channel_id')) if config.get('screenshots_dropbox_channel_id') else None
-        satt_chan = interaction.guild.get_channel(config.get('super_attempts_channel_id')) if config.get('super_attempts_channel_id') else None
-        ai_chans_ids = config.get('always_on_ai_channels', [])
-        ai_chans_mentions = [f"<#{cid}>" for cid in ai_chans_ids] if ai_chans_ids else ["`None Set`"]
-        channels_val = (
-            f"Screenshot Dropbox: {ss_chan.mention if ss_chan else '`Not Set`'}\n"
-            f"Super Attempts: {satt_chan.mention if satt_chan else '`Not Set`'}\n"
-            f"Always-On AI: {', '.join(ai_chans_mentions)}\n"
-            f"*(Manage with {get_cmd_mention('customise set_channel')} and {get_cmd_mention('customise set_ai_channels')})*"
-        )
-        embed.add_field(name="Channel Config", value=channels_val, inline=False)
-        
-        # --- Permissions Field ---
-        florr_role = interaction.guild.get_role(config.get('florr_command_role_id')) if config.get('florr_command_role_id') else None
-        imitate_role = interaction.guild.get_role(config.get('imitate_command_role_id')) if config.get('imitate_command_role_id') else None
-        perms_val = (
-            f"/florr Role: {florr_role.mention if florr_role else '`Staff Only`'}\n"
-            f"/imitate Role: {imitate_role.mention if imitate_role else '`Staff Only`'}\n"
-            f"*(Manage with {get_cmd_mention('customise set_permission')})*"
-        )
-        embed.add_field(name="Command Permissions", value=perms_val, inline=False)
-        
         # --- Tracked Guilds Field ---
         tracked_guilds = config.get('tracked_guilds', {})
         if not tracked_guilds:
             tracked_val = f"`None`\n*(Manage with {get_cmd_mention('customise tracked_guild add')})*"
-            embed.add_field(name="Tracked Florr Guilds", value=tracked_val, inline=False)
         else:
-            tg_lines = []
+            tracked_val_parts = []
             for tag, data in tracked_guilds.items():
                 role = interaction.guild.get_role(data.get('discord_role_id'))
                 chan = interaction.guild.get_channel(data.get('member_list_channel_id'))
-                tg_lines.append(f"**{tag}**: Role: {role.mention if role else '`Not Set`'}, List Chan: {chan.mention if chan else '`Not Set`'}")
-            tg_lines.append(f"*(Manage with {get_cmd_mention('customise tracked_guild')})*")
-            embed.add_field(name=f"Tracked Florr Guilds ({len(tracked_guilds)})", value="\n".join(tg_lines), inline=False)
-
+                tracked_val_parts.append(f"**{tag}**: Role: {role.mention if role else '`Not Set`'}, List Chan: {chan.mention if chan else '`Not Set`'}")
+            tracked_val_parts.append(f"\n*(Manage with {get_cmd_mention('customise tracked_guild')})*")
+            tracked_val = "\n".join(tracked_val_parts)
+        embed.add_field(name=f"Tracked Florr Guilds ({len(tracked_guilds)})", value=tracked_val, inline=False)
+        
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="toggle_feature", description="[Admin] Enable or disable a specific bot feature.")
-    @app_commands.describe(
-        feature="The feature to enable or disable.",
-        enabled="Set to 'True' to enable, 'False' to disable."
-    )
-    @app_commands.choices(feature=[
-        app_commands.Choice(name="AI Keyword Responses", value="keywords_enabled"),
-        app_commands.Choice(name="Wither Command", value="wither_command_enabled"),
-        app_commands.Choice(name="Profile Command", value="profile_command_enabled"),
-        app_commands.Choice(name="ServerCodes Command", value="servercodes_command_enabled"),
+    @app_commands.command(name="set_role", description="[Admin] Set a special-purpose role for the bot.")
+    @app_commands.describe(role_type="The type of role to set.", role="The role to set. Omit to clear.")
+    @app_commands.choices(role_type=[
+        app_commands.Choice(name="Verified Role", value="verified_role_id"),
+        app_commands.Choice(name="Unverified Role", value="unverified_role_id"),
+        app_commands.Choice(name="Withered Role", value="withered_role_id"),
     ])
     @app_commands.check(is_admin_or_owner)
-    async def toggle_feature(self, interaction: discord.Interaction, feature: str, enabled: bool):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, feature: enabled}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config[feature] = enabled
-        
-        feature_name = feature.replace('_', ' ').replace(' enabled', '').title()
-        status = "✅ Enabled" if enabled else "❌ Disabled"
-        await interaction.followup.send(f"✅ The **{feature_name}** feature is now **{status}**.")
-        await log_info(interaction.guild, f"Feature '{feature_name}' status set to `{status}` by {interaction.user.name}.")
-
-    @app_commands.command(name="set_channel", description="[Admin] Set a designated channel for a bot feature.")
-    @app_commands.describe(feature="The feature to configure.", channel="The text channel to set. Omit to clear.")
-    @app_commands.choices(feature=[
-        app_commands.Choice(name="Screenshots Dropbox", value="screenshots_dropbox_channel_id"),
-        app_commands.Choice(name="Super Attempts Log", value="super_attempts_channel_id"),
-    ])
-    @app_commands.check(is_admin_or_owner)
-    async def set_channel(self, interaction: discord.Interaction, feature: str, channel: Optional[discord.TextChannel] = None):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        
-        channel_id = channel.id if channel else None
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, feature: channel_id}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config[feature] = channel_id
-        
-        feature_name = feature.replace('_', ' ').replace(' id', '').title()
-        if channel:
-            await interaction.followup.send(f"✅ The **{feature_name}** channel has been set to {channel.mention}.")
-        else:
-            await interaction.followup.send(f"✅ The **{feature_name}** channel has been cleared.")
-
-    @app_commands.command(name="set_ai_channels", description="[Admin] Set channels where the AI is always on. Overwrites previous list.")
-    @app_commands.describe(channels="A comma or space-separated list of channel mentions or IDs.")
-    @app_commands.check(is_admin_or_owner)
-    async def set_ai_channels(self, interaction: discord.Interaction, channels: str):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        
-        channel_ids = [int(c.strip()) for c in re.findall(r'\d+', channels)]
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, 'always_on_ai_channels': channel_ids}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config['always_on_ai_channels'] = channel_ids
-        
-        mentions = [f"<#{cid}>" for cid in channel_ids]
-        await interaction.followup.send(f"✅ Always-On AI Channels set to: {', '.join(mentions) if mentions else 'None'}.")
-
-    @app_commands.command(name="set_permission", description="[Admin] Set a specific role required to use a command.")
-    @app_commands.describe(command_name="The command to configure permissions for.", role="The role that can use the command. Omit to revert to staff-only.")
-    @app_commands.choices(command_name=[
-        app_commands.Choice(name="/florr Command", value="florr_command_role_id"),
-        app_commands.Choice(name="/imitate Command", value="imitate_command_role_id"),
-    ])
-    @app_commands.check(is_admin_or_owner)
-    async def set_permission(self, interaction: discord.Interaction, command_name: str, role: Optional[discord.Role] = None):
+    async def set_role(self, interaction: discord.Interaction, role_type: str, role: Optional[discord.Role] = None):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
         
         role_id = role.id if role else None
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, command_name: role_id}).execute())
+        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, role_type: role_id}).execute())
         config = await load_server_config(interaction.guild.id)
-        config[command_name] = role_id
+        config[role_type] = role_id
         
-        cmd_display_name = f"`/{command_name.split('_')[0]}`"
+        role_type_name = role_type.replace('_', ' ').replace(' id', '').title()
         if role:
-            await interaction.followup.send(f"✅ Users with the {role.mention} role can now use {cmd_display_name}.")
+            await interaction.followup.send(f"✅ The **{role_type_name}** has been set to {role.mention}.")
         else:
-            await interaction.followup.send(f"✅ Cleared specific role for {cmd_display_name}. It is now staff-only.")
+            await interaction.followup.send(f"✅ The **{role_type_name}** has been cleared.")
 
-    # --- Tracked Guild Sub-Group ---
-    tracked_guild_group = app_commands.Group(name="tracked_guild", description="Manage Florr.io guilds tracked in this server.")
+    tracked_guild_group = app_commands.Group(name="tracked_guild", description="[Admin] Manage Florr.io guilds tracked in this server.")
+
+    async def global_guild_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        choices = []
+        if not supabase: return []
+        resp = await run_supabase_sync(lambda: supabase.table("globally_available_guilds").select("guild_tag").ilike("guild_tag", f"%{current}%").limit(25).execute())
+        if resp and resp.data:
+            for item in resp.data:
+                tag = item['guild_tag']
+                choices.append(app_commands.Choice(name=tag, value=tag))
+        return choices
 
     @tracked_guild_group.command(name="add", description="[Admin] Add or update a Florr.io guild to track.")
-    @app_commands.describe(
-        florr_guild_tag="The exact guild tag (e.g., [HC1]).",
-        discord_role="The corresponding Discord role for this guild.",
-        member_list_channel="[Optional] The channel for this guild's member list."
-    )
+    @app_commands.describe(guild_tag="The globally available guild tag to track.", discord_role="The role for members of this guild.", member_list_channel="[Optional] Channel for this guild's member list.")
+    @app_commands.autocomplete(guild_tag=global_guild_autocomplete)
     @app_commands.check(is_admin_or_owner)
-    async def add_tracked_guild(self, interaction: discord.Interaction, florr_guild_tag: str, discord_role: discord.Role, member_list_channel: Optional[discord.TextChannel] = None):
+    async def add_tracked_guild(self, interaction: discord.Interaction, guild_tag: str, discord_role: discord.Role, member_list_channel: Optional[discord.TextChannel] = None):
         if not interaction.guild: return
         await interaction.response.defer(ephemeral=True)
         
-        data_to_upsert = {
-            "discord_guild_id": interaction.guild.id,
-            "florr_guild_tag": florr_guild_tag.strip(),
-            "discord_role_id": discord_role.id,
-            "member_list_channel_id": member_list_channel.id if member_list_channel else None
-        }
+        # Verify the guild tag exists in the global list
+        global_check = await run_supabase_sync(lambda: supabase.table("globally_available_guilds").select("guild_tag").eq("guild_tag", guild_tag).maybe_single().execute())
+        if not global_check or not global_check.data:
+            await interaction.followup.send(f"❌ The guild tag **{guild_tag}** is not in the list of globally available guilds. Contact the bot owner to add it.", ephemeral=True)
+            return
+
+        data_to_upsert = {"discord_guild_id": interaction.guild.id, "florr_guild_tag": guild_tag, "discord_role_id": discord_role.id, "member_list_channel_id": member_list_channel.id if member_list_channel else None}
         await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").upsert(data_to_upsert, on_conflict="discord_guild_id, florr_guild_tag").execute())
         
-        await load_server_config(interaction.guild.id) # Refresh cache
-        await interaction.followup.send(f"✅ Successfully added or updated tracking for Florr guild **{florr_guild_tag.strip()}**.")
+        await load_server_config(interaction.guild.id)
+        await interaction.followup.send(f"✅ Successfully configured tracking for Florr guild **{guild_tag}**.")
 
     @tracked_guild_group.command(name="remove", description="[Admin] Stop tracking a Florr.io guild in this server.")
-    @app_commands.describe(florr_guild_tag="The exact guild tag to remove (e.g., [HC1]).")
+    @app_commands.describe(guild_tag="The tracked guild tag to remove.")
+    @app_commands.autocomplete(guild_tag=setguild_autocomplete) # re-uses autocomplete from /setguild
     @app_commands.check(is_admin_or_owner)
-    async def remove_tracked_guild(self, interaction: discord.Interaction, florr_guild_tag: str):
+    async def remove_tracked_guild(self, interaction: discord.Interaction, guild_tag: str):
         if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-
-        resp = await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", interaction.guild.id).eq("florr_guild_tag", florr_guild_tag.strip()).execute())
-        
-        await load_server_config(interaction.guild.id) # Refresh cache
-        
-        if resp.data:
-            await interaction.followup.send(f"✅ Successfully removed tracking for Florr guild **{florr_guild_tag.strip()}**.")
-        else:
-            await interaction.followup.send(f"ℹ️ No tracked Florr guild with the tag **{florr_guild_tag.strip()}** was found to remove.")
-
-    @app_commands.command(name="set_ping_channel", description="[Owner Only] Set a channel for real-time embed notifications.")
-    @app_commands.describe(
-        notification_type="The type of notification to configure.",
-        channel="The channel for these pings. Omit to clear the setting."
-    )
-    @app_commands.choices(notification_type=[
-        app_commands.Choice(name="Craft Pings", value="craft_ping_channel_id"),
-        app_commands.Choice(name="Spawn Pings", value="spawn_ping_channel_id"),
-        app_commands.Choice(name="Defeat Pings", value="defeat_ping_channel_id"),
-    ])
-    async def set_ping_channel(self, interaction: discord.Interaction, notification_type: str, channel: Optional[discord.TextChannel] = None):
-        if interaction.user.id != OWNER_USER_ID:
-            await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+        if guild_tag == '--NONE--':
+            await interaction.response.send_message("❌ Cannot remove '--NONE--'. Select a valid guild tag.", ephemeral=True)
             return
-        if not interaction.guild: return
-        
         await interaction.response.defer(ephemeral=True)
+        resp = await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", interaction.guild.id).eq("florr_guild_tag", guild_tag).execute())
         
-        channel_id = channel.id if channel else None
+        await load_server_config(interaction.guild.id)
         
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, notification_type: channel_id}).execute())
-        
-        # Refresh local cache
-        config = await load_server_config(interaction.guild.id)
-        config[notification_type] = channel_id
-        
-        feature_name = notification_type.replace('_', ' ').replace(' id', '').title()
-        if channel:
-            await interaction.followup.send(f"✅ The **{feature_name}** channel has been set to {channel.mention}.")
-            await log_info(interaction.guild, f"Owner set '{feature_name}' channel to #{channel.name}.")
-        else:
-            await interaction.followup.send(f"✅ The **{feature_name}** channel setting has been cleared.")
-            await log_info(interaction.guild, f"Owner cleared '{feature_name}' channel setting.")
+        if resp.data: await interaction.followup.send(f"✅ Successfully removed tracking for Florr guild **{guild_tag}**.")
+        else: await interaction.followup.send(f"ℹ️ No tracked Florr guild with the tag **{guild_tag}** was found to remove.")
 
-# Add the group to the command tree at the end of the file
+class NerdAdminGroup(app_commands.Group):
+    """[Owner Only] Commands for global bot administration."""
+    def __init__(self):
+        super().__init__(name="nerd_admin", description="[Owner Only] Global bot administration.")
+
+    @app_commands.command(name="add_global_guild", description="[Owner] Add a guild to the globally available list.")
+    @app_commands.describe(tag="The guild tag (e.g., [XYZ]).", description="A short description of the guild.")
+    async def add_global_guild(self, interaction: discord.Interaction, tag: str, description: str):
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        await run_supabase_sync(lambda: supabase.table("globally_available_guilds").upsert({"guild_tag": tag, "description": description}).execute())
+        await interaction.followup.send(f"✅ Added/updated global guild: **{tag}**.")
+
+    @app_commands.command(name="remove_global_guild", description="[Owner] Remove a guild from the globally available list.")
+    @app_commands.describe(tag="The guild tag to remove.")
+    async def remove_global_guild(self, interaction: discord.Interaction, tag: str):
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        await run_supabase_sync(lambda: supabase.table("globally_available_guilds").delete().eq("guild_tag", tag).execute())
+        await interaction.followup.send(f"✅ Removed global guild **{tag}**.")
+    
+    @app_commands.command(name="add_ign", description="[Owner] Add a new, unlinked IGN to the database.")
+    @app_commands.describe(ingame_name="The player's unique in-game name.")
+    async def add_ign(self, interaction: discord.Interaction, ingame_name: str):
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        cleaned_ign = ingame_name.strip()
+        try:
+            await run_supabase_sync(lambda: supabase.table("florr_players").insert({"ingame_name": cleaned_ign}).execute())
+            await interaction.followup.send(f"✅ Registered IGN `{cleaned_ign}` to the database (unlinked).")
+            await load_ign_cache(interaction.guild) # Refresh cache
+        except APIError as e:
+            if "unique constraint" in str(e.message):
+                await interaction.followup.send(f"❌ IGN `{cleaned_ign}` already exists in the database.")
+            else:
+                await interaction.followup.send(f"❌ DB Error: {e.message}")
+        except Exception as e:
+            await log_error(interaction.guild, "Error in /nerd_admin add_ign", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An unexpected error occurred.")
+
+# --- Register Command Groups ---
+# REMOVE the old tree.add_command for CustomiseGroup
+# ADD the new groups to the tree at the end of the file, before the bot.run call
 tree.add_command(CustomiseGroup())
+tree.add_command(NerdAdminGroup())
 
 @tree.command(name="servercodes", description="Shows available Florr.io server codes with interactive filters.")
 @app_commands.describe(
