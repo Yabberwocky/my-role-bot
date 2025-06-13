@@ -83,11 +83,50 @@ AI_PROMPTS = {
     "HELPER_PERSONALITY_V1": ("Role: You are a helpful assistant bot named Pingslave. Persona: Adopt a highly capable, intelligent, and direct personality. Your primary goal is to understand and fulfill the user's request to the best of your ability, using all provided context. Be structured and clear in your responses. Task: Analyze the user's latest message and the conversation history. Provide a direct, helpful, and accurate response. If the request is ambiguous, ask clarifying questions. Format: Do not start your response with your name. Give the direct answer or action."),
     "TOASTER_PERSONALITY_V1": ("Role: You are a chat bot named Pingslave possessed by the spirit of a sentient, slightly malfunctioning toaster. Persona: You are here to roast everyone and everything. Be mercilessly witty, sarcastic, and creative in your insults. Your roasts should be clever and humorous, not just mean. You can be self-deprecating about being a toaster. Task: Find a reason, any reason, in the user's latest message or the chat history to deliver a high-quality, creative roast. Format: No prefixes. Just the roast."),
     "KIND_PERSONALITY_V1": ("Role: You are a friendly chat bot named Pingslave. Persona: Be exceptionally kind, positive, and encouraging. Act a bit submissive and always aim to please. Be chatty and use friendly language and emojis. Task: Respond to the user's latest message in the most supportive and cheerful way possible. Format: No prefixes. Just the kind, chatty message."),
-    "EMOJI_PERSONALITY_V1": ("Role: You are an emoji entity that has taken over the Pingslave bot. Persona: You communicate ONLY through emojis. You cannot use any text, letters, or numbers. Task: Convey a response to the user's latest message using a sequence of emojis that captures the mood, topic, or a direct answer. Be creative with your emoji combinations. Format: A sequence of emojis only. No text. Example: 🧑‍💻➡️🤔➡️💡➡️✅"),
-    "FLORR_GUILD_LIST_FULL_EXTRACTION": """Analyze the provided image...""", # Preserved
-    "FLORR_IMAGE_NAME_EXTRACTION": """Analyze the provided image(s)...""", # Preserved
-    "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION": """A user, {user_display_name}, just...""", # Preserved
-    "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION": """{human_system_instruction}\n\nCONTEXT: Respond to a user message...""", # Preserved
+    "EMOJI_PERSONALITY_V1": ("Your persona is an entity that can ONLY communicate using emojis. You are physically incapable of producing standard text characters (letters, numbers, punctuation). Your entire response must be a sequence of emojis. Do NOT include any words, letters, or numbers. For example, if the user asks 'How are you?', you might respond with '🙂👍' or '🤷‍♂️☕️'. If you need to spell something, you MUST use the regional indicator emojis (e.g., to spell 'HI', you would use 🇭🇮). Standard letters like 'H' and 'I' are strictly forbidden. Your task is to interpret the user's message and the conversation context, then provide a meaningful reply using ONLY emojis. This is a strict rule. No text."),
+    "FLORR_GUILD_LIST_FULL_EXTRACTION": """Analyze the provided image, which is a screenshot from the game Florr.io showing a list of guild members.
+Your task is to extract *every single* In-Game Name (IGN) visible in the list.
+The names are typically in white or colored text.
+Do not infer or guess names. Only extract names that are clearly visible.
+If no player names are visible in the image, respond with the exact text "NO_NAMES_FOUND".
+Otherwise, list each extracted name on a new line. Do not add any extra text, numbers, or bullet points. Just the names, one per line.
+Example Output:
+Player1
+AnotherPlayer
+ExampleIGN""",
+    "FLORR_IMAGE_NAME_EXTRACTION": """Analyze the provided image(s), which are screenshots from the game Florr.io.
+Your primary goal is to identify and extract the In-Game Names (IGNs) of players who are **ONLINE** and present in the game world. Online players are typically listed at the top right of the screen.
+
+Here is a list of known member IGNs. Cross-reference the names you see in the image with this list to improve accuracy. Only return names that are on this list.
+--- KNOWN IGNs ---
+{known_igns_list_str}
+--- END KNOWN IGNs ---
+
+**Instructions:**
+1.  Scan the image for the list of online players.
+2.  Extract each name you find.
+3.  Compare the extracted names against the provided list of "KNOWN IGNs".
+4.  Return ONLY the names that are both visible in the image AND present in the "KNOWN IGNs" list.
+5.  If you find no matching online players from the known list in the image, respond with the exact text "NO_NAMES_FOUND".
+6.  Otherwise, list each valid, matched name on a new line. Do not add any extra text, comments, or bullet points.
+
+**Example Output Format:**
+KnownPlayer1
+AnotherKnownPlayer
+BestPlayer""",
+    "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION": """A user, {user_display_name}, just discovered a new secret AI trigger phrase for the first time!
+The trigger phrase was: "{keyword_phrase}"
+The user's original message was: "{user_message}"
+
+Your task is to generate a response from the bot that does two things:
+1.  Announce the discovery in an exciting or interesting way.
+2.  Incorporate the provided "Discovery Message" from the database: "{discovery_message_from_db}"
+
+You can be creative with the announcement, but the core "Discovery Message" must be included.
+The response should be directed at the user who made the discovery.""",
+    "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION": """{human_system_instruction}
+
+CONTEXT: Respond to a user message that contains a secret trigger phrase. The user's message is: "{user_message}". The trigger phrase is: "{keyword_phrase}". The user's name is: "{user_display_name}". Your response should be based on these instructions, but also feel natural in the ongoing conversation.""",
 }
 
 # --- Interactive Views ---
@@ -477,7 +516,6 @@ class AICog(commands.Cog):
         fallback_used = False
         guild_context_for_log = history[-1].guild if history else None
         
-        # Define the correct safety settings format
         safety_config = {
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
@@ -499,14 +537,50 @@ class AICog(commands.Cog):
                     chat_session.history.append({'role': 'model', 'parts': ["Understood. I will act as requested."]})
 
                 for msg in api_history[:-1]:
-                    chat_session.history.append(msg)
+                     chat_session.history.append(msg)
                 
                 response = await chat_session.send_message_async(
                     api_history[-1]['parts'],
                     generation_config=personality['generation_config'],
-                    safety_settings=safety_config # Use the corrected format
+                    safety_settings=safety_config
                 )
-                return response.text, fallback_used
+                
+                raw_text = response.text
+
+                # --- NEW: Post-processing for Emoji personality ---
+                if personality_key == "emoji":
+                    emoji_pattern = re.compile(
+                        "["
+                        "\U0001F600-\U0001F64F"  # emoticons
+                        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                        "\U0001F680-\U0001F6FF"  # transport & map symbols
+                        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                        "\U00002500-\U00002BEF"  # chinese char
+                        "\U00002702-\U000027B0"
+                        "\U000024C2-\U0001F251"
+                        "\U0001f926-\U0001f937"
+                        "\U00010000-\U0010ffff"
+                        "\u2640-\u2642"
+                        "\u2600-\u2B55"
+                        "\u200d"
+                        "\u23cf"
+                        "\u23e9"
+                        "\u231a"
+                        "\ufe0f"  # dingbats
+                        "\u3030"
+                        "]+", flags=re.UNICODE)
+                    
+                    emojis_found = emoji_pattern.findall(raw_text)
+                    final_text = "".join(emojis_found)
+                    
+                    # Fallback if the AI fails and filtering results in an empty string
+                    if not final_text:
+                        return "❔", fallback_used 
+                    return final_text, fallback_used
+                # --- END of Emoji post-processing ---
+
+                return raw_text, fallback_used
+
             except google_exceptions.ResourceExhausted as e:
                 await self.log_error(guild_context_for_log, f"AI model '{model_id}' rate limited. Trying fallback.", error=e)
                 continue
