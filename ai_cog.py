@@ -236,7 +236,7 @@ class AIResponseView(discord.ui.View):
         await self.handle_regeneration(interaction, new_personality=None)
 
     async def handle_regeneration(self, interaction: discord.Interaction, new_personality: Optional[str] = None):
-        """Core logic to regenerate the AI response by editing the existing embed message."""
+        """Core logic to regenerate the AI response by editing the existing plain text message."""
         retry_after = self.interaction_cooldown.update_rate_limit(interaction)
         if retry_after:
             await interaction.response.send_message(f"⏳ You're doing that too fast. Please wait **{retry_after:.1f}s**.", ephemeral=True, delete_after=5)
@@ -262,14 +262,12 @@ class AIResponseView(discord.ui.View):
             await self.cog_ref._send_personality_response(
                 channel=interaction.channel, 
                 content=new_content, 
-                personality_key=self.current_personality,
                 view=new_view,
                 message_to_edit=self.bot_response_message
             )
         else:
             if self.bot_response_message:
-                error_embed = discord.Embed(description="❌ Failed to regenerate response.", color=discord.Color.red())
-                await self.bot_response_message.edit(content=None, embed=error_embed, view=None)
+                await self.bot_response_message.edit(content="❌ Failed to regenerate response.", view=None)
 
     async def on_timeout(self):
         if self.bot_response_message:
@@ -315,13 +313,12 @@ class AICog(commands.Cog):
 
         self.ai_models: Dict[str, genai.GenerativeModel] = {}
         
-        self.channel_cooldowns: Dict[int, float] = {}
+        # --- NEW: Per-user cooldown for sending messages & one-time slowmode tasks ---
+        self.message_cooldown = commands.CooldownMapping.from_cooldown(1, AI_RESPONSE_COOLDOWN_SECONDS, commands.BucketType.user)
         self.slowmode_tasks: Dict[int, asyncio.Task] = {}
+        # -----------------------------------------------------------------------------
         
-        # --- NEW: For remembering user's last chosen personality per channel ---
         self.channel_personalities: Dict[int, str] = {}
-        # ----------------------------------------------------------------------
-
         self.keyword_data_cache: Dict[str, Any] = {}
         self.total_keywords = 0
         self.discovered_keywords_count = 0
@@ -557,6 +554,18 @@ class AICog(commands.Cog):
         except Exception as e:
             await self.log_error(None, f"AI image processing failed during generation with model '{model_id}'.", error=e)
             return None
+        
+    async def _apply_slowmode(self, channel: discord.TextChannel):
+        """Attempts to apply a 5-second slowmode to a channel. Fails silently."""
+        try:
+            # Only apply if slowmode is not already set to 5s or more
+            if channel.slowmode_delay < 5:
+                await channel.edit(slowmode_delay=5)
+                print(f"AI Cog: Applied 5s slowmode to #{channel.name}.")
+        except discord.Forbidden:
+            print(f"AI Cog: Missing permissions to apply slowmode in #{channel.name}.")
+        except discord.HTTPException as e:
+            print(f"AI Cog: Failed to apply slowmode in #{channel.name} due to an API error: {e}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -568,20 +577,18 @@ class AICog(commands.Cog):
 
         if not is_ai_channel: return
         
-        current_time = time.time()
-        if current_time - self.channel_cooldowns.get(message.channel.id, 0) < AI_RESPONSE_COOLDOWN_SECONDS:
-            if not message.author.guild_permissions.manage_channels:
-                view = RetryAIView(self, message)
-                retry_msg = await message.reply("Whoa there, speedy! The channel is cooling down. Try again in a moment.", view=view, mention_author=False)
-                view.message = retry_msg
+        # --- Per-user Cooldown Check ---
+        retry_after = self.message_cooldown.update_rate_limit(message)
+        if retry_after:
+            view = RetryAIView(self, message)
+            retry_msg = await message.reply(f"⏳ You're doing that too fast. Please wait **{retry_after:.1f}s**.", view=view, mention_author=False, delete_after=10)
+            view.message = retry_msg
             return
-
-        self.channel_cooldowns[message.channel.id] = current_time
+        
+        # --- One-time Channel Slowmode Attempt ---
         if message.channel.id not in self.slowmode_tasks:
-            try:
-                await message.channel.edit(slowmode_delay=5)
-                self.slowmode_tasks[message.channel.id] = asyncio.create_task(self._remove_slowmode(message.channel))
-            except discord.Forbidden: pass
+            task = self.slowmode_tasks[message.channel.id] = asyncio.create_task(self._apply_slowmode(message.channel))
+            task.add_done_callback(lambda t: self.slowmode_tasks.pop(message.channel.id, None))
         
         async with message.channel.typing():
             history = [m async for m in message.channel.history(limit=50, before=message)]
@@ -599,7 +606,6 @@ class AICog(commands.Cog):
                 response_message = await self._send_personality_response(
                     channel=message.channel, 
                     content=response_text, 
-                    personality_key=initial_personality,
                     view=view
                 )
                 
@@ -610,23 +616,24 @@ class AICog(commands.Cog):
         self, 
         channel: discord.TextChannel, 
         content: str, 
-        personality_key: str, 
         view: discord.ui.View, 
         message_to_edit: Optional[discord.Message] = None
     ) -> Optional[discord.Message]:
-        """Sends or edits an AI response as a bot-owned embed."""
+        """Sends or edits an AI response as a plain text message."""
         
-        embed = self._create_ai_embed(content, personality_key)
-        
+        full_content = content
+        if len(full_content) > 2000:
+            full_content = content[:1997] + "..."
+
         try:
-            # We must set content=None to ensure any previous plain-text content is removed.
+            # We must set embed=None to ensure any previous embed is removed.
             if message_to_edit:
-                await message_to_edit.edit(content=None, embed=embed, view=view)
+                await message_to_edit.edit(content=full_content, embed=None, view=view)
                 return message_to_edit
             else:
-                return await channel.send(embed=embed, view=view)
+                return await channel.send(content=full_content, view=view)
         except Exception as e:
-            await self.log_error(channel.guild, f"Failed to send/edit AI embed for personality {personality_key}", error=e)
+            await self.log_error(channel.guild, "Failed to send/edit AI plain text response", error=e)
             return None
 
     async def _remove_slowmode(self, channel: discord.TextChannel):
