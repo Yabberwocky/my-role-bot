@@ -537,14 +537,20 @@ async def _setup_and_load_cogs(bot: commands.Bot):
     bot.run_supabase_sync_global = run_supabase_sync
     bot._handle_self_bot_event = _handle_self_bot_event # Important for listener
     
+    # --- THIS IS THE FIX ---
+    # Manually attach the webhook helper function to the bot instance so the cog can access it.
+    bot.get_or_create_webhook = get_or_create_webhook
+    # -----------------------
+    
     # Pass config values
     bot.OWNER_USER_ID_config = OWNER_USER_ID
     bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
     bot.ingame_name_cache_ref_config = ingame_name_cache
     bot.NERDY_YELLOW_config = NERDY_YELLOW
-    bot.PROFILE_PIC_BASE_PATH_config = PROFILE_PIC_BASE_PATH
-    bot.MOBS_FOLDER_PATH_config = os.path.join(PROFILE_PIC_BASE_PATH, MOBS_FOLDER_NAME)
     bot.server_settings_cache_ref_config = server_settings_cache
+    # Pass the bot's own avatar URL for webhook fallbacks
+    bot.BOT_AVATAR_URL_config = bot.user.display_avatar.url if bot.user and bot.user.display_avatar else None
+    
     print("Bot attributes set.")
 
     print("Loading cogs...")
@@ -553,7 +559,8 @@ async def _setup_and_load_cogs(bot: commands.Bot):
         await bot.load_extension('ai_cog')
         print("AICog load_extension call completed.")
         if bot.get_cog('AICog') is None:
-             raise commands.ExtensionFailed("ai_cog", "Cog is None after load attempt.")
+             # Use the correct way to raise this exception
+             raise commands.ExtensionFailed("ai_cog", original=TypeError("Cog is None after load attempt."))
         print("AICog loading verified successfully.")
     except Exception as e_cog:
         print(f"CRITICAL: Failed to load AICog: {e_cog}\n{traceback.format_exc()}")
