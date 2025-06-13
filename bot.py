@@ -6450,27 +6450,75 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
     await interaction.response.defer(ephemeral=True)
 
     cleaned_ign = ingame_name.strip()
+    if not cleaned_ign:
+        await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=True)
+        return
+
     try:
-        # Check if the IGN exists in the database
-        ign_check_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id").eq("ingame_name", cleaned_ign).maybe_single().execute())
+        # Step 1: Check if the target IGN is already connected to a *different* user.
+        ign_check_resp = await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .select("discord_id")
+                           .eq("ingame_name", cleaned_ign)
+                           .maybe_single()
+                           .execute()
+        )
         if ign_check_resp is None:
-            await interaction.followup.send("❌ DB error while checking IGN. Please try again.", ephemeral=True); return
-        
-        if not ign_check_resp.data:
-            await interaction.followup.send(f"❌ The IGN `{cleaned_ign}` is not registered in the database. An admin must add it first with `/nerd_admin add_ign`.", ephemeral=True); return
+            await interaction.followup.send("❌ DB error while checking for IGN conflicts. Please try again.", ephemeral=True)
+            return
+            
+        if ign_check_resp.data and ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
+            conflict_user_id = ign_check_resp.data['discord_id']
+            await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{conflict_user_id}>). An admin must use `/disconnect` on that user first.", ephemeral=True)
+            return
 
-        if ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
-            await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{ign_check_resp.data['discord_id']}>).", ephemeral=True); return
+        # Step 2: Ensure the target user is not already connected to a different IGN.
+        # This prevents one Discord account from claiming multiple IGNs.
+        user_check_resp = await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .select("ingame_name")
+                           .eq("discord_id", str(target_user.id))
+                           .execute()
+        )
+        if user_check_resp and user_check_resp.data:
+            for existing_connection in user_check_resp.data:
+                # If the user is connected to an IGN that is NOT the one they're trying to connect to now,
+                # we must remove that old connection.
+                if existing_connection.get('ingame_name', '').lower() != cleaned_ign.lower():
+                    # Set the discord_id and discord_name to NULL for the old connection.
+                    old_ign = existing_connection.get('ingame_name')
+                    await run_supabase_sync(
+                        lambda: supabase.table("florr_players")
+                                       .update({"discord_id": None, "discord_name": None})
+                                       .eq("ingame_name", old_ign)
+                                       .execute()
+                    )
+                    await log_info(guild, f"Implicit Disconnect: Removed `{target_user.name}`'s link from old IGN `{old_ign}` during new /connect call.")
 
-        # Perform the update
-        await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": str(target_user.id), "discord_name": str(target_user)}).eq("ingame_name", cleaned_ign).execute())
-        
+        # Step 3: Perform the upsert. This will create the IGN if it doesn't exist,
+        # or update it if it does (e.g., it was unlinked). on_conflict is crucial.
+        await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .upsert({
+                               "ingame_name": cleaned_ign,
+                               "discord_id": str(target_user.id),
+                               "discord_name": str(target_user)
+                           }, on_conflict="ingame_name")
+                           .execute()
+        )
+
+        # Step 4: Refresh roles and respond.
         await refresh_roles_for_single_user(guild, target_user)
+        # Refresh the cache since a new IGN might have been added
+        await load_ign_cache(guild)
         await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
-        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`.")
+        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`. This may have created a new IGN record.")
 
+    except APIError as e:
+        await log_error(guild, f"Error during /connect (API)", error=e, interaction=interaction)
+        await interaction.followup.send(f"❌ A database error occurred: {e.message}", ephemeral=True)
     except Exception as e:
-        await log_error(guild, f"Error during /connect for {target_user.name}", error=e, interaction=interaction)
+        await log_error(guild, f"Error during /connect (General)", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 @tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
