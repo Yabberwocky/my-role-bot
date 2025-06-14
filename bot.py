@@ -535,20 +535,14 @@ async def _setup_and_load_cogs(bot: commands.Bot):
     bot.log_info_global = log_info
     bot.log_error_global = log_error
     bot.run_supabase_sync_global = run_supabase_sync
-    bot._handle_self_bot_event = _handle_self_bot_event # Important for listener
-    
-    # --- THIS IS THE FIX ---
-    # Manually attach the webhook helper function to the bot instance so the cog can access it.
+    bot._handle_self_bot_event = _handle_self_bot_event
     bot.get_or_create_webhook = get_or_create_webhook
-    # -----------------------
     
-    # Pass config values
     bot.OWNER_USER_ID_config = OWNER_USER_ID
     bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
     bot.ingame_name_cache_ref_config = ingame_name_cache
     bot.NERDY_YELLOW_config = NERDY_YELLOW
     bot.server_settings_cache_ref_config = server_settings_cache
-    # Pass the bot's own avatar URL for webhook fallbacks
     bot.BOT_AVATAR_URL_config = bot.user.display_avatar.url if bot.user and bot.user.display_avatar else None
     
     print("Bot attributes set.")
@@ -556,16 +550,26 @@ async def _setup_and_load_cogs(bot: commands.Bot):
     print("Loading cogs...")
     log_guild_for_cog_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     try:
-        await bot.load_extension('ai_cog')
-        print("AICog load_extension call completed.")
+        # Prevent crashing if the extension is already loaded (e.g., during hot reload)
+        if 'ai_cog' not in bot.extensions:
+            await bot.load_extension('ai_cog')
+            print("AICog load_extension call completed.")
+        else:
+            print("AICog was already loaded. Attempting to reload for updates...")
+            await bot.reload_extension('ai_cog')
+            print("AICog reloaded successfully.")
+
         if bot.get_cog('AICog') is None:
-             # Use the correct way to raise this exception
-             raise commands.ExtensionFailed("ai_cog", original=TypeError("Cog is None after load attempt."))
-        print("AICog loading verified successfully.")
+             raise commands.ExtensionFailed("ai_cog", original=TypeError("Cog is None after load/reload attempt."))
+        print("AICog loading/reloading verified successfully.")
+    except commands.ExtensionAlreadyLoaded:
+        # This case is now handled by the check above, but kept for safety.
+        print("AICog was already loaded, continuing.")
+        pass
     except Exception as e_cog:
-        print(f"CRITICAL: Failed to load AICog: {e_cog}\n{traceback.format_exc()}")
+        print(f"CRITICAL: Failed to load/reload AICog: {e_cog}\n{traceback.format_exc()}")
         if log_guild_for_cog_load:
-            await log_error(log_guild_for_cog_load, "CRITICAL: Failed to load AICog. AI features will be unavailable.", error=e_cog, ping_owner=True)
+            await log_error(log_guild_for_cog_load, "CRITICAL: Failed to load/reload AICog. AI features will be unavailable.", error=e_cog, ping_owner=True)
 
 
 async def _sync_app_commands(bot: commands.Bot) -> list:
@@ -5518,20 +5522,23 @@ async def run_supabase_sync(func):
     """Runs sync Supabase func in executor, now with more robust error handling."""
     if not supabase:
         print("Supabase Error: Client is not available.")
-        return None # Return None if client is not initialized
+        return None
 
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func)
     except APIError as e:
-        # This is a controlled error from the DB (e.g., policy violation, bad data)
+        # Gracefully handle "204 No Content" which can be raised on .maybe_single() with no result
+        if e.code == "204":
+            print(f"Supabase Info: Received 204 No Content, treating as None result.")
+            return None # Treat as a valid "not found" response
+        
+        # For other API errors, re-raise as they might be important (e.g., policy violation)
         print(f"Supabase API Error: {e}")
-        # We re-raise this because some command logic specifically checks for APIError types.
         raise
     except Exception as e:
         # This catches other errors like connection issues, timeouts, etc.
         print(f"Supabase Executor/Connection Error: {e}\n{traceback.format_exc()}")
-        # Return None to signal a general failure to the calling function.
         return None
 
 # --- Logging ---
@@ -6288,88 +6295,63 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # --- App Command Error Handling ---
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    guild = interaction.guild # Can be None if in DMs
-    user_msg = "❌ An unexpected error occurred. Please try again later or contact an admin." # Default user message
-    log_desc = "Unhandled App Command Error" # Default log description
-    error_to_log: Optional[Exception] = error # Default error to log
+    guild = interaction.guild
+    user_msg = "❌ An unexpected error occurred. Please try again later or contact an admin."
+    log_desc = "Unhandled App Command Error"
+    error_to_log: Optional[Exception] = error
+    # Default to ephemeral for user-facing errors
+    is_ephemeral_response = True
 
-    # Specific error handling
     if isinstance(error, app_commands.CommandNotFound):
-        # This usually shouldn't happen with synced commands, but log just in case
         print(f"CommandNotFound error received for interaction: {interaction.data.get('name', 'N/A')}")
-        # Don't notify the user, Discord handles this
         return
     elif isinstance(error, app_commands.MissingPermissions):
         perms = ", ".join(f"`{perm}`" for perm in error.missing_permissions)
         user_msg = f"❌ You lack the required permissions to use this command: {perms}"
         log_desc = f"User Missing Permissions: {perms}"
-        error_to_log = None # Don't log traceback for user permission issues
+        error_to_log = None
     elif isinstance(error, app_commands.BotMissingPermissions):
         perms = ", ".join(f"`{perm}`" for perm in error.missing_permissions)
         user_msg = f"❌ I lack the required permissions to perform this action: {perms}. Please contact an admin."
         log_desc = f"Bot Missing Permissions: {perms}"
-        error_to_log = None # Don't log traceback for bot permission issues (config error)
+        error_to_log = None
     elif isinstance(error, app_commands.CheckFailure):
-        # General check failure (could be custom checks or decorators like has_permissions)
         user_msg = "❌ You do not meet the requirements to use this command in this context."
-        # Improve logging if the check has a specific message
         log_desc = f"Check Failure ({type(error).__name__})"
-        if hasattr(error, 'message') and error.message:
-            log_desc += f": {error.message}"
-        error_to_log = None # Usually no need for traceback
+        if hasattr(error, 'message') and error.message: log_desc += f": {error.message}"
+        error_to_log = None
     elif isinstance(error, app_commands.CommandInvokeError):
-        # Error occurred inside the command's callback
         original_error = error.original
-        error_to_log = original_error # Log the original error
+        error_to_log = original_error
         user_msg = f"❌ An error occurred while running the command. Please report this if it persists."
-        # Add original error type to user message for slightly more info if desired
-        # user_msg += f" (`{type(original_error).__name__}`)"
         log_desc = f"Command Invoke Error in `/{interaction.command.name if interaction.command else 'Unknown'}`"
-        # Print full traceback to console for immediate debugging
+        is_ephemeral_response = False # Make invocation errors public so others see there's a problem
         print(f"CommandInvokeError in command '{interaction.command.name if interaction.command else 'Unknown'}':")
         traceback.print_exception(type(original_error), original_error, original_error.__traceback__)
     elif isinstance(error, app_commands.TransformerError):
-        # Error converting an argument (e.g., invalid user mention, bad number format)
         user_msg = f"❌ Invalid input provided: {error}"
         log_desc = f"Transformer Error: {error}"
-        error_to_log = error # Log the transformer error details
+        error_to_log = error
     elif isinstance(error, app_commands.CommandOnCooldown):
         user_msg = f"⏳ This command is on cooldown. Please try again in {error.retry_after:.1f} seconds."
         log_desc = f"Command Cooldown Hit ({error.retry_after:.1f}s)"
-        error_to_log = None # No traceback needed
+        error_to_log = None
     elif isinstance(error, app_commands.NoPrivateMessage):
          user_msg = "❌ This command cannot be used in Direct Messages."
          log_desc = "Command used in DM"
          error_to_log = None
-    # Add more specific checks if needed (e.g., app_commands.ArgumentParsingError)
     else:
-        # Catch-all for other discord.py app command errors
         log_desc = f"Unknown App Command Error Type: `{type(error).__name__}`"
 
-    # Log the error to the designated channel
-    # Pass the original error if it's more informative (like from CommandInvokeError)
     await log_error(guild, log_desc, error=error_to_log, interaction=interaction)
 
-    # Respond to the user ephemerally
     try:
         if interaction.response.is_done():
-            # If already responded (e.g., deferred), send a followup
-            await interaction.followup.send(user_msg, ephemeral=False)
+            await interaction.followup.send(user_msg, ephemeral=is_ephemeral_response)
         else:
-            # Otherwise, send the initial response
-            await interaction.response.send_message(user_msg, ephemeral=False)
-    except discord.NotFound:
-        # Interaction might have expired between error and response
-        print(f"Error Handler: Interaction {interaction.id} already expired or deleted.")
-    except discord.InteractionResponded:
-         # Should ideally be caught by is_done(), but handle defensively
-         try:
-             await interaction.followup.send(user_msg, ephemeral=False)
-         except Exception as e_followup:
-             print(f"Error Handler: Failed to send followup after InteractionResponded state: {e_followup}")
-    except Exception as e_send:
-        # Catch any other exceptions during the response sending
-        print(f"Error Handler: Failed to send error message to user: {e_send}")
+            await interaction.response.send_message(user_msg, ephemeral=is_ephemeral_response)
+    except (discord.NotFound, discord.InteractionResponded, discord.HTTPException) as e:
+        print(f"Error Handler: Failed to send error message to user (InteractionID: {interaction.id}): {type(e).__name__} - {e}")
 
 
 # --- Modals ---
@@ -6463,17 +6445,12 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
                            .maybe_single()
                            .execute()
         )
-        if ign_check_resp is None:
-            await interaction.followup.send("❌ DB error while checking for IGN conflicts. Please try again.", ephemeral=True)
-            return
-            
-        if ign_check_resp.data and ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
+        if ign_check_resp and ign_check_resp.data and ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
             conflict_user_id = ign_check_resp.data['discord_id']
             await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{conflict_user_id}>). An admin must use `/disconnect` on that user first.", ephemeral=True)
             return
-
+            
         # Step 2: Ensure the target user is not already connected to a different IGN.
-        # This prevents one Discord account from claiming multiple IGNs.
         user_check_resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .select("ingame_name")
@@ -6482,10 +6459,7 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
         )
         if user_check_resp and user_check_resp.data:
             for existing_connection in user_check_resp.data:
-                # If the user is connected to an IGN that is NOT the one they're trying to connect to now,
-                # we must remove that old connection.
                 if existing_connection.get('ingame_name', '').lower() != cleaned_ign.lower():
-                    # Set the discord_id and discord_name to NULL for the old connection.
                     old_ign = existing_connection.get('ingame_name')
                     await run_supabase_sync(
                         lambda: supabase.table("florr_players")
@@ -6495,8 +6469,7 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
                     )
                     await log_info(guild, f"Implicit Disconnect: Removed `{target_user.name}`'s link from old IGN `{old_ign}` during new /connect call.")
 
-        # Step 3: Perform the upsert. This will create the IGN if it doesn't exist,
-        # or update it if it does (e.g., it was unlinked). on_conflict is crucial.
+        # Step 3: Perform the upsert to create or update the IGN record.
         await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .upsert({
@@ -6507,9 +6480,8 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
                            .execute()
         )
 
-        # Step 4: Refresh roles and respond.
+        # Step 4: Refresh roles, cache, and respond.
         await refresh_roles_for_single_user(guild, target_user)
-        # Refresh the cache since a new IGN might have been added
         await load_ign_cache(guild)
         await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
         await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`. This may have created a new IGN record.")
@@ -8192,6 +8164,18 @@ tree.add_command(NerdAdminGroup())
     app_commands.Choice(name="Factory", value="factory"),
 ])
 async def servercodes(interaction: discord.Interaction, region: Optional[str] = None, map_name: Optional[str] = None):
+    # Permission check for sending messages in the channel
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(interaction.guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            err_msg = "❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the server list."
+            # Try to send ephemerally, but it might fail too if channel perms are restrictive
+            try:
+                await interaction.response.send_message(err_msg, ephemeral=True)
+            except discord.Forbidden:
+                pass # Can't do anything if we can't even respond ephemerally
+            return
+
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     view = ServerCodeView(initial_region=region, initial_map=map_name)
