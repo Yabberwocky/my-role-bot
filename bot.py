@@ -168,12 +168,8 @@ SELF_DISCORD_TOKEN = os.getenv("SELF_DISCORD_TOKEN")
 OWNER_USER_ID = 1230848174218940416
 CATERCORD_GUILD_ID = 1200476681803137024
 HC1_ROLE_ID = 1230235110415274004
-FLORRIST_ROLE_ID = 1248708073019805717
-NEWBEE_ROLE_ID = 1360176495947022447
-EX_MEMBER_ROLE_ID = 1267882075390873681
 RANDOM_SERVER_ID = 1318657897550577776
 PRIVATE_SERVER_ID = 1332980983003349012
-WITHERED_ROLE_ID_RANDOM_SERVER = 1370374993287975024
 ORDINARY_LOGS_CHANNEL_ID = 1317943895606165579
 EXTRAORDINARY_LOGS_GUILD_ID = 1332980983003349012
 EXTRAORDINARY_LOGS_CHANNEL_ID = 1382301903601532928
@@ -182,9 +178,7 @@ EXTRAORDINARY_LOGS_CHANNEL_ID = 1382301903601532928
 AUTOMOD_ALERT_CHANNEL_ID = 1236340209239724115
 ZORR_PRO_DESIGNATED_CHANNEL_ID = 1236340209239724115
 SUPER_ATTEMPT_CHANNEL_ID = 1303267777284673566
-SCREENSHOTS_DROPBOX_CHANNEL_ID = 1359782718426316840
-HC_MEMBER_LIST_CHANNEL_ID = 1354431395140731165 # Fallback for Catercord if not in DB
-SUPER_CRAFT_CHANNEL_ID = "1349166028126556160" # Self-bot listener target
+SUPER_CRAFT_SELF_BOT_CHANNEL_ID = "1349166028126556160" # Self-bot listener target
 
 # Bot Behavior
 BOT_INSTANCE_TYPE = os.getenv("BOT_INSTANCE_TYPE", "PRODUCTION").upper()
@@ -201,7 +195,6 @@ pending_static_list_updates: Dict[int, asyncio.Task] = {}
 guild_sync_sessions: Dict[int, Dict[str, Any]] = {}
 available_profile_pics_cache: List[Tuple[str, str, str]] = []
 PROFILE_PIC_BASE_PATH = ""
-STAFF_CHANNELS = set()
 m28_server_list: Dict[str, Dict[str, Any]] = {}
 m28_server_list_lock = asyncio.Lock()
 
@@ -214,14 +207,6 @@ PETAL_ABBREVIATIONS = {"ygg": "yggdrasil", "begg": "beetle egg", "beggs": "beetl
 ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage"]
 GUILD_SYNC_SESSION_TIMEOUT_SECONDS = 1800
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
-DEPRECATION_MESSAGE_ACTIVITY = (
-    "ℹ️ The 'Activate Myself' feature is being phased out soon.\n\n"
-    "The screenshot system in <#{channel_id}> is a more efficient way to track activity for everyone!\n\n"
-    "**Quick Screenshot Guide:**\n"
-    "1. Press `Ctrl + Shift + S` to capture your Florr.io screen.\n"
-    "2. In Discord (in the <#{channel_id}> channel), press `Ctrl + V` to paste and send.\n\n"
-    "This method is quick and helps keep activity records accurate. Thanks for your understanding!"
-).format(channel_id=SCREENSHOTS_DROPBOX_CHANNEL_ID)
 # (Add any other constants from your original file here if they were missed)
 MAX_WITHER_SECONDS = 3600
 MEMBERS_PER_PAGE = 50
@@ -247,6 +232,7 @@ m28_scrape_counter = 0
 last_craft_post_time = 0.0
 last_spawn_defeat_post_time = 0.0
 NOTIFICATION_COOLDOWN_SECONDS = 120.0
+STAFF_PERMISSION_FOR_AI = "manage_guild"
 
 
 # --- Supabase Client ---
@@ -292,6 +278,318 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Resolves a user-provided name or ID to a specific role or channel ID.
+    Returns (ID, status_message). ID is None on failure.
+    """
+    if not name_or_id:
+        return None, "Not set."
+
+    # 1. Check if it's already a valid ID
+    if name_or_id.isdigit():
+        item_id = int(name_or_id)
+        if item_type == 'role' and guild.get_role(item_id):
+            return item_id, None
+        if item_type == 'channel' and guild.get_channel(item_id):
+            return item_id, None
+    
+    # 2. Fuzzy match against names
+    search_space = guild.roles if item_type == 'role' else guild.text_channels
+    name_lower = name_or_id.lower()
+    
+    # Exact match (case-insensitive)
+    exact_matches = [item for item in search_space if item.name.lower() == name_lower]
+    if len(exact_matches) == 1:
+        return exact_matches[0].id, None
+
+    # Partial match (starts with)
+    partial_matches = [item for item in search_space if item.name.lower().startswith(name_lower)]
+    if len(partial_matches) == 1:
+        return partial_matches[0].id, None
+
+    # Difflib fuzzy match as a last resort
+    closest_matches = difflib.get_close_matches(name_lower, [item.name.lower() for item in search_space], n=2, cutoff=0.7)
+    if len(closest_matches) == 1:
+        matched_item = discord.utils.get(search_space, name=closest_matches[0])
+        if matched_item:
+            return matched_item.id, None
+    
+    # 3. Handle failure cases
+    if not closest_matches and not partial_matches and not exact_matches:
+        return None, f"⚠️ No role/channel found for '{name_or_id}'."
+    else:
+        # Ambiguous match
+        all_possible = set()
+        if exact_matches: all_possible.update(i.name for i in exact_matches)
+        if partial_matches: all_possible.update(i.name for i in partial_matches)
+        if closest_matches: all_possible.update(i for i in closest_matches)
+
+        return None, f"❓ Ambiguous. Could be: {', '.join(f'`{n}`' for n in list(all_possible)[:3])}."
+
+async def trigger_global_role_sync_for_user(user: discord.Member):
+    """
+    Finds all mutual guilds the bot shares with a user and triggers a role refresh for them in each one.
+    """
+    if not user: return
+    
+    print(f"Triggering global role sync for user {user.name} ({user.id})")
+    synced_guilds_count = 0
+    for guild in bot.guilds:
+        # Check if the user is a member of the guild
+        member_in_guild = guild.get_member(user.id)
+        if member_in_guild:
+            # Run the role sync for this member in this specific guild
+            await refresh_roles_for_single_user(guild, member_in_guild)
+            synced_guilds_count += 1
+            await asyncio.sleep(0.5) # Be gentle with the API
+            
+    await log_info(None, f"Global role sync for {user.name} completed. Checked {synced_guilds_count} mutual guilds.")
+
+class SetupModal(discord.ui.Modal):
+    def __init__(self, title: str, fields: List[Dict[str, Any]], callback_func):
+        super().__init__(title=title, timeout=300)
+        self.callback_func = callback_func
+        self.fields_data = fields
+        
+        for field in fields:
+            text_input = discord.ui.TextInput(
+                label=field['label'],
+                placeholder=field.get('placeholder', 'Enter value. Leave blank to clear.'),
+                default=field.get('default', ''),
+                custom_id=field['id'],
+                style=field.get('style', discord.TextStyle.short),
+                required=False,
+                max_length=field.get('max_length', 100)
+            )
+            self.add_item(text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        results = {field.custom_id: field.value for field in self.children if isinstance(field, discord.ui.TextInput)}
+        await self.callback_func(interaction, results)
+
+class SetupView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, config: Dict[str, Any]):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.config = config
+        self.message: Optional[discord.Message] = None
+
+    def create_embed(self) -> discord.Embed:
+        embed = discord.Embed(title=f"⚙️ Bot Setup for {self.guild.name}", color=NERDY_YELLOW)
+        embed.description = "Use the buttons below to configure the bot for this server. All settings are optional."
+        
+        def get_mention(item_id, item_type):
+            if not item_id: return "`Not Set`"
+            if item_type == 'role': item_obj = self.guild.get_role(item_id)
+            else: item_obj = self.guild.get_channel(item_id)
+            return item_obj.mention if item_obj else f"⚠️ `Not Found (ID: {item_id})`"
+            
+        def get_bool_status(key: str) -> str:
+            return "✅ Enabled" if self.config.get(key, True) else "❌ Disabled"
+
+        # --- Roles ---
+        roles_val = (
+            f"**Verified:** {get_mention(self.config.get('verified_role_id'), 'role')}\n"
+            f"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
+            f"**Withered:** {get_mention(self.config.get('withered_role_id'), 'role')}\n"
+            f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}"
+        )
+        embed.add_field(name="Core Roles", value=roles_val, inline=False)
+        
+        # --- Channels ---
+        chans_val = (
+            f"**Screenshots:** {get_mention(self.config.get('screenshots_dropbox_channel_id'), 'channel')}\n"
+            f"**Super Attempts:** {get_mention(self.config.get('super_attempts_channel_id'), 'channel')}"
+        )
+        embed.add_field(name="Feature Channels", value=chans_val, inline=False)
+        
+        # --- Ping Channels ---
+        ping_chans_val = (
+            f"**Craft Pings:** {get_mention(self.config.get('craft_ping_channel_id'), 'channel')}\n"
+            f"**Spawn Pings:** {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
+            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}"
+        )
+        embed.add_field(name="Self-Bot Ping Channels", value=ping_chans_val, inline=False)
+
+        # --- AI Channels ---
+        ai_channel_ids = self.config.get('always_on_ai_channels') or []
+        ai_mentions = [get_mention(cid, 'channel') for cid in ai_channel_ids]
+        ai_chans_val = ", ".join(ai_mentions) if ai_mentions else "`Not Set`"
+        embed.add_field(name="Always-On AI Channels", value=ai_chans_val, inline=False)
+
+        # --- Command Permissions ---
+        perms_val = (
+            f"**/florr:** {get_mention(self.config.get('florr_command_role_id'), 'role')}\n"
+            f"**/imitate:** {get_mention(self.config.get('imitate_command_role_id'), 'role')}\n"
+            f"**/wither:** {get_mention(self.config.get('wither_command_role_id'), 'role')}"
+        )
+        embed.add_field(name="Command Permissions", value=perms_val, inline=False)
+
+        # --- Feature Toggles ---
+        toggles_val = (
+            f"**Keyword Triggers:** {get_bool_status('keywords_enabled')}\n"
+            f"**/wither Command:** {get_bool_status('wither_command_enabled')}"
+        )
+        embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
+
+        embed.set_footer(text="Enter a name or ID in the modals. Leave blank to clear a setting.")
+        return embed
+
+    async def update_config_and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
+        if not self.guild: return
+        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
+        self.config = await load_server_config(self.guild.id)
+        if self.message:
+            await self.message.edit(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="Set Roles", style=discord.ButtonStyle.primary, row=0)
+    async def set_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = [
+            {'label': "Verified Role Name/ID", 'id': "verified_role_id", 'default': str(self.config.get('verified_role_id') or '')},
+            {'label': "Unverified Role Name/ID", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
+            {'label': "Withered Role Name/ID", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
+            {'label': "Ex-Member Role Name/ID", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
+        ]
+        modal = SetupModal(title="Set Core Roles", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=0)
+    async def set_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = [
+            {'label': "Screenshots Channel Name/ID", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
+            {'label': "Super Attempts Channel Name/ID", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
+        ]
+        modal = SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Set Command Permissions", style=discord.ButtonStyle.primary, row=0)
+    async def set_perms_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = [
+            {'label': "/florr Command Role Name/ID", 'id': "florr_command_role_id", 'default': str(self.config.get('florr_command_role_id') or '')},
+            {'label': "/imitate Command Role Name/ID", 'id': "imitate_command_role_id", 'default': str(self.config.get('imitate_command_role_id') or '')},
+            {'label': "/wither Command Role Name/ID", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')},
+        ]
+        modal = SetupModal(title="Set Command Roles", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Set Ping Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def set_ping_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = [
+            {'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
+            {'label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
+            {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')},
+        ]
+        modal = SetupModal(title="Set Self-Bot Ping Channels", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Set AI Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def set_ai_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_ai_channels = self.config.get('always_on_ai_channels', [])
+        default_str = ', '.join(map(str, current_ai_channels)) if current_ai_channels else ''
+        fields = [
+            {
+                'label': "AI Channel Names/IDs (comma-separated)",
+                'id': "always_on_ai_channels",
+                'placeholder': "e.g., general, ai-chat, 123456789...",
+                'default': default_str,
+                'style': discord.TextStyle.paragraph,
+                'max_length': 1024
+            }
+        ]
+        modal = SetupModal(title="Set Always-On AI Channels", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = [
+            {'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) else "no"},
+            {'label': "/wither Command Enabled (yes/no)", 'id': "wither_command_enabled", 'default': "yes" if self.config.get('wither_command_enabled', True) else "no"},
+        ]
+        modal = SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=2)
+    async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)
+        self.stop()
+
+    async def handle_modal_submit(self, interaction: discord.Interaction, results: Dict[str, str]):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        updates = {"guild_id": self.guild.id}
+        errors = []
+        resolved_items = []
+
+        for key, value in results.items():
+            value_stripped = value.strip()
+            
+            if not value_stripped:
+                updates[key] = None
+                resolved_items.append(f"Cleared setting for `{key}`.")
+                continue
+
+            # --- Handle Special Cases First ---
+            if key.endswith('_enabled'):
+                if value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']:
+                    updates[key] = True
+                    resolved_items.append(f"Set `{key}` to ✅ Enabled.")
+                elif value_stripped.lower() in ['no', 'false', '0', 'off', 'disabled']:
+                    updates[key] = False
+                    resolved_items.append(f"Set `{key}` to ❌ Disabled.")
+                else:
+                    errors.append(f"For `{key}`: Invalid input. Please use 'yes' or 'no'.")
+                continue
+
+            if key == 'always_on_ai_channels':
+                channel_inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]
+                resolved_ids = []
+                temp_errors = []
+                for channel_input in channel_inputs:
+                    resolved_id, status_msg = await resolve_name_to_id(self.guild, channel_input, 'channel')
+                    if resolved_id:
+                        resolved_ids.append(resolved_id)
+                    else:
+                        temp_errors.append(f"Could not resolve '{channel_input}': {status_msg}")
+                
+                if not temp_errors:
+                    updates[key] = resolved_ids
+                    mentions = [f"<#{cid}>" for cid in resolved_ids]
+                    resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
+                else:
+                    errors.extend(temp_errors)
+                continue
+
+            # --- Default Case: Role/Channel ID/Name Resolution ---
+            item_type = 'channel' if 'channel' in key else 'role'
+            resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
+            
+            if resolved_id:
+                updates[key] = resolved_id
+                item_obj = self.guild.get_role(resolved_id) if item_type == 'role' else self.guild.get_channel(resolved_id)
+                resolved_items.append(f"Set `{key}` to {item_obj.mention}.")
+            else:
+                errors.append(f"For `{key}`: {status_msg}")
+
+        feedback_embed = discord.Embed(title="Setup Update Confirmation", color=NERDY_YELLOW)
+        
+        if resolved_items:
+            feedback_embed.add_field(name="✅ Changes Applied", value="\n".join(resolved_items), inline=False)
+        
+        if errors:
+            feedback_embed.add_field(name="❌ Errors / Unchanged", value="\n".join(errors), inline=False)
+            feedback_embed.color = discord.Color.orange()
+            feedback_embed.set_footer(text="Settings with errors were not saved. Try again with valid names/IDs.")
+        else:
+            feedback_embed.color = discord.Color.green()
+        
+        await self.update_config_and_refresh(interaction, updates)
+        await interaction.followup.send(embed=feedback_embed, ephemeral=True)
+
+    async def on_timeout(self):
+        if self.message:
+            try: await self.message.edit(content="Setup timed out.", view=None)
+            except (discord.NotFound, discord.HTTPException): pass
 
 async def _create_ping_embed(item: Dict[str, Any]) -> Optional[discord.Embed]:
     """Creates a human-friendly embed for a game event notification."""
@@ -511,21 +809,9 @@ async def _initialize_data_caches(bot: commands.Bot):
     print("Loading profile picture choices...")
     await load_profile_picture_choices(log_guild_for_data_load)
 
-    print("Identifying staff channels in target guild...")
-    STAFF_CHANNELS.clear()
-    target_guild_for_staff_channels = bot.get_guild(CATERCORD_GUILD_ID)
-    if target_guild_for_staff_channels:
-        # This logic is specific to Catercord and can remain here
-        florrist_role = target_guild_for_staff_channels.get_role(FLORRIST_ROLE_ID)
-        hc1_role = target_guild_for_staff_channels.get_role(HC1_ROLE_ID)
-        if florrist_role and hc1_role:
-            for channel in target_guild_for_staff_channels.text_channels:
-                if not channel.permissions_for(target_guild_for_staff_channels.default_role).view_channel:
-                    if not channel.overwrites_for(florrist_role).view_channel and not channel.overwrites_for(hc1_role).view_channel:
-                        STAFF_CHANNELS.add(channel.id)
-            print(f"Staff Channel Identification Complete: Found {len(STAFF_CHANNELS)} staff channel(s).")
-    else:
-        print(f"WARN: Target guild (ID: {CATERCORD_GUILD_ID}) not found. Cannot identify staff channels.")
+    # The hardcoded staff channel identification has been removed to support multi-server functionality.
+    # The AI cog will now rely on user permissions ('manage_guild') instead of a static channel list.
+    print("Staff channel identification is now dynamic based on user permissions.")
 
 
 async def _setup_and_load_cogs(bot: commands.Bot):
@@ -545,6 +831,9 @@ async def _setup_and_load_cogs(bot: commands.Bot):
     bot.server_settings_cache_ref_config = server_settings_cache
     bot.BOT_AVATAR_URL_config = bot.user.display_avatar.url if bot.user and bot.user.display_avatar else None
     
+    # NEW: Pass the staff permission name to the AI cog
+    bot.STAFF_PERMISSION_FOR_AI_config = STAFF_PERMISSION_FOR_AI
+    
     print("Bot attributes set.")
 
     print("Loading cogs...")
@@ -563,7 +852,6 @@ async def _setup_and_load_cogs(bot: commands.Bot):
              raise commands.ExtensionFailed("ai_cog", original=TypeError("Cog is None after load/reload attempt."))
         print("AICog loading/reloading verified successfully.")
     except commands.ExtensionAlreadyLoaded:
-        # This case is now handled by the check above, but kept for safety.
         print("AICog was already loaded, continuing.")
         pass
     except Exception as e_cog:
@@ -594,18 +882,16 @@ async def _start_background_tasks(bot: commands.Bot):
     """Initializes and starts all background tasks and listeners."""
     print("Starting background tasks...")
 
-    # Standard discord.py tasks
     if not check_static_view_timeout.is_running(): check_static_view_timeout.start()
     if not m28_server_scraper.is_running(): m28_server_scraper.start()
     if not aperiodic_craft_poster.is_running(): aperiodic_craft_poster.start()
     if not aperiodic_spawn_defeat_poster.is_running(): aperiodic_spawn_defeat_poster.start()
     print("Started periodic tasks: view timeout, m28 scraper, aperiodic posters.")
     
-    # Self-Bot Integration
     print("--- Starting Self-Bot Integration ---")
     if SELF_DISCORD_TOKEN:
         print("SELF_DISCORD_TOKEN found. Initializing listener...")
-        listener = SelfBotListener(token=SELF_DISCORD_TOKEN, channel_id=SUPER_CRAFT_CHANNEL_ID, bot_instance=bot)
+        listener = SelfBotListener(token=SELF_DISCORD_TOKEN, channel_id=SUPER_CRAFT_SELF_BOT_CHANNEL_ID, bot_instance=bot)
         
         def run_listener_in_thread():
             asyncio.run(listener.run())
@@ -660,13 +946,14 @@ async def _format_announcement(data: Dict[str, Any]) -> str:
     return "Could not format announcement."
 
 async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Member):
-    """Syncs a single user's roles based on their database state (connection and guild tag)."""
+    """Syncs a single user's roles based on their database state (connection, guild tag, and ex-member status)."""
     if not supabase or not guild.me.guild_permissions.manage_roles:
         return
 
     config = await load_server_config(guild.id)
     verified_role_id = config.get('verified_role_id')
     unverified_role_id = config.get('unverified_role_id')
+    ex_member_role_id = config.get('ex_member_role_id')
     tracked_guilds_config = config.get('tracked_guilds', {})
     
     roles_to_add = []
@@ -675,7 +962,7 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
     try:
         user_db_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id, florr_guild_tag").eq("discord_id", str(member.id)).maybe_single().execute())
         
-        db_data = user_db_resp.data if user_db_resp and user_db_resp.data else {}
+        db_data = user_db_resp.data if user_db_resp and hasattr(user_db_resp, 'data') else {}
         is_connected = bool(db_data)
         db_guild_tag = db_data.get('florr_guild_tag') if is_connected else None
         
@@ -688,15 +975,16 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
                 roles_to_add.append(verified_role)
             if unverified_role and unverified_role in member.roles and guild.me.top_role > unverified_role:
                 roles_to_remove.append(unverified_role)
-        else: # Not connected to any IGN
+        else:
             if unverified_role and unverified_role not in member.roles and guild.me.top_role > unverified_role:
                 roles_to_add.append(unverified_role)
             if verified_role and verified_role in member.roles and guild.me.top_role > verified_role:
                 roles_to_remove.append(verified_role)
         
         # 2. Handle Tracked Guild Roles
+        is_in_tracked_guild = db_guild_tag and db_guild_tag in tracked_guilds_config
         required_guild_role_id = None
-        if db_guild_tag and db_guild_tag in tracked_guilds_config:
+        if is_in_tracked_guild:
             required_guild_role_id = tracked_guilds_config[db_guild_tag].get('discord_role_id')
         
         if required_guild_role_id:
@@ -710,11 +998,20 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
                 role_obj = guild.get_role(role_id)
                 if role_obj and role_obj in member.roles and guild.me.top_role > role_obj:
                     roles_to_remove.append(role_obj)
-        
-        # 3. Apply changes
+
+        # 3. Handle Ex-Member Role
+        ex_member_role = guild.get_role(ex_member_role_id) if ex_member_role_id else None
+        if ex_member_role:
+            # Add ex-member role if user is connected but not in a tracked guild
+            if is_connected and not is_in_tracked_guild and ex_member_role not in member.roles and guild.me.top_role > ex_member_role:
+                roles_to_add.append(ex_member_role)
+            # Remove ex-member role if user is not connected or has joined a tracked guild
+            elif (not is_connected or is_in_tracked_guild) and ex_member_role in member.roles and guild.me.top_role > ex_member_role:
+                roles_to_remove.append(ex_member_role)
+
+        # 4. Apply changes
         if roles_to_add or roles_to_remove:
-            current_roles = list(member.roles)
-            final_roles = [r for r in current_roles if r not in roles_to_remove] + roles_to_add
+            final_roles = [r for r in member.roles if r not in roles_to_remove] + roles_to_add
             await member.edit(roles=final_roles, reason="Automatic role sync with database")
             add_names = [r.name for r in roles_to_add]
             rem_names = [r.name for r in roles_to_remove]
@@ -1332,35 +1629,24 @@ async def handle_screenshot_dropbox(message: discord.Message):
         del guild_sync_sessions[user_id]
         active_session = None
 
-    if len(valid_images) == 10: # Guild Sync Mode (Batch of 10)
+    # Treat any message with 10 or more images as starting/continuing a sync.
+    # Also continue if a session is active and at least one image is sent.
+    if len(valid_images) >= 10 or (active_session and len(valid_images) > 0):
         is_new_session = not active_session
-        await log_info(message.guild, f"GuildSync Mode: {'Starting new session' if is_new_session else 'Adding batch'} for {message.author.name}.")
-        asyncio.create_task(process_guild_sync_batch(message, valid_images, is_new_session))
-    elif active_session: # Has an active session but didn't send 10 images
+        batch_to_process = valid_images[:10] # Process up to 10 images at a time
+        
+        await log_info(message.guild, f"GuildSync Mode: {'Starting new session' if is_new_session else 'Adding batch'} for {message.author.name} with {len(batch_to_process)} image(s).")
+        asyncio.create_task(process_guild_sync_batch(message, batch_to_process, is_new_session))
+    elif active_session:
         try:
             await message.reply(
-                f"{message.author.mention} You have an active guild sync session. To add more, send exactly 10 screenshots. Or, use the buttons on my reply to finalize.",
+                f"{message.author.mention}, you have an active guild sync session. Send more screenshots to continue, or use the buttons on my last reply to finalize.",
                 delete_after=30.0
             )
         except discord.HTTPException: pass
-    else: # Regular activity logging from screenshots
+    else:
+        # Regular activity logging from screenshots (fewer than 10 images, no active session)
         await handle_guild_sync_from_screenshots(message, valid_images)
-
-async def handle_hc_list_channel_cleanup(message: discord.Message):
-    """Deletes non-bot messages from the static HC member list channel."""
-    is_main_list_message = False
-    active_view_data = active_static_list_views.get(HC_MEMBER_LIST_CHANNEL_ID)
-    if active_view_data and active_view_data.get('message_id') == message.id:
-        is_main_list_message = True
-    
-    if not is_main_list_message:
-        if message.author.id != bot.user.id or not message.interaction:
-            try:
-                await message.delete(delay=AUTODELETE_DELAY_SECONDS)
-            except (discord.Forbidden, discord.NotFound):
-                pass
-            except Exception as e:
-                await log_error(message.guild, f"Error auto-deleting message {message.id} in HC list channel", error=e)
 
 async def handle_super_attempt_message(message: discord.Message):
     """Processes a message to check for and log a super attempt."""
@@ -1621,10 +1907,10 @@ class GuildSyncInProgressView(discord.ui.View):
 
 
 async def process_guild_sync_batch(
-    message: discord.Message, # The user's message with screenshots
+    message: discord.Message,
     valid_image_attachments: List[discord.Attachment],
     is_new_session: bool
-) -> Optional[discord.Message]: # Returns the bot's reply message if a new one is sent
+) -> Optional[discord.Message]:
     """Processes a batch of screenshots for guild sync, updating or creating a session."""
     guild = message.guild
     user = message.author
@@ -1633,60 +1919,86 @@ async def process_guild_sync_batch(
     ai_cog = bot.get_cog('AICog')
     if not ai_cog:
         await log_error(guild, "GuildSync: AICog not found during batch processing.", message_context=message)
-        # If it's a new session, we need to inform the user via a new reply
         if is_new_session:
-            try:
-                return await message.reply(f"{user.mention} ❌ AI Module error. Sync aborted.")
+            try: return await message.reply(f"{user.mention} ❌ AI Module error. Sync aborted.")
             except discord.HTTPException: pass
-        # If it's an existing session, the view interaction might handle user feedback
+        return None
+
+    # Determine the target guild for this sync session
+    target_guild_tag = None
+    known_igns_for_ai = []
+    if is_new_session:
+        user_ign = await get_ign_from_user(guild, user.id)
+        if user_ign:
+            player_data_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("florr_guild_tag").eq("ingame_name", user_ign).maybe_single().execute())
+            if player_data_resp and player_data_resp.data:
+                target_guild_tag = player_data_resp.data.get('florr_guild_tag')
+        
+        if not target_guild_tag:
+            try: return await message.reply(f"{user.mention} ❌ Could not determine your Florr guild from your database record. Please use `/setguild` first.")
+            except discord.HTTPException: pass
+            return None
+            
+        guild_members_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("ingame_name").eq("florr_guild_tag", target_guild_tag).execute())
+        if guild_members_resp and guild_members_resp.data:
+            known_igns_for_ai = [entry['ingame_name'] for entry in guild_members_resp.data]
+    else: # Existing session
+        session_data = guild_sync_sessions.get(user_id, {})
+        target_guild_tag = session_data.get('target_guild_tag')
+        known_igns_for_ai = session_data.get('known_igns_for_ai', [])
+
+    if not target_guild_tag or not known_igns_for_ai:
+        msg = f"{user.mention} ❌ Could not find members for guild `{target_guild_tag}`. Sync aborted." if target_guild_tag else f"{user.mention} ❌ Sync failed: Could not determine target guild."
+        try: return await message.reply(msg)
+        except discord.HTTPException: pass
+        if user_id in guild_sync_sessions: del guild_sync_sessions[user_id]
         return None
 
     extracted_from_this_batch: Set[str] = set()
     failed_ai_this_batch = 0
     
-    # Use the NEW AI prompt key
-    known_igns_list_for_ai = "\n".join(ai_cog.ingame_name_cache_ref) if ai_cog.ingame_name_cache_ref else "No known names provided."
+    known_igns_list_for_ai_str = "\n".join(known_igns_for_ai)
 
     for image_att in valid_image_attachments:
         try:
             image_bytes = await image_att.read()
             ai_extracted_text = await ai_cog.get_ai_response_with_image(
-                prompt_key="FLORR_GUILD_LIST_FULL_EXTRACTION", # Use new prompt
+                prompt_key="FLORR_GUILD_LIST_FULL_EXTRACTION",
                 image_bytes=image_bytes,
-                prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai}
+                prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai_str}
             )
             if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
                 extracted_this_image = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
                 extracted_from_this_batch.update(extracted_this_image)
             elif not ai_extracted_text:
-                failed_ai_this_batch +=1
+                failed_ai_this_batch += 1
         except Exception as e_img_proc:
-            failed_ai_this_batch +=1
+            failed_ai_this_batch += 1
             await log_error(guild, f"GuildSync: Error processing image {image_att.filename} in batch.", error=e_img_proc, message_context=message)
 
     if is_new_session:
         if not extracted_from_this_batch and failed_ai_this_batch == len(valid_image_attachments):
             return await message.reply(f"{user.mention} ❌ AI failed to extract names from all initial images. Sync aborted.")
-        if not extracted_from_this_batch:
-            return await message.reply(f"{user.mention} ℹ️ AI did not identify any player names from the initial screenshots. Sync aborted.")
-
+        
         guild_sync_sessions[user_id] = {
+            'target_guild_tag': target_guild_tag,
+            'known_igns_for_ai': known_igns_for_ai,
             'screenshot_igns_collected': extracted_from_this_batch,
-            'bot_reply_message_id': 0, # Will be set after sending
+            'bot_reply_message_id': 0,
             'last_update_time': discord.utils.utcnow()
         }
         session_data = guild_sync_sessions[user_id]
         
-        reply_content = f"{user.mention} ✅ Initial batch of {len(valid_image_attachments)} images processed. **{len(extracted_from_this_batch)}** unique IGNs collected so far."
+        reply_content = f"{user.mention} ✅ Initial batch processed for **{target_guild_tag}**. **{len(extracted_from_this_batch)}** unique IGNs collected so far."
         view = GuildSyncInProgressView(user_id, user_id)
         bot_reply_msg = await message.reply(content=reply_content, view=view)
         session_data['bot_reply_message_id'] = bot_reply_msg.id
-        view.message = bot_reply_msg # Link message to view for timeout edits
-        await log_info(guild, f"GuildSync: New session started for {user.name}. Collected {len(extracted_from_this_batch)} IGNs from first batch.")
+        view.message = bot_reply_msg
+        await log_info(guild, f"GuildSync: New session started for {user.name} ({target_guild_tag}). Collected {len(extracted_from_this_batch)} IGNs.")
         return bot_reply_msg
-    else: # Adding to existing session
+    else:
         session_data = guild_sync_sessions.get(user_id)
-        if not session_data: # Should not happen if called correctly
+        if not session_data:
             await log_error(guild, f"GuildSync: Tried to add to non-existent session for user {user_id}.")
             return None 
         
@@ -1696,34 +2008,26 @@ async def process_guild_sync_batch(
         
         bot_reply_msg_obj: Optional[discord.Message] = None
         if session_data['bot_reply_message_id']:
-            try:
-                bot_reply_msg_obj = await message.channel.fetch_message(session_data['bot_reply_message_id'])
-            except (discord.NotFound, discord.HTTPException):
-                await log_error(guild, f"GuildSync: Could not fetch previous bot reply {session_data['bot_reply_message_id']} to update.")
+            try: bot_reply_msg_obj = await message.channel.fetch_message(session_data['bot_reply_message_id'])
+            except (discord.NotFound, discord.HTTPException): pass
 
         update_msg_content = f"{user.mention} ✅ Batch processed. Added **{newly_added_count}** new unique IGNs. **Total collected: {len(session_data['screenshot_igns_collected'])}**."
         if failed_ai_this_batch > 0:
-            update_msg_content += f" (Failed to extract from {failed_ai_this_batch} image(s) in this batch)."
+            update_msg_content += f" (Failed to extract from {failed_ai_this_batch} image(s) this batch)."
 
         if bot_reply_msg_obj:
             try:
-                # Ensure the view is fresh if it's being re-sent or message is edited
                 current_view = GuildSyncInProgressView(user_id, user_id)
                 current_view.message = bot_reply_msg_obj
                 await bot_reply_msg_obj.edit(content=update_msg_content, view=current_view)
-                # Update the view instance in GuildSyncInProgressView if necessary, or re-instantiate
                 if isinstance(bot_reply_msg_obj.view, GuildSyncInProgressView):
-                     bot_reply_msg_obj.view.message = bot_reply_msg_obj # Ensure it's linked
-                
+                     bot_reply_msg_obj.view.message = bot_reply_msg_obj
             except discord.HTTPException as e_edit:
                 await log_error(guild, "GuildSync: Failed to edit bot reply for additional batch.", error=e_edit)
-                # Fallback to sending a new message if edit fails, though this can clutter.
-                # For now, log and user might have to finalize if edit fails.
-        else: # No previous message to edit, this implies an issue. User might need to re-initiate or finalize.
+        else:
              await message.reply(f"{user.mention} Processed batch, but couldn't update previous status message. Total collected so far: {len(session_data['screenshot_igns_collected'])}.")
 
-
-        await log_info(guild, f"GuildSync: Added {newly_added_count} IGNs to session for {user.name}. Total: {len(session_data['screenshot_igns_collected'])}. Failures this batch: {failed_ai_this_batch}")
+        await log_info(guild, f"GuildSync: Added {newly_added_count} IGNs to session for {user.name}. Total: {len(session_data['screenshot_igns_collected'])}. Failures: {failed_ai_this_batch}")
         return bot_reply_msg_obj # Or None if not fetched/edited
 
 
@@ -3502,25 +3806,30 @@ class ProfilePagesView(discord.ui.View):
 
         ign_display = "`Not Linked / Not Found`"
         hc_status_display = "❔ `Status Unknown (Not in DB)`"
+        
+        # Load server config for role IDs
+        guild_id = self.original_command_interaction.guild_id
+        config = server_settings_cache.get(guild_id, {})
+        ex_member_role_id = config.get('ex_member_role_id')
+
         if self.hc_profile_data:
             ign = self.hc_profile_data.get("ingame_name")
             is_in_hc = self.hc_profile_data.get("is_in_hc")
             ign_display = f"`{discord.utils.escape_markdown(ign)}`" if ign else "`Not Set in DB`"
-            if ign is not None: # Check ign exists before status
+            if ign is not None:
                 if is_in_hc is True: 
                     hc_status_display = "✅ `In Guild (HC1)`"
                 elif is_in_hc is False:
-                    # Check for EX_MEMBER_ROLE_ID
                     has_ex_role = False
-                    if self.profile_target_member and EX_MEMBER_ROLE_ID:
-                        if any(role.id == EX_MEMBER_ROLE_ID for role in self.profile_target_member.roles):
+                    if self.profile_target_member and ex_member_role_id:
+                        if any(role.id == ex_member_role_id for role in self.profile_target_member.roles):
                             has_ex_role = True
                     
                     if has_ex_role:
                         hc_status_display = "⏳ `Formerly in Guild (HC1)`"
                     else:
-                        hc_status_display = "❌ `Not in Guild (HC1)`" # Generic "not in guild"
-                else: # is_in_hc is None or other unexpected value
+                        hc_status_display = "❌ `Not in Guild (HC1)`"
+                else:
                     hc_status_display = "❔ `HC Status Unknown (DB)`" 
         
         general_info_value = (
@@ -3542,7 +3851,6 @@ class ProfilePagesView(discord.ui.View):
         else:
             embed.add_field(name="📈 Activity Overview", value="`Activity data N/A (No IGN Linked).`", inline=False)
         
-        # Super Attempt Stats on Main Profile
         if self.super_attempt_stats_data and self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
             sa_stats = self.super_attempt_stats_data
             sa_value = (
@@ -3552,10 +3860,10 @@ class ProfilePagesView(discord.ui.View):
             embed.add_field(name="💥 Super Attempts Overview", value=sa_value, inline=False)
         elif self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
              embed.add_field(name="💥 Super Attempts Overview", value="`No super attempt data found.`", inline=False)
-        else: # No IGN, no Satt stats
+        else:
             embed.add_field(name="💥 Super Attempts Overview", value="`Super attempt data N/A (No IGN Linked).`", inline=False)
 
-        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()} | Use /activatemyself to mark active!")
+        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()} | Use screenshot dropbox for activity!")
         return embed
 
     def _create_monthly_embed(self) -> discord.Embed:
@@ -4034,97 +4342,86 @@ class HelpPagesView(discord.ui.View):
         self.current_page = "general"
         self.is_staff_view_allowed = is_staff_view_allowed
         self.message: Optional[discord.Message] = None
-        if self.is_staff_view_allowed:
-            self.toggle_page_button = discord.ui.Button(label="View Staff Commands", emoji="🛡️", style=discord.ButtonStyle.secondary, custom_id="help_toggle_page_decorator_final")
-            self.toggle_page_button.callback = self.toggle_page_button_callback
-            self.add_item(self.toggle_page_button)
-        else:
-            self.toggle_page_button = None
+        self.buttons = {}
+        self._add_buttons()
 
-    def _update_decorated_button_appearance(self):
-        if not self.toggle_page_button: return
-        if self.current_page == "general":
-            self.toggle_page_button.label = "View Staff Commands"; self.toggle_page_button.emoji = "🛡️"; self.toggle_page_button.style = discord.ButtonStyle.secondary
-        else:
-            self.toggle_page_button.label = "Back to General"; self.toggle_page_button.emoji = "⬅️"; self.toggle_page_button.style = discord.ButtonStyle.primary
+    def _add_buttons(self):
+        self.clear_items()
+        self.buttons['general'] = discord.ui.Button(label="General", emoji="📜", style=discord.ButtonStyle.primary if self.current_page == 'general' else discord.ButtonStyle.secondary, custom_id="help_page_general")
+        self.buttons['general'].callback = self.switch_page
+        self.add_item(self.buttons['general'])
+
+        if self.is_staff_view_allowed:
+            self.buttons['customization'] = discord.ui.Button(label="Customization", emoji="⚙️", style=discord.ButtonStyle.primary if self.current_page == 'customization' else discord.ButtonStyle.secondary, custom_id="help_page_customization")
+            self.buttons['customization'].callback = self.switch_page
+            self.add_item(self.buttons['customization'])
+
+            self.buttons['owner'] = discord.ui.Button(label="Owner", emoji="👑", style=discord.ButtonStyle.primary if self.current_page == 'owner' else discord.ButtonStyle.secondary, custom_id="help_page_owner")
+            self.buttons['owner'].callback = self.switch_page
+            self.add_item(self.buttons['owner'])
+
+    async def switch_page(self, interaction: discord.Interaction):
+        self.current_page = interaction.data['custom_id'].split('_')[-1]
+        self._add_buttons()
+        await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
     def _create_general_embed(self) -> discord.Embed:
         embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "Here are commands generally available to users:\n\u200B"
-
         embed.add_field(name="✨ Main Commands", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('profile')} · View a player's profile and stats.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('connect')} · Link your Discord to an IGN.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('disconnect')} · Unlink your Discord from your IGN.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')} · Show interactive list of guild members.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('servercodes')} · Browse Florr.io server codes.", value="\u200B", inline=False)
-
         embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname.", value="\u200B", inline=False)
-
         embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret AI phrase discovery progress.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-
         embed.set_footer(text="Bot by TheNerd | sweet_honey")
         return embed
 
-    def _create_staff_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="🛡️ Pingslave Bot - Staff Commands", color=NERDY_YELLOW)
+    def _create_customization_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="⚙️ Pingslave Bot - Customization Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "These commands require server management permissions:\n\u200B"
-
-        embed.add_field(name="🔑 Guild & Member Management", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('setguild')} · Set a user's Florr guild. `[Manage Roles]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('verify')} · Manually manage verified/unverified roles. `[Manage Roles]`", value="\u200B", inline=False)
-
-        embed.add_field(name="\u200B\n⏱️ Activity Tracking", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('active')} · Mark member active today. `[Manage Server]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('inactive')} · Remove activity record. `[Manage Server]`", value="\u200B", inline=False)
-
-        embed.add_field(name="\u200B\n⚙️ Server & Bot Customisation", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('customise')} · View/edit bot settings for this server. `[Admin]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('imitate')} · Send as another user. `[Admin]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('wither')} · Temp role removal. `[Admin]`", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('refresh')} · Sync all roles, refresh data. `[Manage Server]`", value="\u200B", inline=False)
-
-        embed.add_field(name="\u200B\n👑 Owner Only", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings.", value="\u200B", inline=False)
+        embed.description = "These commands require server admin permissions:\n\u200B"
+        embed.add_field(name=f"{get_cmd_mention('setup')} · Interactively configure all bot settings for this server.", value="This is the primary command for setting up roles, channels, and command permissions.", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('verify')} · Manually manage verified/unverified roles for a user.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setguild')} · Set a user's Florr guild.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('refresh')} · Sync all roles, refresh data.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('active')} / {get_cmd_mention('inactive')} · Manually manage activity logs.", value="\u200B", inline=False)
+        embed.set_footer(text="Use /setup for most configuration needs.")
+        return embed
+    
+    def _create_owner_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="👑 Pingslave Bot - Owner Commands", color=NERDY_YELLOW)
+        if self.bot_user and self.bot_user.display_avatar:
+            embed.set_thumbnail(url=self.bot_user.display_avatar.url)
+        embed.description = "These commands can only be run by the bot owner.\n\u200B"
+        embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings (e.g., add global guilds, add IGNs).", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add AI keyword rule.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages.", value="\u200B", inline=False)
-
-        embed.set_footer(text="Bot by TheNerd | sweet_honey")
+        embed.set_footer(text="These commands affect the bot globally.")
         return embed
 
     def get_current_embed(self) -> discord.Embed:
-        if self.current_page == "staff": return self._create_staff_embed()
+        if self.current_page == "customization": return self._create_customization_embed()
+        if self.current_page == "owner": return self._create_owner_embed()
         return self._create_general_embed()
 
-    async def toggle_page_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_staff_view_allowed:
-            await interaction.response.send_message("This action is not available.", ephemeral=True, delete_after=5)
-            return
-        self.current_page = "staff" if self.current_page == "general" else "general"
-        self._update_decorated_button_appearance()
-        await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
-
     async def on_timeout(self):
-        if self.message and self.toggle_page_button:
-            try:
-                current_embed_on_timeout = self.get_current_embed()
-                if current_embed_on_timeout.footer and current_embed_on_timeout.footer.text:
-                    current_embed_on_timeout.set_footer(text=f"{current_embed_on_timeout.footer.text} (Interaction timed out)")
-                else:
-                    current_embed_on_timeout.set_footer(text="Interaction timed out")
-                self.toggle_page_button.disabled = True
-                await self.message.edit(embed=current_embed_on_timeout, view=self)
-            except discord.HTTPException: pass
+        if self.message:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button): item.disabled = True
+            try: await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException): pass
         self.stop()
 
 async def profile_pic_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -4482,24 +4779,7 @@ async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
 
 
 
-class SelfActivateButton(discord.ui.Button):
-    """Button for users to mark themselves active for today."""
-    def __init__(self, row: int):
-        super().__init__(label="Activate Myself Today", style=discord.ButtonStyle.success, emoji="✅", custom_id="static_activate_self", row=row)
 
-    async def callback(self, interaction: discord.Interaction):
-        view: StaticHCPagesView = self.view # type: ignore
-        guild = interaction.guild 
-
-        if not view or not guild:
-            await interaction.response.send_message("❌ Cannot perform action: View or Guild context lost.", ephemeral=True)
-            return
-
-        # Send deprecation message
-        await interaction.response.send_message(DEPRECATION_MESSAGE_ACTIVITY, ephemeral=True)
-        
-        # Log the attempt
-        await log_info(guild, f"`{interaction.user.name}` (`{interaction.user.id}`) clicked the deprecated 'Activate Myself Today' button on the static list.")
         # IMPORTANT: Do NOT update view.last_interaction_time here to prevent view reset timer from being affected by this deprecated feature.
 
 # --- Buttons and Views for the NEW Static List ---
@@ -4709,9 +4989,6 @@ class StaticHCPagesView(View):
             info_button = InfoButton(is_info_active=False, row=1)
             info_button.callback = self.toggle_info_mode
             self.add_item(info_button)
-
-            activate_button = SelfActivateButton(row=2)
-            self.add_item(activate_button)
 
             profile_button = MyProfileButton(row=2)
             profile_button.callback = self.show_my_profile
@@ -6179,20 +6456,12 @@ async def on_close():
 
 async def update_static_list_message(guild: discord.Guild):
     """
-    DEPRECATED WRAPPER. Creates or updates the interactive HC list message for [HC1] in Catercord.
-    New features should call update_single_tracked_guild_list directly.
+    DEPRECATED. Static lists are now updated via /refresh, which calls update_single_tracked_guild_list.
+    This function is kept for backward compatibility but does nothing.
     """
-    if guild.id == CATERCORD_GUILD_ID:
-        # For backward compatibility, refresh the primary [HC1] list
-        hc1_config = {
-            "florr_guild_tag": "[HC1]",
-            "discord_role_id": HC1_ROLE_ID,
-            "member_list_channel_id": HC_MEMBER_LIST_CHANNEL_ID
-        }
-        await update_single_tracked_guild_list(guild, hc1_config)
-    else:
-        # Don't do anything for other guilds through this old function
-        pass
+    # This function is now a no-op to prevent outdated logic from running.
+    # All list updates should be triggered via the more generic refresh_all_guild_lists.
+    pass
 
 # --- Discord Events ---
 @bot.event
@@ -6510,15 +6779,14 @@ async def disconnect(interaction: discord.Interaction, user: Optional[discord.Me
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # Find the record by discord_id and set discord_id/name to NULL
         update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(target_user.id)).execute())
 
         if not update_resp.data:
             await interaction.followup.send(f"ℹ️ {target_user.mention} was not connected to any IGN in the database.", ephemeral=True); return
         
-        await refresh_roles_for_single_user(guild, target_user)
+        await trigger_global_role_sync_for_user(target_user)
         ign_disconnected = update_resp.data[0].get('ingame_name', 'an IGN')
-        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`.", ephemeral=True)
+        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`. Roles are being updated across all servers.", ephemeral=True)
         await log_info(guild, f"`{interaction.user.name}` disconnected `{target_user.name}`.")
 
     except Exception as e:
@@ -6562,18 +6830,23 @@ async def setguild(interaction: discord.Interaction, user: discord.Member, guild
         if not update_resp.data:
             await interaction.followup.send(f"❌ Could not find a connected database record for {user.mention}. Use `/connect` first.", ephemeral=True)
             return
+
+        # Trigger a role refresh for the user in ALL mutual servers
+        await trigger_global_role_sync_for_user(user)
             
-        await refresh_roles_for_single_user(guild, user)
         ign = update_resp.data[0].get('ingame_name', 'N/A')
         
         if normalized_tag:
-            await interaction.followup.send(f"✅ Set `{ign}` ({user.mention})'s guild to **{normalized_tag}**. Roles are being updated.", ephemeral=True)
+            await interaction.followup.send(f"✅ Set `{ign}` ({user.mention})'s guild to **{normalized_tag}**. Roles are being updated across all servers.", ephemeral=True)
             await log_info(guild, f"`{interaction.user.name}` set `{user.name}`'s guild to {normalized_tag}.")
         else:
-            await interaction.followup.send(f"✅ Removed `{ign}` ({user.mention}) from any tracked guild. Roles are being updated.", ephemeral=True)
+            await interaction.followup.send(f"✅ Removed `{ign}` ({user.mention}) from any tracked guild. Roles are being updated across all servers.", ephemeral=True)
             await log_info(guild, f"`{interaction.user.name}` removed `{user.name}` from their guild.")
             
-        asyncio.create_task(refresh_all_guild_lists(guild))
+        # Refresh lists in all relevant guilds
+        for bot_guild in bot.guilds:
+            if bot_guild.get_member(user.id):
+                asyncio.create_task(refresh_all_guild_lists(bot_guild))
 
     except Exception as e:
         await log_error(guild, f"Error during /setguild for {user.name}", error=e, interaction=interaction)
@@ -6583,14 +6856,27 @@ async def setguild(interaction: discord.Interaction, user: discord.Member, guild
 @tree.command(name="activatemyself", description="Mark yourself as active for today in the HC activity log.")
 async def activatemyself(interaction: discord.Interaction):
     guild = interaction.guild
-    if not guild: # Should already be caught by tree if guild_only, but for safety
+    if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
 
-    # Send deprecation message
-    await interaction.response.send_message(DEPRECATION_MESSAGE_ACTIVITY, ephemeral=True)
+    config = await load_server_config(guild.id)
+    dropbox_channel_id = config.get('screenshots_dropbox_channel_id')
     
-    # Log the attempt
+    if dropbox_channel_id:
+        channel_mention = f"<#{dropbox_channel_id}>"
+        deprecation_message = (
+            "ℹ️ The 'Activate Myself' feature is being phased out soon.\n\n"
+            f"The screenshot system in {channel_mention} is a more efficient way to track activity for everyone!\n\n"
+            "**Quick Screenshot Guide:**\n"
+            "1. Press `Ctrl + Shift + S` to capture your Florr.io screen.\n"
+            f"2. In Discord (in the {channel_mention} channel), press `Ctrl + V` to paste and send.\n\n"
+            "This method is quick and helps keep activity records accurate. Thanks for your understanding!"
+        )
+    else:
+        deprecation_message = "ℹ️ The 'Activate Myself' feature is being phased out soon. Please use the server's configured screenshot channel for activity tracking."
+
+    await interaction.response.send_message(deprecation_message, ephemeral=True)
     await log_info(guild, f"`{interaction.user.name}` (`{interaction.user.id}`) used the deprecated /activatemyself command.")
 
 # --- Active Command (MODIFIED: No date, Manage Server perm required) ---
@@ -7042,55 +7328,54 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     invoker = interaction.user
 
     if not guild:
-        await interaction.response.send_message("This command cannot be used outside a server.", ephemeral=False)
+        await interaction.response.send_message("This command cannot be used outside a server.", ephemeral=True)
         return
 
     config = await load_server_config(guild.id)
     if not config.get('wither_command_enabled', True) and interaction.user.id != OWNER_USER_ID:
         await interaction.response.send_message("❌ This command is currently disabled in this server.", ephemeral=True)
         return
+    
+    # Permission Check
+    required_role_id = config.get('wither_command_role_id')
+    user_is_staff = await is_admin_or_owner(interaction)
+    if required_role_id:
+        required_role = guild.get_role(required_role_id)
+        if required_role and not isinstance(invoker, discord.Member) or (required_role not in invoker.roles and not user_is_staff):
+            await interaction.response.send_message(f"❌ You need the {required_role.mention} role to use this command.", ephemeral=True)
+            return
+    elif not user_is_staff:
+        await interaction.response.send_message("❌ You need to be an admin to use this command.", ephemeral=True)
+        return
 
     bot_member = guild.me
-
-    async def fail_check(log_reason: str, user_message: str):
-        send_method = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        try:
-            await send_method(embed=create_embed(user_message, discord.Color.red()), ephemeral=False)
-        except (discord.NotFound, discord.InteractionResponded, discord.HTTPException): pass
-        await log_error(guild, f"Wither check fail ({invoker.name} -> {user.name}): {log_reason}", interaction=interaction)
-
-    if not await is_admin_or_owner(interaction):
-        await fail_check("Invoker permission denied.", "❌ You need to be a server administrator to use this command.")
-        return
-        
     if not interaction.response.is_done():
         try: await interaction.response.defer(thinking=True, ephemeral=False)
         except discord.InteractionResponded: pass
 
-    if user.id == invoker.id: await fail_check("Target self.", "🤨 You cannot wither yourself."); return
-    if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await fail_check("Target protected.", f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>)."); return
-    if user.id == BOT_USER_ID: await fail_check("Target bot.", "😭 You cannot wither me!"); return
-    if user.bot: await fail_check("Target other bot.", "🤖 You cannot wither other bots."); return
-    if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await fail_check("Target guild owner.", f"👑 You cannot wither the server owner (<@{guild.owner_id}>)."); return
-    if bot_member.top_role.position <= user.top_role.position: await fail_check("Bot hierarchy low.", f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles."); return
-    if not bot_member.guild_permissions.manage_roles: await fail_check("Bot missing manage_roles perm.", "❌ I lack the `Manage Roles` permission needed for this command."); return
+    if user.id == invoker.id: await interaction.followup.send("🤨 You cannot wither yourself.", ephemeral=True); return
+    if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await interaction.followup.send(f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>).", ephemeral=True); return
+    if user.id == BOT_USER_ID: await interaction.followup.send("😭 You cannot wither me!", ephemeral=True); return
+    if user.bot: await interaction.followup.send("🤖 You cannot wither other bots.", ephemeral=True); return
+    if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await interaction.followup.send(f"👑 You cannot wither the server owner (<@{guild.owner_id}>).", ephemeral=True); return
+    if bot_member.top_role.position <= user.top_role.position: await interaction.followup.send(f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles.", ephemeral=True); return
+    if not bot_member.guild_permissions.manage_roles: await interaction.followup.send("❌ I lack the `Manage Roles` permission needed for this command.", ephemeral=True); return
 
     original_roles = [r for r in user.roles if r.id != guild.default_role.id]
     if not original_roles:
-        await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles (other than @everyone) to remove.", discord.Color.orange()), ephemeral=False)
+        await interaction.followup.send(embed=create_embed(f"ℹ️ {user.display_name} has no roles to remove.", discord.Color.orange()), ephemeral=False)
         return
 
     try:
         wither_seconds = min(max(1, int(time * 60)), int(MAX_WITHER_SECONDS or 600))
         actual_minutes = wither_seconds / 60.0
-        reason_wither = f"Withered by {invoker.name} ({invoker.id}) for {actual_minutes:.1f}m."
+        reason_wither = f"Withered by {invoker.name} for {actual_minutes:.1f}m."
 
         roles_to_remove_actually = [r for r in original_roles if bot_member.top_role.position > r.position]
         skipped_roles_remove = [r for r in original_roles if r not in roles_to_remove_actually]
 
         if not roles_to_remove_actually:
-             await interaction.followup.send(embed=create_embed(f"ℹ️ Cannot wither {user.display_name}: None of their roles are below my highest role.", color=discord.Color.orange()), ephemeral=False)
-             await log_info(guild, f"Wither attempt on {user.name} by {invoker.name} failed: No manageable roles.")
+             await interaction.followup.send(embed=create_embed(f"ℹ️ Cannot wither {user.display_name}: No manageable roles.", color=discord.Color.orange()), ephemeral=False)
              return
 
         roles_to_set_during_wither = [guild.default_role]
@@ -7113,7 +7398,6 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         wither_desc += special_wither_role_added_msg_part
         if skipped_roles_remove:
             skipped_names = (', '.join(f"`{r.name}`" for r in skipped_roles_remove))
-            if len(skipped_names) > 100: skipped_names = skipped_names[:97] + "..."
             wither_desc += f"\n*(Skipped removing {len(skipped_roles_remove)} role(s) due to hierarchy: {skipped_names})*"
 
         await interaction.followup.send(embed=create_embed(title="🌪️ Wither Cast! 🌪️", description=wither_desc, color=discord.Color.dark_purple()), ephemeral=False)
@@ -7123,15 +7407,14 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         try:
             member_after = await guild.fetch_member(user.id)
             await member_after.edit(roles=[guild.default_role] + original_roles, reason=f"Wither expired after {actual_minutes:.1f}m.")
-            
             restore_msg = f"✨ {member_after.mention}'s roles have been restored!"
             await interaction.followup.send(embed=create_embed(restore_msg, color=NERDY_YELLOW), ephemeral=False)
         except discord.NotFound:
-            await log_info(guild, f"Wither restore skipped: User `{user.name}` ({user.id}) left the server.")
+            await log_info(guild, f"Wither restore skipped: User `{user.name}` left.")
         except Exception as e_restore:
-            await log_error(guild, f"Wither restore failed for {user.name} ({user.id}).", error=e_restore)
+            await log_error(guild, f"Wither restore failed for {user.name}.", error=e_restore)
     except Exception as e:
-        await log_error(guild, f"Wither initial remove failed: Unexpected error for {user.name} ({user.id}).", error=e, interaction=interaction)
+        await log_error(guild, f"Wither initial remove failed for {user.name}.", error=e, interaction=interaction)
 
 
 
@@ -7141,52 +7424,40 @@ async def on_message(message: discord.Message):
        message.author.id == bot.user.id or (message.author.bot and not message.webhook_id):
         return
 
-    # --- //super Command Handler (Owner Only) ---
+    config = await load_server_config(message.guild.id)
+    if not config.get('bot_enabled', True) and message.author.id != OWNER_USER_ID:
+        return
+
     if message.content.strip() == "//super" and message.author.id == OWNER_USER_ID:
         await handle_super_command(message)
-        return # Stop processing after this
+        return
 
-    # Load the config for this specific guild for all other handlers
-    config = await load_server_config(message.guild.id)
-
-    # Catercord-specific Zorr.pro AutoMod Alert Handler (Hardcoded)
+    # Check for feature channels configured for this server
+    screenshot_channel_id = config.get('screenshots_dropbox_channel_id')
+    super_attempt_channel_id = config.get('super_attempts_channel_id')
+    
+    # Catercord-specific Zorr.pro handler (can be moved to config later if needed)
     if message.guild.id == CATERCORD_GUILD_ID and message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action:
         await handle_zorr_pro_automod(message)
         return
 
-    # Ignore messages with no content, attachments, or embeds from this point
     if not message.content and not message.attachments and not message.embeds:
         return
 
-    # Catercord-specific Screenshot Dropbox Handler (Hardcoded)
-    if message.guild.id == CATERCORD_GUILD_ID and message.channel.id == SCREENSHOTS_DROPBOX_CHANNEL_ID and message.attachments:
+    if screenshot_channel_id and message.channel.id == screenshot_channel_id and message.attachments:
         await handle_screenshot_dropbox(message)
         return
 
-    # Configurable Super Attempt Message Handler
-    super_attempts_config_id = config.get('super_attempts_channel_id')
-    # Also check Catercord hardcoded ID as a fallback
-    is_super_attempt_channel = (super_attempts_config_id and message.channel.id == super_attempts_config_id) or \
-                               (message.guild.id == CATERCORD_GUILD_ID and message.channel.id == SUPER_ATTEMPT_CHANNEL_ID)
-    if is_super_attempt_channel:
+    if super_attempt_channel_id and message.channel.id == super_attempt_channel_id:
         await handle_super_attempt_message(message)
         return
 
-    # Configurable HC Member List Channel Cleanup Handler
-    tracked_guilds = config.get('tracked_guilds', {})
     is_a_list_channel = False
-    for guild_data in tracked_guilds.values():
+    for guild_data in config.get('tracked_guilds', {}).values():
         if message.channel.id == guild_data.get('member_list_channel_id'):
             is_a_list_channel = True
             break
-    if not is_a_list_channel and message.guild.id == CATERCORD_GUILD_ID and message.channel.id == HC_MEMBER_LIST_CHANNEL_ID:
-        is_a_list_channel = True
-
-    if is_a_list_channel:
-        await handle_hc_list_channel_cleanup(message)
-        return
-
-    # AI Cog Handler (passes the loaded config)
+        
     ai_cog = bot.get_cog('AICog')
     if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
         await ai_cog.process_message_for_ai(message, config)
@@ -7377,36 +7648,27 @@ async def imitate(
         await interaction.response.send_message("This command can only be used in server text channels.", ephemeral=True)
         return
 
-    # --- NEW PERMISSION CHECK ---
     config = await load_server_config(guild.id)
-    if not config.get('bot_enabled', True) and interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ The bot is currently disabled in this server.", ephemeral=True)
-        return
-
     required_role_id = config.get('imitate_command_role_id')
     user_is_staff = await is_admin_or_owner(interaction)
 
     if required_role_id:
         required_role = guild.get_role(required_role_id)
         if not required_role:
-            await interaction.response.send_message("⚠️ Config Error: The required role for this command was not found. Please contact an admin.", ephemeral=True)
-            await log_error(guild, f"/imitate failed: Configured role ID {required_role_id} not found.", interaction=interaction)
+            await interaction.response.send_message("⚠️ Config Error: The role for this command was not found. Contact an admin.", ephemeral=True)
             return
         if not isinstance(interaction.user, discord.Member) or (required_role not in interaction.user.roles and not user_is_staff):
             await interaction.response.send_message(f"❌ You need the {required_role.mention} role to use this command.", ephemeral=True)
             return
     elif not user_is_staff:
-        await interaction.response.send_message("❌ You need to be a server admin to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You need to be an admin to use this command.", ephemeral=True)
         return
-    # --- END NEW PERMISSION CHECK ---
 
-    # Defer ephemerally as the command result is just a confirmation
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     bot_perms = interaction.channel.permissions_for(guild.me)
     if not bot_perms.manage_webhooks:
-        await interaction.followup.send(f"❌ I lack the 'Manage Webhooks' permission in {interaction.channel.mention} to imitate {user.display_name}.", ephemeral=True)
-        await log_error(guild, f"/imitate failed: Bot missing manage_webhooks permission for user {user.display_name}.", interaction=interaction)
+        await interaction.followup.send(f"❌ I lack 'Manage Webhooks' permission in {interaction.channel.mention}.", ephemeral=True)
         return
 
     avatar_bytes: Optional[bytes] = None
@@ -7420,21 +7682,18 @@ async def imitate(
         if any(d in webhook_name.lower() for d in ["@", "#", ":", "```", "discord"]) or webhook_name.lower() == "clyde":
              webhook_name = "Imitated User"
 
-        temp_webhook = await interaction.channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason=f"Temp webhook for /imitate by {interaction.user}")
+        temp_webhook = await interaction.channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason=f"/imitate by {interaction.user}")
         await temp_webhook.send(content=message_content, wait=True)
         await interaction.edit_original_response(content=f"✅ Message sent, imitating {user.mention}.")
-        await log_info(guild, f"User `{interaction.user}` used /imitate as {user.mention} in {interaction.channel.mention}.")
+        await log_info(guild, f"`{interaction.user}` used /imitate as {user.mention} in {interaction.channel.mention}.")
 
     except Exception as e:
-        await log_error(guild, f"/imitate failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
-        try:
-            await interaction.edit_original_response(content=f"❌ An unexpected error occurred.")
-        except discord.HTTPException:
-            pass # Ignore if interaction already gone
+        await log_error(guild, f"/imitate failed", error=e, interaction=interaction, ping_owner=True)
+        await interaction.edit_original_response(content=f"❌ An unexpected error occurred.")
     finally:
         if temp_webhook:
-            try: await temp_webhook.delete(reason="Temp webhook cleanup for /imitate")
-            except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /imitate.", error=e_del)
+            try: await temp_webhook.delete(reason="/imitate cleanup")
+            except Exception as e_del: await log_error(guild, "Failed to delete temp webhook for /imitate.", error=e_del)
 
 # Helper function to handle sending public errors for /florr
 async def send_public_florr_error(interaction: discord.Interaction, public_message_content: str, log_message_content: str, log_level: str = "info", ping_owner_on_log: bool = False):
@@ -7483,133 +7742,92 @@ async def florr(
         await interaction.response.send_message("This command can only be used in server text channels.", ephemeral=True)
         return
 
-    # --- NEW PERMISSION CHECK ---
     config = await load_server_config(guild.id)
-    if not config.get('bot_enabled', True) and interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ The bot is currently disabled in this server.", ephemeral=True)
-        return
-
     required_role_id = config.get('florr_command_role_id')
     user_is_staff = await is_admin_or_owner(interaction)
 
     if required_role_id:
         required_role = guild.get_role(required_role_id)
         if not required_role:
-            await interaction.response.send_message("⚠️ Config Error: The required role for this command was not found. Please contact an admin.", ephemeral=True)
-            await log_error(guild, f"/florr failed: Configured role ID {required_role_id} not found.", interaction=interaction)
+            await interaction.response.send_message("⚠️ Config Error: The role for this command was not found. Contact an admin.", ephemeral=True)
             return
-        # Allow staff to use it regardless of role setting
-        if required_role not in interaction.user.roles and not user_is_staff:
+        if not isinstance(interaction.user, discord.Member) or (required_role not in interaction.user.roles and not user_is_staff):
             await interaction.response.send_message(f"❌ You need the {required_role.mention} role to use this command.", ephemeral=True)
             return
-    elif not user_is_staff: # If no role is set, default to staff-only
-        await interaction.response.send_message("❌ You need to be a server admin to use this command.", ephemeral=True)
+    elif not user_is_staff:
+        await interaction.response.send_message("❌ You need to be an admin to use this command.", ephemeral=True)
         return
-    # --- END NEW PERMISSION CHECK ---
 
-    # Defer ephemerally. We will send public messages for specific errors if needed.
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # (The rest of the /florr command logic remains exactly the same as before)
     cleaned_name = name.strip()
     if not (1 <= len(cleaned_name) <= 80):
         await interaction.edit_original_response(content="❌ Custom name must be 1-80 characters long.", view=None)
         return
     disallowed_in_names = ["@", "#", ":", "```", "discord"]
     if any(disallowed in cleaned_name.lower() for disallowed in disallowed_in_names) or cleaned_name.lower() == "clyde":
-        await interaction.edit_original_response(content=f"❌ The custom name '{discord.utils.escape_markdown(cleaned_name)}' contains disallowed characters or is a reserved name.", view=None)
+        await interaction.edit_original_response(content=f"❌ The name '{discord.utils.escape_markdown(cleaned_name)}' contains disallowed characters or is reserved.", view=None)
         return
 
     if not available_profile_pics_cache:
-        await interaction.edit_original_response(content="❌ Profile picture choices are currently unavailable. Please try again later or use `/refresh`.", view=None)
-        await log_error(guild, "/florr: available_profile_pics_cache is empty.", interaction=interaction, ping_owner=True)
+        await interaction.edit_original_response(content="❌ Profile pictures unavailable. Try `/refresh` or contact an admin.", view=None)
         return
 
     if profile == "error_no_images_loaded":
-        await send_public_florr_error(interaction, "Profile picture choices could not be loaded by the bot. Please try `/refresh` or ask an admin to check the bot's setup.", "/florr: User selected 'error_no_images_loaded'.", log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, "Profile pictures could not be loaded. Please try `/refresh`.", "/florr: User selected 'error_no_images_loaded'.", log_level="error", ping_owner_on_log=True)
         return
     if profile == "error_no_matches_found":
-         await send_public_florr_error(interaction, "No profile picture matches your search term.", f"/florr: User selected 'error_no_matches_found'.")
+         await send_public_florr_error(interaction, "No profile picture matches your search.", f"/florr: User selected 'error_no_matches_found'.")
          return
 
     valid_choice_values = {f"{folder_id_cache}:{filename_cache}" for _, folder_id_cache, filename_cache in available_profile_pics_cache}
     if profile not in valid_choice_values:
-        public_err_msg = f"Invalid profile picture selection: `{discord.utils.escape_markdown(profile)}`."
-        log_err_msg = f"/florr: User {interaction.user.name} provided invalid profile selection '{profile}'."
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg)
+        await send_public_florr_error(interaction, f"Invalid profile selection: `{discord.utils.escape_markdown(profile)}`.", f"/florr: User provided invalid profile selection '{profile}'.")
         return
 
     try:
         folder_id, filename_with_ext = profile.split(":", 1)
     except ValueError:
-        public_err_msg = "Internal error processing profile selection format."
-        log_err_msg = f"/florr: Invalid profile value format AFTER cache validation: '{profile}'"
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
-        return
-
-    if folder_id not in [PETALS_FOLDER_NAME, MOBS_FOLDER_NAME]:
-        public_err_msg = "Invalid folder specified in profile picture selection."
-        log_err_msg = f"/florr: Unknown folder_id in profile value AFTER cache validation: '{folder_id}'"
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, "Internal error processing profile selection.", f"/florr: Invalid profile value format: '{profile}'", log_level="error", ping_owner_on_log=True)
         return
 
     if not PROFILE_PIC_BASE_PATH:
-        await interaction.edit_original_response(content="⚠️ Configuration error: Profile picture base path not set.", view=None)
-        await log_error(guild, "/florr command failed: PROFILE_PIC_BASE_PATH is not set.", interaction=interaction, ping_owner=True)
+        await interaction.edit_original_response(content="⚠️ Config error: Profile picture path not set.", view=None)
         return
         
     image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename_with_ext)
 
     if not os.path.exists(image_path):
-        public_err_msg = f"The image file for `{discord.utils.escape_markdown(filename_with_ext)}` seems to be missing."
-        log_err_msg = f"/florr: Image file not found at '{image_path}'."
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, f"The image for `{discord.utils.escape_markdown(filename_with_ext)}` is missing.", f"/florr: Image file not found at '{image_path}'.", log_level="error", ping_owner_on_log=True)
         return
 
     chosen_avatar_bytes: Optional[bytes] = None
     try:
-        with open(image_path, "rb") as f:
-            chosen_avatar_bytes = f.read()
+        with open(image_path, "rb") as f: chosen_avatar_bytes = f.read()
     except Exception as e:
-        public_err_msg = f"Error reading image file for `{discord.utils.escape_markdown(filename_with_ext)}`."
-        log_err_msg = f"Error reading image file {image_path} for /florr"
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
-        if guild: await log_error(guild, f"Error reading image file {image_path} for /florr", error=e, interaction=interaction)
-        return
-
-    if not chosen_avatar_bytes:
-        public_err_msg = f"Failed to load image data for `{discord.utils.escape_markdown(filename_with_ext)}`."
-        log_err_msg = f"/florr: chosen_avatar_bytes was None after attempting to read {image_path}."
-        await send_public_florr_error(interaction, public_err_msg, log_err_msg, log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, f"Error reading image file for `{discord.utils.escape_markdown(filename_with_ext)}`.", f"Error reading image file {image_path} for /florr", log_level="error", ping_owner_on_log=True)
+        if guild: await log_error(guild, f"Error reading image file {image_path}", error=e, interaction=interaction)
         return
 
     temp_webhook: Optional[discord.Webhook] = None
     try:
         bot_perms = interaction.channel.permissions_for(guild.me)
         if not bot_perms.manage_webhooks:
-            await interaction.edit_original_response(content=f"❌ I lack the 'Manage Webhooks' permission in {interaction.channel.mention}.", view=None)
-            await log_error(guild, f"/florr failed: Bot missing manage_webhooks permission.", interaction=interaction)
+            await interaction.edit_original_response(content=f"❌ I lack 'Manage Webhooks' permission in {interaction.channel.mention}.", view=None)
             return
 
-        temp_webhook = await interaction.channel.create_webhook(name=cleaned_name, avatar=chosen_avatar_bytes, reason=f"Temp webhook for /florr by {interaction.user}")
+        temp_webhook = await interaction.channel.create_webhook(name=cleaned_name, avatar=chosen_avatar_bytes, reason=f"/florr by {interaction.user}")
         await temp_webhook.send(content=message_content, wait=True)
-        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}' with picture '{folder_id}/{filename_with_ext}'.", view=None)
-        await log_info(guild, f"User `{interaction.user}` used /florr as '{cleaned_name}' (Pic: {folder_id}/{filename_with_ext}) in {interaction.channel.mention}. Msg: '{message_content[:50].strip()}...'")
+        await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}'.", view=None)
+        await log_info(guild, f"`{interaction.user}` used /florr as '{cleaned_name}' (Pic: {profile}) in {interaction.channel.mention}.")
 
-    except discord.Forbidden:
-        await interaction.edit_original_response(content=f"❌ I lack permissions (likely 'Manage Webhooks') in {interaction.channel.mention}.", view=None)
-        await log_error(guild, f"/florr failed: Forbidden.", interaction=interaction)
-    except discord.HTTPException as e:
-        error_text = f"Discord API Error: Failed to send. Code: {e.code}, Text: {e.text}"
-        await interaction.edit_original_response(content=error_text[:1900], view=None)
-        await log_error(guild, f"/florr failed: HTTP Exception", error=e, interaction=interaction)
     except Exception as e:
         await interaction.edit_original_response(content="❌ An unexpected error occurred.", view=None)
-        await log_error(guild, f"/florr failed: Unexpected error.", error=e, interaction=interaction, ping_owner=True)
+        await log_error(guild, "/florr failed.", error=e, interaction=interaction, ping_owner=True)
     finally:
         if temp_webhook:
-            try: await temp_webhook.delete(reason="Temp webhook cleanup for /florr")
-            except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /florr. ID: {temp_webhook.id}", error=e_del)
+            try: await temp_webhook.delete(reason="/florr cleanup")
+            except Exception as e_del: await log_error(guild, f"Failed to delete temp webhook for /florr.", error=e_del)
    
 @tree.command(name="nerdhelp", description="Show the list of available bot commands.")
 async def nerdhelp(interaction: discord.Interaction):
@@ -7980,119 +8198,17 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
     await interaction.followup.send("\n".join(response_message_parts), ephemeral=True)
     await log_info(guild, f"`{interaction.user}` used /setnickname for {target_user.mention}. Manage: {manage_by_bot_new_value}, Template: '{template_to_store}'.")
 
-class CustomiseGroup(app_commands.Group):
-    """Commands to customise bot settings for this server."""
-    def __init__(self):
-        super().__init__(name="customise", description="Customise bot settings for this server.")
-
-    @app_commands.command(name="settings", description="[Admin] View the current custom settings for this server.")
-    @app_commands.check(is_admin_or_owner)
-    async def view_settings(self, interaction: discord.Interaction):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        config = await load_server_config(interaction.guild.id)
-
-        embed = discord.Embed(title=f"⚙️ Current Settings for {interaction.guild.name}", color=NERDY_YELLOW)
-        
-        # --- Role Settings ---
-        ver_role = interaction.guild.get_role(config.get('verified_role_id'))
-        unver_role = interaction.guild.get_role(config.get('unverified_role_id'))
-        wither_role = interaction.guild.get_role(config.get('withered_role_id'))
-        roles_val = (
-            f"Verified Role: {ver_role.mention if ver_role else '`Not Set`'}\n"
-            f"Unverified Role: {unver_role.mention if unver_role else '`Not Set`'}\n"
-            f"Withered Role: {wither_role.mention if wither_role else '`Not Set`'}\n"
-            f"*(Manage with {get_cmd_mention('customise set_role')})*"
-        )
-        embed.add_field(name="Role Configuration", value=roles_val, inline=False)
-
-        # --- Tracked Guilds Field ---
-        tracked_guilds = config.get('tracked_guilds', {})
-        if not tracked_guilds:
-            tracked_val = f"`None`\n*(Manage with {get_cmd_mention('customise tracked_guild add')})*"
-        else:
-            tracked_val_parts = []
-            for tag, data in tracked_guilds.items():
-                role = interaction.guild.get_role(data.get('discord_role_id'))
-                chan = interaction.guild.get_channel(data.get('member_list_channel_id'))
-                tracked_val_parts.append(f"**{tag}**: Role: {role.mention if role else '`Not Set`'}, List Chan: {chan.mention if chan else '`Not Set`'}")
-            tracked_val_parts.append(f"\n*(Manage with {get_cmd_mention('customise tracked_guild')})*")
-            tracked_val = "\n".join(tracked_val_parts)
-        embed.add_field(name=f"Tracked Florr Guilds ({len(tracked_guilds)})", value=tracked_val, inline=False)
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="set_role", description="[Admin] Set a special-purpose role for the bot.")
-    @app_commands.describe(role_type="The type of role to set.", role="The role to set. Omit to clear.")
-    @app_commands.choices(role_type=[
-        app_commands.Choice(name="Verified Role", value="verified_role_id"),
-        app_commands.Choice(name="Unverified Role", value="unverified_role_id"),
-        app_commands.Choice(name="Withered Role", value="withered_role_id"),
-    ])
-    @app_commands.check(is_admin_or_owner)
-    async def set_role(self, interaction: discord.Interaction, role_type: str, role: Optional[discord.Role] = None):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        
-        role_id = role.id if role else None
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert({'guild_id': interaction.guild.id, role_type: role_id}).execute())
-        config = await load_server_config(interaction.guild.id)
-        config[role_type] = role_id
-        
-        role_type_name = role_type.replace('_', ' ').replace(' id', '').title()
-        if role:
-            await interaction.followup.send(f"✅ The **{role_type_name}** has been set to {role.mention}.")
-        else:
-            await interaction.followup.send(f"✅ The **{role_type_name}** has been cleared.")
-
-    tracked_guild_group = app_commands.Group(name="tracked_guild", description="[Admin] Manage Florr.io guilds tracked in this server.")
-
-    async def global_guild_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        choices = []
-        if not supabase: return []
-        resp = await run_supabase_sync(lambda: supabase.table("globally_available_guilds").select("guild_tag").ilike("guild_tag", f"%{current}%").limit(25).execute())
-        if resp and resp.data:
-            for item in resp.data:
-                tag = item['guild_tag']
-                choices.append(app_commands.Choice(name=tag, value=tag))
-        return choices
-
-    @tracked_guild_group.command(name="add", description="[Admin] Add or update a Florr.io guild to track.")
-    @app_commands.describe(guild_tag="The globally available guild tag to track.", discord_role="The role for members of this guild.", member_list_channel="[Optional] Channel for this guild's member list.")
-    @app_commands.autocomplete(guild_tag=global_guild_autocomplete)
-    @app_commands.check(is_admin_or_owner)
-    async def add_tracked_guild(self, interaction: discord.Interaction, guild_tag: str, discord_role: discord.Role, member_list_channel: Optional[discord.TextChannel] = None):
-        if not interaction.guild: return
-        await interaction.response.defer(ephemeral=True)
-        
-        # Verify the guild tag exists in the global list
-        global_check = await run_supabase_sync(lambda: supabase.table("globally_available_guilds").select("guild_tag").eq("guild_tag", guild_tag).maybe_single().execute())
-        if not global_check or not global_check.data:
-            await interaction.followup.send(f"❌ The guild tag **{guild_tag}** is not in the list of globally available guilds. Contact the bot owner to add it.", ephemeral=True)
-            return
-
-        data_to_upsert = {"discord_guild_id": interaction.guild.id, "florr_guild_tag": guild_tag, "discord_role_id": discord_role.id, "member_list_channel_id": member_list_channel.id if member_list_channel else None}
-        await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").upsert(data_to_upsert, on_conflict="discord_guild_id, florr_guild_tag").execute())
-        
-        await load_server_config(interaction.guild.id)
-        await interaction.followup.send(f"✅ Successfully configured tracking for Florr guild **{guild_tag}**.")
-
-    @tracked_guild_group.command(name="remove", description="[Admin] Stop tracking a Florr.io guild in this server.")
-    @app_commands.describe(guild_tag="The tracked guild tag to remove.")
-    @app_commands.autocomplete(guild_tag=setguild_autocomplete) # re-uses autocomplete from /setguild
-    @app_commands.check(is_admin_or_owner)
-    async def remove_tracked_guild(self, interaction: discord.Interaction, guild_tag: str):
-        if not interaction.guild: return
-        if guild_tag == '--NONE--':
-            await interaction.response.send_message("❌ Cannot remove '--NONE--'. Select a valid guild tag.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        resp = await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", interaction.guild.id).eq("florr_guild_tag", guild_tag).execute())
-        
-        await load_server_config(interaction.guild.id)
-        
-        if resp.data: await interaction.followup.send(f"✅ Successfully removed tracking for Florr guild **{guild_tag}**.")
-        else: await interaction.followup.send(f"ℹ️ No tracked Florr guild with the tag **{guild_tag}** was found to remove.")
+@tree.command(name="setup", description="[Admin] Interactively configure the bot for this server.")
+@app_commands.check(is_admin_or_owner)
+async def setup(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild: return
+    
+    await interaction.response.defer(ephemeral=False)
+    config = await load_server_config(guild.id)
+    view = SetupView(guild, config)
+    message = await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=False)
+    view.message = message
 
 class NerdAdminGroup(app_commands.Group):
     """[Owner Only] Commands for global bot administration."""
@@ -8140,7 +8256,6 @@ class NerdAdminGroup(app_commands.Group):
 # --- Register Command Groups ---
 # REMOVE the old tree.add_command for CustomiseGroup
 # ADD the new groups to the tree at the end of the file, before the bot.run call
-tree.add_command(CustomiseGroup())
 tree.add_command(NerdAdminGroup())
 
 @tree.command(name="servercodes", description="Shows available Florr.io server codes with interactive filters.")
