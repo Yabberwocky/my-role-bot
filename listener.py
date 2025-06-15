@@ -30,7 +30,7 @@ class SelfBotListener:
         
         self.patterns = {
             'petal_craft': re.compile(
-                fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (\S+))?!$", re.IGNORECASE
+                fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (.+?))?!*$", re.IGNORECASE
             ),
             'mob_spawn_standard': re.compile(
                 fr"^\s*A {rarities_pattern} (.+?) has spawned!$", re.IGNORECASE
@@ -41,7 +41,7 @@ class SelfBotListener:
         }
         self.special_spawn_messages = {
             "Something mountain-like appears in the distance...": "rock", "A tower of thorns rises from the sands...": "cactus",
-            "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from a far distance...": "jellyfish",
+            "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from a different realm...": "jellyfish",
             "There's a bright light in the horizon...": "firefly", "You sense ominous vibrations coming from a different realm...": "beetle_hel",
             "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
         }
@@ -72,7 +72,8 @@ class SelfBotListener:
         if not item_data:
             match = self.patterns['petal_craft'].match(description)
             if match:
-                item_data = {'category': 'super_craft', 'rarity': match.group(2), 'petal': match.group(3).strip(), 'player': match.group(4).strip() if match.group(4) else None, 'server': server}
+                # CORRECTED group indices: 1 for rarity, 2 for petal, 3 for player
+                item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
 
         if not item_data:
             match = self.patterns['mob_spawn_standard'].match(description)
@@ -89,6 +90,9 @@ class SelfBotListener:
             item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
 
         if item_data:
+            # Add message_id and timestamp to the data payload
+            item_data['message_id'] = message_id
+            item_data['timestamp'] = timestamp
             # This is the key change: Schedule the handler to run in the bot's thread.
             asyncio.run_coroutine_threadsafe(self.bot._handle_self_bot_event(item_data), self.main_loop)
 

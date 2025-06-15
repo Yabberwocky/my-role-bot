@@ -589,28 +589,38 @@ class AICog(commands.Cog):
                 return None, fallback_used
         return None, fallback_used
 
-    async def get_ai_response_with_image(self, prompt_key: str, image_bytes: bytes, prompt_kwargs: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """Generates an AI response for a prompt that includes an image."""
+    async def get_ai_response_with_image(self, prompt_key: str, image_bytes_list: List[bytes], prompt_kwargs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Generates an AI response for a prompt that includes one or more images."""
         if not self.ai_models:
             await self.log_error(None, "AI image processing failed: No models configured.", ping_owner=True)
             return None
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-        except (UnidentifiedImageError, OSError) as e:
-            await self.log_error(None, "AI image processing failed: Invalid image data.", error=e)
+        if not image_bytes_list:
             return None
+
+        content_for_api = []
         prompt_text = self.get_prompt(prompt_key, **(prompt_kwargs or {}))
         if not prompt_text:
             await self.log_error(None, f"AI image processing failed: Prompt key '{prompt_key}' not found.")
             return None
+        content_for_api.append(prompt_text)
+
+        for image_bytes in image_bytes_list:
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                content_for_api.append(img)
+            except (UnidentifiedImageError, OSError) as e:
+                await self.log_error(None, "AI image processing failed: Invalid image data encountered in batch.", error=e)
+                # Continue with the valid images, or return None if you want to fail the whole batch
         
-        model_id = "gemini-2.5-flash-preview-05-20"
+        if len(content_for_api) <= 1: # Only prompt text is present, no valid images
+            return None
+
+        model_id = "gemini-2.5-flash-preview-05-20" # This model supports multiple images
         model = self.ai_models.get(model_id)
         if not model:
             await self.log_error(None, f"AI image processing failed: Required model '{model_id}' not available.", ping_owner=True)
             return None
         
-        # Define the correct safety settings format
         safety_config = {
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
@@ -619,12 +629,18 @@ class AICog(commands.Cog):
         }
             
         try:
+            # The model can take a list of [prompt, image1, image2, ...]
             response = await model.generate_content_async(
-                [prompt_text, img], stream=False,
+                content_for_api, stream=False,
                 generation_config=GenerationConfig(temperature=0.1),
-                safety_settings=safety_config # Use the corrected format
+                safety_settings=safety_config
             )
             return response.text.strip() if response and response.text else None
+        except google_exceptions.ResourceExhausted as e:
+            # This can still happen if the user sends >10 images in a single message.
+            # We now log it and return None, which the calling function handles gracefully.
+            await self.log_error(None, f"AI image processing hit ResourceExhausted even with batching. User likely sent too many images.", error=e)
+            return None
         except Exception as e:
             await self.log_error(None, f"AI image processing failed during generation with model '{model_id}'.", error=e)
             return None

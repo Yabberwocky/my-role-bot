@@ -640,12 +640,94 @@ async def _create_ping_embed(item: Dict[str, Any]) -> Optional[discord.Embed]:
         
     return embed
 
+async def _log_super_defeat_to_db(item: Dict[str, Any]):
+    """Logs a super defeat event to the new super_defeats table."""
+    if not supabase:
+        print("Super Defeat DB Log: Supabase unavailable.")
+        return
+
+    try:
+        guild_for_log = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+
+        event_timestamp = None
+        if item.get('timestamp'):
+            try:
+                event_timestamp = date_parse(item['timestamp']).isoformat()
+            except (ValueError, TypeError):
+                pass 
+
+        insert_payload = {
+            "mob": item.get('mob'),
+            "rarity": item.get('rarity'),
+            "server": item.get('server'),
+            "players": item.get('players', []),
+            "message_id": str(item.get('message_id')) if item.get('message_id') else None,
+            "event_timestamp": event_timestamp
+        }
+        
+        insert_payload = {k: v for k, v in insert_payload.items() if v is not None}
+        
+        await run_supabase_sync(
+            lambda: supabase.table("super_defeats").insert(insert_payload).execute()
+        )
+        print(f"Super Defeat DB Log: Successfully logged defeat of {item.get('rarity')} {item.get('mob')}.")
+    except Exception as e:
+        await log_error(guild_for_log, f"Failed to log super defeat event to database", error=e)
+
+async def _log_super_craft_to_db(item: Dict[str, Any]):
+    """Logs a super craft event to the super_craft_logs table."""
+    if not supabase:
+        print("Super Craft DB Log: Supabase unavailable.")
+        return
+
+    guild_for_log = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+    try:
+        # --- Extract and Validate Data ---
+        player_ign = item.get('player')
+        rarity = item.get('rarity')
+        petal_name = item.get('petal')
+        message_id = str(item.get('message_id')) if item.get('message_id') else None
+        event_timestamp_str = item.get('timestamp')
+
+        # The table has NOT NULL constraints, so we must validate before inserting.
+        if not all([player_ign, rarity, petal_name, message_id, event_timestamp_str]):
+            await log_error(guild_for_log, f"Super Craft DB Log: Missing required data in event payload for message {message_id}. Data: {item}")
+            return
+
+        # --- Format Data for DB ---
+        super_petal_name = f"{rarity} {petal_name}"
+        craft_date = date_parse(event_timestamp_str).date()
+        processed_by_id = str(bot.user.id) if bot.user else None
+
+        insert_payload = {
+            "player_ign": player_ign,
+            "super_petal_name": super_petal_name,
+            "craft_date": craft_date.isoformat(),
+            "original_message_id": message_id,
+            "processed_by_id": processed_by_id
+        }
+
+        await run_supabase_sync(
+            lambda: supabase.table("super_craft_logs").insert(insert_payload).execute()
+        )
+        print(f"Super Craft DB Log: Successfully logged craft of '{super_petal_name}' by '{player_ign}'.")
+
+    except APIError as e:
+        # Gracefully handle if the message ID was already logged
+        if "unique constraint" in str(e.message) and "super_craft_logs_original_message_id_key" in str(e.message):
+            print(f"Super Craft DB Log: Craft for message ID {item.get('message_id')} already exists in the database. Skipping.")
+        else:
+            await log_error(guild_for_log, f"Failed to log super craft event to database (APIError)", error=e)
+    except Exception as e:
+        await log_error(guild_for_log, f"Failed to log super craft event to database (General Error)", error=e)
+
 async def _handle_self_bot_event(item: Dict[str, Any]):
     """
     This coroutine runs in the main bot's event loop. It dispatches an event
-    to TWO systems:
+    to multiple systems:
     1. The rate-limited JSON logging system (via queues).
-    2. The new instantaneous, human-friendly ping system (direct webhook send).
+    2. The new database logging system for specific events (e.g., super defeats/crafts).
+    3. The new instantaneous, human-friendly ping system (direct webhook send).
     """
     category = item.get('category')
     print(f"\n--- [Self-Bot Handler] ---")
@@ -662,7 +744,13 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
         embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
         await log_error(None, "Unclassified Self-Bot Event", embed=embed)
     
-    # --- 2. Dispatch to new instantaneous ping system (NEW system) ---
+    # --- 2. Dispatch to new database logging system (NEW) ---
+    if category == 'super_defeat':
+        await _log_super_defeat_to_db(item)
+    elif category == 'super_craft':
+        await _log_super_craft_to_db(item)
+
+    # --- 3. Dispatch to new instantaneous ping system (existing) ---
     if category in ['super_craft', 'super_spawn', 'super_defeat']:
         ping_embed = await _create_ping_embed(item)
         if not ping_embed:
@@ -1629,14 +1717,25 @@ async def handle_screenshot_dropbox(message: discord.Message):
         del guild_sync_sessions[user_id]
         active_session = None
 
+    # Read image bytes first
+    image_bytes_list = []
+    for img_att in valid_images:
+        try:
+            image_bytes_list.append(await img_att.read())
+        except discord.HTTPException as e:
+            await log_error(message.guild, f"Failed to read attachment {img_att.filename} for GuildSync", error=e)
+
+    if not image_bytes_list:
+        await message.reply("❌ Could not read any of the attached images.", mention_author=False)
+        return
+
     # Treat any message with 10 or more images as starting/continuing a sync.
     # Also continue if a session is active and at least one image is sent.
-    if len(valid_images) >= 10 or (active_session and len(valid_images) > 0):
+    if len(image_bytes_list) >= 10 or (active_session and len(image_bytes_list) > 0):
         is_new_session = not active_session
-        batch_to_process = valid_images[:10] # Process up to 10 images at a time
         
-        await log_info(message.guild, f"GuildSync Mode: {'Starting new session' if is_new_session else 'Adding batch'} for {message.author.name} with {len(batch_to_process)} image(s).")
-        asyncio.create_task(process_guild_sync_batch(message, batch_to_process, is_new_session))
+        await log_info(message.guild, f"GuildSync Mode: {'Starting new session' if is_new_session else 'Adding batch'} for {message.author.name} with {len(image_bytes_list)} image(s).")
+        asyncio.create_task(process_guild_sync_batch(message, image_bytes_list, is_new_session))
     elif active_session:
         try:
             await message.reply(
@@ -1908,7 +2007,7 @@ class GuildSyncInProgressView(discord.ui.View):
 
 async def process_guild_sync_batch(
     message: discord.Message,
-    valid_image_attachments: List[discord.Attachment],
+    image_bytes_list: List[bytes],
     is_new_session: bool
 ) -> Optional[discord.Message]:
     """Processes a batch of screenshots for guild sync, updating or creating a session."""
@@ -1955,29 +2054,22 @@ async def process_guild_sync_batch(
         return None
 
     extracted_from_this_batch: Set[str] = set()
-    failed_ai_this_batch = 0
-    
     known_igns_list_for_ai_str = "\n".join(known_igns_for_ai)
 
-    for image_att in valid_image_attachments:
-        try:
-            image_bytes = await image_att.read()
-            ai_extracted_text = await ai_cog.get_ai_response_with_image(
-                prompt_key="FLORR_GUILD_LIST_FULL_EXTRACTION",
-                image_bytes=image_bytes,
-                prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai_str}
-            )
-            if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
-                extracted_this_image = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
-                extracted_from_this_batch.update(extracted_this_image)
-            elif not ai_extracted_text:
-                failed_ai_this_batch += 1
-        except Exception as e_img_proc:
-            failed_ai_this_batch += 1
-            await log_error(guild, f"GuildSync: Error processing image {image_att.filename} in batch.", error=e_img_proc, message_context=message)
+    # --- BATCHED AI CALL ---
+    ai_extracted_text = await ai_cog.get_ai_response_with_image(
+        prompt_key="FLORR_GUILD_LIST_FULL_EXTRACTION",
+        image_bytes_list=image_bytes_list,
+        prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai_str}
+    )
+
+    if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
+        extracted_from_this_batch = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
+    
+    failed_ai_this_batch = not bool(ai_extracted_text)
 
     if is_new_session:
-        if not extracted_from_this_batch and failed_ai_this_batch == len(valid_image_attachments):
+        if not extracted_from_this_batch and failed_ai_this_batch:
             return await message.reply(f"{user.mention} ❌ AI failed to extract names from all initial images. Sync aborted.")
         
         guild_sync_sessions[user_id] = {
@@ -1996,39 +2088,37 @@ async def process_guild_sync_batch(
         view.message = bot_reply_msg
         await log_info(guild, f"GuildSync: New session started for {user.name} ({target_guild_tag}). Collected {len(extracted_from_this_batch)} IGNs.")
         return bot_reply_msg
-    else:
+    else: # Existing session
         session_data = guild_sync_sessions.get(user_id)
         if not session_data:
             await log_error(guild, f"GuildSync: Tried to add to non-existent session for user {user_id}.")
             return None 
         
+        # --- ROBUST MESSAGE UPDATE LOGIC ---
+        # Delete old status message if it exists
+        if session_data.get('bot_reply_message_id'):
+            try:
+                old_msg = await message.channel.fetch_message(session_data['bot_reply_message_id'])
+                await old_msg.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass # Ignore if already gone
+
         newly_added_count = len(extracted_from_this_batch - session_data['screenshot_igns_collected'])
         session_data['screenshot_igns_collected'].update(extracted_from_this_batch)
         session_data['last_update_time'] = discord.utils.utcnow()
         
-        bot_reply_msg_obj: Optional[discord.Message] = None
-        if session_data['bot_reply_message_id']:
-            try: bot_reply_msg_obj = await message.channel.fetch_message(session_data['bot_reply_message_id'])
-            except (discord.NotFound, discord.HTTPException): pass
-
         update_msg_content = f"{user.mention} ✅ Batch processed. Added **{newly_added_count}** new unique IGNs. **Total collected: {len(session_data['screenshot_igns_collected'])}**."
-        if failed_ai_this_batch > 0:
-            update_msg_content += f" (Failed to extract from {failed_ai_this_batch} image(s) this batch)."
+        if failed_ai_this_batch:
+            update_msg_content += f" (AI may have failed to process this batch)."
 
-        if bot_reply_msg_obj:
-            try:
-                current_view = GuildSyncInProgressView(user_id, user_id)
-                current_view.message = bot_reply_msg_obj
-                await bot_reply_msg_obj.edit(content=update_msg_content, view=current_view)
-                if isinstance(bot_reply_msg_obj.view, GuildSyncInProgressView):
-                     bot_reply_msg_obj.view.message = bot_reply_msg_obj
-            except discord.HTTPException as e_edit:
-                await log_error(guild, "GuildSync: Failed to edit bot reply for additional batch.", error=e_edit)
-        else:
-             await message.reply(f"{user.mention} Processed batch, but couldn't update previous status message. Total collected so far: {len(session_data['screenshot_igns_collected'])}.")
+        # Send a new message with the updated view
+        new_view = GuildSyncInProgressView(user_id, user_id)
+        new_bot_reply_msg = await message.channel.send(content=update_msg_content, view=new_view)
+        new_view.message = new_bot_reply_msg
+        session_data['bot_reply_message_id'] = new_bot_reply_msg.id
 
         await log_info(guild, f"GuildSync: Added {newly_added_count} IGNs to session for {user.name}. Total: {len(session_data['screenshot_igns_collected'])}. Failures: {failed_ai_this_batch}")
-        return bot_reply_msg_obj # Or None if not fetched/edited
+        return new_bot_reply_msg # Or None if not fetched/edited
 
 
 async def generate_final_sync_report_embed_only(guild: Optional[discord.Guild], user: discord.User, user_id_session_key: int) -> Optional[discord.Embed]:
@@ -2195,37 +2285,7 @@ async def fetch_all_db_florr_players_for_sync(guild: Optional[discord.Guild]) ->
         if guild: await log_error(guild, "GuildSync: Error fetching all HC members from DB", error=e)
         return []
 
-def find_potential_ign_typos(screenshot_igns: Set[str], db_igns_with_status: List[Dict[str, Any]], threshold: float = 0.85) -> List[Tuple[str, str, bool, float]]:
-    """
-    Compares screenshot IGNs to DB IGNs, finds potential typos.
-    Returns: List of (screenshot_ign, db_ign, db_ign_is_in_hc, score)
-    """
-    potential_typos = []
-    
-    db_ign_names_only_set = {entry['ingame_name'] for entry in db_igns_with_status}
-    unique_screenshot_igns = screenshot_igns - db_ign_names_only_set # Focus on SS IGNs not exact in DB
 
-    for s_ign in unique_screenshot_igns:
-        # Create a list of (db_ign_name, db_ign_is_in_hc) for matching
-        db_ign_tuples_for_matching = [(entry['ingame_name'], entry.get('is_in_hc', False)) for entry in db_igns_with_status]
-        
-        # Use process.extractBests from fuzzywuzzy or similar if available and more performant for large lists
-        # For now, using difflib's get_close_matches on names and then looking up status
-        
-        best_db_name_matches = difflib.get_close_matches(s_ign, [t[0] for t in db_ign_tuples_for_matching], n=1, cutoff=threshold)
-        
-        if best_db_name_matches:
-            best_db_name_match_str = best_db_name_matches[0]
-            # Find the full entry for this matched DB name to get its 'is_in_hc' status
-            matched_db_entry = next((entry for entry in db_igns_with_status if entry['ingame_name'] == best_db_name_match_str), None)
-            if matched_db_entry:
-                db_ign_is_in_hc = matched_db_entry.get('is_in_hc', False)
-                ratio = difflib.SequenceMatcher(None, s_ign, best_db_name_match_str).ratio()
-                if ratio >= threshold : # Double check
-                    potential_typos.append((s_ign, best_db_name_match_str, db_ign_is_in_hc, round(ratio, 3)))
-    
-    potential_typos.sort(key=lambda x: x[3], reverse=True) # Sort by score desc
-    return potential_typos
 
 
 class GuildSyncDoneView(discord.ui.View):
@@ -6806,15 +6866,31 @@ async def setguild_autocomplete(interaction: discord.Interaction, current: str) 
             choices.append(app_commands.Choice(name=tag, value=tag))
     return choices
 
-@tree.command(name="setguild", description="[Staff Only] Set a user's tracked Florr guild.")
-@app_commands.describe(user="The user to modify.", guild_tag="The guild to assign them to, or 'None' to remove.")
-@app_commands.autocomplete(guild_tag=setguild_autocomplete)
+@tree.command(name="setguild", description="[Staff Only] Set a user's tracked Florr guild by Discord or IGN.")
+@app_commands.describe(
+    guild_tag="The guild to assign them to, or 'None' to remove.",
+    user="[Optional] The Discord user to modify.",
+    ingame_name="[Optional] The In-Game Name to modify."
+)
+@app_commands.autocomplete(guild_tag=setguild_autocomplete, ingame_name=ign_autocomplete)
 @app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.checks.bot_has_permissions(manage_roles=True)
-async def setguild(interaction: discord.Interaction, user: discord.Member, guild_tag: str):
+async def setguild(
+    interaction: discord.Interaction, 
+    guild_tag: str,
+    user: Optional[discord.Member] = None,
+    ingame_name: Optional[str] = None
+):
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
-    
+
+    # --- Input Validation ---
+    if not user and not ingame_name:
+        await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True)
+        return
+    if user and ingame_name:
+        await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=True)
 
     normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
@@ -6825,31 +6901,49 @@ async def setguild(interaction: discord.Interaction, user: discord.Member, guild
         return
         
     try:
-        update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
+        update_resp = None
+        target_display = ""
+        target_member_for_roles: Optional[discord.Member] = None
+
+        if user:
+            target_display = user.mention
+            target_member_for_roles = user
+            update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
         
-        if not update_resp.data:
-            await interaction.followup.send(f"❌ Could not find a connected database record for {user.mention}. Use `/connect` first.", ephemeral=True)
+        elif ingame_name:
+            cleaned_ign = ingame_name.strip()
+            target_display = f"IGN `{cleaned_ign}`"
+            update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("ingame_name", cleaned_ign).execute())
+            if update_resp and update_resp.data and update_resp.data[0].get('discord_id'):
+                discord_id = int(update_resp.data[0]['discord_id'])
+                target_member_for_roles = guild.get_member(discord_id)
+        
+        if not update_resp or not update_resp.data:
+            await interaction.followup.send(f"❌ Could not find a database record for {target_display}. Use `/connect` or `/nerd_admin add_ign` first.", ephemeral=True)
             return
 
-        # Trigger a role refresh for the user in ALL mutual servers
-        await trigger_global_role_sync_for_user(user)
+        # Trigger role sync only if we have a Discord member object
+        if target_member_for_roles:
+            await trigger_global_role_sync_for_user(target_member_for_roles)
             
-        ign = update_resp.data[0].get('ingame_name', 'N/A')
+        ign_from_db = update_resp.data[0].get('ingame_name', 'N/A')
         
         if normalized_tag:
-            await interaction.followup.send(f"✅ Set `{ign}` ({user.mention})'s guild to **{normalized_tag}**. Roles are being updated across all servers.", ephemeral=True)
-            await log_info(guild, f"`{interaction.user.name}` set `{user.name}`'s guild to {normalized_tag}.")
+            await interaction.followup.send(f"✅ Set `{ign_from_db}` ({target_display})'s guild to **{normalized_tag}**. Roles are being updated if applicable.", ephemeral=True)
+            await log_info(guild, f"`{interaction.user.name}` set guild for {target_display} to {normalized_tag}.")
         else:
-            await interaction.followup.send(f"✅ Removed `{ign}` ({user.mention}) from any tracked guild. Roles are being updated across all servers.", ephemeral=True)
-            await log_info(guild, f"`{interaction.user.name}` removed `{user.name}` from their guild.")
+            await interaction.followup.send(f"✅ Removed `{ign_from_db}` ({target_display}) from any tracked guild. Roles are being updated if applicable.", ephemeral=True)
+            await log_info(guild, f"`{interaction.user.name}` removed guild from {target_display}.")
             
         # Refresh lists in all relevant guilds
         for bot_guild in bot.guilds:
-            if bot_guild.get_member(user.id):
+            if target_member_for_roles and bot_guild.get_member(target_member_for_roles.id):
                 asyncio.create_task(refresh_all_guild_lists(bot_guild))
+            # For IGN-only updates, we can't reliably know which guild lists to refresh
+            # A full /refresh on the target guild is a safe bet if needed, but for now we only update on user presence
 
     except Exception as e:
-        await log_error(guild, f"Error during /setguild for {user.name}", error=e, interaction=interaction)
+        await log_error(guild, f"Error during /setguild for {user.name if user else ingame_name}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 # --- Activate Myself Command ---
