@@ -49,10 +49,10 @@
 #       within that function (that are intended to remain) are preserved in their
 #       correct positions.
 #
-# --- BOT CONTEXT (TheNerd's Pingslave) ---
+# --- BOT CONTEXT (TheNerd's FlorrNerd) ---
 # (This information is for your understanding and may be useful for generating accurate code.)
 #
-# Bot Name: TheNerd's Pingslave (also referred to as Sweet Honey Bot by the user)
+# Bot Name: TheNerd's FlorrNerd (also referred to as Sweet Honey Bot by the user)
 # Owner: Vibhor / TheNerd / sweet_honey (Discord ID: 1230848174218940416)
 # Target Server: Catercord (This bot is primarily intended for use only in this specific server)
 # Primary Purpose: Manage verification and information related to the "[HC1]" guild within the game Florr.io.
@@ -222,7 +222,7 @@ ACTIVITY_COLUMN_WIDTH = 18
 HC_LIST_EMBED_TITLE = r"**\[HC1\] Guild Members**"
 STATIC_LIST_UPDATE_DEBOUNCE_DELAY = 10
 M28_SERVER_TIMEOUT_SECONDS = 300
-M28_API_HEADERS = {'User-Agent': 'TheNerdsPingslave/1.0 (DiscordBot)'}
+M28_API_HEADERS = {'User-Agent': 'TheNerdsFlorrNerd/1.0 (DiscordBot)'}
 SERVER_CONFIGS_TABLE_NAME = "server_configs"
 ALLOWED_WITHERER_IDS = {879320982299484240, 1230848174218940416, 955448447790620692}
 self_bot_queue = asyncio.Queue()
@@ -233,6 +233,7 @@ last_craft_post_time = 0.0
 last_spawn_defeat_post_time = 0.0
 NOTIFICATION_COOLDOWN_SECONDS = 120.0
 STAFF_PERMISSION_FOR_AI = "manage_guild"
+DISABLE_DB_EVENT_LOGGING = BOT_INSTANCE_TYPE != "PRODUCTION"
 
 
 # --- Supabase Client ---
@@ -269,7 +270,7 @@ command_ids: Dict[str, int] = {} # Dictionary to store command IDs after sync
 # --- Flask App (Keep Alive) ---
 app = Flask('')
 @app.route('/')
-def home(): return "Pingslave bot is alive!"
+def home(): return "FlorrNerd bot is alive!"
 def run_flask():
     try: port = int(os.environ.get('PORT', 8080)); print(f"Starting Flask server on 0.0.0.0:{port}"); app.run(host='0.0.0.0', port=port)
     except Exception as e: print(f"Flask server failed: {e}\n{traceback.format_exc()}")
@@ -642,6 +643,9 @@ async def _create_ping_embed(item: Dict[str, Any]) -> Optional[discord.Embed]:
 
 async def _log_super_defeat_to_db(item: Dict[str, Any]):
     """Logs a super defeat event to the new super_defeats table."""
+    if DISABLE_DB_EVENT_LOGGING:
+        print("Super Defeat DB Log: Skipped due to testing instance.")
+        return
     if not supabase:
         print("Super Defeat DB Log: Supabase unavailable.")
         return
@@ -676,6 +680,9 @@ async def _log_super_defeat_to_db(item: Dict[str, Any]):
 
 async def _log_super_craft_to_db(item: Dict[str, Any]):
     """Logs a super craft event to the super_craft_logs table."""
+    if DISABLE_DB_EVENT_LOGGING:
+        print("Super Craft DB Log: Skipped due to testing instance.")
+        return
     if not supabase:
         print("Super Craft DB Log: Supabase unavailable.")
         return
@@ -1181,6 +1188,7 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
 async def get_or_create_webhook(channel: discord.TextChannel, purpose: str, name: str, avatar_url: Optional[str] = None) -> Optional[discord.Webhook]:
     """
     Fetches a webhook URL from the DB for a specific purpose, or creates one if it doesn't exist.
+    Defaults to using the bot's own profile picture if no avatar_url is provided.
     """
     if not supabase:
         print(f"Webhook manager failed for purpose '{purpose}': Supabase unavailable.")
@@ -1207,8 +1215,14 @@ async def get_or_create_webhook(channel: discord.TextChannel, purpose: str, name
 
     try:
         avatar_bytes = None
-        if avatar_url:
-            avatar_bytes = await fetch_avatar_bytes(bot.http_session, avatar_url)
+        # Determine which URL to use for the avatar
+        url_for_avatar = avatar_url
+        if url_for_avatar is None and bot.user and bot.user.display_avatar:
+            # If no avatar_url is passed, default to the bot's own avatar
+            url_for_avatar = bot.user.display_avatar.url
+
+        if url_for_avatar:
+            avatar_bytes = await fetch_avatar_bytes(bot.http_session, url_for_avatar)
 
         new_webhook = await channel.create_webhook(name=name, avatar=avatar_bytes, reason=f"Webhook for bot purpose: {purpose}")
         
@@ -4426,7 +4440,7 @@ class HelpPagesView(discord.ui.View):
         await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
     def _create_general_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="🤓 Pingslave Bot - General Commands", color=NERDY_YELLOW)
+        embed = discord.Embed(title="🤓 FlorrNerd Bot - General Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "Here are commands generally available to users:\n\u200B"
@@ -4448,7 +4462,7 @@ class HelpPagesView(discord.ui.View):
         return embed
 
     def _create_customization_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="⚙️ Pingslave Bot - Customization Commands", color=NERDY_YELLOW)
+        embed = discord.Embed(title="⚙️ FlorrNerd Bot - Customization Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "These commands require server admin permissions:\n\u200B"
@@ -4461,7 +4475,7 @@ class HelpPagesView(discord.ui.View):
         return embed
     
     def _create_owner_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="👑 Pingslave Bot - Owner Commands", color=NERDY_YELLOW)
+        embed = discord.Embed(title="👑 FlorrNerd Bot - Owner Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
         embed.description = "These commands can only be run by the bot owner.\n\u200B"
@@ -6534,6 +6548,8 @@ async def on_ready():
         print(f"Logged in as {bot.user} (ID: {BOT_USER_ID})")
         print(f"Discord.py v{discord.__version__}")
         print(f"Bot Instance Type: {BOT_INSTANCE_TYPE}") 
+        if DISABLE_DB_EVENT_LOGGING:
+            print("INFO: Database event logging is DISABLED for this instance.")
     else:
         print("CRITICAL ERROR: Bot user object not found on ready.")
         return
@@ -7636,8 +7652,8 @@ async def message_command( # Renamed function to avoid conflict if you had 'mess
                 if ai_response_raw:
                     # Process the AI response (stripping, etc.)
                     processed_response = ai_response_raw.strip()
-                    pingslave_prefix_pattern = re.compile(r"^(?:\[.*?UTC\]\s*)?(?:.*?\(You \(Pingslave\)\):\s*)", re.IGNORECASE)
-                    match = pingslave_prefix_pattern.match(processed_response)
+                    FlorrNerd_prefix_pattern = re.compile(r"^(?:\[.*?UTC\]\s*)?(?:.*?\(You \(FlorrNerd\)\):\s*)", re.IGNORECASE)
+                    match = FlorrNerd_prefix_pattern.match(processed_response)
                     if match:
                         processed_response = processed_response[match.end():]
                     
@@ -8400,7 +8416,7 @@ async def servercodes(interaction: discord.Interaction, region: Optional[str] = 
 
 # --- Bot Startup ---
 if __name__ == "__main__":
-    print("--- Initializing Pingslave Bot ---")
+    print("--- Initializing FlorrNerd Bot ---")
     # Essential checks before starting
     if not MAIN_TOKEN:
         print("CRITICAL: DISCORD_BOT_MAIN_TOKEN environment variable not found. Bot cannot start.")
