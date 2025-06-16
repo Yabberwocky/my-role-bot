@@ -54,7 +54,8 @@ class SelfBotListener:
     def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
         """Classifies the event and schedules it to run on the main bot's event loop."""
         raw_description = embed.get('description', '')
-        description = raw_description.replace('\u200b', '').strip()
+        # Improved cleaning: strip whitespace, remove zero-width spaces, and strip common markdown characters.
+        description = raw_description.replace('\u200b', '').strip().strip('*_`')
         
         footer_text = embed.get('footer', {}).get('text')
         message_id = embed.get('_message_id')

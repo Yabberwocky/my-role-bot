@@ -156,6 +156,7 @@ import contextlib
 import difflib
 from listener import SelfBotListener
 import json
+import random
 
 # --- Configuration ---
 load_dotenv()
@@ -234,6 +235,7 @@ last_spawn_defeat_post_time = 0.0
 NOTIFICATION_COOLDOWN_SECONDS = 120.0
 STAFF_PERMISSION_FOR_AI = "manage_guild"
 DISABLE_DB_EVENT_LOGGING = BOT_INSTANCE_TYPE != "PRODUCTION"
+is_catching_up = False # Flag to pause live event processing during startup catch-up
 
 
 # --- Supabase Client ---
@@ -279,6 +281,168 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def _revive_static_list_views():
+    """On startup, finds old static list messages and attaches new, live views."""
+    print("--- Reviving Static List Views ---")
+    for guild in bot.guilds:
+        config = server_settings_cache.get(guild.id)
+        if not config: continue
+
+        tracked_guilds = config.get('tracked_guilds', {})
+        for tag, tracked_config in tracked_guilds.items():
+            channel_id = tracked_config.get("member_list_channel_id")
+            if not channel_id: continue
+
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                print(f"Revive Views: Skipping channel {channel_id} in {guild.name} (not a text channel).")
+                continue
+
+            print(f"Revive Views: Scanning #{channel.name} in {guild.name} for list message...")
+            embed_title_to_find = f"**{tag} Guild Members**"
+            
+            try:
+                async for msg in channel.history(limit=20):
+                    if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == embed_title_to_find and msg.components:
+                        print(f"Revive Views: Found zombie view for '{tag}' (Msg ID: {msg.id}). Reviving...")
+                        # We found an old list. Let's update it with a fresh view.
+                        # This re-uses the same logic as a full refresh.
+                        await update_single_tracked_guild_list(guild, tracked_config)
+                        # We only expect one list per channel, so we can break after finding it.
+                        break
+            except discord.Forbidden:
+                print(f"Revive Views: Lacking permissions to read history in #{channel.name} ({guild.name}).")
+            except Exception as e:
+                await log_error(guild, f"Error during static list revival for channel #{channel.name}", error=e)
+    print("--- Finished Reviving Static List Views ---")
+
+async def _classify_discord_message(message: discord.Message):
+    """
+    Takes a discord.Message, extracts its embed, and classifies it for logging.
+    This is used by the startup catch-up mechanism.
+    """
+    if not message.embeds:
+        return
+
+    embed = message.embeds[0]
+    raw_description = embed.description or ""
+    description = raw_description.replace('\u200b', '').strip().strip('*_`')
+    footer_text = embed.footer.text if embed.footer else None
+    
+    # The patterns are defined in the SelfBotListener, we can't access them directly.
+    # So, we redefine them here for the catch-up logic. A bit of duplication but safer.
+    rarities_pattern = r"(Unique|Super|Ultra|Mythic|Legendary|Epic|Rare|Uncommon|Common)"
+    petal_craft_pattern = re.compile(fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (.+?))?!*$", re.IGNORECASE)
+    mob_defeat_pattern = re.compile(fr"^\s*A {rarities_pattern} (.+?) has been defeated by (.+?)!$", re.IGNORECASE)
+    special_spawn_messages = {
+        "Something mountain-like appears in the distance...": "rock", "A tower of thorns rises from the sands...": "cactus",
+        "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from a different realm...": "jellyfish",
+        "There's a bright light in the horizon...": "firefly", "You sense ominous vibrations coming from a different realm...": "beetle_hel",
+        "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
+    }
+
+    item_data: Optional[Dict[str, Any]] = None
+    server = None
+    if footer_text:
+        match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
+        server = match.group(1).upper() if match else None
+
+    match = mob_defeat_pattern.match(description)
+    if match:
+        player_list_str = match.group(3).strip().replace(" and ", ", ")
+        players = [p.strip() for p in player_list_str.split(',') if p.strip()]
+        item_data = {'category': 'super_defeat', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'players': players, 'server': server}
+    
+    if not item_data:
+        match = petal_craft_pattern.match(description)
+        if match:
+            item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
+    
+    if not item_data:
+        for spawn_text, mob_name in special_spawn_messages.items():
+            if spawn_text in description:
+                item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
+                break
+
+    if not item_data:
+        item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
+    
+    if item_data:
+        item_data['message_id'] = str(message.id)
+        item_data['timestamp'] = message.created_at.isoformat()
+        await _handle_self_bot_event(item_data)
+
+async def _catch_up_missed_self_bot_events():
+    """On startup, fetches and processes messages missed while the bot was offline."""
+    global is_catching_up
+    print("--- Starting Self-Bot Catch-up Procedure ---")
+    is_catching_up = True
+
+    try:
+        if not supabase:
+            print("Catch-up: Supabase unavailable, skipping.")
+            return
+
+        # 1. Get the last known message ID from the database
+        last_msg_resp = await run_supabase_sync(
+            lambda: supabase.table("super_craft_logs").select("original_message_id").order("id", desc=True).limit(1).maybe_single().execute()
+        )
+        if last_msg_resp and last_msg_resp.data:
+            last_message_id = int(last_msg_resp.data['original_message_id'])
+        else:
+            print("Catch-up: No previous craft logs found. Skipping catch-up.")
+            return
+
+        # 2. Get the channel object
+        try:
+            channel_id = int(SUPER_CRAFT_SELF_BOT_CHANNEL_ID)
+            channel = await bot.fetch_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                print(f"Catch-up: Channel ID {channel_id} is not a valid text channel.")
+                return
+        except (ValueError, discord.NotFound, discord.Forbidden) as e:
+            print(f"Catch-up: Could not fetch self-bot channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). Error: {e}")
+            return
+
+        print(f"Catch-up: Starting fetch from channel #{channel.name} after message ID {last_message_id}.")
+        last_message_obj = channel.get_partial_message(last_message_id)
+        total_processed = 0
+        
+        # 3. Loop and process messages
+        while True:
+            messages_to_process = []
+            async for message in channel.history(limit=100, after=last_message_obj):
+                messages_to_process.append(message)
+            
+            if not messages_to_process:
+                print("Catch-up: No new messages found to process.")
+                break
+            
+            print(f"Catch-up: Fetched {len(messages_to_process)} new message(s). Processing...")
+            for msg in reversed(messages_to_process): # Process in chronological order
+                await _classify_discord_message(msg)
+                total_processed += 1
+            
+            last_message_obj = messages_to_process[0] # The newest message becomes the 'after' for the next batch
+            
+            if len(messages_to_process) < 100:
+                print("Catch-up: Last batch was less than 100 messages. Assuming we are caught up.")
+                break
+
+            # Cooldown between fetches
+            cooldown = random.uniform(15, 45)
+            print(f"Catch-up: Cooling down for {cooldown:.1f} seconds before next fetch...")
+            await asyncio.sleep(cooldown)
+
+        print(f"--- Self-Bot Catch-up Finished. Processed {total_processed} messages. ---")
+
+    except Exception as e:
+        print(f"CRITICAL ERROR during self-bot catch-up: {e}")
+        traceback.print_exc()
+    finally:
+        is_catching_up = False
+        print("--- Resuming normal self-bot event processing. ---")
 
 async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: str) -> Tuple[Optional[int], Optional[str]]:
     """
@@ -410,9 +574,10 @@ class SetupView(discord.ui.View):
         ping_chans_val = (
             f"**Craft Pings:** {get_mention(self.config.get('craft_ping_channel_id'), 'channel')}\n"
             f"**Spawn Pings:** {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
-            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}"
+            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}\n"
+            f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}"
         )
-        embed.add_field(name="Self-Bot Ping Channels", value=ping_chans_val, inline=False)
+        embed.add_field(name="Self-Bot Ping Settings", value=ping_chans_val, inline=False)
 
         # --- AI Channels ---
         ai_channel_ids = self.config.get('always_on_ai_channels') or []
@@ -475,14 +640,15 @@ class SetupView(discord.ui.View):
         modal = SetupModal(title="Set Command Roles", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Ping Channels", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Set Ping Settings", style=discord.ButtonStyle.secondary, row=1)
     async def set_ping_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
             {'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
             {'label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
             {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')},
+            {'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')},
         ]
-        modal = SetupModal(title="Set Self-Bot Ping Channels", fields=fields, callback_func=self.handle_modal_submit)
+        modal = SetupModal(title="Set Self-Bot Ping Settings", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Set AI Channels", style=discord.ButtonStyle.secondary, row=1)
@@ -592,54 +758,40 @@ class SetupView(discord.ui.View):
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
 
-async def _create_ping_embed(item: Dict[str, Any]) -> Optional[discord.Embed]:
-    """Creates a human-friendly embed for a game event notification."""
+async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    """Creates a human-friendly text ping for a game event notification."""
     category = item.get('category')
     rarity = item.get('rarity')
     server = item.get('server')
-    
-    embed: Optional[discord.Embed] = None
+    ping_role = False
+    text = None
+
+    # Add region prefix if available
+    region_prefix = f"**[{server}]** " if server else ""
 
     if category == 'super_craft':
         petal = item.get('petal')
         player = item.get('player')
-        embed = discord.Embed(
-            title=f"✨ Petal Crafted!",
-            description=f"**{player or 'Someone'}** just crafted a **{rarity} {petal}**!",
-            color=discord.Color.from_rgb(255, 215, 0) # Gold
-        )
-        if player:
-            embed.add_field(name="Crafter", value=f"`{player}`", inline=True)
-        embed.add_field(name="Petal", value=f"`{rarity} {petal}`", inline=True)
+        text = f"{region_prefix}A **{rarity} {petal}** was just crafted by **{player or 'Someone'}**!"
 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
-        embed = discord.Embed(
-            title=f"⚔️ Mob Spawned!",
-            description=f"A **{rarity} {mob}** has appeared!",
-            color=discord.Color.from_rgb(255, 69, 58) # Red
-        )
-        embed.add_field(name="Mob", value=f"`{rarity} {mob}`", inline=True)
+        text = f"{region_prefix}A **{rarity} {mob}** has spawned!"
+        ping_role = True # Only spawn events should ping the role
 
     elif category == 'super_defeat':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
         players = item.get('players', [])
-        player_str = ", ".join(f"`{p}`" for p in players) if players else "`Unknown`"
-        embed = discord.Embed(
-            title=f"🏆 Mob Defeated!",
-            description=f"The **{rarity} {mob}** has been defeated!",
-            color=discord.Color.from_rgb(88, 101, 242) # Blurple
-        )
-        embed.add_field(name="Mob", value=f"`{rarity} {mob}`", inline=True)
-        embed.add_field(name=f"Defeated By ({len(players)})", value=player_str, inline=True)
+        if players:
+            player_str = f" by **{', '.join(players)}**"
+        else:
+            player_str = ""
+        text = f"{region_prefix}The **{rarity} {mob}** has been defeated{player_str}!"
 
-    if embed and server:
-        embed.set_footer(text=f"Server Region: {server}")
-    
-    if embed:
-        embed.timestamp = discord.utils.utcnow()
-        
-    return embed
+    if rarity == "Unique" and text:
+        text = f"✨ **UNIQUE EVENT!** ✨\n{text}"
+
+    return text, ping_role
 
 async def _log_super_defeat_to_db(item: Dict[str, Any]):
     """Logs a super defeat event to the new super_defeats table."""
@@ -687,16 +839,21 @@ async def _log_super_craft_to_db(item: Dict[str, Any]):
         print("Super Craft DB Log: Supabase unavailable.")
         return
 
+    # Add verbose logging to see the exact data received
+    print(f"Super Craft DB Log: Received event data: {item}")
+
     guild_for_log = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     try:
         # --- Extract and Validate Data ---
         player_ign = item.get('player')
         rarity = item.get('rarity')
         petal_name = item.get('petal')
-        message_id = str(item.get('message_id')) if item.get('message_id') else None
+        # Correctly handle potential None value for message_id before converting to string
+        message_id = str(item.get('message_id')) if item.get('message_id') is not None else None
         event_timestamp_str = item.get('timestamp')
 
         # The table has NOT NULL constraints, so we must validate before inserting.
+        # This check will now also fail if message_id is None or an empty string.
         if not all([player_ign, rarity, petal_name, message_id, event_timestamp_str]):
             await log_error(guild_for_log, f"Super Craft DB Log: Missing required data in event payload for message {message_id}. Data: {item}")
             return
@@ -736,6 +893,10 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
     2. The new database logging system for specific events (e.g., super defeats/crafts).
     3. The new instantaneous, human-friendly ping system (direct webhook send).
     """
+    if is_catching_up: # Pause live event processing during catch-up
+        print(f"Event received but paused for catch-up: {item.get('category')}")
+        return
+
     category = item.get('category')
     print(f"\n--- [Self-Bot Handler] ---")
     print(f"⚡ Received event: {category}")
@@ -757,11 +918,11 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
     elif category == 'super_craft':
         await _log_super_craft_to_db(item)
 
-    # --- 3. Dispatch to new instantaneous ping system (existing) ---
+    # --- 3. Dispatch to new instantaneous TEXT ping system (REWORKED) ---
     if category in ['super_craft', 'super_spawn', 'super_defeat']:
-        ping_embed = await _create_ping_embed(item)
-        if not ping_embed:
-            print("   [PING FAIL] Could not generate ping embed.")
+        ping_text, should_ping_role = await _create_ping_text(item)
+        if not ping_text:
+            print("   [PING FAIL] Could not generate ping text.")
             return
 
         config_key_map = {
@@ -792,9 +953,20 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
                 if isinstance(channel, discord.TextChannel):
                     webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
                     if webhook:
+                        content_to_send = ping_text
+                        role_mention = ""
+                        if should_ping_role:
+                            role_id_to_ping = config.get('super_ping_role_id')
+                            if role_id_to_ping:
+                                role_mention = f"<@&{role_id_to_ping}>"
+                        
+                        # Add role mention to the content if applicable
+                        if role_mention:
+                            content_to_send += f" {role_mention}"
+                        
                         try:
-                            await webhook.send(embed=ping_embed)
-                            print(f"   [PING SUCCESS] Sent '{category}' ping to #{channel.name} in {guild.name}.")
+                            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
+                            print(f"   [PING SUCCESS] Sent '{category}' text ping to #{channel.name} in {guild.name}.")
                         except Exception as e:
                             print(f"   [PING FAIL] Failed to send webhook to #{channel.name} in {guild.name}: {e}")
     
@@ -2347,6 +2519,9 @@ async def handle_guild_sync_from_screenshots(
     num_images = len(valid_image_attachments)
     processing_reply: Optional[discord.Message] = None
     
+    # FIX: Load the server configuration at the beginning of the function
+    config = await load_server_config(guild.id)
+    
     try:
         processing_reply = await message.reply(
             f"{user.mention} ⏳ Analyzing {num_images} image(s) for activity updates...",
@@ -2376,10 +2551,9 @@ async def handle_guild_sync_from_screenshots(
         try:
             image_data = await image_att.read()
             # Use the prompt for finding ONLINE players
-            # FIX: Pass the image bytes as a list to match the updated function signature
             ai_extracted_text = await ai_cog.get_ai_response_with_image(
                 prompt_key="FLORR_IMAGE_NAME_EXTRACTION", 
-                image_bytes_list=[image_data], # <--- THIS IS THE FIX
+                image_bytes_list=[image_data],
                 prompt_kwargs={'known_igns_list_str': known_igns_str}
             )
             if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
@@ -2434,9 +2608,17 @@ async def handle_guild_sync_from_screenshots(
     if final_message_obj:
         confirm_view.message = final_message_obj
     
-    if activity_changed and guild.id == CATERCORD_GUILD_ID: # Only update HC1 list for now
-        await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering list update.")
-        await update_single_tracked_guild_list(guild, {"member_list_channel_id": config.get('hcmembers_channel_id'), "discord_role_id": HC1_ROLE_ID, "florr_guild_tag": "[HC1]"})
+    # FIX: Use the loaded config and modern tracked_guilds structure
+    if activity_changed and guild.id == CATERCORD_GUILD_ID:
+        await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering list update for [HC1].")
+        
+        tracked_guilds = config.get('tracked_guilds', {})
+        hc1_config = tracked_guilds.get('[HC1]')
+        
+        if hc1_config and hc1_config.get('member_list_channel_id'):
+            await update_single_tracked_guild_list(guild, hc1_config)
+        else:
+            await log_info(guild, "Could not trigger list update for [HC1]: Config for tag '[HC1]' or its member_list_channel_id not found.")
 
 async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str) -> Dict[str, Any]:
     """
@@ -6567,6 +6749,12 @@ async def on_ready():
     await _initialize_data_caches(bot)
     await _setup_and_load_cogs(bot)
     synced_commands = await _sync_app_commands(bot)
+
+    # --- NEW: REVIVE VIEWS & STARTUP CATCH-UP ---
+    await _revive_static_list_views()
+    asyncio.create_task(_catch_up_missed_self_bot_events())
+    # ----------------------------------------
+
     await _start_background_tasks(bot)
 
     # Final "Ready" log message
@@ -6796,26 +6984,16 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
             await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{conflict_user_id}>). An admin must use `/disconnect` on that user first.", ephemeral=True)
             return
             
-        # Step 2: Ensure the target user is not already connected to a different IGN.
-        user_check_resp = await run_supabase_sync(
+        # Step 2: Unlink the target user from any old IGNs they might have.
+        await run_supabase_sync(
             lambda: supabase.table("florr_players")
-                           .select("ingame_name")
+                           .update({"discord_id": None, "discord_name": None})
                            .eq("discord_id", str(target_user.id))
                            .execute()
         )
-        if user_check_resp and user_check_resp.data:
-            for existing_connection in user_check_resp.data:
-                if existing_connection.get('ingame_name', '').lower() != cleaned_ign.lower():
-                    old_ign = existing_connection.get('ingame_name')
-                    await run_supabase_sync(
-                        lambda: supabase.table("florr_players")
-                                       .update({"discord_id": None, "discord_name": None})
-                                       .eq("ingame_name", old_ign)
-                                       .execute()
-                    )
-                    await log_info(guild, f"Implicit Disconnect: Removed `{target_user.name}`'s link from old IGN `{old_ign}` during new /connect call.")
 
-        # Step 3: Perform the upsert to create or update the IGN record.
+        # Step 3: Use UPSERT to create the IGN if it doesn't exist, or update it with the new user info.
+        # This is the key change that allows staff to add new IGNs directly.
         await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .upsert({
@@ -6828,7 +7006,7 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
 
         # Step 4: Refresh roles, cache, and respond.
         await refresh_roles_for_single_user(guild, target_user)
-        await load_ign_cache(guild)
+        await load_ign_cache(guild) # Refresh cache with the new IGN
         await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
         await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`. This may have created a new IGN record.")
 
@@ -6900,22 +7078,17 @@ async def setguild(
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
-    # --- Input Validation ---
     if not user and not ingame_name:
-        await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True)
-        return
+        await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True); return
     if user and ingame_name:
-        await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True)
-        return
+        await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True); return
 
     await interaction.response.defer(ephemeral=True)
-
     normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
     
     config = await load_server_config(guild.id)
     if normalized_tag and normalized_tag not in config.get('tracked_guilds', {}):
-        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not a tracked guild in this server.", ephemeral=True)
-        return
+        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not a tracked guild in this server.", ephemeral=True); return
         
     try:
         update_resp = None
@@ -6925,39 +7098,44 @@ async def setguild(
         if user:
             target_display = user.mention
             target_member_for_roles = user
+            # When targeting a user, we assume they should already be connected.
+            # We will just update their record. If they don't exist, it will fail gracefully.
             update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
         
         elif ingame_name:
             cleaned_ign = ingame_name.strip()
             target_display = f"IGN `{cleaned_ign}`"
-            update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("ingame_name", cleaned_ign).execute())
+            # Use UPSERT to create the IGN if it doesn't exist, or update it if it does.
+            update_resp = await run_supabase_sync(
+                lambda: supabase.table("florr_players")
+                               .upsert({"ingame_name": cleaned_ign, "florr_guild_tag": normalized_tag}, on_conflict="ingame_name")
+                               .execute()
+            )
+            await load_ign_cache(guild) # Refresh cache with the potentially new IGN
+            
             if update_resp and update_resp.data and update_resp.data[0].get('discord_id'):
                 discord_id = int(update_resp.data[0]['discord_id'])
                 target_member_for_roles = guild.get_member(discord_id)
         
         if not update_resp or not update_resp.data:
-            await interaction.followup.send(f"❌ Could not find a database record for {target_display}. Use `/connect` or `/nerd_admin add_ign` first.", ephemeral=True)
+            await interaction.followup.send(f"❌ Could not find or create a database record for {target_display}. If targeting a user, use `/connect` first.", ephemeral=True)
             return
 
-        # Trigger role sync only if we have a Discord member object
         if target_member_for_roles:
             await trigger_global_role_sync_for_user(target_member_for_roles)
             
         ign_from_db = update_resp.data[0].get('ingame_name', 'N/A')
         
         if normalized_tag:
-            await interaction.followup.send(f"✅ Set `{ign_from_db}` ({target_display})'s guild to **{normalized_tag}**. Roles are being updated if applicable.", ephemeral=True)
+            await interaction.followup.send(f"✅ Set `{ign_from_db}` ({target_display})'s guild to **{normalized_tag}**. Roles updated if applicable.", ephemeral=True)
             await log_info(guild, f"`{interaction.user.name}` set guild for {target_display} to {normalized_tag}.")
         else:
-            await interaction.followup.send(f"✅ Removed `{ign_from_db}` ({target_display}) from any tracked guild. Roles are being updated if applicable.", ephemeral=True)
+            await interaction.followup.send(f"✅ Removed `{ign_from_db}` ({target_display}) from any tracked guild. Roles updated if applicable.", ephemeral=True)
             await log_info(guild, f"`{interaction.user.name}` removed guild from {target_display}.")
             
-        # Refresh lists in all relevant guilds
         for bot_guild in bot.guilds:
             if target_member_for_roles and bot_guild.get_member(target_member_for_roles.id):
                 asyncio.create_task(refresh_all_guild_lists(bot_guild))
-            # For IGN-only updates, we can't reliably know which guild lists to refresh
-            # A full /refresh on the target guild is a safe bet if needed, but for now we only update on user presence
 
     except Exception as e:
         await log_error(guild, f"Error during /setguild for {user.name if user else ingame_name}", error=e, interaction=interaction)
