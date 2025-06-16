@@ -8542,6 +8542,118 @@ class NerdAdminGroup(app_commands.Group):
             await log_error(interaction.guild, "Error in /nerd_admin add_ign", error=e, interaction=interaction)
             await interaction.followup.send("❌ An unexpected error occurred.")
 
+    @app_commands.command(name="backfill_events", description="[Owner] [Testing Only] One-time backfill of events from local JSON file.")
+    async def backfill_events(self, interaction: discord.Interaction):
+        # --- Security and Environment Checks ---
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
+        if BOT_INSTANCE_TYPE != "TESTING":
+            await interaction.response.send_message("❌ This command can only be used on a 'TESTING' bot instance.", ephemeral=True); return
+        if not supabase:
+            await interaction.response.send_message("❌ Supabase client is not available.", ephemeral=True); return
+
+        await interaction.response.defer(ephemeral=True)
+        
+        # --- File Path and Reading ---
+        # IMPORTANT: The file path is hardcoded as per the request for your local machine.
+        # This command will ONLY work when the bot is run on that specific machine.
+        file_path = r"C:\Users\Vibhor Goel\Desktop\Florr.io\classified_events.json"
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                events_data = json.load(f)
+        except FileNotFoundError:
+            await interaction.followup.send(f"❌ **File Not Found:** The file could not be found at `{file_path}`.", ephemeral=True)
+            return
+        except json.JSONDecodeError as e:
+            await interaction.followup.send(f"❌ **JSON Error:** The file is not a valid JSON. Error: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ **File Read Error:** An unexpected error occurred while reading the file: {e}", ephemeral=True)
+            return
+
+        # --- Data Processing and Batching ---
+        crafts_to_insert = []
+        defeats_to_insert = []
+        
+        for event in events_data:
+            category = event.get('category')
+            
+            if category == 'petal_craft':
+                try:
+                    player_ign = event.get('player')
+                    rarity = event.get('rarity')
+                    petal_name = event.get('item') # Key is 'item' in your JSON
+                    message_id = str(event.get('id'))
+                    timestamp_str = event.get('timestamp')
+
+                    if not all([player_ign, rarity, petal_name, message_id, timestamp_str]):
+                        continue
+
+                    crafts_to_insert.append({
+                        "player_ign": player_ign,
+                        "super_petal_name": f"{rarity} {petal_name}",
+                        "craft_date": date_parse(timestamp_str).date().isoformat(),
+                        "original_message_id": message_id,
+                        "processed_by_id": str(bot.user.id)
+                    })
+                except Exception:
+                    continue # Skip malformed entries
+
+            elif category == 'mob_defeat':
+                try:
+                    defeats_to_insert.append({
+                        "mob": event.get('mob'),
+                        "rarity": event.get('rarity'),
+                        "server": event.get('server'),
+                        "players": event.get('players', []),
+                        "message_id": str(event.get('id')),
+                        "event_timestamp": date_parse(event.get('timestamp')).isoformat() if event.get('timestamp') else None
+                    })
+                except Exception:
+                    continue # Skip malformed entries
+        
+        # --- Database Insertion ---
+        craft_success_count = 0
+        craft_fail_count = 0
+        defeat_success_count = 0
+        defeat_fail_count = 0
+
+        # Batch insert crafts
+        if crafts_to_insert:
+            try:
+                # Using `upsert` with `ignore_duplicates=True` is safer for one-time runs
+                # to prevent crashes on unique constraint violations.
+                craft_resp = await run_supabase_sync(
+                    lambda: supabase.table("super_craft_logs").upsert(crafts_to_insert, on_conflict="original_message_id", ignore_duplicates=True).execute()
+                )
+                craft_success_count = len(craft_resp.data) if craft_resp and craft_resp.data else 0
+                craft_fail_count = len(crafts_to_insert) - craft_success_count
+            except Exception as e:
+                craft_fail_count = len(crafts_to_insert)
+                await log_error(interaction.guild, "Backfill failed during craft insertion", error=e)
+
+        # Batch insert defeats
+        if defeats_to_insert:
+            try:
+                # Defeats don't have a unique constraint, so we just insert.
+                defeat_resp = await run_supabase_sync(
+                    lambda: supabase.table("super_defeats").insert(defeats_to_insert).execute()
+                )
+                defeat_success_count = len(defeat_resp.data) if defeat_resp and defeat_resp.data else 0
+                defeat_fail_count = len(defeats_to_insert) - defeat_success_count
+            except Exception as e:
+                defeat_fail_count = len(defeats_to_insert)
+                await log_error(interaction.guild, "Backfill failed during defeat insertion", error=e)
+
+        # --- Final Report ---
+        report_embed = discord.Embed(title="✅ Event Backfill Complete", color=discord.Color.green())
+        report_embed.description = f"Processed **{len(events_data)}** events from `{file_path}`."
+        report_embed.add_field(name="Super Crafts", value=f"**Success:** {craft_success_count}\n**Skipped/Failed:** {craft_fail_count}", inline=True)
+        report_embed.add_field(name="Super Defeats", value=f"**Success:** {defeat_success_count}\n**Skipped/Failed:** {defeat_fail_count}", inline=True)
+        
+        await interaction.followup.send(embed=report_embed, ephemeral=True)
+
 # --- Register Command Groups ---
 # REMOVE the old tree.add_command for CustomiseGroup
 # ADD the new groups to the tree at the end of the file, before the bot.run call

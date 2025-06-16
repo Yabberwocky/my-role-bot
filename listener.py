@@ -54,8 +54,11 @@ class SelfBotListener:
     def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
         """Classifies the event and schedules it to run on the main bot's event loop."""
         raw_description = embed.get('description', '')
-        # Improved cleaning: strip whitespace, remove zero-width spaces, and strip common markdown characters.
-        description = raw_description.replace('\u200b', '').strip().strip('*_`')
+        # MORE ROBUST CLEANING:
+        # 1. Replace zero-width spaces.
+        # 2. Strip leading/trailing whitespace and newlines.
+        # 3. Strip common markdown characters from the start and end.
+        description = raw_description.replace('\u200b', '').strip().strip('*_`~')
         
         footer_text = embed.get('footer', {}).get('text')
         message_id = embed.get('_message_id')
@@ -73,7 +76,6 @@ class SelfBotListener:
         if not item_data:
             match = self.patterns['petal_craft'].match(description)
             if match:
-                # CORRECTED group indices: 1 for rarity, 2 for petal, 3 for player
                 item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
 
         if not item_data:
@@ -82,8 +84,9 @@ class SelfBotListener:
                 item_data = {'category': 'super_spawn', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'server': server}
 
         if not item_data:
+            # Check special spawn messages against the cleaned description
             for spawn_text, mob_name in self.special_spawn_messages.items():
-                if spawn_text in description:
+                if spawn_text == description: # Use exact match after cleaning
                     item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
                     break
         
@@ -91,10 +94,8 @@ class SelfBotListener:
             item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
 
         if item_data:
-            # Add message_id and timestamp to the data payload
             item_data['message_id'] = message_id
             item_data['timestamp'] = timestamp
-            # This is the key change: Schedule the handler to run in the bot's thread.
             asyncio.run_coroutine_threadsafe(self.bot._handle_self_bot_event(item_data), self.main_loop)
 
     async def _send_heartbeat(self):
