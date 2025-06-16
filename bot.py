@@ -282,6 +282,142 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+class ConnectUserModal(discord.ui.Modal, title="Connect Florr IGN"):
+    ign_input = discord.ui.TextInput(
+        label="User's Exact In-Game Name",
+        placeholder="Enter the Florr.io IGN to link...",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=50
+    )
+
+    def __init__(self, target_user: discord.Member):
+        super().__init__(timeout=300)
+        self.target_user = target_user
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Double-check permissions on submit
+        is_staff = await is_admin_or_owner(interaction)
+        if interaction.user.id != self.target_user.id and not is_staff:
+            await interaction.response.send_message("❌ You are not authorized to connect this user.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        guild = interaction.guild
+        cleaned_ign = clean_ign(self.ign_input.value)
+        if not cleaned_ign:
+            await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=True)
+            return
+
+        # This logic is adapted from the /connect command
+        try:
+            ign_check_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("discord_id").eq("ingame_name", cleaned_ign).maybe_single().execute())
+            if ign_check_resp and ign_check_resp.data and ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(self.target_user.id):
+                conflict_user_id = ign_check_resp.data['discord_id']
+                await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to <@{conflict_user_id}>.", ephemeral=True)
+                return
+
+            await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(self.target_user.id)).execute())
+            await run_supabase_sync(lambda: supabase.table("florr_players").upsert({"ingame_name": cleaned_ign, "discord_id": str(self.target_user.id), "discord_name": str(self.target_user)}, on_conflict="ingame_name").execute())
+            
+            await trigger_global_role_sync_for_user(self.target_user)
+            await load_ign_cache(guild)
+            
+            await interaction.followup.send(f"✅ Successfully connected {self.target_user.mention} to IGN `{cleaned_ign}`. Their profile is now viewable.", ephemeral=True)
+            await log_info(guild, f"`{interaction.user.name}` connected `{self.target_user.name}` to IGN `{cleaned_ign}` via profile modal.")
+        except Exception as e:
+            await log_error(guild, "Error during modal connect", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An unexpected error occurred during connection.", ephemeral=True)
+
+
+class ProfileNotFoundView(discord.ui.View):
+    def __init__(self, target_user: discord.Member, timeout=180.0):
+        super().__init__(timeout=timeout)
+        self.target_user = target_user
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Allow the target user OR a staff member to interact
+        is_staff = await is_admin_or_owner(interaction)
+        if interaction.user.id == self.target_user.id or is_staff:
+            return True
+        else:
+            await interaction.response.send_message("❌ You are not authorized to connect this user.", ephemeral=True)
+            return False
+
+    @discord.ui.button(label="Connect This User", style=discord.ButtonStyle.success, emoji="🔗")
+    async def connect_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = ConnectUserModal(target_user=self.target_user)
+        await interaction.response.send_modal(modal)
+    
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children: item.disabled = True
+            try:
+                await self.message.edit(content=self.message.content, embed=self.message.embeds[0] if self.message.embeds else None, view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
+
+async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
+    """Fetches just the florr_guild_tag for a given IGN."""
+    if not supabase: return None
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .select("florr_guild_tag")
+                           .ilike("ingame_name", ign)
+                           .limit(1)
+                           .maybe_single()
+                           .execute()
+        )
+        if resp and resp.data:
+            return resp.data.get('florr_guild_tag')
+        return None
+    except Exception as e:
+        await log_error(guild, f"Failed to fetch guild tag for IGN {ign}", error=e)
+        return None
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Handles auto-assigning the unverified role to new members in Catercord."""
+    # Only run for Catercord and ignore bots
+    if member.guild.id != CATERCORD_GUILD_ID or member.bot:
+        return
+
+    await log_info(member.guild, f"New member joined: {member.mention} ({member.display_name})")
+
+    config = await load_server_config(member.guild.id)
+    unverified_role_id = config.get('unverified_role_id')
+
+    if not unverified_role_id:
+        await log_error(member.guild, f"on_member_join: `unverified_role_id` is not configured for this server. Cannot assign role to {member.mention}.")
+        return
+
+    unverified_role = member.guild.get_role(unverified_role_id)
+    if not unverified_role:
+        await log_error(member.guild, f"on_member_join: Configured unverified role (ID: {unverified_role_id}) not found.")
+        return
+
+    if not member.guild.me.guild_permissions.manage_roles or member.guild.me.top_role <= unverified_role:
+        await log_error(member.guild, f"on_member_join: Bot lacks permissions or hierarchy to assign '{unverified_role.name}' role.")
+        return
+
+    try:
+        if unverified_role not in member.roles:
+            await member.add_roles(unverified_role, reason="New member auto-role")
+            await log_info(member.guild, f"Assigned '{unverified_role.name}' role to new member {member.mention}.")
+    except Exception as e:
+        await log_error(member.guild, f"on_member_join: Failed to assign role to {member.mention}", error=e)
+
+def clean_ign(ign: str) -> str:
+    """Removes backslashes and strips whitespace from an IGN."""
+    if not ign:
+        return ""
+    # Remove all backslashes and strip leading/trailing whitespace.
+    return ign.replace('\\', '').strip()
+
 async def get_user_super_craft_log_entries(
     guild: Optional[discord.Guild], 
     ign: str, 
@@ -294,8 +430,9 @@ async def get_user_super_craft_log_entries(
 
     offset = page * per_page
     try:
+        # Use ilike for case-insensitive matching
         count_resp = await run_supabase_sync(
-            lambda: supabase.table("super_craft_logs").select("id", count='exact').eq("player_ign", ign).execute()
+            lambda: supabase.table("super_craft_logs").select("id", count='exact').ilike("player_ign", ign).execute()
         )
         total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
         if total_count == 0:
@@ -304,7 +441,7 @@ async def get_user_super_craft_log_entries(
         data_resp = await run_supabase_sync(
             lambda: supabase.table("super_craft_logs")
                            .select("id, craft_date, super_petal_name")
-                           .eq("player_ign", ign)
+                           .ilike("player_ign", ign) # Use ilike here as well
                            .order("craft_date", desc=True)
                            .order("id", desc=True)
                            .range(offset, offset + per_page - 1)
@@ -327,11 +464,12 @@ async def get_user_super_defeat_log_entries(
 
     offset = page * per_page
     try:
-        # FIX: Properly format the value for the 'contains' filter.
-        # It needs to be a JSON array containing a JSON string.
-        json_ign_for_query = json.dumps([ign])
+        # Query using lowercase ign, as player names are now stored in lowercase.
+        # NOTE: This will only find defeats logged AFTER this code change.
+        # Old entries with mixed-case names will not be found.
+        ign_lower = ign.lower()
+        json_ign_for_query = json.dumps([ign_lower])
 
-        # Use the @> operator to check if the jsonb array contains the player's name
         count_resp = await run_supabase_sync(
             lambda: supabase.table("super_defeats").select("id", count='exact').contains("players", json_ign_for_query).execute()
         )
@@ -348,6 +486,7 @@ async def get_user_super_defeat_log_entries(
                            .range(offset, offset + per_page - 1)
                            .execute()
         )
+        # The 'players' list returned will be all lowercase. This is acceptable for the log display.
         return (data_resp.data if data_resp and data_resp.data else []), total_count
     except Exception as e:
         await log_error(guild, f"Error fetching super defeat log for {ign}", error=e)
@@ -836,31 +975,71 @@ class SetupView(discord.ui.View):
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
 
-async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool]:
-    """Creates a human-friendly text ping for a game event notification."""
+async def fetch_hc_member_profile_data_with_retry(guild: Optional[discord.Guild], discord_id_str: str, retries: int = 4, delay: float = 1.0) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to fetch HC member profile data, retrying on failure to account for DB replication lag.
+    Uses a longer, more robust retry schedule.
+    """
+    for attempt in range(retries):
+        profile_data = await fetch_hc_member_profile_data(guild, discord_id_str)
+        if profile_data:
+            return profile_data # Success, return the data immediately
+        
+        # If no data, wait and try again
+        await log_info(guild, f"Profile fetch retry {attempt + 1}/{retries} for user {discord_id_str}...")
+        await asyncio.sleep(delay + (attempt * 0.5)) # Wait a bit longer each time, starting at 1s
+        
+    # If all retries fail, return None
+    await log_error(guild, f"Profile fetch for user {discord_id_str} failed after {retries} retries.")
+    return None
+
+async def fetch_profile_details_by_ign_with_retry(guild: Optional[discord.Guild], ign: str, retries: int = 4, delay: float = 1.0) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to fetch profile data by IGN, retrying on failure to account for DB replication lag.
+    """
+    for attempt in range(retries):
+        profile_data = await fetch_profile_details_by_ign(guild, ign)
+        if profile_data:
+            return profile_data
+        
+        await log_info(guild, f"Profile fetch retry {attempt + 1}/{retries} for IGN {ign}...")
+        await asyncio.sleep(delay + (attempt * 0.5))
+        
+    await log_error(guild, f"Profile fetch for IGN {ign} failed after {retries} retries.")
+    return None
+
+async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, Optional[str]]:
+    """
+    Creates a human-friendly text ping template for a game event notification.
+    Returns the template, a boolean indicating if a role should be pinged, and the event timestamp.
+    """
     category = item.get('category')
     rarity = item.get('rarity')
     server = item.get('server')
+    timestamp = item.get('timestamp')
     ping_role = False
     text = None
 
-    # Add region prefix if available
-    region_prefix = f"**[{server}]** " if server else ""
+    # Add region prefix if available, with a colon for better formatting
+    region_prefix = f"**[{server}]**: " if server else ""
 
     if category == 'super_craft':
         petal = item.get('petal')
         player = item.get('player')
+        # Made the phrasing a bit more natural
         text = f"{region_prefix}A **{rarity} {petal}** was just crafted by **{player or 'Someone'}**!"
 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
-        text = f"{region_prefix}A **{rarity} {mob}** has spawned!"
+        # The {{time}} placeholder will be replaced by the handler with a dynamic timestamp
+        text = f"{region_prefix}A **{rarity} {mob}** spawned {{time}}!"
         ping_role = True # Only spawn events should ping the role
 
     elif category == 'super_defeat':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
         players = item.get('players', [])
         if players:
+            # Bolding the players for emphasis
             player_str = f" by **{', '.join(players)}**"
         else:
             player_str = ""
@@ -869,7 +1048,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool]:
     if rarity == "Unique" and text:
         text = f"✨ **UNIQUE EVENT!** ✨\n{text}"
 
-    return text, ping_role
+    return text, ping_role, timestamp
 
 async def _log_super_defeat_to_db(item: Dict[str, Any]):
     """Logs a super defeat event to the new super_defeats table."""
@@ -890,11 +1069,15 @@ async def _log_super_defeat_to_db(item: Dict[str, Any]):
             except (ValueError, TypeError):
                 pass 
 
+        # Store player names in lowercase to ensure case-insensitive searching later.
+        players_list = item.get('players', [])
+        players_lower = [p.lower() for p in players_list if p] if players_list else []
+
         insert_payload = {
             "mob": item.get('mob'),
             "rarity": item.get('rarity'),
             "server": item.get('server'),
-            "players": item.get('players', []),
+            "players": players_lower, # Store the lowercase list
             "message_id": str(item.get('message_id')) if item.get('message_id') else None,
             "event_timestamp": event_timestamp
         }
@@ -998,10 +1181,22 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
 
     # --- 3. Dispatch to new instantaneous TEXT ping system (REWORKED) ---
     if category in ['super_craft', 'super_spawn', 'super_defeat']:
-        ping_text, should_ping_role = await _create_ping_text(item)
-        if not ping_text:
+        ping_template, should_ping_role, event_timestamp_str = await _create_ping_text(item)
+        if not ping_template:
             print("   [PING FAIL] Could not generate ping text.")
             return
+
+        # Replace timestamp placeholder with a dynamic Discord timestamp
+        final_ping_text = ping_template
+        if '{{time}}' in ping_template and event_timestamp_str:
+            try:
+                event_dt = date_parse(event_timestamp_str)
+                unix_ts = int(event_dt.timestamp())
+                # Format as a relative timestamp (e.g., "2 seconds ago")
+                final_ping_text = ping_template.replace('{{time}}', f'<t:{unix_ts}:R>')
+            except (ValueError, TypeError):
+                # Fallback if timestamp is bad: just remove the placeholder
+                final_ping_text = ping_template.replace(' {{time}}', '')
 
         config_key_map = {
             'super_craft': 'craft_ping_channel_id',
@@ -1009,14 +1204,10 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
             'super_defeat': 'defeat_ping_channel_id',
         }
         webhook_purpose_map = {
-            'super_craft': 'craft_pings',
-            'super_spawn': 'spawn_pings',
-            'super_defeat': 'defeat_pings',
+            'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings',
         }
         webhook_name_map = {
-            'super_craft': 'Craft Pings',
-            'super_spawn': 'Spawn Pings',
-            'super_defeat': 'Defeat Pings',
+            'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings',
         }
         
         config_key = config_key_map.get(category)
@@ -1031,16 +1222,12 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
                 if isinstance(channel, discord.TextChannel):
                     webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
                     if webhook:
-                        content_to_send = ping_text
-                        role_mention = ""
+                        content_to_send = final_ping_text
                         if should_ping_role:
                             role_id_to_ping = config.get('super_ping_role_id')
                             if role_id_to_ping:
-                                role_mention = f"<@&{role_id_to_ping}>"
-                        
-                        # Add role mention to the content if applicable
-                        if role_mention:
-                            content_to_send += f" {role_mention}"
+                                # Add the role mention on a new line
+                                content_to_send += f"\n<@&{role_id_to_ping}>"
                         
                         try:
                             await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
@@ -2328,7 +2515,8 @@ async def process_guild_sync_batch(
     )
 
     if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
-        extracted_from_this_batch = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
+        # Clean IGNs from AI output to remove any backslashes
+        extracted_from_this_batch = {clean_ign(name) for name in ai_extracted_text.split('\n') if name.strip()}
     
     failed_ai_this_batch = not bool(ai_extracted_text)
 
@@ -2382,7 +2570,7 @@ async def process_guild_sync_batch(
         session_data['bot_reply_message_id'] = new_bot_reply_msg.id
 
         await log_info(guild, f"GuildSync: Added {newly_added_count} IGNs to session for {user.name}. Total: {len(session_data['screenshot_igns_collected'])}. Failures: {failed_ai_this_batch}")
-        return new_bot_reply_msg # Or None if not fetched/edited
+        return new_bot_reply_msg # Or None if not fetched/edited # Or None if not fetched/edited
 
 
 async def generate_final_sync_report_embed_only(guild: Optional[discord.Guild], user: discord.User, user_id_session_key: int) -> Optional[discord.Embed]:
@@ -2437,7 +2625,8 @@ async def generate_final_sync_report_embed_only(guild: Optional[discord.Guild], 
     def format_field_value(items: List[str], max_items_display=15) -> str:
         if not items: return "None found."
         items_sorted = sorted(items, key=str.lower)
-        lines = [f"- `{discord.utils.escape_markdown(ign)}`" for ign in items_sorted[:max_items_display]]
+        # REMOVED redundant escape_markdown call for values inside code blocks
+        lines = [f"- `{ign}`" for ign in items_sorted[:max_items_display]]
         if len(items) > max_items_display: lines.append(f"- ...and {len(items) - max_items_display} more.")
         return "\n".join(lines)
 
@@ -2635,7 +2824,8 @@ async def handle_guild_sync_from_screenshots(
                 prompt_kwargs={'known_igns_list_str': known_igns_str}
             )
             if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
-                potential_names = {name.strip() for name in ai_extracted_text.split('\n') if name.strip()}
+                # Clean names from AI output before matching
+                potential_names = {clean_ign(name) for name in ai_extracted_text.split('\n') if name.strip()}
                 for ai_name in potential_names:
                     # Case-insensitive check against the cache
                     for cached_ign in ai_cog.ingame_name_cache_ref:
@@ -4124,42 +4314,58 @@ class ProfilePagesView(discord.ui.View):
             self.add_item(discord.ui.Button(label="➖ Remove Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_log), callback=self.handle_remove_s_attempt))
 
     def _create_main_embed(self) -> discord.Embed:
-        is_partial_profile = not self.hc_profile_data.get('discord_id') and not self.hc_profile_data.get('is_in_hc')
+        # --- NEW VISUALLY IMPROVED EMBED ---
+        is_partial_profile = not self.hc_profile_data.get('discord_id')
         
         embed = discord.Embed(
-            title=f"🌟 Profile: {discord.utils.escape_markdown(self.target_user_display_data['name'])}",
+            title=f"🌟 Profile for {self.target_user_display_data['name']}",
             color=NERDY_YELLOW
         )
         if self.target_user_display_data['avatar_url']:
             embed.set_thumbnail(url=self.target_user_display_data['avatar_url'])
 
-        ign_display = f"`{discord.utils.escape_markdown(self.hc_profile_data.get('ingame_name', 'N/A'))}`"
+        # --- Main Identity Block ---
+        ign = self.hc_profile_data.get('ingame_name', 'N/A')
+        description_parts = [f"**Florr IGN:** `{ign}`"]
         
-        status_display = ""
         if is_partial_profile:
-            status_display = "*(This is a partial profile based on event logs only)*"
+            description_parts.append("\n*(This is a partial profile based on event logs only.)*")
         else:
-            hc_status_display = "❔ `Status Unknown`"
-            if self.hc_profile_data.get('is_in_hc') is True: hc_status_display = "✅ `In Guild (HC1)`"
-            elif self.hc_profile_data.get('is_in_hc') is False: hc_status_display = "❌ `Not in Guild (HC1)`"
-            status_display = f"**Discord:** {self.target_user_display_data['mention_or_status']}\n**[HC1] Guild Status:** {hc_status_display}"
+            description_parts.append(f"**Discord:** {self.target_user_display_data['mention_or_status']}")
+            guild_status_text = "❔ Unknown"
+            if self.hc_profile_data.get('florr_guild_tag'):
+                guild_status_text = f"✅ `{self.hc_profile_data['florr_guild_tag']}`"
+            else:
+                guild_status_text = "❌ Not in a tracked guild"
+            description_parts.append(f"**Guild:** {guild_status_text}")
         
-        embed.description = f"**In-Game Name (IGN):** {ign_display}\n{status_display}"
+        embed.description = "\n".join(description_parts)
 
+        # --- Activity Snapshot ---
         if self.activity_summary_data:
-            embed.add_field(name="📈 Activity", value=f"**Total Days Logged:** `{self.activity_summary_data['total_days_logged']}`\n**Last Seen:** {self.activity_summary_data['last_seen_display']}", inline=False)
+            activity_value = (
+                f"**Total Days:** `{self.activity_summary_data['total_days_logged']}`\n"
+                f"**Last Seen:** {self.activity_summary_data['last_seen_display']}"
+            )
+            embed.add_field(name="📈 Activity Snapshot", value=activity_value, inline=False)
         
+        # --- Super Stats Block (Inline) ---
+        has_super_stats = False
+        stats_value = ""
         if self.super_attempt_stats_data and self.super_attempt_stats_data.get('total_attempts', 0) > 0:
-            stats = self.super_attempt_stats_data
-            embed.add_field(name="💥 Super Attempts", value=f"**Total:** `{stats.get('total_attempts', 0)}`\n**Favorite:** `{stats.get('favorite_petal_name', 'N/A')}` ({stats.get('favorite_petal_attempts', 0)}x)", inline=True)
-        
+            stats_value += f"💥 **Attempts:** `{self.super_attempt_stats_data.get('total_attempts', 0)}`\n"
+            has_super_stats = True
         if self.s_craft_log_total_entries > 0:
-            embed.add_field(name="🛠️ Super Crafts", value=f"**Total:** `{self.s_craft_log_total_entries}`", inline=True)
-            
+            stats_value += f"🛠️ **Crafts:** `{self.s_craft_log_total_entries}`\n"
+            has_super_stats = True
         if self.s_defeat_log_total_entries > 0:
-            embed.add_field(name="⚔️ Super Defeats", value=f"**Total:** `{self.s_defeat_log_total_entries}`", inline=True)
+            stats_value += f"⚔️ **Defeats:** `{self.s_defeat_log_total_entries}`"
+            has_super_stats = True
 
-        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()}")
+        if has_super_stats:
+            embed.add_field(name="🏆 Super Event Log", value=stats_value.strip(), inline=False)
+        
+        embed.set_footer(text=f"Profile generated at {get_formatted_utc_now()}")
         return embed
 
     def _create_monthly_embed(self) -> discord.Embed:
@@ -4337,7 +4543,7 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
     Performs a case-insensitive search for the IGN.
     Returns a dict {'ingame_name': str (actual case from DB), 
                     'discord_id': str | None, 
-                    'is_in_hc': bool, 
+                    'florr_guild_tag': str | None, 
                     'discord_name': str | None} 
     or None if not found.
     """
@@ -4345,30 +4551,20 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
         if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for IGN '{input_ign}'.")
         return None
     try:
-        # Perform a case-insensitive query for the ingame_name
-        # Note: Supabase ilike is good for patterns. For exact case-insensitive match,
-        # you might need to query without ilike and handle case in Python if your DB collation is case-sensitive
-        # OR rely on a GIN/GIST index with pg_trgm for faster ilike if this becomes slow.
-        # For now, a simple .eq() and then checking a lowercase version (if needed) or direct .ilike()
-        # Let's try .ilike() as it's simpler for case-insensitivity directly in query
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
-                           .select("ingame_name, discord_id, is_in_hc, discord_name")
-                           .ilike("ingame_name", input_ign) # Case-insensitive match
-                           .maybe_single() # Expecting at most one due to unique constraint on ingame_name
+                           .select("ingame_name, discord_id, florr_guild_tag, discord_name")
+                           .ilike("ingame_name", input_ign)
+                           .limit(1)
+                           .maybe_single()
                            .execute()
         )
         
-        # PostgREST `ilike` with an exact string (no wildcards) effectively becomes a case-insensitive equality check.
-        # If multiple results were possible due to no unique constraint, you'd need to loop or pick one.
-        # With a unique constraint on ingame_name, ilike should return 0 or 1.
-
         if resp and hasattr(resp, 'data') and resp.data:
-            # Ensure we return the ingame_name exactly as it is in the database for correct casing
             return {
-                "ingame_name": resp.data.get("ingame_name"), # Actual case from DB
+                "ingame_name": resp.data.get("ingame_name"),
                 "discord_id": str(resp.data.get("discord_id")) if resp.data.get("discord_id") else None,
-                "is_in_hc": resp.data.get("is_in_hc"),
+                "florr_guild_tag": resp.data.get("florr_guild_tag"),
                 "discord_name": resp.data.get("discord_name")
             }
         return None
@@ -4380,8 +4576,8 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
 
 async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_id_str: str) -> Optional[Dict[str, Any]]:
     """
-    Fetches core profile data (IGN, is_in_hc) for a given Discord ID from florr_players.
-    Returns a dict {'ingame_name': str, 'is_in_hc': bool, 'discord_name': str | None} or None if not found.
+    Fetches core profile data (IGN, guild tag) for a given Discord ID from florr_players.
+    Returns a dict {'ingame_name': str, 'florr_guild_tag': str | None, 'discord_name': str | None} or None if not found.
     """
     if not supabase:
         if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for user {discord_id_str}.")
@@ -4389,7 +4585,7 @@ async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_i
     try:
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
-                           .select("ingame_name, is_in_hc, discord_name")
+                           .select("ingame_name, florr_guild_tag, discord_name")
                            .eq("discord_id", discord_id_str)
                            .maybe_single()
                            .execute()
@@ -4397,8 +4593,8 @@ async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_i
         if resp and hasattr(resp, 'data') and resp.data:
             return {
                 "ingame_name": resp.data.get("ingame_name"),
-                "is_in_hc": resp.data.get("is_in_hc"),
-                "discord_name": resp.data.get("discord_name") # Store this for users not in guild
+                "florr_guild_tag": resp.data.get("florr_guild_tag"),
+                "discord_name": resp.data.get("discord_name")
             }
         return None
     except (ConnectionError, APIError) as e:
@@ -6889,54 +7085,39 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
 
     await interaction.response.defer(ephemeral=True)
 
-    cleaned_ign = ingame_name.strip()
+    cleaned_ign = clean_ign(ingame_name)
     if not cleaned_ign:
         await interaction.followup.send("❌ In-game name cannot be empty.", ephemeral=True)
         return
 
     try:
-        # Step 1: Check if the target IGN is already connected to a *different* user.
-        ign_check_resp = await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .select("discord_id")
-                           .eq("ingame_name", cleaned_ign)
-                           .maybe_single()
-                           .execute()
-        )
-        if ign_check_resp and ign_check_resp.data and ign_check_resp.data.get('discord_id') and str(ign_check_resp.data['discord_id']) != str(target_user.id):
-            conflict_user_id = ign_check_resp.data['discord_id']
-            await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to another Discord account (<@{conflict_user_id}>). An admin must use `/disconnect` on that user first.", ephemeral=True)
-            return
-            
-        # Step 2: Unlink the target user from any old IGNs they might have.
-        await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .update({"discord_id": None, "discord_name": None})
-                           .eq("discord_id", str(target_user.id))
-                           .execute()
-        )
+        # Call the database function. It will handle all logic and error checking atomically.
+        params = {
+            'p_discord_id': str(target_user.id),
+            'p_discord_name': str(target_user),
+            'p_ign': cleaned_ign
+        }
+        # The function now handles everything. If it doesn't raise an error, it succeeded.
+        await run_supabase_sync(lambda: supabase.rpc('connect_florr_player', params).execute())
 
-        # Step 3: Use UPSERT to create the IGN if it doesn't exist, or update it with the new user info.
-        # This is the key change that allows staff to add new IGNs directly.
-        await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .upsert({
-                               "ingame_name": cleaned_ign,
-                               "discord_id": str(target_user.id),
-                               "discord_name": str(target_user)
-                           }, on_conflict="ingame_name")
-                           .execute()
-        )
-
-        # Step 4: Refresh roles, cache, and respond.
-        await refresh_roles_for_single_user(guild, target_user)
-        await load_ign_cache(guild) # Refresh cache with the new IGN
+        # If the RPC call was successful, we can proceed with bot-side updates.
+        await trigger_global_role_sync_for_user(target_user)
+        await load_ign_cache(guild)
+        
         await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
-        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`. This may have created a new IGN record.")
+        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`.")
 
     except APIError as e:
-        await log_error(guild, f"Error during /connect (API)", error=e, interaction=interaction)
-        await interaction.followup.send(f"❌ A database error occurred: {e.message}", ephemeral=True)
+        # Gracefully handle the custom error for taken IGNs.
+        if "IGN_TAKEN_BY" in e.message:
+            try:
+                conflict_user_id = e.message.split(':')[-1]
+                await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already connected to <@{conflict_user_id}>.", ephemeral=True)
+            except Exception:
+                await interaction.followup.send(f"❌ **Conflict:** The IGN `{cleaned_ign}` is already in use by another account.", ephemeral=True)
+        else:
+            await log_error(guild, f"Error during /connect (API)", error=e, interaction=interaction)
+            await interaction.followup.send(f"❌ A database error occurred: {e.message}", ephemeral=True)
     except Exception as e:
         await log_error(guild, f"Error during /connect (General)", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
@@ -7027,7 +7208,8 @@ async def setguild(
             update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
         
         elif ingame_name:
-            cleaned_ign = ingame_name.strip()
+            # Clean the input IGN to remove backslashes and strip whitespace
+            cleaned_ign = clean_ign(ingame_name)
             target_display = f"IGN `{cleaned_ign}`"
             # Use UPSERT to create the IGN if it doesn't exist, or update it if it does.
             update_resp = await run_supabase_sync(
@@ -7093,15 +7275,6 @@ async def activatemyself(interaction: discord.Interaction):
     await log_info(guild, f"`{interaction.user.name}` (`{interaction.user.id}`) used the deprecated /activatemyself command.")
 
 # --- Active Command (MODIFIED: No date, Manage Server perm required) ---
-@tree.command(name="active", description="Mark an In-Game Name (IGN) as active for today.") # MODIFIED Description
-@app_commands.describe(
-    ingame_name="The In-Game Name (IGN) to mark active."
-    # REMOVED date description
-)
-@app_commands.autocomplete(ingame_name=ign_autocomplete) # REMOVED date autocomplete
-@app_commands.checks.has_permissions(manage_guild=True) # ADDED Permission Check
-# VV Ensure this 'async' keyword is present VV
-# MODIFIED: Removed 'date: str' parameter
 async def active(interaction: discord.Interaction, ingame_name: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
@@ -7123,7 +7296,8 @@ async def active(interaction: discord.Interaction, ingame_name: str):
     if not target_ign:
         await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
         return
-    display_target = f"IGN `{discord.utils.escape_markdown(target_ign)}`"
+    # REMOVED redundant escape_markdown call for IGN inside a code block
+    display_target = f"IGN `{target_ign}`"
 
     success, message = await upsert_activity_log(guild, target_ign, activity_date, interaction.user.id)
 
@@ -7135,13 +7309,6 @@ async def active(interaction: discord.Interaction, ingame_name: str):
         asyncio.create_task(update_static_list_message(guild))
 
 # --- Inactive Command (CORRECTED DECORATOR and Date Handling, ADDED PERMISSION CHECK) ---
-@tree.command(name="inactive", description="Remove an activity record for an IGN on a specific date.")
-@app_commands.describe(
-    ingame_name="The In-Game Name (IGN) to mark inactive.",
-    date="Date of activity to remove (Select from list)."
-)
-@app_commands.autocomplete(ingame_name=ign_autocomplete, date=activity_date_autocomplete)
-@app_commands.checks.has_permissions(manage_guild=True) # <<<--- ADDED PERMISSION CHECK
 async def inactive(interaction: discord.Interaction, ingame_name: str, date: str):
     guild = interaction.guild
     if not await check_supabase_available(interaction): return
@@ -7170,7 +7337,8 @@ async def inactive(interaction: discord.Interaction, ingame_name: str, date: str
     if not target_ign:
         await interaction.followup.send(f"❌ In-game name cannot be empty.", ephemeral=False)
         return
-    display_target = f"IGN `{discord.utils.escape_markdown(target_ign)}`"
+    # REMOVED redundant escape_markdown call for IGN inside a code block
+    display_target = f"IGN `{target_ign}`"
 
     success, message = await remove_activity_log(guild, target_ign, activity_date, interaction.user.id)
 
@@ -7306,46 +7474,50 @@ async def profile(interaction: discord.Interaction,
     hc_profile_db_data: Optional[Dict[str, Any]] = None
     partial_profile_ign: Optional[str] = None
     target_discord_id_str: Optional[str] = None
-    target_is_self_profile = False
 
     if user:
         target_discord_id_str = str(user.id)
-        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
+        hc_profile_db_data = await fetch_hc_member_profile_data_with_retry(guild, target_discord_id_str)
         if not hc_profile_db_data:
-            await interaction.edit_original_response(content=f"❌ No profile data found for {user.mention}. They may need to use `/connect`.", view=None)
+            embed = discord.Embed(
+                title=f"🔗 Profile Not Linked",
+                description=f"**{user.display_name}** does not have a Florr.io profile connected to their Discord account yet.",
+                color=discord.Color.orange()
+            )
+            embed.set_footer(text="The user themselves or a staff member can use the button below.")
+            view = ProfileNotFoundView(target_user=user)
+            await interaction.edit_original_response(embed=embed, view=view)
+            view.message = await interaction.original_response()
             return
-        if user.id == interaction.user.id:
-            target_is_self_profile = True
+            
     elif ingame_name:
-        cleaned_ign = ingame_name.strip()
-        hc_profile_db_data = await fetch_profile_details_by_ign(guild, cleaned_ign)
+        cleaned_ign = clean_ign(ingame_name)
+        hc_profile_db_data = await fetch_profile_details_by_ign_with_retry(guild, cleaned_ign)
         if not hc_profile_db_data:
-            # --- NEW: Fallback to check log tables ---
             crafts, _ = await get_user_super_craft_log_entries(guild, cleaned_ign, 0, 1)
             defeats, _ = await get_user_super_defeat_log_entries(guild, cleaned_ign, 0, 1)
             if crafts or defeats:
                 partial_profile_ign = cleaned_ign
             else:
-                await interaction.edit_original_response(content=f"❌ No profile data or event logs found for IGN `{discord.utils.escape_markdown(cleaned_ign)}`.", view=None)
+                await interaction.edit_original_response(content=f"❌ No profile data or event logs found for IGN `{cleaned_ign}`.", view=None)
                 return
         else:
             target_discord_id_str = hc_profile_db_data.get("discord_id")
-            if target_discord_id_str and target_discord_id_str == str(interaction.user.id):
-                target_is_self_profile = True
-    else: # Default to self
-        target_is_self_profile = True
+    else:
         target_discord_id_str = str(interaction.user.id)
-        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
+        hc_profile_db_data = await fetch_hc_member_profile_data_with_retry(guild, target_discord_id_str)
         if not hc_profile_db_data:
-            await interaction.edit_original_response(content=f"❌ You don't have a profile yet. Use `/connect` to create one.", view=None)
+            embed = discord.Embed(
+                title=f"🔗 Profile Not Linked",
+                description=f"You don't have a Florr.io profile connected to your Discord account yet.",
+                color=discord.Color.orange()
+            )
+            embed.set_footer(text="You can use the button below to connect your account.")
+            view = ProfileNotFoundView(target_user=interaction.user)
+            await interaction.edit_original_response(embed=embed, view=view)
+            view.message = await interaction.original_response()
             return
 
-    # --- Permission Check ---
-    if not target_is_self_profile and not await can_manage_guild_or_is_bypass_user(interaction):
-        await interaction.edit_original_response(content="❌ You can only view your own profile or require staff permissions to view others'.", embed=None, view=None)
-        return
-
-    # --- Consolidate Target Info ---
     target_ign = (hc_profile_db_data.get("ingame_name") if hc_profile_db_data else None) or partial_profile_ign
     if not target_ign:
         await interaction.edit_original_response(content="❌ Critical error: Could not determine target IGN for profile.", view=None)
@@ -7355,9 +7527,9 @@ async def profile(interaction: discord.Interaction,
     if target_discord_id_str and guild:
         target_user_for_display = guild.get_member(int(target_discord_id_str))
     elif target_discord_id_str:
-        target_user_for_display = await bot.fetch_user(int(target_discord_id_str))
+        try: target_user_for_display = await bot.fetch_user(int(target_discord_id_str))
+        except discord.NotFound: await log_info(guild, f"Could not fetch user object for Discord ID {target_discord_id_str}.")
 
-    # --- Prepare Display Data ---
     display_name_for_view = target_user_for_display.display_name if target_user_for_display else target_ign
     avatar_url_for_view = target_user_for_display.display_avatar.url if target_user_for_display and target_user_for_display.display_avatar else (bot.user.display_avatar.url if bot.user else None)
     mention_or_status_for_view = target_user_for_display.mention if target_user_for_display else ("`Not in Main Player List`" if partial_profile_ign else "`Not Linked to Discord`")
@@ -7368,16 +7540,13 @@ async def profile(interaction: discord.Interaction,
         "_discord_id_for_sa_management": target_discord_id_str
     }
 
-    # --- Fetch All Stats and Logs ---
     today_utc_obj, _ = get_utc_date()
     activity_summary, initial_monthly_dates = None, set()
-    if hc_profile_db_data and today_utc_obj:
+    if hc_profile_db_data and hc_profile_db_data.get('discord_id') and today_utc_obj:
         ign_lower = target_ign.lower()
-        is_active_today = await check_activity_exists(guild, ign_lower, today_utc_obj)
-        active_today_disp = "✅ `Yes`" if is_active_today else "❌ `No`"
         all_time_summary = await fetch_activity_data(guild, [ign_lower])
         ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
-        activity_summary = {"active_today_display": active_today_disp, "total_days_logged": ign_all_time_data['count'], "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"}
+        activity_summary = {"total_days_logged": ign_all_time_data['count'], "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"}
         first_day_current_month = today_utc_obj.replace(day=1)
         last_day_current_month = (first_day_current_month.replace(month=first_day_current_month.month % 12 + 1, year=first_day_current_month.year + (first_day_current_month.month // 12))) - datetime.timedelta(days=1)
         initial_monthly_dates = await fetch_activity_dates_in_range(guild, ign_lower, first_day_current_month, last_day_current_month)
@@ -7386,9 +7555,12 @@ async def profile(interaction: discord.Interaction,
     initial_craft_logs, craft_total = await get_user_super_craft_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
     initial_defeat_logs, defeat_total = await get_user_super_defeat_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
 
-    # --- Create and Send View ---
+    final_hc_profile_data = hc_profile_db_data if hc_profile_db_data else {"ingame_name": partial_profile_ign}
+    if 'florr_guild_tag' not in final_hc_profile_data:
+        final_hc_profile_data['florr_guild_tag'] = await get_guild_tag_from_ign(guild, target_ign)
+
     profile_view = ProfilePagesView(
-        interaction=interaction, target_user_display_data=target_user_display_data, hc_profile_data=hc_profile_db_data or {"ingame_name": partial_profile_ign},
+        interaction=interaction, target_user_display_data=target_user_display_data, hc_profile_data=final_hc_profile_data,
         activity_summary_data=activity_summary, initial_monthly_active_dates=initial_monthly_dates,
         super_attempt_stats_data=super_attempt_stats_data, 
         initial_craft_logs=initial_craft_logs, total_crafts=craft_total,
@@ -7399,6 +7571,26 @@ async def profile(interaction: discord.Interaction,
     initial_embed = profile_view._create_main_embed()
     await interaction.edit_original_response(embed=initial_embed, view=profile_view)
     profile_view.message = await interaction.original_response()
+
+# Add a new helper function right before the /profile command definition
+async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
+    """Fetches just the florr_guild_tag for a given IGN."""
+    if not supabase: return None
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .select("florr_guild_tag")
+                           .ilike("ingame_name", ign)
+                           .limit(1)
+                           .maybe_single()
+                           .execute()
+        )
+        if resp and resp.data:
+            return resp.data.get('florr_guild_tag')
+        return None
+    except Exception as e:
+        await log_error(guild, f"Failed to fetch guild tag for IGN {ign}", error=e)
+        return None
 
 @tree.command(name="refresh", description="Syncs all roles with the database and refreshes all server-specific data.")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -8250,60 +8442,57 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
     template_to_store: Optional[str] = None
     response_message_parts = []
 
-    # Fetch current settings to toggle manage_nickname_by_bot if template is omitted
     current_settings_resp = await run_supabase_sync(
         lambda: supabase.table("florr_players")
-                       .select("manage_nickname_by_bot, custom_nickname_template, is_in_hc")
+                       .select("manage_nickname_by_bot, custom_nickname_template, florr_guild_tag")
                        .eq("discord_id", str(target_user.id))
                        .maybe_single()
                        .execute()
     )
     
     current_manage_by_bot = False
-    current_is_in_hc = False
+    current_is_in_a_guild = False
     if current_settings_resp and hasattr(current_settings_resp, 'data') and current_settings_resp.data:
         current_manage_by_bot = current_settings_resp.data.get("manage_nickname_by_bot", False)
-        current_is_in_hc = current_settings_resp.data.get("is_in_hc", False)
-        # If template is not provided, current_custom_template is not directly used for setting, but for info.
-        # current_custom_template = current_settings_resp.data.get("custom_nickname_template")
+        current_is_in_a_guild = current_settings_resp.data.get("florr_guild_tag") is not None
 
 
-    if template is not None: # Template parameter was explicitly provided (even if empty string)
+    if template is not None:
         cleaned_template = template.strip()
-        if not cleaned_template: # User provided blank string explicitly to clear template
-            manage_by_bot_new_value = True # Keep management ON but use default format
-            template_to_store = None # Store NULL for custom_template
+        if not cleaned_template:
+            manage_by_bot_new_value = True
+            template_to_store = None
             response_message_parts.append(f"⚙️ Custom nickname template **cleared** for {target_user.mention}.")
-            if current_is_in_hc:
-                 response_message_parts.append(f"🤖 Bot will now use the default HC nickname format: `IGN (SATT satt)` or `IGN`.")
+            if current_is_in_a_guild:
+                 response_message_parts.append(f"🤖 Bot will now use the default nickname format: `IGN (SATT satt)` or `IGN`.")
             else:
-                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in HC.")
+                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in a tracked guild.")
             response_message_parts.append(f"🤖 Bot nickname management remains **enabled** (or enabled if it was off).")
 
         elif len(cleaned_template) > 200:
             await interaction.followup.send(f"❌ Nickname template is too long (max 200 characters).", ephemeral=True)
             return
-        else: # Valid custom template provided
+        else:
             manage_by_bot_new_value = True
             template_to_store = cleaned_template
-            response_message_parts.append(f"⚙️ Custom nickname template for {target_user.mention} set to: `{discord.utils.escape_markdown(template_to_store)}`.")
+            response_message_parts.append(f"⚙️ Custom nickname template for {target_user.mention} set to: `{template_to_store}`.")
             response_message_parts.append(f"🤖 Bot nickname management **enabled** (or enabled if it was off).")
             if "{satt}" not in template_to_store:
                 response_message_parts.append(f"⚠️ Your template does not include `{{satt}}`. The super attempt count will not be shown.")
-    else: # Template parameter was omitted entirely (is None) -> Toggle management
-        manage_by_bot_new_value = not current_manage_by_bot # Toggle the current state
+    else:
+        manage_by_bot_new_value = not current_manage_by_bot
         if manage_by_bot_new_value:
-            template_to_store = None # When turning ON by toggle, ensure custom template is NULL for default format
+            template_to_store = None
             response_message_parts.append(f"🤖 Bot nickname management **enabled** for {target_user.mention}.")
-            if current_is_in_hc:
-                 response_message_parts.append(f"🤖 Bot will now use the default HC nickname format.")
+            if current_is_in_a_guild:
+                 response_message_parts.append(f"🤖 Bot will now use the default nickname format.")
             else:
-                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in HC (if different).")
+                 response_message_parts.append(f"🤖 Bot will now set nickname to IGN as user is not in a tracked guild (if different).")
 
-        else: # Turning OFF
-            template_to_store = None # Clear template when turning off management too, for consistency
+        else:
+            template_to_store = None
             response_message_parts.append(f"🤖 Bot nickname management **disabled** for {target_user.mention}.")
-            response_message_parts.append(f"🏷️ Nickname will revert to IGN (if different and user is in HC) or be unmanaged.")
+            response_message_parts.append(f"🏷️ Nickname will revert to IGN (if different and user is in a tracked guild) or be unmanaged.")
 
 
     try:
@@ -8314,24 +8503,14 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
                                "custom_nickname_template": template_to_store
                            })
                            .eq("discord_id", str(target_user.id))
-                           # Ensure it's for the correct IGN if user has multiple accounts (rare)
-                           # This also implicitly checks if the user is in florr_players for this IGN
                            .eq("ingame_name", author_ign) 
                            .execute()
         )
         response_message_parts.append(f"💾 Settings saved.")
 
-        # Immediately update nickname based on new settings
         all_time_count = await get_all_time_super_attempt_count(guild, author_ign)
-        # Call update_custom_nickname_on_attempt. It will now handle:
-        # 1. Custom template if manage_by_bot_new_value is True and template_to_store is not None.
-        # 2. Default HC format if manage_by_bot_new_value is True, template_to_store is None, and is_in_hc is True.
-        # 3. Reverting to IGN if manage_by_bot_new_value is False and is_in_hc is True.
         await update_custom_nickname_on_attempt(guild, target_user, author_ign, all_time_count)
         
-        current_nick = target_user.nick # Get nick after potential update
-        # This confirmation is a bit trickier now due to multiple nickname outcomes.
-        # update_custom_nickname_on_attempt logs the actual change.
         response_message_parts.append(f"ℹ️ Nickname update based on new settings has been processed. Check server for changes.")
 
     except Exception as e:
@@ -8383,7 +8562,8 @@ class NerdAdminGroup(app_commands.Group):
         if interaction.user.id != OWNER_USER_ID:
             await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
-        cleaned_ign = ingame_name.strip()
+        # Clean the input IGN to remove backslashes and strip whitespace
+        cleaned_ign = clean_ign(ingame_name)
         try:
             await run_supabase_sync(lambda: supabase.table("florr_players").insert({"ingame_name": cleaned_ign}).execute())
             await interaction.followup.send(f"✅ Registered IGN `{cleaned_ign}` to the database (unlinked).")
@@ -8396,6 +8576,67 @@ class NerdAdminGroup(app_commands.Group):
         except Exception as e:
             await log_error(interaction.guild, "Error in /nerd_admin add_ign", error=e, interaction=interaction)
             await interaction.followup.send("❌ An unexpected error occurred.")
+
+    @app_commands.command(name="ensure_member_roles", description="[Owner] Ensures all members in Catercord have a verified or unverified role.")
+    async def ensure_member_roles(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_USER_ID:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+            return
+        if interaction.guild_id != CATERCORD_GUILD_ID:
+            await interaction.response.send_message("❌ This command can only be used in the Catercord server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        config = await load_server_config(guild.id)
+        verified_role_id = config.get('verified_role_id')
+        unverified_role_id = config.get('unverified_role_id')
+
+        if not verified_role_id or not unverified_role_id:
+            await interaction.followup.send("❌ Verified and/or Unverified roles are not configured for this server.", ephemeral=True)
+            return
+        
+        verified_role = guild.get_role(verified_role_id)
+        unverified_role = guild.get_role(unverified_role_id)
+
+        if not verified_role or not unverified_role:
+            await interaction.followup.send("❌ Could not find the configured Verified or Unverified role objects in the server.", ephemeral=True)
+            return
+
+        if not guild.me.guild_permissions.manage_roles or guild.me.top_role <= unverified_role:
+            await interaction.followup.send("❌ I lack the `Manage Roles` permission or my role is not high enough to assign the unverified role.", ephemeral=True)
+            return
+
+        fixed_members_count = 0
+        total_members_checked = 0
+        
+        await interaction.edit_original_response(content=f"⏳ Checking all {guild.member_count} members... This may take a while.")
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            
+            total_members_checked += 1
+            has_verified = verified_role in member.roles
+            has_unverified = unverified_role in member.roles
+
+            if not has_verified and not has_unverified:
+                try:
+                    await member.add_roles(unverified_role, reason="Role safety net check by owner")
+                    fixed_members_count += 1
+                    await log_info(guild, f"Role Check: Assigned '{unverified_role.name}' to {member.mention} as they had neither role.")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    await log_error(guild, f"Role Check: Failed to add unverified role to {member.mention}", error=e)
+
+        report_message = (
+            f"✅ **Role Check Complete!**\n\n"
+            f"- Members checked: {total_members_checked}\n"
+            f"- Members fixed (given unverified role): {fixed_members_count}"
+        )
+        await interaction.edit_original_response(content=report_message)
+        await log_info(guild, f"Owner completed `ensure_member_roles` check. Fixed {fixed_members_count} members.")
 
     @app_commands.command(name="backfill_events", description="[Owner] [Testing Only] One-time backfill of events from local JSON file.")
     async def backfill_events(self, interaction: discord.Interaction):

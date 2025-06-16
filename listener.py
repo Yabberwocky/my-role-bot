@@ -39,17 +39,28 @@ class SelfBotListener:
                 fr"^\s*A {rarities_pattern} (.+?) has been defeated by (.+?)!$", re.IGNORECASE
             )
         }
+        # Use prefixes for special spawn messages to handle variations.
         self.special_spawn_messages = {
-            "Something mountain-like appears in the distance...": "rock", "A tower of thorns rises from the sands...": "cactus",
-            "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from a different realm...": "jellyfish",
-            "There's a bright light in the horizon...": "firefly", "You sense ominous vibrations coming from a different realm...": "beetle_hel",
+            "Something mountain-like appears in the distance...": "rock",
+            "A tower of thorns rises from the sands...": "cactus",
+            "A big yellow spot shows up in the distance...": "hornet",
+            "You hear lightning strikes coming from": "jellyfish",
+            "There's a bright light in the horizon...": "firefly",
+            "You sense ominous vibrations coming from a different realm...": "beetle_hel",
             "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
         }
 
     def _extract_server(self, footer_text: Optional[str]) -> Optional[str]:
         if not footer_text: return None
         match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
-        return match.group(1).upper() if match else None
+        if not match:
+            return None
+        
+        # Normalize the server name. ASIA becomes AS.
+        server = match.group(1).upper()
+        if server == "ASIA":
+            return "AS"
+        return server
 
     def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
         """Classifies the event and schedules it to run on the main bot's event loop."""
@@ -84,9 +95,9 @@ class SelfBotListener:
                 item_data = {'category': 'super_spawn', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'server': server}
 
         if not item_data:
-            # Check special spawn messages against the cleaned description
-            for spawn_text, mob_name in self.special_spawn_messages.items():
-                if spawn_text == description: # Use exact match after cleaning
+            # Check special spawn messages using startswith for flexibility
+            for spawn_prefix, mob_name in self.special_spawn_messages.items():
+                if description.startswith(spawn_prefix):
                     item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
                     break
         
