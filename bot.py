@@ -2376,9 +2376,10 @@ async def handle_guild_sync_from_screenshots(
         try:
             image_data = await image_att.read()
             # Use the prompt for finding ONLINE players
+            # FIX: Pass the image bytes as a list to match the updated function signature
             ai_extracted_text = await ai_cog.get_ai_response_with_image(
                 prompt_key="FLORR_IMAGE_NAME_EXTRACTION", 
-                image_bytes=image_data, 
+                image_bytes_list=[image_data], # <--- THIS IS THE FIX
                 prompt_kwargs={'known_igns_list_str': known_igns_str}
             )
             if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
@@ -2433,9 +2434,9 @@ async def handle_guild_sync_from_screenshots(
     if final_message_obj:
         confirm_view.message = final_message_obj
     
-    if activity_changed:
+    if activity_changed and guild.id == CATERCORD_GUILD_ID: # Only update HC1 list for now
         await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering list update.")
-        asyncio.create_task(update_static_list_message(guild))
+        await update_single_tracked_guild_list(guild, {"member_list_channel_id": config.get('hcmembers_channel_id'), "discord_role_id": HC1_ROLE_ID, "florr_guild_tag": "[HC1]"})
 
 async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str) -> Dict[str, Any]:
     """
