@@ -282,6 +282,77 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def get_user_super_craft_log_entries(
+    guild: Optional[discord.Guild], 
+    ign: str, 
+    page: int, 
+    per_page: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches paginated super craft log entries for a given IGN."""
+    if not supabase or not ign:
+        return [], 0
+
+    offset = page * per_page
+    try:
+        count_resp = await run_supabase_sync(
+            lambda: supabase.table("super_craft_logs").select("id", count='exact').eq("player_ign", ign).execute()
+        )
+        total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
+        if total_count == 0:
+            return [], 0
+
+        data_resp = await run_supabase_sync(
+            lambda: supabase.table("super_craft_logs")
+                           .select("id, craft_date, super_petal_name")
+                           .eq("player_ign", ign)
+                           .order("craft_date", desc=True)
+                           .order("id", desc=True)
+                           .range(offset, offset + per_page - 1)
+                           .execute()
+        )
+        return (data_resp.data if data_resp and data_resp.data else []), total_count
+    except Exception as e:
+        await log_error(guild, f"Error fetching super craft log for {ign}", error=e)
+        return [], 0
+
+async def get_user_super_defeat_log_entries(
+    guild: Optional[discord.Guild], 
+    ign: str, 
+    page: int, 
+    per_page: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches paginated super defeat log entries where the IGN is one of the players."""
+    if not supabase or not ign:
+        return [], 0
+
+    offset = page * per_page
+    try:
+        # FIX: Properly format the value for the 'contains' filter.
+        # It needs to be a JSON array containing a JSON string.
+        json_ign_for_query = json.dumps([ign])
+
+        # Use the @> operator to check if the jsonb array contains the player's name
+        count_resp = await run_supabase_sync(
+            lambda: supabase.table("super_defeats").select("id", count='exact').contains("players", json_ign_for_query).execute()
+        )
+        total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
+        if total_count == 0:
+            return [], 0
+
+        data_resp = await run_supabase_sync(
+            lambda: supabase.table("super_defeats")
+                           .select("id, event_timestamp, rarity, mob, players")
+                           .contains("players", json_ign_for_query)
+                           .order("event_timestamp", desc=True)
+                           .order("id", desc=True)
+                           .range(offset, offset + per_page - 1)
+                           .execute()
+        )
+        return (data_resp.data if data_resp and data_resp.data else []), total_count
+    except Exception as e:
+        await log_error(guild, f"Error fetching super defeat log for {ign}", error=e)
+        return [], 0
+
 async def _revive_static_list_views():
     """On startup, finds old static list messages and attaches new, live views."""
     print("--- Reviving Static List Views ---")
@@ -388,21 +459,28 @@ async def _catch_up_missed_self_bot_events():
         last_msg_resp = await run_supabase_sync(
             lambda: supabase.table("super_craft_logs").select("original_message_id").order("id", desc=True).limit(1).maybe_single().execute()
         )
-        if last_msg_resp and last_msg_resp.data:
+        if last_msg_resp and last_msg_resp.data and last_msg_resp.data.get('original_message_id'):
             last_message_id = int(last_msg_resp.data['original_message_id'])
         else:
-            print("Catch-up: No previous craft logs found. Skipping catch-up.")
+            print("Catch-up: No previous craft logs found. Skipping catch-up as there's no starting point.")
             return
 
         # 2. Get the channel object
         try:
             channel_id = int(SUPER_CRAFT_SELF_BOT_CHANNEL_ID)
-            channel = await bot.fetch_channel(channel_id)
+            # Use bot.get_channel first if the bot might be in the guild, then fallback to fetch
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                channel = await bot.fetch_channel(channel_id)
+            
             if not isinstance(channel, discord.TextChannel):
                 print(f"Catch-up: Channel ID {channel_id} is not a valid text channel.")
                 return
-        except (ValueError, discord.NotFound, discord.Forbidden) as e:
-            print(f"Catch-up: Could not fetch self-bot channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). Error: {e}")
+        except (ValueError, discord.NotFound) as e:
+            print(f"Catch-up ERROR: Could not find self-bot channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). Error: {e}")
+            return
+        except discord.Forbidden:
+            print(f"Catch-up ERROR: 403 Forbidden. The main bot does not have permission to access the self-bot's channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). This is expected if the channel is private to the self-bot.")
             return
 
         print(f"Catch-up: Starting fetch from channel #{channel.name} after message ID {last_message_id}.")
@@ -2861,12 +2939,12 @@ class AddUnknownAttemptsModal(discord.ui.Modal, title="Add Unknown Super Attempt
         label="Number of unknown attempts to add (1-100)",
         placeholder="e.g., 5",
         min_length=1,
-        max_length=3, # Allows up to 999, but we'll cap at 100
+        max_length=3,
         style=discord.TextStyle.short,
         required=True
     )
 
-    def __init__(self, view_ref: 'ProfilePagesView'): # Forward reference
+    def __init__(self, view_ref: 'ProfilePagesView'):
         super().__init__(timeout=120.0)
         self.view_ref = view_ref
 
@@ -2875,35 +2953,31 @@ class AddUnknownAttemptsModal(discord.ui.Modal, title="Add Unknown Super Attempt
         
         try:
             num_to_add = int(self.num_attempts_input.value)
-            if not (1 <= num_to_add <= 1000): # Sensible limit
+            if not (1 <= num_to_add <= 1000):
                 await interaction.followup.send("❌ Please enter a number between 1 and 1000.", ephemeral=True)
                 return
         except ValueError:
             await interaction.followup.send("❌ Invalid number entered.", ephemeral=True)
             return
 
-        if not self.view_ref.hc_profile_data or not self.view_ref.hc_profile_data.get("ingame_name"):
+        ign = self.view_ref.hc_profile_data.get("ingame_name")
+        if not ign:
             await interaction.followup.send("❌ Cannot add attempts: IGN not found for this profile.", ephemeral=True)
             return
-        
-        ign = self.view_ref.hc_profile_data.get("ingame_name")
-        author_id = int(self.view_ref.target_user_display_data.get("_discord_id_for_sa_management")) # Relies on this being set
+
+        author_id_str = self.view_ref.target_user_display_data.get("_discord_id_for_sa_management")
+        author_id = int(author_id_str) if author_id_str else self.view_ref.original_command_interaction.user.id
 
         success, msg = await add_unknown_super_attempts(interaction.guild, ign, num_to_add, author_id)
         
-        feedback_color = discord.Color.green() if success else discord.Color.orange()
-        feedback_embed = discord.Embed(title="Add Unknown Attempts Result", description=msg, color=feedback_color)
+        feedback_embed = discord.Embed(title="Add Unknown Attempts Result", description=msg, color=discord.Color.green() if success else discord.Color.orange())
         await interaction.followup.send(embed=feedback_embed, ephemeral=True)
 
         if success:
-            # Refresh the log page if currently on it
-            if self.view_ref.current_page_mode == ProfilePagesView.SUPER_ATTEMPT_LOG_PAGE:
-                # Refetch current page data for the log
-                await self.view_ref._fetch_s_attempt_log_page_data(self.view_ref.s_attempt_log_current_page) 
-            # Also, refetch overall stats as they have changed
             await self.view_ref._fetch_super_attempt_stats_data()
-            # Trigger a view update (this should handle being on stats or log page)
-            await self.view_ref._update_message(interaction) # Use the modal's interaction for the update context
+            if self.view_ref.current_page_mode == ProfilePagesView.SUPER_ATTEMPT_LOG_PAGE:
+                await self.view_ref._fetch_s_attempt_log_page_data(self.view_ref.s_attempt_log_current_page)
+            await self.view_ref._update_message(interaction)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await log_error(interaction.guild, "Error in AddUnknownAttemptsModal", error=error, interaction=interaction)
@@ -2926,42 +3000,40 @@ class RemoveAttemptModal(discord.ui.Modal, title="Remove Super Attempt Log Entry
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-
+        entry_data_source = []
+        if self.view_ref.current_page_mode == ProfilePagesView.SUPER_ATTEMPT_LOG_PAGE:
+            entry_data_source = self.view_ref.current_s_attempt_log_entries
+        elif self.view_ref.current_page_mode == ProfilePagesView.SUPER_CRAFT_LOG_PAGE:
+            entry_data_source = self.view_ref.current_s_craft_log_entries
+        
         try:
             entry_num_on_page = int(self.entry_number_input.value)
-            # Validate against number of entries on current page (1-indexed for user)
-            if not (1 <= entry_num_on_page <= len(self.view_ref.current_s_attempt_log_entries)):
-                await interaction.followup.send(
-                    f"❌ Invalid entry number. Please enter a number between 1 and {len(self.view_ref.current_s_attempt_log_entries)} "
-                    f"for the current page.", 
-                    ephemeral=True
-                )
+            if not (1 <= entry_num_on_page <= len(entry_data_source)):
+                await interaction.followup.send(f"❌ Invalid entry number. Please enter a number between 1 and {len(entry_data_source)} for the current page.", ephemeral=True)
                 return
         except ValueError:
             await interaction.followup.send("❌ Invalid number entered.", ephemeral=True)
             return
 
-        # Get the DB ID of the selected entry
-        # current_s_attempt_log_entries is 0-indexed internally
-        entry_to_remove_data = self.view_ref.current_s_attempt_log_entries[entry_num_on_page - 1]
+        entry_to_remove_data = entry_data_source[entry_num_on_page - 1]
         attempt_db_id_to_remove = entry_to_remove_data.get('id')
-
         if not attempt_db_id_to_remove:
             await interaction.followup.send("❌ Error: Could not find database ID for the selected entry.", ephemeral=True)
             return
 
+        # For now, only super attempts can be removed this way. Craft/Defeat removal would need separate logic.
+        if self.view_ref.current_page_mode != ProfilePagesView.SUPER_ATTEMPT_LOG_PAGE:
+             await interaction.followup.send("❌ Removal is currently only supported for Super Attempt logs.", ephemeral=True)
+             return
+
         success, msg = await remove_super_attempt_by_id(interaction.guild, attempt_db_id_to_remove)
         
-        feedback_color = discord.Color.green() if success else discord.Color.orange()
-        feedback_embed = discord.Embed(title="Remove Attempt Result", description=msg, color=feedback_color)
+        feedback_embed = discord.Embed(title="Remove Attempt Result", description=msg, color=discord.Color.green() if success else discord.Color.orange())
         await interaction.followup.send(embed=feedback_embed, ephemeral=True)
 
         if success:
-            # Refresh the log page
-            await self.view_ref._fetch_s_attempt_log_page_data(self.view_ref.s_attempt_log_current_page)
-            # Also, refetch overall stats
             await self.view_ref._fetch_super_attempt_stats_data()
-            # Trigger a view update
+            await self.view_ref._fetch_s_attempt_log_page_data(self.view_ref.s_attempt_log_current_page)
             await self.view_ref._update_message(interaction)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -3949,461 +4021,313 @@ class ProfileMonthSelect(discord.ui.Select):
 class ProfilePagesView(discord.ui.View):
     MAIN_PAGE = "main"
     MONTHLY_PAGE = "monthly"
-    SUPER_ATTEMPT_STATS_PAGE = "sa_stats" # New
-    SUPER_ATTEMPT_LOG_PAGE = "sa_log"     # New
-    SA_LOG_ENTRIES_PER_PAGE = 10          # New
+    SUPER_ATTEMPT_STATS_PAGE = "sa_stats"
+    SUPER_ATTEMPT_LOG_PAGE = "sa_log"
+    SUPER_CRAFT_LOG_PAGE = "sc_log"
+    SUPER_DEFEAT_LOG_PAGE = "sd_log"
+    SA_LOG_ENTRIES_PER_PAGE = 50
 
-    def __init__(self, interaction: discord.Interaction,
-                 target_user_display_data: Dict[str, Any], # Must contain '_member_object_ref' and '_discord_id_for_sa_management'
-                 hc_profile_data: Optional[Dict[str, Any]],
-                 activity_summary_data: Optional[Dict[str, Any]],
-                 initial_monthly_active_dates: Optional[Set[datetime.date]],
-                 super_attempt_stats_data: Optional[Dict[str, Any]], # New
-                 today_date_obj: datetime.date,
-                 timeout=300.0): # Increased timeout slightly
+    def __init__(self, interaction: discord.Interaction, target_user_display_data: Dict[str, Any], hc_profile_data: Dict[str, Any],
+                 activity_summary_data: Optional[Dict[str, Any]], initial_monthly_active_dates: Set[datetime.date],
+                 super_attempt_stats_data: Optional[Dict[str, Any]],
+                 initial_craft_logs: List[Dict[str, Any]], total_crafts: int,
+                 initial_defeat_logs: List[Dict[str, Any]], total_defeats: int,
+                 today_date_obj: datetime.date, timeout=300.0):
         super().__init__(timeout=timeout)
         self.original_command_interaction = interaction
         self.target_user_display_data = target_user_display_data
         self.hc_profile_data = hc_profile_data
         self.activity_summary_data = activity_summary_data
-        self.super_attempt_stats_data = super_attempt_stats_data # Store pre-fetched stats
-
-        self.profile_target_member: Optional[discord.Member] = None
-        if isinstance(target_user_display_data.get('_member_object_ref'), discord.Member):
-            self.profile_target_member = target_user_display_data['_member_object_ref']
+        self.super_attempt_stats_data = super_attempt_stats_data
         
-        # State for monthly activity view
+        self.monthly_active_dates_for_current_view = initial_monthly_active_dates
         self.current_display_month = today_date_obj.month
         self.current_display_year = today_date_obj.year
-        self.monthly_active_dates_for_current_view = initial_monthly_active_dates or set()
-        
         self.today_date_obj = today_date_obj
         
         self.current_page_mode = self.MAIN_PAGE
         self.message: Optional[discord.Message] = None
 
-        # Super Attempt Log State
+        # State for Super Attempt Logs
         self.s_attempt_log_current_page = 0
-        self.s_attempt_log_total_pages = 0
-        self.s_attempt_log_total_entries = 0 # Total entries for THIS user
-        self.current_s_attempt_log_entries: List[Dict[str, Any]] = []
-        self.is_fetching_sa_log = False # Lock for Satt log fetching
+        self.s_attempt_log_total_entries = self.super_attempt_stats_data.get('total_attempts', 0) if self.super_attempt_stats_data else 0
+        self.s_attempt_log_total_pages = math.ceil(self.s_attempt_log_total_entries / self.SA_LOG_ENTRIES_PER_PAGE) if self.s_attempt_log_total_entries > 0 else 1
+        self.current_s_attempt_log_entries = []
 
+        # State for Super Craft Logs
+        self.s_craft_log_current_page = 0
+        self.s_craft_log_total_entries = total_crafts
+        self.s_craft_log_total_pages = math.ceil(total_crafts / self.SA_LOG_ENTRIES_PER_PAGE) if total_crafts > 0 else 1
+        self.current_s_craft_log_entries = initial_craft_logs
+        
+        # State for Super Defeat Logs
+        self.s_defeat_log_current_page = 0
+        self.s_defeat_log_total_entries = total_defeats
+        self.s_defeat_log_total_pages = math.ceil(total_defeats / self.SA_LOG_ENTRIES_PER_PAGE) if total_defeats > 0 else 1
+        self.current_s_defeat_log_entries = initial_defeat_logs
+
+        self.is_fetching_log = False
         self._update_ui_elements()
 
     def _update_ui_elements(self):
         self.clear_items()
         
-        # Common: Back to Main Profile (if not on main)
         if self.current_page_mode != self.MAIN_PAGE:
             back_to_main_btn = discord.ui.Button(label="⬅️ Back to Main Profile", style=discord.ButtonStyle.primary, custom_id=f"profile_nav_{self.MAIN_PAGE}", row=0)
             back_to_main_btn.callback = self.navigation_button_callback
             self.add_item(back_to_main_btn)
 
         if self.current_page_mode == self.MAIN_PAGE:
-            if self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-                monthly_btn = discord.ui.Button(label="🗓️ View Monthly Activity", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.MONTHLY_PAGE}", row=0)
-                monthly_btn.callback = self.navigation_button_callback
-                self.add_item(monthly_btn)
-
-                s_attempt_btn = discord.ui.Button(label="💥 Super Attempt Details", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_STATS_PAGE}", row=0)
-                s_attempt_btn.callback = self.navigation_button_callback
-                self.add_item(s_attempt_btn)
+            if self.activity_summary_data:
+                self.add_item(discord.ui.Button(label="🗓️ View Activity Calendar", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.MONTHLY_PAGE}", row=0))
+            if self.super_attempt_stats_data and self.super_attempt_stats_data.get('total_attempts', 0) > 0:
+                self.add_item(discord.ui.Button(label="💥 Super Attempt Details", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_STATS_PAGE}", row=0))
+            if self.s_craft_log_total_entries > 0:
+                self.add_item(discord.ui.Button(label="🛠️ View Super Crafts", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_CRAFT_LOG_PAGE}", row=1))
+            if self.s_defeat_log_total_entries > 0:
+                self.add_item(discord.ui.Button(label="⚔️ View Super Defeats", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_DEFEAT_LOG_PAGE}", row=1))
+            for item in self.children:
+                if isinstance(item, discord.ui.Button): item.callback = self.navigation_button_callback
 
         elif self.current_page_mode == self.MONTHLY_PAGE:
-            # Back to main already added
-            self.add_item(ProfileMonthSelect(
-                current_real_year=self.today_date_obj.year, 
-                current_real_month=self.today_date_obj.month,
-                currently_selected_year=self.current_display_year,
-                currently_selected_month=self.current_display_month,
-                num_months_to_show=12
-            ))
-        
+            self.add_item(ProfileMonthSelect(self.today_date_obj.year, self.today_date_obj.month, self.current_display_year, self.current_display_month))
+
         elif self.current_page_mode == self.SUPER_ATTEMPT_STATS_PAGE:
-            # Back to main already added
-            view_log_btn = discord.ui.Button(label="📜 View Full Log", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_LOG_PAGE}", row=1)
-            view_log_btn.callback = self.navigation_button_callback
-            self.add_item(view_log_btn)
+            self.add_item(discord.ui.Button(label="📜 View Full Log", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_LOG_PAGE}", row=1, callback=self.navigation_button_callback))
+        
+        elif self.current_page_mode in [self.SUPER_ATTEMPT_LOG_PAGE, self.SUPER_CRAFT_LOG_PAGE, self.SUPER_DEFEAT_LOG_PAGE]:
+            self._add_pagination_controls()
 
-        elif self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE:
-            # Back to main already added (row 0)
-            # Back to Satt Stats (row 1, next to log nav)
-            back_to_sa_stats_btn = discord.ui.Button(label="📊 Back to Satt Stats", style=discord.ButtonStyle.primary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_STATS_PAGE}", row=1)
-            back_to_sa_stats_btn.callback = self.navigation_button_callback
-            self.add_item(back_to_sa_stats_btn)
+    def _add_pagination_controls(self):
+        page_mode_prefix = self.current_page_mode
+        current_page, total_pages = 0, 1
+        if page_mode_prefix == self.SUPER_ATTEMPT_LOG_PAGE:
+            current_page, total_pages = self.s_attempt_log_current_page, self.s_attempt_log_total_pages
+        elif page_mode_prefix == self.SUPER_CRAFT_LOG_PAGE:
+            current_page, total_pages = self.s_craft_log_current_page, self.s_craft_log_total_pages
+        elif page_mode_prefix == self.SUPER_DEFEAT_LOG_PAGE:
+            current_page, total_pages = self.s_defeat_log_current_page, self.s_defeat_log_total_pages
 
-            # Log Navigation (row 1)
-            log_prev_btn = discord.ui.Button(label="⬅️ Prev Log Page", style=discord.ButtonStyle.blurple, custom_id="profile_sa_log_prev", row=1, disabled=(self.s_attempt_log_current_page == 0 or self.is_fetching_sa_log))
-            log_prev_btn.callback = self.handle_s_attempt_log_prev
-            self.add_item(log_prev_btn)
-            
-            log_next_btn = discord.ui.Button(label="Next Log Page ➡️", style=discord.ButtonStyle.blurple, custom_id="profile_sa_log_next", row=1, disabled=(self.s_attempt_log_current_page >= self.s_attempt_log_total_pages - 1 or self.is_fetching_sa_log))
-            log_next_btn.callback = self.handle_s_attempt_log_next
-            self.add_item(log_next_btn)
+        prev_btn = discord.ui.Button(label="⬅️ Prev", style=discord.ButtonStyle.blurple, custom_id=f"profile_log_prev_{page_mode_prefix}", row=1, disabled=(current_page == 0 or self.is_fetching_log))
+        prev_btn.callback = self.handle_log_pagination
+        self.add_item(prev_btn)
+        
+        next_btn = discord.ui.Button(label="Next ➡️", style=discord.ButtonStyle.blurple, custom_id=f"profile_log_next_{page_mode_prefix}", row=1, disabled=(current_page >= total_pages - 1 or self.is_fetching_log))
+        next_btn.callback = self.handle_log_pagination
+        self.add_item(next_btn)
 
-            # Management Buttons (row 2, if owner)
-            profile_owner_discord_id = self.target_user_display_data.get("_discord_id_for_sa_management")
-            if profile_owner_discord_id and str(self.original_command_interaction.user.id) == str(profile_owner_discord_id):
-                add_sa_btn = discord.ui.Button(label="➕ Add Unknown Attempt(s)", style=discord.ButtonStyle.success, custom_id="profile_sa_add_unknown", row=2)
-                add_sa_btn.callback = self.handle_add_s_attempt
-                self.add_item(add_sa_btn)
-
-                remove_sa_btn = discord.ui.Button(label="➖ Remove Log Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_sa_log))
-                remove_sa_btn.callback = self.handle_remove_s_attempt
-                self.add_item(remove_sa_btn)
+        profile_owner_discord_id = self.target_user_display_data.get("_discord_id_for_sa_management")
+        is_profile_owner = profile_owner_discord_id and str(self.original_command_interaction.user.id) == str(profile_owner_discord_id)
+        
+        if self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE and is_profile_owner:
+            self.add_item(discord.ui.Button(label="➕ Add Unknown", style=discord.ButtonStyle.success, custom_id="profile_sa_add_unknown", row=2, callback=self.handle_add_s_attempt))
+            self.add_item(discord.ui.Button(label="➖ Remove Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_log), callback=self.handle_remove_s_attempt))
 
     def _create_main_embed(self) -> discord.Embed:
+        is_partial_profile = not self.hc_profile_data.get('discord_id') and not self.hc_profile_data.get('is_in_hc')
+        
         embed = discord.Embed(
-            title=f"🌟 [HC1] Profile: {discord.utils.escape_markdown(self.target_user_display_data['name'])}",
+            title=f"🌟 Profile: {discord.utils.escape_markdown(self.target_user_display_data['name'])}",
             color=NERDY_YELLOW
         )
         if self.target_user_display_data['avatar_url']:
             embed.set_thumbnail(url=self.target_user_display_data['avatar_url'])
 
-        ign_display = "`Not Linked / Not Found`"
-        hc_status_display = "❔ `Status Unknown (Not in DB)`"
+        ign_display = f"`{discord.utils.escape_markdown(self.hc_profile_data.get('ingame_name', 'N/A'))}`"
         
-        # Load server config for role IDs
-        guild_id = self.original_command_interaction.guild_id
-        config = server_settings_cache.get(guild_id, {})
-        ex_member_role_id = config.get('ex_member_role_id')
-
-        if self.hc_profile_data:
-            ign = self.hc_profile_data.get("ingame_name")
-            is_in_hc = self.hc_profile_data.get("is_in_hc")
-            ign_display = f"`{discord.utils.escape_markdown(ign)}`" if ign else "`Not Set in DB`"
-            if ign is not None:
-                if is_in_hc is True: 
-                    hc_status_display = "✅ `In Guild (HC1)`"
-                elif is_in_hc is False:
-                    has_ex_role = False
-                    if self.profile_target_member and ex_member_role_id:
-                        if any(role.id == ex_member_role_id for role in self.profile_target_member.roles):
-                            has_ex_role = True
-                    
-                    if has_ex_role:
-                        hc_status_display = "⏳ `Formerly in Guild (HC1)`"
-                    else:
-                        hc_status_display = "❌ `Not in Guild (HC1)`"
-                else:
-                    hc_status_display = "❔ `HC Status Unknown (DB)`" 
+        status_display = ""
+        if is_partial_profile:
+            status_display = "*(This is a partial profile based on event logs only)*"
+        else:
+            hc_status_display = "❔ `Status Unknown`"
+            if self.hc_profile_data.get('is_in_hc') is True: hc_status_display = "✅ `In Guild (HC1)`"
+            elif self.hc_profile_data.get('is_in_hc') is False: hc_status_display = "❌ `Not in Guild (HC1)`"
+            status_display = f"**Discord:** {self.target_user_display_data['mention_or_status']}\n**[HC1] Guild Status:** {hc_status_display}"
         
-        general_info_value = (
-            f"**Discord:** {self.target_user_display_data['mention_or_status']}\n"
-            f"**In-Game Name (IGN):** {ign_display}\n"
-            f"**[HC1] Guild Status:** {hc_status_display}"
-        )
-        embed.add_field(name="📋 General", value=general_info_value, inline=False)
+        embed.description = f"**In-Game Name (IGN):** {ign_display}\n{status_display}"
 
         if self.activity_summary_data:
-            activity_overview_value = (
-                f"**Active Today:** {self.activity_summary_data['active_today_display']}\n"
-                f"**Total Days Logged:** `{self.activity_summary_data['total_days_logged']}`\n"
-                f"**Last Seen Active:** {self.activity_summary_data['last_seen_display']}"
-            )
-            embed.add_field(name="📈 Activity Overview", value=activity_overview_value, inline=False)
-        elif self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-            embed.add_field(name="📈 Activity Overview", value="`No activity data found.`", inline=False)
-        else:
-            embed.add_field(name="📈 Activity Overview", value="`Activity data N/A (No IGN Linked).`", inline=False)
+            embed.add_field(name="📈 Activity", value=f"**Total Days Logged:** `{self.activity_summary_data['total_days_logged']}`\n**Last Seen:** {self.activity_summary_data['last_seen_display']}", inline=False)
         
-        if self.super_attempt_stats_data and self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-            sa_stats = self.super_attempt_stats_data
-            sa_value = (
-                f"**Total Super Attempts:** `{sa_stats.get('total_attempts', 0)}`\n"
-                f"**Favorite Petal:** `{sa_stats.get('favorite_petal_name', 'N/A')}` ({sa_stats.get('favorite_petal_attempts', 0)} attempts)"
-            )
-            embed.add_field(name="💥 Super Attempts Overview", value=sa_value, inline=False)
-        elif self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-             embed.add_field(name="💥 Super Attempts Overview", value="`No super attempt data found.`", inline=False)
-        else:
-            embed.add_field(name="💥 Super Attempts Overview", value="`Super attempt data N/A (No IGN Linked).`", inline=False)
+        if self.super_attempt_stats_data and self.super_attempt_stats_data.get('total_attempts', 0) > 0:
+            stats = self.super_attempt_stats_data
+            embed.add_field(name="💥 Super Attempts", value=f"**Total:** `{stats.get('total_attempts', 0)}`\n**Favorite:** `{stats.get('favorite_petal_name', 'N/A')}` ({stats.get('favorite_petal_attempts', 0)}x)", inline=True)
+        
+        if self.s_craft_log_total_entries > 0:
+            embed.add_field(name="🛠️ Super Crafts", value=f"**Total:** `{self.s_craft_log_total_entries}`", inline=True)
+            
+        if self.s_defeat_log_total_entries > 0:
+            embed.add_field(name="⚔️ Super Defeats", value=f"**Total:** `{self.s_defeat_log_total_entries}`", inline=True)
 
-        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()} | Use screenshot dropbox for activity!")
+        embed.set_footer(text=f"Profile data generated: {get_formatted_utc_now()}")
         return embed
 
     def _create_monthly_embed(self) -> discord.Embed:
-        # // --- UNCHANGED SECTION (ProfilePagesView._create_monthly_embed from previous state) --- //
-        ign = self.hc_profile_data.get("ingame_name") if self.hc_profile_data else "N/A"
-        embed = discord.Embed(
-            title=f"🗓️ Monthly Activity - {discord.utils.escape_markdown(ign)}",
-            color=NERDY_YELLOW
-        )
-            
-        monthly_string = generate_monthly_activity_string_v2(
-            self.monthly_active_dates_for_current_view,
-            self.current_display_month,
-            self.current_display_year,
-            self.today_date_obj
-        )
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"🗓️ Monthly Activity - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
+        monthly_string = generate_monthly_activity_string_v2(self.monthly_active_dates_for_current_view, self.current_display_month, self.current_display_year, self.today_date_obj)
         embed.description = monthly_string
-        display_month_obj = datetime.date(self.current_display_year, self.current_display_month, 1)
-        embed.set_footer(text=f"Calendar for {display_month_obj.strftime('%B %Y')}")
+        embed.set_footer(text=f"Calendar for {datetime.date(self.current_display_year, self.current_display_month, 1).strftime('%B %Y')}")
         return embed
-        # // --- END UNCHANGED SECTION (ProfilePagesView._create_monthly_embed from previous state) --- //
 
     def _create_super_attempt_stats_embed(self) -> discord.Embed:
-        ign = self.hc_profile_data.get("ingame_name") if self.hc_profile_data else "N/A"
-        embed = discord.Embed(
-            title=f"💥 Super Attempt Statistics - {discord.utils.escape_markdown(ign)}",
-            color=NERDY_YELLOW
-        )
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"💥 Super Attempt Statistics - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
         if not self.super_attempt_stats_data or self.super_attempt_stats_data.get('total_attempts', 0) == 0:
             embed.description = "No super attempt data recorded for this user."
             return embed
-
         stats = self.super_attempt_stats_data
-        
-        top_petals_str_parts = []
-        if stats['top_petals']:
-            for i, petal_data in enumerate(stats['top_petals']):
-                # Optional: include petals lost per attempt for these top 3
-                # avg_lost_this_petal = round(petal_data['total_petals_lost_for_petal'] / petal_data['attempts'], 1) if petal_data['attempts'] > 0 else 0
-                # top_petals_str_parts.append(f"{i+1}. `{petal_data['petal_name']}`: {petal_data['attempts']} attempts (avg {avg_lost_this_petal} lost)")
-                top_petals_str_parts.append(f"{i+1}. `{petal_data['petal_name']}`: {petal_data['attempts']} attempts")
-        else:
-            top_petals_str_parts.append("`No specific petals recorded (or only 'Unknown').`")
-
-        embed.add_field(name="🏆 Top 3 Attempted petals", value="\n".join(top_petals_str_parts) or "`N/A`", inline=False)
-        
-        overall_stats_value = (
-            f"**Total Super Attempts (All):** `{stats.get('total_attempts', 0)}`\n"
-            f"**Total Petals Lost (All):** `{stats.get('total_petals_lost', 0.0):.1f}`\n" # Display with 1 decimal for 2.5
-            f"**Average Petals Lost per Attempt:** `{stats.get('average_petals_lost_per_attempt', 0.0):.2f}`"
-        )
+        top_petals_str_parts = [f"{i+1}. `{petal_data['petal_name']}`: {petal_data['attempts']} attempts" for i, petal_data in enumerate(stats['top_petals'])] or ["`No specific petals recorded.`"]
+        embed.add_field(name="🏆 Top 3 Attempted Petals", value="\n".join(top_petals_str_parts), inline=False)
+        overall_stats_value = f"**Total Super Attempts:** `{stats.get('total_attempts', 0)}`\n**Total Petals Lost:** `{stats.get('total_petals_lost', 0.0):.1f}`\n**Average Petals Lost:** `{stats.get('average_petals_lost_per_attempt', 0.0):.2f}`"
         embed.add_field(name="📊 Overall", value=overall_stats_value, inline=False)
-        embed.set_footer(text=f"Stats as of: {get_formatted_utc_now()}")
         return embed
 
     def _create_super_attempt_log_embed(self) -> discord.Embed:
-        ign = self.hc_profile_data.get("ingame_name") if self.hc_profile_data else "N/A"
-        embed = discord.Embed(
-            title=f"📜 Super Attempt Log - {discord.utils.escape_markdown(ign)}",
-            color=NERDY_YELLOW
-        )
-
-        if self.is_fetching_sa_log:
-            embed.description = "⏳ Fetching log entries..."
-            return embed
-            
-        if not self.current_s_attempt_log_entries:
-            embed.description = "No super attempt log entries found."
-            if self.s_attempt_log_total_entries > 0 : # Has entries but this page is empty (should not happen if page num is managed)
-                embed.description += " (Try previous pages if available)."
-        else:
-            log_desc_parts = []
-            start_idx = self.s_attempt_log_current_page * self.SA_LOG_ENTRIES_PER_PAGE
-            for i, entry in enumerate(self.current_s_attempt_log_entries):
-                entry_num_on_page = i + 1
-                # overall_entry_num = start_idx + entry_num_on_page # If you want overall numbering
-                date_str = format_date_dmy(entry['attempt_date']) if entry['attempt_date'] else "Unknown Date"
-                petal_display = _get_display_friendly_petal_name(entry['chosen_petal_name']) if entry['chosen_petal_name'] else "Unknown"
-                petals_lost_str = f"{entry['petals_lost']:.1f}" # Display with 1 decimal for 2.5
-                
-                log_desc_parts.append(
-                    f"**{entry_num_on_page}.** Date: `{date_str}`, Petal: `{petal_display}`, Lost: `{petals_lost_str}`"
-                )
-            embed.description = "\n".join(log_desc_parts)
-
-        footer_text = f"Page {self.s_attempt_log_current_page + 1}/{self.s_attempt_log_total_pages} ({self.s_attempt_log_total_entries} total entries)"
-        if self.is_fetching_sa_log: footer_text += " | Fetching..."
-        embed.set_footer(text=footer_text)
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"📜 Super Attempt Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
+        if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
+        if not self.current_s_attempt_log_entries: embed.description = "No super attempt log entries found."; return embed
+        log_desc_parts = []
+        for i, entry in enumerate(self.current_s_attempt_log_entries):
+            date_str = format_date_dmy(date_parse(entry['attempt_date']).date()) if entry['attempt_date'] else "Unknown Date"
+            petal_display = _get_display_friendly_petal_name(entry['chosen_petal_name']) if entry['chosen_petal_name'] else "Unknown"
+            log_desc_parts.append(f"**{i+1}.** Date: `{date_str}`, Petal: `{petal_display}`, Lost: `{entry['petals_lost']:.1f}`")
+        embed.description = "\n".join(log_desc_parts)
+        embed.set_footer(text=f"Page {self.s_attempt_log_current_page + 1}/{self.s_attempt_log_total_pages} ({self.s_attempt_log_total_entries} total)")
+        return embed
+    
+    def _create_super_craft_log_embed(self) -> discord.Embed:
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"🛠️ Super Craft Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
+        if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
+        if not self.current_s_craft_log_entries: embed.description = "No super craft log entries found."; return embed
+        log_desc_parts = [f"**{i+1}.** Date: `{format_date_dmy(date_parse(e['craft_date']).date())}`, Petal: `{e['super_petal_name']}`" for i, e in enumerate(self.current_s_craft_log_entries)]
+        embed.description = "\n".join(log_desc_parts)
+        embed.set_footer(text=f"Page {self.s_craft_log_current_page + 1}/{self.s_craft_log_total_pages} ({self.s_craft_log_total_entries} total)")
         return embed
 
-    async def _update_message(self, interaction_to_respond_to: discord.Interaction):
-        self._update_ui_elements() 
-        embed_to_send: discord.Embed
-        if self.current_page_mode == self.MONTHLY_PAGE:
-            embed_to_send = self._create_monthly_embed()
-        elif self.current_page_mode == self.SUPER_ATTEMPT_STATS_PAGE:
-            embed_to_send = self._create_super_attempt_stats_embed()
-        elif self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE:
-            embed_to_send = self._create_super_attempt_log_embed()
-        else: 
-            embed_to_send = self._create_main_embed()
+    def _create_super_defeat_log_embed(self) -> discord.Embed:
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"⚔️ Super Defeat Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
+        if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
+        if not self.current_s_defeat_log_entries: embed.description = "No super defeat log entries found."; return embed
+        log_desc_parts = []
+        for i, e in enumerate(self.current_s_defeat_log_entries):
+            date_str = format_date_dmy(date_parse(e['event_timestamp']).date()) if e.get('event_timestamp') else "Unknown"
+            log_desc_parts.append(f"**{i+1}.** Date: `{date_str}`, Mob: `{e['rarity']} {e['mob']}`")
+        embed.description = "\n".join(log_desc_parts)
+        embed.set_footer(text=f"Page {self.s_defeat_log_current_page + 1}/{self.s_defeat_log_total_pages} ({self.s_defeat_log_total_entries} total)")
+        return embed
+
+    async def _update_message(self, interaction: discord.Interaction):
+        self._update_ui_elements()
+        embed_map = {
+            self.MAIN_PAGE: self._create_main_embed,
+            self.MONTHLY_PAGE: self._create_monthly_embed,
+            self.SUPER_ATTEMPT_STATS_PAGE: self._create_super_attempt_stats_embed,
+            self.SUPER_ATTEMPT_LOG_PAGE: self._create_super_attempt_log_embed,
+            self.SUPER_CRAFT_LOG_PAGE: self._create_super_craft_log_embed,
+            self.SUPER_DEFEAT_LOG_PAGE: self._create_super_defeat_log_embed,
+        }
+        embed_to_send = embed_map.get(self.current_page_mode, self._create_main_embed)()
         
         try:
-            # Use edit_original_response if interaction is not done
-            if not interaction_to_respond_to.response.is_done():
-                 await interaction_to_respond_to.response.edit_message(embed=embed_to_send, view=self)
-            elif self.message: # If interaction is done, try to edit the view's message object
-                 await self.message.edit(embed=embed_to_send, view=self)
-            else: # Fallback if no message object and interaction is done (should be rare)
-                 await interaction_to_respond_to.followup.send(embed=embed_to_send, view=self, ephemeral=False) # Send new if all else fails
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=embed_to_send, view=self)
+            elif self.message:
+                await self.message.edit(embed=embed_to_send, view=self)
         except discord.HTTPException as e:
-            print(f"Error updating profile page view: {e}")
-            guild_for_log = interaction_to_respond_to.guild 
-            if bot and hasattr(bot, 'log_error_global'):
-                 await bot.log_error_global(guild_for_log, "Failed to update profile page message", error=e)
-            elif guild_for_log:
-                 await log_error(guild_for_log, "Failed to update profile page message (fallback log)", error=e)
-            # No deferral needed here as it's assumed interaction was already responded to or deferred
-    
+            await log_error(interaction.guild, "Failed to update profile page message", error=e)
+
     async def _fetch_super_attempt_stats_data(self):
-        """Fetches/Refreshes super_attempt_stats_data for the view."""
-        if self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-            ign = self.hc_profile_data.get("ingame_name")
-            self.super_attempt_stats_data = await get_user_super_attempt_stats(self.original_command_interaction.guild, ign)
-        else:
-            self.super_attempt_stats_data = None # Clear if no IGN
+        ign = self.hc_profile_data.get("ingame_name")
+        if ign: self.super_attempt_stats_data = await get_user_super_attempt_stats(self.original_command_interaction.guild, ign)
 
     async def _fetch_s_attempt_log_page_data(self, page_num: int):
-        """Fetches data for a specific page of the Satt log."""
-        if not self.hc_profile_data or not self.hc_profile_data.get("ingame_name"):
-            self.current_s_attempt_log_entries = []
-            self.s_attempt_log_total_pages = 0
-            self.s_attempt_log_total_entries = 0
-            return
-
         ign = self.hc_profile_data.get("ingame_name")
-        self.is_fetching_sa_log = True
-        # Update UI to show loading state on buttons if needed, then call _update_message
-        # For now, the embed itself will show "Fetching..."
-        
-        entries, total_entries = await get_super_attempt_log_entries(
-            self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE
-        )
+        if not ign: self.current_s_attempt_log_entries = []; return
+        self.is_fetching_log = True
+        entries, _ = await get_super_attempt_log_entries(self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE)
         self.current_s_attempt_log_entries = entries
-        self.s_attempt_log_total_entries = total_entries
-        self.s_attempt_log_total_pages = math.ceil(total_entries / self.SA_LOG_ENTRIES_PER_PAGE) if total_entries > 0 else 1
-        self.s_attempt_log_current_page = page_num # Ensure current page is set correctly
-        self.is_fetching_sa_log = False
+        self.s_attempt_log_current_page = page_num
+        self.is_fetching_log = False
+        
+    async def _fetch_s_craft_log_page_data(self, page_num: int):
+        ign = self.hc_profile_data.get("ingame_name")
+        if not ign: self.current_s_craft_log_entries = []; return
+        self.is_fetching_log = True
+        entries, _ = await get_user_super_craft_log_entries(self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE)
+        self.current_s_craft_log_entries = entries
+        self.s_craft_log_current_page = page_num
+        self.is_fetching_log = False
 
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return True 
+    async def _fetch_s_defeat_log_page_data(self, page_num: int):
+        ign = self.hc_profile_data.get("ingame_name")
+        if not ign: self.current_s_defeat_log_entries = []; return
+        self.is_fetching_log = True
+        entries, _ = await get_user_super_defeat_log_entries(self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE)
+        self.current_s_defeat_log_entries = entries
+        self.s_defeat_log_current_page = page_num
+        self.is_fetching_log = False
 
     async def navigation_button_callback(self, interaction: discord.Interaction):
-        button_custom_id = interaction.data.get('custom_id')
-        if not button_custom_id or not button_custom_id.startswith("profile_nav_"):
-            if not interaction.response.is_done(): await interaction.response.defer()
-            return
-
-        new_mode = button_custom_id.split("profile_nav_")[1]
-        
-        valid_modes = [self.MAIN_PAGE, self.MONTHLY_PAGE, self.SUPER_ATTEMPT_STATS_PAGE, self.SUPER_ATTEMPT_LOG_PAGE]
-        if new_mode not in valid_modes:
-            if not interaction.response.is_done(): await interaction.response.defer()
-            return
-
-        if self.current_page_mode == new_mode: 
+        new_mode = interaction.data['custom_id'].split("profile_nav_")[1]
+        if self.current_page_mode == new_mode:
             if not interaction.response.is_done(): await interaction.response.defer()
             return
 
         self.current_page_mode = new_mode
+        if new_mode == self.SUPER_ATTEMPT_LOG_PAGE: await self._fetch_s_attempt_log_page_data(0)
+        elif new_mode == self.SUPER_CRAFT_LOG_PAGE: await self._fetch_s_craft_log_page_data(0)
+        elif new_mode == self.SUPER_DEFEAT_LOG_PAGE: await self._fetch_s_defeat_log_page_data(0)
         
-        # Data fetching logic for new modes
-        if new_mode == self.SUPER_ATTEMPT_STATS_PAGE:
-            # Stats are usually pre-fetched or fetched on demand once
-            if not self.super_attempt_stats_data and self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-                await self._fetch_super_attempt_stats_data()
-        elif new_mode == self.SUPER_ATTEMPT_LOG_PAGE:
-            await self._fetch_s_attempt_log_page_data(0) # Fetch first page of log
-            self.s_attempt_log_current_page = 0 # Reset to first page
-
-        elif new_mode == self.MONTHLY_PAGE and \
-           (self.current_display_month != self.today_date_obj.month or self.current_display_year != self.today_date_obj.year):
-            if self.hc_profile_data and self.hc_profile_data.get("ingame_name"):
-                ign_lower = self.hc_profile_data.get("ingame_name").lower()
-                first_day_current_month = self.today_date_obj.replace(day=1)
-                if self.today_date_obj.month == 12:
-                    first_day_next_month = first_day_current_month.replace(year=self.today_date_obj.year + 1, month=1)
-                else:
-                    first_day_next_month = first_day_current_month.replace(month=self.today_date_obj.month + 1)
-                last_day_current_month = first_day_next_month - datetime.timedelta(days=1)
-
-                self.monthly_active_dates_for_current_view = await fetch_activity_dates_in_range(
-                    self.original_command_interaction.guild, ign_lower, 
-                    first_day_current_month, last_day_current_month
-                )
-                self.current_display_month = self.today_date_obj.month
-                self.current_display_year = self.today_date_obj.year
-            else: self.monthly_active_dates_for_current_view = set()
-
         await self._update_message(interaction)
 
     async def handle_month_selection(self, interaction: discord.Interaction, selected_value: str):
-        # // --- UNCHANGED SECTION (ProfilePagesView.handle_month_selection from previous state) --- //
-        try:
-            year_str, month_str = selected_value.split('-')
-            selected_year = int(year_str)
-            selected_month = int(month_str)
-        except ValueError:
-            await interaction.response.send_message("Invalid month selection format.", ephemeral=True)
-            return
-        if not self.hc_profile_data or not self.hc_profile_data.get("ingame_name"):
-            await interaction.response.send_message("Cannot fetch monthly data: No In-Game Name linked.", ephemeral=True)
-            return
-        ign_lower = self.hc_profile_data.get("ingame_name").lower()
-        try:
-            first_day_selected_month = datetime.date(selected_year, selected_month, 1)
-            if selected_month == 12:
-                first_day_next_selected_month = datetime.date(selected_year + 1, 1, 1)
-            else:
-                first_day_next_selected_month = datetime.date(selected_year, selected_month + 1, 1)
-            last_day_selected_month = first_day_next_selected_month - datetime.timedelta(days=1)
-        except ValueError:
-            await interaction.response.send_message("Invalid date for selected month/year.", ephemeral=True)
-            return
-        self.monthly_active_dates_for_current_view = await fetch_activity_dates_in_range(
-            self.original_command_interaction.guild, 
-            ign_lower, 
-            first_day_selected_month, 
-            last_day_selected_month
-        )
-        self.current_display_month = selected_month
-        self.current_display_year = selected_year
-        self.current_page_mode = self.MONTHLY_PAGE 
+        ign = self.hc_profile_data.get("ingame_name")
+        if not ign: await interaction.response.send_message("Cannot fetch monthly data: No IGN linked.", ephemeral=True); return
+        year, month = map(int, selected_value.split('-'))
+        first_day = datetime.date(year, month, 1)
+        last_day = (first_day.replace(month=first_day.month % 12 + 1, year=first_day.year + (first_day.month // 12))) - datetime.timedelta(days=1)
+        self.monthly_active_dates_for_current_view = await fetch_activity_dates_in_range(interaction.guild, ign.lower(), first_day, last_day)
+        self.current_display_month, self.current_display_year = month, year
         await self._update_message(interaction)
-        # // --- END UNCHANGED SECTION (ProfilePagesView.handle_month_selection from previous state) --- //
 
-    async def handle_s_attempt_log_prev(self, interaction: discord.Interaction):
-        if self.s_attempt_log_current_page > 0 and not self.is_fetching_sa_log:
-            self.s_attempt_log_current_page -= 1
-            await self._fetch_s_attempt_log_page_data(self.s_attempt_log_current_page)
-            await self._update_message(interaction)
-        elif not interaction.response.is_done(): # Ack if no action
-            await interaction.response.defer()
-
-
-    async def handle_s_attempt_log_next(self, interaction: discord.Interaction):
-        if self.s_attempt_log_current_page < self.s_attempt_log_total_pages - 1 and not self.is_fetching_sa_log:
-            self.s_attempt_log_current_page += 1
-            await self._fetch_s_attempt_log_page_data(self.s_attempt_log_current_page)
-            await self._update_message(interaction)
-        elif not interaction.response.is_done():
-            await interaction.response.defer()
+    async def handle_log_pagination(self, interaction: discord.Interaction):
+        action, page_mode = interaction.data['custom_id'].replace("profile_log_", "").split("_", 1)
+        
+        current_page, total_pages = 0, 1
+        if page_mode == self.SUPER_ATTEMPT_LOG_PAGE: current_page, total_pages = self.s_attempt_log_current_page, self.s_attempt_log_total_pages
+        elif page_mode == self.SUPER_CRAFT_LOG_PAGE: current_page, total_pages = self.s_craft_log_current_page, self.s_craft_log_total_pages
+        elif page_mode == self.SUPER_DEFEAT_LOG_PAGE: current_page, total_pages = self.s_defeat_log_current_page, self.s_defeat_log_total_pages
+        
+        new_page = current_page + (1 if action == "next" else -1)
+        if not (0 <= new_page < total_pages):
+            if not interaction.response.is_done(): await interaction.response.defer()
+            return
             
+        fetch_map = {
+            self.SUPER_ATTEMPT_LOG_PAGE: self._fetch_s_attempt_log_page_data,
+            self.SUPER_CRAFT_LOG_PAGE: self._fetch_s_craft_log_page_data,
+            self.SUPER_DEFEAT_LOG_PAGE: self._fetch_s_defeat_log_page_data,
+        }
+        await fetch_map[page_mode](new_page)
+        await self._update_message(interaction)
+
     async def handle_add_s_attempt(self, interaction: discord.Interaction):
-        modal = AddUnknownAttemptsModal(view_ref=self)
-        await interaction.response.send_modal(modal)
-        # Refresh logic is handled in modal's on_submit
+        await interaction.response.send_modal(AddUnknownAttemptsModal(view_ref=self))
 
     async def handle_remove_s_attempt(self, interaction: discord.Interaction):
-        modal = RemoveAttemptModal(view_ref=self)
-        await interaction.response.send_modal(modal)
-        # Refresh logic is handled in modal's on_submit
+        await interaction.response.send_modal(RemoveAttemptModal(view_ref=self))
 
     async def on_timeout(self):
-        # // --- UNCHANGED SECTION (ProfilePagesView.on_timeout from previous state) --- //
-        if self.message: 
+        if self.message:
             try:
-                timeout_embed: discord.Embed
-                if self.current_page_mode == self.MONTHLY_PAGE: timeout_embed = self._create_monthly_embed()
-                elif self.current_page_mode == self.SUPER_ATTEMPT_STATS_PAGE: timeout_embed = self._create_super_attempt_stats_embed()
-                elif self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE: timeout_embed = self._create_super_attempt_log_embed()
-                else: timeout_embed = self._create_main_embed()
-                
-                if timeout_embed.footer.text:
-                    timeout_embed.set_footer(text=f"{timeout_embed.footer.text} (Interaction timed out)")
-                else:
-                    timeout_embed.set_footer(text="Interaction timed out")
-
-                self.clear_items() 
-                await self.message.edit(embed=timeout_embed, view=self) 
-            except discord.HTTPException:
-                pass 
+                self._update_ui_elements()
+                for item in self.children: item.disabled = True
+                await self.message.edit(view=self) 
+            except discord.HTTPException: pass
         self.stop()
         # // --- END UNCHANGED SECTION (ProfilePagesView.on_timeout from previous state) --- //
 
@@ -7362,7 +7286,7 @@ async def hcmembers(interaction: discord.Interaction):
 
 # Replace the /profile command with this new version
 
-@tree.command(name="profile", description="View Florr.io [HC1] profile, activity stats, and recent activity patterns.")
+@tree.command(name="profile", description="View Florr.io profile, activity, super attempts, crafts, and defeats.")
 @app_commands.describe(
     user="[Optional] Select a Discord user to view their profile.",
     ingame_name="[Optional] Or, type an In-Game Name to view its profile."
@@ -7379,171 +7303,102 @@ async def profile(interaction: discord.Interaction,
         await interaction.edit_original_response(content="❌ Database connection unavailable. Cannot fetch profile data.", embed=None, view=None)
         return
 
-    target_user_for_display: Union[discord.Member, discord.User, None] = None # More precise type
-    hc_profile_db_data: Optional[Dict[str, Any]] = None 
+    hc_profile_db_data: Optional[Dict[str, Any]] = None
+    partial_profile_ign: Optional[str] = None
     target_discord_id_str: Optional[str] = None
-    target_ign_from_db: Optional[str] = None 
     target_is_self_profile = False
-    error_message_for_user: Optional[str] = None
 
-    if user: 
-        target_user_for_display = user
+    if user:
         target_discord_id_str = str(user.id)
         hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
-        if hc_profile_db_data:
-            target_ign_from_db = hc_profile_db_data.get("ingame_name")
+        if not hc_profile_db_data:
+            await interaction.edit_original_response(content=f"❌ No profile data found for {user.mention}. They may need to use `/connect`.", view=None)
+            return
         if user.id == interaction.user.id:
             target_is_self_profile = True
-    elif ingame_name: 
-        cleaned_ign_param = ingame_name.strip()
-        if not cleaned_ign_param:
-            error_message_for_user = "❌ Provided In-Game Name was empty."
-        else:
-            hc_profile_db_data = await fetch_profile_details_by_ign(guild, cleaned_ign_param)
-            if hc_profile_db_data:
-                target_ign_from_db = hc_profile_db_data["ingame_name"] 
-                target_discord_id_str = hc_profile_db_data.get("discord_id")
-                if target_discord_id_str and guild:
-                    try:
-                        # Try to fetch member for avatar/name, fallback to bot user if not found
-                        target_user_for_display = await guild.fetch_member(int(target_discord_id_str))
-                    except (discord.NotFound, ValueError, AttributeError):
-                        target_user_for_display = bot.user # Fallback display
-                elif target_discord_id_str: # User ID exists but no guild context (e.g., DM)
-                     try: target_user_for_display = await bot.fetch_user(int(target_discord_id_str))
-                     except (discord.NotFound, ValueError): target_user_for_display = bot.user
-                else: # No Discord ID linked to IGN
-                    target_user_for_display = bot.user # Use bot for avatar if no user linked
-                
-                # Check if the found Discord ID (if any) matches the interactor
-                if target_discord_id_str and target_discord_id_str == str(interaction.user.id):
-                    target_is_self_profile = True
-                    # If it's a self profile via IGN, ensure target_user_for_display is the interactor
-                    if isinstance(interaction.user, (discord.Member, discord.User)):
-                         target_user_for_display = interaction.user
+    elif ingame_name:
+        cleaned_ign = ingame_name.strip()
+        hc_profile_db_data = await fetch_profile_details_by_ign(guild, cleaned_ign)
+        if not hc_profile_db_data:
+            # --- NEW: Fallback to check log tables ---
+            crafts, _ = await get_user_super_craft_log_entries(guild, cleaned_ign, 0, 1)
+            defeats, _ = await get_user_super_defeat_log_entries(guild, cleaned_ign, 0, 1)
+            if crafts or defeats:
+                partial_profile_ign = cleaned_ign
             else:
-                error_message_for_user = f"❌ No profile data found for IGN `{discord.utils.escape_markdown(cleaned_ign_param)}`."
-    else: # Neither user nor IGN provided, default to self
+                await interaction.edit_original_response(content=f"❌ No profile data or event logs found for IGN `{discord.utils.escape_markdown(cleaned_ign)}`.", view=None)
+                return
+        else:
+            target_discord_id_str = hc_profile_db_data.get("discord_id")
+            if target_discord_id_str and target_discord_id_str == str(interaction.user.id):
+                target_is_self_profile = True
+    else: # Default to self
         target_is_self_profile = True
-        target_user_for_display = interaction.user 
         target_discord_id_str = str(interaction.user.id)
         hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
-        if hc_profile_db_data:
-            target_ign_from_db = hc_profile_db_data.get("ingame_name")
-
-    if error_message_for_user:
-        await interaction.edit_original_response(content=error_message_for_user, embed=None, view=None)
-        return
-
-    # Permission check for viewing others' profiles
-    if not target_is_self_profile:
-        invoker_is_staff_or_owner = False
-        if guild and isinstance(interaction.user, discord.Member): # Must be in a guild to have perms
-            invoker_is_staff_or_owner = await can_manage_guild_or_is_bypass_user(interaction)
-        
-        if not invoker_is_staff_or_owner:
-            await interaction.edit_original_response(content="❌ You can only view your own profile or require staff permissions to view others'.", embed=None, view=None)
+        if not hc_profile_db_data:
+            await interaction.edit_original_response(content=f"❌ You don't have a profile yet. Use `/connect` to create one.", view=None)
             return
 
-    # Prepare display data for the view
-    display_name_for_view: str
-    avatar_url_for_view: Optional[str] = None
-    mention_or_status_for_view: str
-    actual_member_object_ref: Optional[discord.Member] = None # For role checks in view
-    discord_id_for_sa_management: Optional[str] = target_discord_id_str # Store the target's ID
-
-    if isinstance(target_user_for_display, (discord.Member, discord.User)):
-        display_name_for_view = target_user_for_display.display_name
-        avatar_url_for_view = target_user_for_display.display_avatar.url if target_user_for_display.display_avatar else target_user_for_display.default_avatar.url
-        mention_or_status_for_view = target_user_for_display.mention
-        if isinstance(target_user_for_display, discord.Member):
-             actual_member_object_ref = target_user_for_display
-    elif hc_profile_db_data and hc_profile_db_data.get("ingame_name"): # IGN-only case, or user not in server
-        display_name_for_view = hc_profile_db_data.get("ingame_name") 
-        if bot.user and bot.user.display_avatar : avatar_url_for_view = bot.user.display_avatar.url 
-        db_disc_name = hc_profile_db_data.get("discord_name")
-        db_disc_id = hc_profile_db_data.get("discord_id") # This is already stored in target_discord_id_str
-        if target_discord_id_str:
-            mention_or_status_for_view = f"`{discord.utils.escape_markdown(db_disc_name or f'ID: {target_discord_id_str}')}` (Info from DB / User not in server)"
-        else:
-            mention_or_status_for_view = "`Not Linked to Discord`"
-    else: 
-        await interaction.edit_original_response(content="❌ Critical error: Could not determine target for profile display.", embed=None, view=None)
-        await log_error(guild, "Profile: Failed to determine target for display", interaction=interaction)
+    # --- Permission Check ---
+    if not target_is_self_profile and not await can_manage_guild_or_is_bypass_user(interaction):
+        await interaction.edit_original_response(content="❌ You can only view your own profile or require staff permissions to view others'.", embed=None, view=None)
         return
 
-    target_user_display_data_for_view = {
-        "name": display_name_for_view,
-        "avatar_url": avatar_url_for_view,
-        "mention_or_status": mention_or_status_for_view,
-        "_member_object_ref": actual_member_object_ref, # For EX_MEMBER_ROLE_ID check
-        "_discord_id_for_sa_management": discord_id_for_sa_management # For Satt management buttons
+    # --- Consolidate Target Info ---
+    target_ign = (hc_profile_db_data.get("ingame_name") if hc_profile_db_data else None) or partial_profile_ign
+    if not target_ign:
+        await interaction.edit_original_response(content="❌ Critical error: Could not determine target IGN for profile.", view=None)
+        return
+        
+    target_user_for_display: Union[discord.Member, discord.User, None] = None
+    if target_discord_id_str and guild:
+        target_user_for_display = guild.get_member(int(target_discord_id_str))
+    elif target_discord_id_str:
+        target_user_for_display = await bot.fetch_user(int(target_discord_id_str))
+
+    # --- Prepare Display Data ---
+    display_name_for_view = target_user_for_display.display_name if target_user_for_display else target_ign
+    avatar_url_for_view = target_user_for_display.display_avatar.url if target_user_for_display and target_user_for_display.display_avatar else (bot.user.display_avatar.url if bot.user else None)
+    mention_or_status_for_view = target_user_for_display.mention if target_user_for_display else ("`Not in Main Player List`" if partial_profile_ign else "`Not Linked to Discord`")
+    
+    target_user_display_data = {
+        "name": display_name_for_view, "avatar_url": avatar_url_for_view, "mention_or_status": mention_or_status_for_view,
+        "_member_object_ref": target_user_for_display if isinstance(target_user_for_display, discord.Member) else None,
+        "_discord_id_for_sa_management": target_discord_id_str
     }
 
-    # --- Fetch Activity and Super Attempt Data ---
-    activity_summary_for_view: Optional[Dict[str, Any]] = None
-    initial_monthly_dates_for_view: Set[datetime.date] = set()
-    super_attempt_stats_data_for_view: Optional[Dict[str, Any]] = None # New
+    # --- Fetch All Stats and Logs ---
     today_utc_obj, _ = get_utc_date()
-
-    if target_ign_from_db and today_utc_obj:
-        ign_lower = target_ign_from_db.lower()
-        
-        # Activity Summary
+    activity_summary, initial_monthly_dates = None, set()
+    if hc_profile_db_data and today_utc_obj:
+        ign_lower = target_ign.lower()
         is_active_today = await check_activity_exists(guild, ign_lower, today_utc_obj)
-        active_today_disp = "❔ `N/A (DB Error)`"
-        if is_active_today is True: active_today_disp = "✅ `Yes`"
-        elif is_active_today is False: active_today_disp = "❌ `No`"
-        
+        active_today_disp = "✅ `Yes`" if is_active_today else "❌ `No`"
         all_time_summary = await fetch_activity_data(guild, [ign_lower])
         ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
-        
-        activity_summary_for_view = {
-            "active_today_display": active_today_disp,
-            "total_days_logged": ign_all_time_data['count'],
-            "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"
-        }
-        
-        # Initial Monthly Dates
-        first_day_of_current_month = today_utc_obj.replace(day=1)
-        if today_utc_obj.month == 12:
-            first_day_of_next_month = first_day_of_current_month.replace(year=today_utc_obj.year + 1, month=1)
-        else:
-            first_day_of_next_month = first_day_of_current_month.replace(month=today_utc_obj.month + 1)
-        last_day_of_current_month = first_day_of_next_month - datetime.timedelta(days=1)
-        
-        initial_monthly_dates_for_view = await fetch_activity_dates_in_range(
-            guild, ign_lower, first_day_of_current_month, last_day_of_current_month
-        )
+        activity_summary = {"active_today_display": active_today_disp, "total_days_logged": ign_all_time_data['count'], "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"}
+        first_day_current_month = today_utc_obj.replace(day=1)
+        last_day_current_month = (first_day_current_month.replace(month=first_day_current_month.month % 12 + 1, year=first_day_current_month.year + (first_day_current_month.month // 12))) - datetime.timedelta(days=1)
+        initial_monthly_dates = await fetch_activity_dates_in_range(guild, ign_lower, first_day_current_month, last_day_current_month)
 
-        # Super Attempt Stats (New)
-        super_attempt_stats_data_for_view = await get_user_super_attempt_stats(guild, target_ign_from_db)
-    
-    if not today_utc_obj:
-        await log_error(guild, "Profile command: Failed to get today's date object.", interaction=interaction)
+    super_attempt_stats_data = await get_user_super_attempt_stats(guild, target_ign)
+    initial_craft_logs, craft_total = await get_user_super_craft_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
+    initial_defeat_logs, defeat_total = await get_user_super_defeat_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
 
     # --- Create and Send View ---
     profile_view = ProfilePagesView(
-        interaction=interaction,
-        target_user_display_data=target_user_display_data_for_view,
-        hc_profile_data=hc_profile_db_data,
-        activity_summary_data=activity_summary_for_view,
-        initial_monthly_active_dates=initial_monthly_dates_for_view,
-        super_attempt_stats_data=super_attempt_stats_data_for_view, # Pass new data
-        today_date_obj=today_utc_obj if today_utc_obj else datetime.date.today() 
+        interaction=interaction, target_user_display_data=target_user_display_data, hc_profile_data=hc_profile_db_data or {"ingame_name": partial_profile_ign},
+        activity_summary_data=activity_summary, initial_monthly_active_dates=initial_monthly_dates,
+        super_attempt_stats_data=super_attempt_stats_data, 
+        initial_craft_logs=initial_craft_logs, total_crafts=craft_total,
+        initial_defeat_logs=initial_defeat_logs, total_defeats=defeat_total,
+        today_date_obj=today_utc_obj or datetime.date.today()
     )
     
-    initial_embed = profile_view._create_main_embed() # Main embed will now include Satt overview
-    
-    try:
-        await interaction.edit_original_response(embed=initial_embed, view=profile_view)
-        profile_view.message = await interaction.original_response() # Link message to view
-    except discord.HTTPException as e_edit_final:
-        if guild: await log_error(guild, "Failed to send initial profile embed with view", error=e_edit_final, interaction=interaction)
-        else: print(f"Failed to send initial profile embed (DM/No Guild): {e_edit_final}")
-        try:
-            await interaction.edit_original_response(content="❌ Error displaying profile. Please try again.", embed=None, view=None)
-        except: pass
+    initial_embed = profile_view._create_main_embed()
+    await interaction.edit_original_response(embed=initial_embed, view=profile_view)
+    profile_view.message = await interaction.original_response()
 
 @tree.command(name="refresh", description="Syncs all roles with the database and refreshes all server-specific data.")
 @app_commands.checks.has_permissions(manage_guild=True)
