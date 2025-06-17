@@ -282,6 +282,82 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def get_user_webhook_url(name: str) -> Optional[str]:
+    """Fetches a user-created webhook's URL from the database by its custom name."""
+    if not supabase:
+        return None
+    
+    purpose_to_find = f"user_webhook_{name}"
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("webhooks")
+                           .select("webhook_url")
+                           .eq("purpose", purpose_to_find)
+                           .limit(1)
+                           .maybe_single()
+                           .execute()
+        )
+        if resp and resp.data:
+            return resp.data.get('webhook_url')
+        return None
+    except Exception as e:
+        print(f"Error fetching user webhook URL for '{name}': {e}")
+        return None
+
+async def get_all_user_webhooks() -> List[Dict[str, Any]]:
+    """Fetches all user-created webhooks from the database."""
+    if not supabase:
+        return []
+        
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("webhooks")
+                           .select("purpose, channel_id")
+                           .like("purpose", "user_webhook_%")
+                           .execute()
+        )
+        if resp and resp.data:
+            # Clean up the purpose name for display
+            for item in resp.data:
+                item['name'] = item['purpose'].replace('user_webhook_', '', 1)
+            return resp.data
+        return []
+    except Exception as e:
+        print(f"Error fetching all user webhooks: {e}")
+        return []
+
+async def user_webhook_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes names of user-created webhooks."""
+    webhooks = await get_all_user_webhooks()
+    choices = [
+        app_commands.Choice(name=wh['name'], value=wh['name'])
+        for wh in webhooks
+        if not current or current.lower() in wh['name'].lower()
+    ]
+    return choices[:25]
+
+async def webhook_avatar_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes avatars from Florr images AND server members."""
+    choices = []
+    current_lower = current.lower()
+
+    # 1. Add Florr images from cache
+    if available_profile_pics_cache:
+        for display_name, folder_id, filename in available_profile_pics_cache:
+            if not current_lower or current_lower in display_name.lower():
+                value = f"image:{folder_id}:{filename}"
+                choices.append(app_commands.Choice(name=f"[Florr] {display_name}", value=value))
+
+    # 2. Add server members
+    if interaction.guild:
+        for member in interaction.guild.members:
+            if not current_lower or current_lower in member.display_name.lower():
+                value = f"member:{member.id}"
+                choices.append(app_commands.Choice(name=f"[Member] {member.display_name}", value=value))
+
+    # Return the first 25 sorted matches
+    return sorted(choices, key=lambda c: c.name)[:25]
+
 class ConnectUserModal(discord.ui.Modal, title="Connect Florr IGN"):
     ign_input = discord.ui.TextInput(
         label="User's Exact In-Game Name",
@@ -8751,8 +8827,6 @@ class NerdAdminGroup(app_commands.Group):
         await interaction.followup.send(embed=report_embed, ephemeral=True)
 
 # --- Register Command Groups ---
-# REMOVE the old tree.add_command for CustomiseGroup
-# ADD the new groups to the tree at the end of the file, before the bot.run call
 tree.add_command(NerdAdminGroup())
 
 @tree.command(name="servercodes", description="Shows available Florr.io server codes with interactive filters.")
@@ -8800,6 +8874,184 @@ async def servercodes(interaction: discord.Interaction, region: Optional[str] = 
         await log_error(interaction.guild, "Failed to send initial /servercodes view", error=e, interaction=interaction)
         try: await interaction.followup.send("❌ An error occurred while preparing the server list.", ephemeral=True)
         except discord.HTTPException: pass
+
+@tree.command(name="webhook", description="[Owner] Manage custom, persistent webhooks for announcements.")
+@app_commands.describe(
+    action="The operation to perform.",
+    name="A unique name for the webhook (for all actions except 'list').",
+    channel="The channel for the 'create' action.",
+    avatar_choice="The avatar for the 'create' action.",
+    content="The message content for 'send' or 'edit' actions.",
+    message_id="The ID of the message to 'edit'."
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="create", value="create"),
+    app_commands.Choice(name="send", value="send"),
+    app_commands.Choice(name="edit", value="edit"),
+    app_commands.Choice(name="delete", value="delete"),
+    app_commands.Choice(name="list", value="list"),
+])
+@app_commands.autocomplete(
+    name=user_webhook_name_autocomplete,
+    avatar_choice=webhook_avatar_autocomplete
+)
+async def webhook(
+    interaction: discord.Interaction,
+    action: str,
+    name: Optional[str] = None,
+    channel: Optional[discord.TextChannel] = None,
+    avatar_choice: Optional[str] = None,
+    content: Optional[str] = None,
+    message_id: Optional[str] = None
+):
+    # Owner-only check for the entire command
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # --- LIST Action ---
+    if action == "list":
+        all_webhooks = await get_all_user_webhooks()
+        if not all_webhooks:
+            await interaction.followup.send("No custom webhooks have been created yet.", ephemeral=True)
+            return
+            
+        embed = discord.Embed(title="Custom Webhooks", color=NERDY_YELLOW)
+        desc_parts = []
+        for wh in all_webhooks:
+            channel_obj = guild.get_channel(wh['channel_id'])
+            channel_mention = channel_obj.mention if channel_obj else f"Unknown Channel (ID: {wh['channel_id']})"
+            desc_parts.append(f"**Name:** `{wh['name']}`\n**Channel:** {channel_mention}\n")
+        
+        embed.description = "\n".join(desc_parts)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    # --- Parameter Validation for other actions ---
+    if not name:
+        await interaction.followup.send("❌ The `name` parameter is required for this action.", ephemeral=True)
+        return
+
+    # --- CREATE Action ---
+    if action == "create":
+        if not channel or not avatar_choice:
+            await interaction.followup.send("❌ The `channel` and `avatar_choice` parameters are required to create a webhook.", ephemeral=True)
+            return
+
+        purpose = f"user_webhook_{name}"
+        if await get_user_webhook_url(name):
+            await interaction.followup.send(f"❌ A webhook with the name `{name}` already exists.", ephemeral=True)
+            return
+
+        if not channel.permissions_for(guild.me).manage_webhooks:
+            await interaction.followup.send(f"❌ I need `Manage Webhooks` permission in {channel.mention}.", ephemeral=True)
+            return
+
+        avatar_bytes: Optional[bytes] = None
+        try:
+            source_type, value = avatar_choice.split(":", 1)
+            
+            if source_type == "member":
+                member_id = int(value)
+                member = await guild.fetch_member(member_id)
+                avatar_url = member.display_avatar.url if member.display_avatar else member.default_avatar.url
+                async with aiohttp.ClientSession() as session:
+                    avatar_bytes = await fetch_avatar_bytes(session, avatar_url)
+            
+            elif source_type == "image":
+                folder_id, filename = value.split(":", 1)
+                image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename)
+                if os.path.exists(image_path):
+                    with open(image_path, "rb") as f:
+                        avatar_bytes = f.read()
+                else:
+                    await interaction.followup.send(f"❌ Could not find image file: `{filename}`", ephemeral=True)
+                    return
+        except Exception as e:
+            await log_error(guild, f"Error processing avatar choice for webhook creation", error=e, interaction=interaction)
+            await interaction.followup.send("❌ Error processing avatar choice.", ephemeral=True)
+            return
+
+        try:
+            new_webhook = await channel.create_webhook(name=name, avatar=avatar_bytes, reason=f"Custom webhook by owner")
+            await run_supabase_sync(
+                lambda: supabase.table("webhooks").insert({
+                    "discord_guild_id": guild.id, "channel_id": channel.id,
+                    "purpose": purpose, "webhook_url": new_webhook.url
+                }).execute()
+            )
+            await interaction.followup.send(f"✅ Successfully created webhook `{name}` in {channel.mention}.", ephemeral=True)
+        except Exception as e:
+            await log_error(guild, f"Error creating custom webhook '{name}'", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An error occurred while creating the webhook.", ephemeral=True)
+        return
+
+    # --- SEND Action ---
+    elif action == "send":
+        if not content:
+            await interaction.followup.send("❌ The `content` parameter is required to send a message.", ephemeral=True)
+            return
+        
+        webhook_url = await get_user_webhook_url(name)
+        if not webhook_url:
+            await interaction.followup.send(f"❌ Could not find a webhook named `{name}`.", ephemeral=True)
+            return
+
+        try:
+            webhook = discord.Webhook.from_url(webhook_url, session=bot.http_session)
+            sent_message = await webhook.send(content, wait=True)
+            await interaction.followup.send(f"✅ Message sent via webhook `{name}`.\n**Message ID:** `{sent_message.id}`", ephemeral=True)
+        except discord.NotFound:
+            await interaction.followup.send(f"❌ Webhook `{name}` not found on Discord. It may have been deleted.", ephemeral=True)
+        except Exception as e:
+            await log_error(guild, f"Error sending message with webhook '{name}'", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An error occurred while sending the message.", ephemeral=True)
+        return
+
+    # --- EDIT Action ---
+    elif action == "edit":
+        if not message_id or not content:
+            await interaction.followup.send("❌ `message_id` and `content` are required to edit a message.", ephemeral=True)
+            return
+
+        webhook_url = await get_user_webhook_url(name)
+        if not webhook_url:
+            await interaction.followup.send(f"❌ Could not find a webhook named `{name}`.", ephemeral=True)
+            return
+
+        try:
+            webhook = discord.Webhook.from_url(webhook_url, session=bot.http_session)
+            await webhook.edit_message(message_id, content=content)
+            await interaction.followup.send(f"✅ Message `{message_id}` successfully edited.", ephemeral=True)
+        except discord.NotFound:
+            await interaction.followup.send(f"❌ Could not find a message with ID `{message_id}` to edit.", ephemeral=True)
+        except Exception as e:
+            await log_error(guild, f"Error editing message '{message_id}'", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An error occurred while editing the message.", ephemeral=True)
+        return
+
+    # --- DELETE Action ---
+    elif action == "delete":
+        purpose = f"user_webhook_{name}"
+        webhook_url = await get_user_webhook_url(name)
+
+        if webhook_url:
+            try:
+                webhook = discord.Webhook.from_url(webhook_url, session=bot.http_session)
+                await webhook.delete()
+            except discord.NotFound: pass
+            except Exception as e: await log_error(guild, f"Could not delete webhook '{name}' from Discord, but proceeding.", error=e)
+
+        try:
+            await run_supabase_sync(lambda: supabase.table("webhooks").delete().eq("purpose", purpose).execute())
+            await interaction.followup.send(f"✅ Webhook `{name}` has been deleted.", ephemeral=True)
+        except Exception as e:
+            await log_error(guild, f"Error deleting webhook '{name}' from database", error=e, interaction=interaction)
+            await interaction.followup.send(f"❌ Error removing webhook from DB.", ephemeral=True)
+        return
 
 # --- Bot Startup ---
 if __name__ == "__main__":
