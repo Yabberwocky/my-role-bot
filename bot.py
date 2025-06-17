@@ -7874,176 +7874,172 @@ async def on_message(message: discord.Message):
     if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
         await ai_cog.process_message_for_ai(message, config)
 
-@tree.command(name="message", description="Send a message as the bot, optionally using AI.")
+@tree.command(name="message", description="[Owner] Send, edit, or reply to a message with full customization.")
 @app_commands.describe(
-    message_content="The message content. If AI is used, this becomes the prompt.",
-    ai="[Optional] Have AI generate the message content? (Defaults to No)"
+    action="The operation to perform.",
+    content="The message content to send, or the new content for an edit.",
+    as_user="The custom name to use for the webhook message (for 'send'/'reply').",
+    avatar="The custom avatar to use for the webhook message (for 'send'/'reply').",
+    target_message_link="The link to the message you want to 'edit' or 'reply' to.",
+    ping_on_reply="For the 'reply' action, choose whether to ping the original author."
 )
-@app_commands.choices(ai=[
-    app_commands.Choice(name="No", value="no"),
-    app_commands.Choice(name="Yes", value="yes"),
+@app_commands.choices(action=[
+    app_commands.Choice(name="Send New Message", value="send"),
+    app_commands.Choice(name="Reply to Message", value="reply"),
+    app_commands.Choice(name="Edit Bot's Message", value="edit"),
 ])
-async def message_command( # Renamed function to avoid conflict if you had 'message' before
+@app_commands.choices(ping_on_reply=[
+    app_commands.Choice(name="Yes, ping the user", value=1),
+    app_commands.Choice(name="No, do not ping", value=0),
+])
+@app_commands.autocomplete(avatar=webhook_avatar_autocomplete)
+async def message_command(
     interaction: discord.Interaction,
-    message_content: str,
-    ai: Optional[str] = "no"
+    action: str,
+    content: str,
+    as_user: Optional[str] = None,
+    avatar: Optional[str] = None,
+    target_message_link: Optional[str] = None,
+    ping_on_reply: Optional[app_commands.Choice[int]] = None
 ):
-    if not interaction.channel:
-        await interaction.response.send_message("This command needs a channel context.", ephemeral=True)
+    # --- 1. Owner and Guild Check ---
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+        return
+    
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
         return
 
-    target_channel: discord.abc.Messageable = interaction.channel
-    guild = interaction.guild # Can be None if in DMs
-    use_ai_generation = ai.lower() == "yes" if ai else False
-    final_content_to_send = message_content.strip() # Strip initial input
-    ai_response_raw = None # To track if AI was successful
+    await interaction.response.defer(ephemeral=True)
 
-    bot_is_true_guild_member = guild and interaction.guild.me and interaction.guild.me.joined_at
+    # --- 2. EDIT Action Logic ---
+    if action == "edit":
+        if not target_message_link:
+            await interaction.followup.send("❌ The `target_message_link` is required for the 'edit' action.", ephemeral=True)
+            return
 
-    # Deferral Logic - Important to defer based on where the message will be sent
-    # If bot is not a "true member" (e.g., app only), the command response itself is the message.
-    # Otherwise, the command response is ephemeral, and bot sends a separate message.
-    is_ephemeral_response = True
-    if guild and not bot_is_true_guild_member:
-        is_ephemeral_response = False # Bot will edit the interaction response directly
-
-    await interaction.response.defer(thinking=True, ephemeral=is_ephemeral_response)
-
-    # --- AI Generation Block ---
-    if use_ai_generation:
-        ai_cog = bot.get_cog('AICog')
-        if not ai_cog:
-            await log_info(guild, "/message command: AI cog not loaded. Sending original content.")
-            feedback_msg = "⚠️ AI module is not available. Sending your original content."
-            if is_ephemeral_response: await interaction.followup.send(feedback_msg, ephemeral=True)
-            else: await interaction.edit_original_response(content=feedback_msg)
-            # Fall through to send original content
-        elif not ai_cog.get_all_available_models_details(): # Check if any models are actually configured in the cog
-            await log_info(guild, "/message command: No AI models available in AICog. Sending original content.")
-            feedback_msg = "⚠️ AI models are currently unavailable. Sending your original content."
-            if is_ephemeral_response: await interaction.followup.send(feedback_msg, ephemeral=True)
-            else: await interaction.edit_original_response(content=feedback_msg)
-            # Fall through to send original content
-        else:
-            await log_info(guild, f"User `{interaction.user}` attempting AI message generation with prompt: \"{message_content[:100]}...\"")
-            try:
-                preferred_model_for_message_cmd = 'gemini_2_5_flash' # Or 'gemini_2_0_flash'
-
-                prompt_data_for_ai = {
-                    'current_message_content': message_content, # This is the user's prompt for the AI
-                    'server_name': guild.name if guild else "DM",
-                    'channel_name': target_channel.name if hasattr(target_channel, 'name') else "DM Channel"
-                }
-                # The HUMAN_SYSTEM_INSTRUCTION_V3 prompt gets server_name, channel_name etc. from prompt_data
-                # if not explicitly overridden in system_instruction_details.kwargs.
-                system_instruction_details_for_ai = {
-                    'key': "HUMAN_SYSTEM_INSTRUCTION_V3",
-                    'kwargs': {} # No specific overrides needed here for /message
-                }
-
-                # If the message needs to be sent in a text channel, provide typing context
-                typing_ctx = target_channel.typing() if isinstance(target_channel, discord.TextChannel) and is_ephemeral_response else contextlib.nullcontext()
-                async with typing_ctx:
-                    ai_response_raw = await ai_cog.get_ai_response(
-                        prompt_data=prompt_data_for_ai,
-                        history=None, # No history for this command currently
-                        system_instruction_details=system_instruction_details_for_ai,
-                        preferred_model_id=preferred_model_for_message_cmd
-                    )
-
-                if ai_response_raw:
-                    # Process the AI response (stripping, etc.)
-                    processed_response = ai_response_raw.strip()
-                    FlorrNerd_prefix_pattern = re.compile(r"^(?:\[.*?UTC\]\s*)?(?:.*?\(You \(FlorrNerd\)\):\s*)", re.IGNORECASE)
-                    match = FlorrNerd_prefix_pattern.match(processed_response)
-                    if match:
-                        processed_response = processed_response[match.end():]
-                    
-                    if bot.user and bot.user.name:
-                        display_name_prefix_lower = f"{bot.user.display_name.lower()}:"
-                        name_prefix_lower = f"{bot.user.name.lower()}:"
-                        if processed_response.lower().startswith(display_name_prefix_lower):
-                            processed_response = processed_response[len(display_name_prefix_lower):].lstrip()
-                        elif processed_response.lower().startswith(name_prefix_lower):
-                            processed_response = processed_response[len(name_prefix_lower):].lstrip()
-                    
-                    processed_response = processed_response.strip()
-                    if processed_response.endswith(('.', '!', '?')) and not any(processed_response.endswith(x) for x in ['...', '?!', '!!']):
-                        processed_response = processed_response[:-1]
-                    if len(processed_response) > 1980: processed_response = processed_response[:1977] + "..."
-                    
-                    if processed_response:
-                        final_content_to_send = processed_response
-                        await log_info(guild, f"User `{interaction.user}` used /message with AI. Generated: '{final_content_to_send[:100].strip()}...'")
-                    else:
-                        ai_response_raw = None # Treat empty processed response as no response
-                        feedback_msg = "⚠️ AI generated an empty response. Sending your original content."
-                        await log_info(guild, "/message command: AI generated an empty response.")
-                        if is_ephemeral_response: await interaction.followup.send(feedback_msg, ephemeral=True)
-                        else: await interaction.edit_original_response(content=feedback_msg)
-                else:
-                    feedback_msg = "⚠️ AI generated no response. Sending your original content."
-                    await log_info(guild, "/message command: AI generated no response (None/empty raw).")
-                    if is_ephemeral_response: await interaction.followup.send(feedback_msg, ephemeral=True)
-                    else: await interaction.edit_original_response(content=feedback_msg)
-
-            except Exception as ai_err:
-                await log_error(guild, f"AI generation error for /message command", error=ai_err, interaction=interaction)
-                feedback_msg = "⚠️ An error occurred during AI generation. Sending your original content."
-                if is_ephemeral_response: await interaction.followup.send(feedback_msg, ephemeral=True)
-                else: await interaction.edit_original_response(content=feedback_msg)
-                ai_response_raw = None # Ensure it's None on error
-
-    # --- Send Message Block ---
-    try:
-        if not final_content_to_send: # Should not happen if AI fails as it defaults to original
-            final_content_to_send = "*(Original message was empty or AI failed to generate content.)*"
-
-        if len(final_content_to_send) > 2000:
-            final_content_to_send = final_content_to_send[:1997] + "..."
-
-        if not is_ephemeral_response: # Bot is not a "true member", edit the interaction response
-            response_text_for_edit = final_content_to_send
-            if use_ai_generation and ai_response_raw : response_text_for_edit += "\n*(AI Generated)*"
-            if len(response_text_for_edit) > 2000 : response_text_for_edit = response_text_for_edit[:1997] + "..."
-            await interaction.edit_original_response(content=response_text_for_edit, view=None, embed=None)
-            await log_info(guild, f"User `{interaction.user}` used /message (App-Only Mode) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'UnknownChannel'}. AI Used: {use_ai_generation}, AI Success: {bool(ai_response_raw)}.")
-        else: # Bot is a "true member", send a new message and confirm ephemerally
-            if isinstance(target_channel, discord.TextChannel) and guild and interaction.guild.me:
-                if not target_channel.permissions_for(interaction.guild.me).send_messages:
-                    await interaction.edit_original_response(content=f"❌ I don't have 'Send Messages' permission in {target_channel.mention}.", view=None, embed=None)
-                    return
+        try:
+            # Parse the message link to get IDs
+            match = re.match(r"https://discord\.com/channels/(\d+)/(\d+)/(\d+)", target_message_link)
+            if not match:
+                await interaction.followup.send("❌ Invalid message link format. Please provide a valid Discord message link.", ephemeral=True)
+                return
             
-            await target_channel.send(final_content_to_send)
-            confirmation_msg = "✅ Message sent."
-            if use_ai_generation and ai_response_raw: confirmation_msg += " (AI Generated)"
-            await interaction.edit_original_response(content=confirmation_msg, view=None, embed=None) # Confirm ephemerally
-            await log_info(guild, f"User `{interaction.user}` used /message (Full Member/DM) in {target_channel.mention if isinstance(target_channel, discord.TextChannel) else 'DM/Group'}. AI Used: {use_ai_generation}, AI Success: {bool(ai_response_raw)}.")
+            link_guild_id, channel_id, message_id = map(int, match.groups())
 
-    except discord.Forbidden:
-        await log_error(guild, "/message failed sending: Forbidden", interaction=interaction)
+            if link_guild_id != guild.id:
+                 await interaction.followup.send("❌ The message link must be from the current server.", ephemeral=True)
+                 return
+
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.followup.send("❌ Could not find the channel from the message link.", ephemeral=True)
+                return
+
+            message_to_edit = await channel.fetch_message(message_id)
+
+            # IMPORTANT: Only allow editing messages sent by the bot itself.
+            if message_to_edit.author.id != bot.user.id:
+                await interaction.followup.send("❌ The 'edit' action can only be used on messages sent by me (the bot).", ephemeral=True)
+                return
+
+            await message_to_edit.edit(content=content)
+            await interaction.followup.send(f"✅ Successfully edited the message. [Jump to message]({message_to_edit.jump_url})", ephemeral=True)
+            await log_info(guild, f"Owner used /message to edit bot message {message_id} in #{channel.name}.")
+
+        except discord.NotFound:
+            await interaction.followup.send("❌ The message or channel from the link could not be found.", ephemeral=True)
+        except Exception as e:
+            await log_error(guild, "Error during /message 'edit' action", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An unexpected error occurred while editing the message.", ephemeral=True)
+        return
+
+    # --- 3. SEND and REPLY Action Logic ---
+    elif action in ["send", "reply"]:
+        # Parameter validation for these actions
+        if not as_user or not avatar:
+            await interaction.followup.send("❌ The `as_user` and `avatar` parameters are required to send or reply.", ephemeral=True)
+            return
+            
+        target_channel = interaction.channel
+        message_to_reply = None
+        
+        # Validate and fetch reply target if needed
+        if action == "reply":
+            if not target_message_link:
+                await interaction.followup.send("❌ `target_message_link` is required for the 'reply' action.", ephemeral=True)
+                return
+            try:
+                match = re.match(r"https://discord\.com/channels/(\d+)/(\d+)/(\d+)", target_message_link)
+                if not match:
+                    await interaction.followup.send("❌ Invalid message link format for reply.", ephemeral=True)
+                    return
+                
+                _, channel_id, message_id = map(int, match.groups())
+                reply_channel = guild.get_channel(channel_id)
+                if not isinstance(reply_channel, discord.TextChannel):
+                    await interaction.followup.send("❌ Channel from reply link not found.", ephemeral=True)
+                    return
+                
+                target_channel = reply_channel # The message will be sent in the reply's channel
+                message_to_reply = await target_channel.fetch_message(message_id)
+            except discord.NotFound:
+                await interaction.followup.send("❌ The message to reply to was not found.", ephemeral=True)
+                return
+            except Exception as e:
+                await log_error(guild, "Error fetching reply target for /message", error=e, interaction=interaction)
+                await interaction.followup.send("❌ Error fetching the message to reply to.", ephemeral=True)
+                return
+
+        # Check permissions in the target channel
+        if not target_channel.permissions_for(guild.me).manage_webhooks:
+            await interaction.followup.send(f"❌ I need the `Manage Webhooks` permission in {target_channel.mention}.", ephemeral=True)
+            return
+            
+        # Process avatar choice
+        avatar_bytes: Optional[bytes] = None
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ Failed to send message: I lack permissions in this channel/context.", ephemeral=True)
-            else: # Should have been deferred
-                await interaction.edit_original_response(content=f"❌ Failed to send message: I lack permissions in this channel/context.", view=None, embed=None)
-        except Exception: pass
-    except discord.HTTPException as e:
-        await log_error(guild, "/message failed sending: HTTP Exception", error=e, interaction=interaction)
+            source_type, value = avatar.split(":", 1)
+            if source_type == "member":
+                member = await guild.fetch_member(int(value))
+                avatar_url = member.display_avatar.url or member.default_avatar.url
+                async with aiohttp.ClientSession() as session: avatar_bytes = await fetch_avatar_bytes(session, avatar_url)
+            elif source_type == "image":
+                folder_id, filename = value.split(":", 1)
+                image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename)
+                if os.path.exists(image_path):
+                    with open(image_path, "rb") as f: avatar_bytes = f.read()
+                else: await interaction.followup.send(f"❌ Image file not found: `{filename}`", ephemeral=True); return
+        except Exception as e:
+            await log_error(guild, f"Error processing avatar choice for /message", error=e, interaction=interaction)
+            await interaction.followup.send("❌ Error processing avatar choice.", ephemeral=True)
+            return
+
+        # Create and use the temporary webhook
+        temp_webhook = None
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ Failed to send message: Discord API error. {e.text}", ephemeral=True)
-            else:
-                await interaction.edit_original_response(content=f"❌ Failed to send message: Discord API error. {e.text}", view=None, embed=None)
-        except Exception: pass
-    except Exception as e:
-        await log_error(guild, "/message failed sending: Unexpected error", error=e, interaction=interaction, ping_owner=True)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ An unexpected error occurred while sending the message.", ephemeral=True)
-            else:
-                 await interaction.edit_original_response(content=f"❌ An unexpected error occurred while sending the message.", view=None, embed=None)
-        except Exception: pass
+            webhook_name = as_user[:80] # Discord limit for webhook name
+            temp_webhook = await target_channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason="/message command by owner")
+            
+            send_kwargs = {}
+            if action == "reply" and message_to_reply:
+                send_kwargs["message_reference"] = message_to_reply.to_reference()
+                send_kwargs["allowed_mentions"] = discord.AllowedMentions(replied_user=(ping_on_reply is not None and ping_on_reply.value == 1))
+            
+            await temp_webhook.send(content, **send_kwargs)
+            
+            action_past_tense = "replied to the message" if action == "reply" else "sent the message"
+            await interaction.followup.send(f"✅ Successfully {action_past_tense} in {target_channel.mention} as `{as_user}`.", ephemeral=True)
+            await log_info(guild, f"Owner used /message to {action} in #{target_channel.name} as '{as_user}'.")
+
+        except Exception as e:
+            await log_error(guild, f"Error using temp webhook for /message", error=e, interaction=interaction)
+            await interaction.followup.send("❌ An unexpected error occurred while sending the message.", ephemeral=True)
+        finally:
+            if temp_webhook:
+                await temp_webhook.delete(reason="/message command cleanup")
 
 @tree.command(name="imitate", description="[Staff Only] Send a message appearing as another user.")
 @app_commands.describe(
