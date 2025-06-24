@@ -5153,6 +5153,7 @@ class ProfilePagesView(discord.ui.View):
     SUPER_DEFEAT_LOG_PAGE = "sd_log"
     NOTES_PAGE = "notes"
     SA_LOG_ENTRIES_PER_PAGE = 50
+    NOTES_PER_PAGE = 5
 
     def __init__(self, interaction: discord.Interaction, target_user_display_data: Dict[str, Any], hc_profile_data: Dict[str, Any],
                  activity_summary_data: Optional[Dict[str, Any]], initial_monthly_active_dates: Set[datetime.date],
@@ -5193,7 +5194,7 @@ class ProfilePagesView(discord.ui.View):
 
         self.notes_current_page = 0
         self.notes_total_entries = total_notes
-        self.notes_total_pages = math.ceil(total_notes / self.SA_LOG_ENTRIES_PER_PAGE) if total_notes > 0 else 1
+        self.notes_total_pages = math.ceil(total_notes / self.NOTES_PER_PAGE) if total_notes > 0 else 1
         self.current_notes = initial_notes
 
         self.is_fetching_log = False
@@ -5431,7 +5432,7 @@ class ProfilePagesView(discord.ui.View):
         embed.set_footer(text=f"Page {self.s_defeat_log_current_page + 1}/{self.s_defeat_log_total_pages} ({self.s_defeat_log_total_entries} total)")
         return embed
 
-    def _create_notes_embed(self) -> discord.Embed:
+    async def _create_notes_embed(self) -> discord.Embed:
         ign = self.hc_profile_data.get("ingame_name", "N/A")
         embed = discord.Embed(title=f"📝 Notes for {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
         if self.is_fetching_log:
@@ -5443,54 +5444,82 @@ class ProfilePagesView(discord.ui.View):
 
         author_ids = {note['author_discord_id'] for note in self.current_notes if note.get('author_discord_id')}
         authors_map = {}
-        for author_id_str in author_ids:
-            try:
-                user_obj = bot.get_user(int(author_id_str))
-                if not user_obj:
-                    user_obj = asyncio.run_coroutine_threadsafe(bot.fetch_user(int(author_id_str)), bot.loop).result()
-                authors_map[author_id_str] = user_obj.name
-            except (discord.NotFound, ValueError, AttributeError):
-                authors_map[author_id_str] = f"ID:{author_id_str}"
+        if author_ids:
+            author_ids_list = [int(uid) for uid in author_ids if uid.isdigit()]
+            author_fetch_tasks = [bot.fetch_user(uid) for uid in author_ids_list]
+            fetched_users = await asyncio.gather(*author_fetch_tasks, return_exceptions=True)
+            for i, result in enumerate(fetched_users):
+                original_id = author_ids_list[i]
+                if isinstance(result, discord.User):
+                    authors_map[str(original_id)] = result.name
+                else:
+                    authors_map[str(original_id)] = f"ID:{original_id}"
         
-        IDX_W, DATE_W, AUTHOR_W, NOTE_W = 4, 11, 15, 45
-        header = f"{'#':<{IDX_W}}{'Date':<{DATE_W}}{'Author':<{AUTHOR_W}}{'Note':<{NOTE_W}}"
-        separator = "-" * len(header)
-        lines = [f"```{header}", separator]
-
-        start_index = self.notes_current_page * self.SA_LOG_ENTRIES_PER_PAGE
+        lines = []
+        start_index = self.notes_current_page * self.NOTES_PER_PAGE
+        
         for i, entry in enumerate(self.current_notes):
             global_index = start_index + i + 1
             author_id = entry.get('author_discord_id')
             author_name = authors_map.get(str(author_id), "Unknown")
-            author_display = (author_name[:AUTHOR_W-1] + '…') if len(author_name) > AUTHOR_W else author_name
-            
-            note_content = entry.get('note_content', '').replace('\n', ' ')
-            note_display = (note_content[:NOTE_W-1] + '…') if len(note_content) > NOTE_W else note_content
             
             date_obj = date_parse(entry['created_at']) if entry.get('created_at') else None
             date_str = format_date_dmy(date_obj) if date_obj else "N/A"
             
-            index_str = f"{global_index}."
-            line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{author_display:<{AUTHOR_W}}{note_display:<{NOTE_W}}"
-            lines.append(line)
+            header_line = f"{global_index}. Date: {date_str} | By: {author_name}"
+            lines.append(header_line)
+            
+            note_content = entry.get('note_content', '')
+            
+            wrapped_lines = []
+            for paragraph in note_content.split('\n'):
+                words = paragraph.split()
+                if not words:
+                    wrapped_lines.append('')
+                    continue
+                
+                current_line = ""
+                for word in words:
+                    if not current_line:
+                        current_line = word
+                    elif len(current_line) + 1 + len(word) <= 38:
+                        current_line += " " + word
+                    else:
+                        wrapped_lines.append(current_line)
+                        current_line = word
+                if current_line:
+                    wrapped_lines.append(current_line)
+            
+            for line in wrapped_lines:
+                lines.append(f"   {line}")
+            
+            if i < len(self.current_notes) - 1:
+                lines.append("----------------------------------------")
         
-        lines.append("```")
-        embed.description = "\n".join(lines)
+        if not lines:
+             embed.description = "No notes to display on this page."
+        else:
+             embed.description = "```\n" + "\n".join(lines) + "\n```"
+        
         embed.set_footer(text=f"Page {self.notes_current_page + 1}/{self.notes_total_pages} ({self.notes_total_entries} total)")
         return embed
 
     async def _update_message(self, interaction: discord.Interaction):
         self._update_ui_elements()
-        embed_map = {
-            self.MAIN_PAGE: self._create_main_embed,
-            self.MONTHLY_PAGE: self._create_monthly_embed,
-            self.SUPER_ATTEMPT_STATS_PAGE: self._create_super_attempt_stats_embed,
-            self.SUPER_ATTEMPT_LOG_PAGE: self._create_super_attempt_log_embed,
-            self.SUPER_CRAFT_LOG_PAGE: self._create_super_craft_log_embed,
-            self.SUPER_DEFEAT_LOG_PAGE: self._create_super_defeat_log_embed,
-            self.NOTES_PAGE: self._create_notes_embed,
-        }
-        embed_to_send = embed_map.get(self.current_page_mode, self._create_main_embed)()
+        embed_to_send: discord.Embed
+        
+        if self.current_page_mode == self.NOTES_PAGE:
+            embed_to_send = await self._create_notes_embed()
+        else:
+            embed_map = {
+                self.MAIN_PAGE: self._create_main_embed,
+                self.MONTHLY_PAGE: self._create_monthly_embed,
+                self.SUPER_ATTEMPT_STATS_PAGE: self._create_super_attempt_stats_embed,
+                self.SUPER_ATTEMPT_LOG_PAGE: self._create_super_attempt_log_embed,
+                self.SUPER_CRAFT_LOG_PAGE: self._create_super_craft_log_embed,
+                self.SUPER_DEFEAT_LOG_PAGE: self._create_super_defeat_log_embed,
+            }
+            embed_to_send = embed_map.get(self.current_page_mode, self._create_main_embed)()
         
         try:
             if not interaction.response.is_done():
@@ -5537,11 +5566,11 @@ class ProfilePagesView(discord.ui.View):
             self.current_notes = []
             return
         self.is_fetching_log = True
-        entries, total = await get_user_notes(self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE)
+        entries, total = await get_user_notes(self.original_command_interaction.guild, ign, page_num, self.NOTES_PER_PAGE)
         self.current_notes = entries
         self.notes_current_page = page_num
         self.notes_total_entries = total
-        self.notes_total_pages = math.ceil(total / self.SA_LOG_ENTRIES_PER_PAGE) if total > 0 else 1
+        self.notes_total_pages = math.ceil(total / self.NOTES_PER_PAGE) if total > 0 else 1
         self.is_fetching_log = False
 
     async def navigation_button_callback(self, interaction: discord.Interaction):
@@ -5608,7 +5637,6 @@ class ProfilePagesView(discord.ui.View):
                 await self.message.edit(view=self) 
             except discord.HTTPException: pass
         self.stop()
-        # // --- END UNCHANGED SECTION (ProfilePagesView.on_timeout from previous state) --- //
 
 async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign: str) -> Optional[Dict[str, Any]]:
     """
@@ -8585,7 +8613,7 @@ async def profile(interaction: discord.Interaction,
     super_attempt_stats_data = await get_user_super_attempt_stats(guild, target_ign)
     initial_craft_logs, craft_total = await get_user_super_craft_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
     initial_defeat_logs, defeat_total = await get_user_super_defeat_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
-    initial_notes, notes_total = await get_user_notes(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
+    initial_notes, notes_total = await get_user_notes(guild, target_ign, 0, ProfilePagesView.NOTES_PER_PAGE)
 
     final_hc_profile_data = hc_profile_db_data if hc_profile_db_data else {"ingame_name": partial_profile_ign}
     if 'florr_guild_tag' not in final_hc_profile_data:
@@ -8602,17 +8630,20 @@ async def profile(interaction: discord.Interaction,
         start_page=start_page or "main"
     )
     
-    embed_creator_map = {
-        profile_view.MAIN_PAGE: profile_view._create_main_embed,
-        profile_view.MONTHLY_PAGE: profile_view._create_monthly_embed,
-        profile_view.SUPER_ATTEMPT_STATS_PAGE: profile_view._create_super_attempt_stats_embed,
-        profile_view.SUPER_ATTEMPT_LOG_PAGE: profile_view._create_super_attempt_log_embed,
-        profile_view.SUPER_CRAFT_LOG_PAGE: profile_view._create_super_craft_log_embed,
-        profile_view.SUPER_DEFEAT_LOG_PAGE: profile_view._create_super_defeat_log_embed,
-        profile_view.NOTES_PAGE: profile_view._create_notes_embed,
-    }
-    creator_func = embed_creator_map.get(profile_view.current_page_mode, profile_view._create_main_embed)
-    initial_embed = creator_func()
+    initial_embed: discord.Embed
+    if profile_view.current_page_mode == profile_view.NOTES_PAGE:
+        initial_embed = await profile_view._create_notes_embed()
+    else:
+        embed_creator_map = {
+            profile_view.MAIN_PAGE: profile_view._create_main_embed,
+            profile_view.MONTHLY_PAGE: profile_view._create_monthly_embed,
+            profile_view.SUPER_ATTEMPT_STATS_PAGE: profile_view._create_super_attempt_stats_embed,
+            profile_view.SUPER_ATTEMPT_LOG_PAGE: profile_view._create_super_attempt_log_embed,
+            profile_view.SUPER_CRAFT_LOG_PAGE: profile_view._create_super_craft_log_embed,
+            profile_view.SUPER_DEFEAT_LOG_PAGE: profile_view._create_super_defeat_log_embed,
+        }
+        creator_func = embed_creator_map.get(profile_view.current_page_mode, profile_view._create_main_embed)
+        initial_embed = creator_func()
 
     await interaction.edit_original_response(embed=initial_embed, view=profile_view)
     profile_view.message = await interaction.original_response()
