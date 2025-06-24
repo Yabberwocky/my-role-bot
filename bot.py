@@ -2113,7 +2113,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
         # The {time} placeholder will now be replaced in the calling function.
-        text = f"{region_prefix}**{rarity} {mob}** has spawned! {{time}}"
+        text = f"{region_prefix}**{rarity} {mob}** has spawned{{time}}!"
         ping_role = True
 
     elif category == 'super_defeat':
@@ -2130,15 +2130,17 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
 
     # Replace the {time} placeholder if it exists and a valid timestamp is available
     if text and '{{time}}' in text:
+        time_replacement = ""
         if timestamp_str:
             try:
                 event_dt = date_parse(timestamp_str)
                 unix_ts = int(event_dt.timestamp())
-                text = text.replace('{{time}}', f'<t:{unix_ts}:R>')
+                # The replacement string includes the leading space
+                time_replacement = f" <t:{unix_ts}:R>"
             except (ValueError, TypeError):
-                text = text.replace(' {{time}}', '') # Remove placeholder if parse fails
-        else:
-            text = text.replace(' {{time}}', '') # Remove placeholder if no timestamp
+                pass # Keep time_replacement as empty string
+        
+        text = text.replace('{{time}}', time_replacement)
 
     return text, ping_role, timestamp_str
 
