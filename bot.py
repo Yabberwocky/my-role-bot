@@ -245,7 +245,6 @@ last_spawn_defeat_post_time = 0.0
 NOTIFICATION_COOLDOWN_SECONDS = 120.0
 STAFF_PERMISSION_FOR_AI = "manage_guild"
 DISABLE_DB_EVENT_LOGGING = BOT_INSTANCE_TYPE != "PRODUCTION"
-is_catching_up = False # Flag to pause live event processing during startup catch-up
 ai_models: Dict[str, genai.GenerativeModel] = {}
 keyword_data_cache: Dict[str, Any] = {}
 total_keywords: int = 0
@@ -253,6 +252,14 @@ discovered_keywords_count: int = 0
 channel_personalities: Dict[int, str] = {}
 ai_message_cooldown = commands.CooldownMapping.from_cooldown(1, AI_RESPONSE_COOLDOWN_SECONDS, commands.BucketType.user)
 slowmode_tasks: Dict[int, asyncio.Task] = {}
+STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes
+EVENT_CONSOLIDATION_WINDOW_SECONDS = 3.0 # Collect events for 3s before posting
+consolidated_event_cache: Dict[str, List[Dict[str, Any]]] = {
+    'super_craft': [],
+    'super_spawn': [],
+    'super_defeat': [],
+}
+consolidation_task: Optional[asyncio.Task] = None
 
 
 # --- Supabase Client ---
@@ -402,6 +409,150 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def _format_consolidated_ping(category: str, events: List[Dict[str, Any]]) -> Optional[discord.Embed]:
+    """Formats a consolidated embed for a burst of events."""
+    if not events:
+        return None
+
+    title_map = {
+        'super_craft': "🛠️ Super Crafts Detected",
+        'super_spawn': "✨ Super Spawns Detected",
+        'super_defeat': "🛡️ Super Defeats Detected",
+    }
+    
+    embed = discord.Embed(
+        title=f"Event Burst: {title_map.get(category, 'Multiple Events')}",
+        description=f"Detected **{len(events)}** recent events:",
+        color=NERDY_YELLOW
+    )
+
+    lines = []
+    for event in events[:15]: # Limit to 15 entries to keep embed clean
+        server = f"[{event.get('server')}] " if event.get('server') else ""
+        if category == 'super_craft':
+            player = f"by **{event.get('player', 'Someone')}**" if event.get('player') else ""
+            line = f"{server}**{event.get('rarity')} {event.get('petal')}** {player}"
+        elif category == 'super_spawn':
+            mob = event.get('mob', 'Unknown').replace('_', ' ').title()
+            timestamp_str = event.get('timestamp')
+            time_display = ""
+            if timestamp_str:
+                try:
+                    event_dt = date_parse(timestamp_str)
+                    unix_ts = int(event_dt.timestamp())
+                    time_display = f" <t:{unix_ts}:R>"
+                except (ValueError, TypeError): pass
+            line = f"{server}**{event.get('rarity')} {mob}**{time_display}"
+        elif category == 'super_defeat':
+            mob = event.get('mob', 'Unknown').replace('_', ' ').title()
+            players = event.get('players', [])
+            player_str = f"by **{', '.join(players)}**" if players else ""
+            line = f"{server}**{event.get('rarity')} {mob}** {player_str}"
+        else:
+            continue
+        lines.append(f"- {line}")
+    
+    if len(events) > 15:
+        lines.append(f"- ...and {len(events) - 15} more.")
+
+    embed.add_field(name=f"Event Details", value="\n".join(lines), inline=False)
+    embed.set_footer(text=f"Consolidated View | {get_formatted_utc_now()}")
+    return embed
+
+
+async def _process_consolidated_events():
+    """Processes and dispatches all cached events after the debounce window."""
+    global consolidated_event_cache, consolidation_task
+    # Wait for the consolidation window to pass
+    await asyncio.sleep(EVENT_CONSOLIDATION_WINDOW_SECONDS)
+
+    for category, events in consolidated_event_cache.items():
+        if not events:
+            continue
+
+        config_key_map = {'super_craft': 'craft_ping_channel_id', 'super_spawn': 'spawn_ping_channel_id', 'super_defeat': 'defeat_ping_channel_id'}
+        webhook_purpose_map = {'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings'}
+        webhook_name_map = {'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings'}
+        
+        config_key = config_key_map.get(category)
+        if not config_key: continue
+
+        for guild in bot.guilds:
+            config = await load_server_config(guild.id)
+            channel_id = config.get(config_key)
+            if not channel_id: continue
+            
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel): continue
+            
+            webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
+            if not webhook: continue
+
+            # If only one event, send the simple text ping
+            if len(events) == 1:
+                ping_template, should_ping_role, _ = await _create_ping_text(events[0])
+                if ping_template:
+                    content_to_send = ping_template
+                    if should_ping_role and config.get('super_ping_role_id'):
+                        content_to_send += f"\n<@&{config.get('super_ping_role_id')}>"
+                    await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
+            
+            # If multiple events, send the consolidated embed
+            else:
+                embed = await _format_consolidated_ping(category, events)
+                if embed:
+                    content_to_send = f"<@&{config.get('super_ping_role_id')}>" if category == 'super_spawn' and config.get('super_ping_role_id') else None
+                    await webhook.send(content=content_to_send, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+
+    # Clear the cache and task tracker
+    consolidated_event_cache = { 'super_craft': [], 'super_spawn': [], 'super_defeat': [] }
+    consolidation_task = None
+
+
+async def _handle_self_bot_event(item: Dict[str, Any]):
+    """
+    This coroutine runs in the main bot's event loop. It implements a 3-layer
+    firewall to validate and process events from the listener.
+    """
+    global consolidated_event_cache, consolidation_task
+    # REMOVE THE LINE BELOW
+    # if is_catching_up: return
+
+    category = item.get('category')
+    timestamp_str = item.get('timestamp')
+    message_id = item.get('message_id')
+    
+    # --- Gate 1: Timestamp Freshness ---
+    if not timestamp_str: return
+    try:
+        event_dt = date_parse(timestamp_str)
+        if (discord.utils.utcnow() - event_dt).total_seconds() > STALE_EVENT_THRESHOLD_SECONDS:
+            embed = discord.Embed(title="🕵️ Stale Event Discarded", color=discord.Color.dark_grey())
+            embed.description = f"An event from the self-bot listener was discarded for being too old (over {STALE_EVENT_THRESHOLD_SECONDS}s)."
+            embed.add_field(name="Event Details", value=f"```json\n{json.dumps(item, indent=2)}\n```")
+            await log_error(None, "Stale event discarded", embed=embed, ping_owner=False)
+            return
+    except (ValueError, TypeError):
+        return
+
+    # --- Gate 2: Idempotency (Handled by the listener's cache now) ---
+    # This logic has been moved to the listener to be more efficient.
+    # We trust that if an event reaches here, it's unique for its (message_id, category).
+
+    # --- Log to Database (happens regardless of consolidation) ---
+    if category == 'super_defeat':
+        await _log_super_defeat_to_db(item)
+    elif category == 'super_craft':
+        await _log_super_craft_to_db(item)
+
+    # --- Gate 3: Debounce & Consolidate ---
+    if category in consolidated_event_cache:
+        consolidated_event_cache[category].append(item)
+        
+        # If no consolidation task is running, start one.
+        if consolidation_task is None or consolidation_task.done():
+            consolidation_task = asyncio.create_task(_process_consolidated_events())
+
 async def get_note_author_count(guild: Optional[discord.Guild], author_id: str, target_ign: str) -> int:
     """Counts how many notes a specific author has on a specific target IGN."""
     if not supabase: return 0
@@ -536,8 +687,9 @@ async def is_module_enabled(interaction: discord.Interaction, module_name: str) 
 
 class SelfBotListener:
     """
-    Connects to the Discord Gateway and dispatches events directly to the
-    main bot's event loop for immediate processing.
+    Connects to the Discord Gateway using the raw websockets library and dispatches 
+    events to the main bot's event loop for immediate processing. This avoids
+    library conflicts with the main discord.py bot instance.
     """
 
     def __init__(self, token: str, channel_id: str, bot_instance):
@@ -545,8 +697,8 @@ class SelfBotListener:
             raise ValueError("A valid self-bot token must be provided.")
         self.token = token
         self.target_channel_id = str(channel_id)
-        self.bot = bot_instance  # Store the main bot instance
-        self.main_loop = self.bot.loop # Get a reference to the bot's event loop
+        self.bot = bot_instance
+        self.main_loop = self.bot.loop
 
         self.ws_connection = None
         self.heartbeat_interval = None
@@ -554,8 +706,10 @@ class SelfBotListener:
         self.session_id = None
         self.resume_gateway_url = None
 
+        # This cache implements idempotency to handle Discord's CREATE/UPDATE event flow.
+        self.processed_events_cache: List[Tuple[Optional[str], str]] = []
+
         rarities_pattern = r"(Unique|Super|Ultra|Mythic|Legendary|Epic|Rare|Uncommon|Common)"
-        
         self.patterns = {
             'petal_craft': re.compile(
                 fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (.+?))?!*$", re.IGNORECASE
@@ -567,75 +721,67 @@ class SelfBotListener:
                 fr"^\s*A {rarities_pattern} (.+?) has been defeated by (.+?)!$", re.IGNORECASE
             )
         }
-        # Use prefixes for special spawn messages to handle variations.
         self.special_spawn_messages = {
-            "Something mountain-like appears in the distance...": "rock",
-            "A tower of thorns rises from the sands...": "cactus",
-            "A big yellow spot shows up in the distance...": "hornet",
-            "You hear lightning strikes coming from": "jellyfish",
-            "There's a bright light in the horizon...": "firefly",
-            "You sense ominous vibrations coming from a different realm...": "beetle_hel",
+            "Something mountain-like appears in the distance...": "rock", "A tower of thorns rises from the sands...": "cactus",
+            "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from": "jellyfish",
+            "There's a bright light in the horizon...": "firefly", "You sense ominous vibrations coming from a different realm...": "beetle_hel",
             "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
         }
 
     def _extract_server(self, footer_text: Optional[str]) -> Optional[str]:
         if not footer_text: return None
         match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
-        if not match:
-            return None
-        
-        # Normalize the server name. ASIA becomes AS.
+        if not match: return None
         server = match.group(1).upper()
-        if server == "ASIA":
-            return "AS"
-        return server
+        return "AS" if server == "ASIA" else server
 
     def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
-        """Classifies the event and schedules it to run on the main bot's event loop."""
         raw_description = embed.get('description', '')
-        # MORE ROBUST CLEANING:
-        # 1. Replace zero-width spaces.
-        # 2. Strip leading/trailing whitespace and newlines.
-        # 3. Strip common markdown characters from the start and end.
         description = raw_description.replace('\u200b', '').strip().strip('*_`~')
-        
-        footer_text = embed.get('footer', {}).get('text')
         message_id = embed.get('_message_id')
-        timestamp = embed.get('_timestamp')
-        server = self._extract_server(footer_text)
-
         item_data: Optional[Dict[str, Any]] = None
 
+        # --- Classification Logic ---
         match = self.patterns['mob_defeat'].match(description)
         if match:
             player_list_str = match.group(3).strip().replace(" and ", ", ")
             players = [p.strip() for p in player_list_str.split(',') if p.strip()]
-            item_data = {'category': 'super_defeat', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'players': players, 'server': server}
+            item_data = {'category': 'super_defeat', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'players': players, 'server': self._extract_server(embed.get('footer', {}).get('text'))}
         
         if not item_data:
             match = self.patterns['petal_craft'].match(description)
             if match:
-                item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
+                item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': self._extract_server(embed.get('footer', {}).get('text'))}
 
         if not item_data:
             match = self.patterns['mob_spawn_standard'].match(description)
             if match:
-                item_data = {'category': 'super_spawn', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'server': server}
+                item_data = {'category': 'super_spawn', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'server': self._extract_server(embed.get('footer', {}).get('text'))}
 
         if not item_data:
-            # Check special spawn messages using startswith for flexibility
             for spawn_prefix, mob_name in self.special_spawn_messages.items():
                 if description.startswith(spawn_prefix):
-                    item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
+                    item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': self._extract_server(embed.get('footer', {}).get('text'))}
                     break
         
         if not item_data and event_type != "MESSAGE_UPDATE":
-            item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
+            item_data = {'category': 'unclassified', 'text': raw_description, 'footer': embed.get('footer', {}).get('text')}
 
         if item_data:
             item_data['message_id'] = message_id
-            item_data['timestamp'] = timestamp
-            # Calls the global _handle_self_bot_event function in the bot's main event loop
+            item_data['timestamp'] = embed.get('timestamp') # This is the crucial field from Discord payload
+            
+            event_category = item_data.get('category', 'unknown')
+            if event_category == 'unclassified': return
+
+            event_key = (item_data.get('message_id'), event_category)
+            if event_key in self.processed_events_cache:
+                return
+            
+            self.processed_events_cache.append(event_key)
+            if len(self.processed_events_cache) > 200:
+                self.processed_events_cache.pop(0)
+
             asyncio.run_coroutine_threadsafe(_handle_self_bot_event(item_data), self.main_loop)
 
     async def _send_heartbeat(self):
@@ -664,7 +810,8 @@ class SelfBotListener:
                 if str(event_data.get('channel_id')) == self.target_channel_id and event_data.get('embeds'):
                     for embed in event_data['embeds']:
                         embed['_message_id'] = event_data.get('id')
-                        embed['_timestamp'] = event_data.get('timestamp')
+                        # The raw Discord timestamp is passed directly now
+                        embed['timestamp'] = event_data.get('timestamp') 
                         self._classify_and_dispatch(embed, event_type)
         elif op_code == 7:
             await self.ws_connection.close()
@@ -694,6 +841,35 @@ class SelfBotListener:
                 print(f"[Self-Bot Listener] Connection lost or error: {type(e).__name__}. Reconnecting...")
             self.ws_connection = None
             await asyncio.sleep(random.uniform(3, 7))
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """Logs when a message is deleted from the self-bot's channel."""
+    # We only care about deletions in the self-bot's channel
+    if str(payload.channel_id) != SUPER_CRAFT_SELF_BOT_CHANNEL_ID:
+        return
+
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+
+    embed = discord.Embed(
+        title="🕵️ Message Deleted in Self-Bot Channel",
+        description="A message was deleted from the self-bot feed channel. This could be due to an edit that replaces the embed or a manual deletion.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Message ID", value=f"`{payload.message_id}`", inline=True)
+    if payload.guild_id:
+        embed.add_field(name="Guild ID", value=f"`{payload.guild_id}`", inline=True)
+    embed.add_field(name="Channel ID", value=f"`{payload.channel_id}`", inline=True)
+    embed.set_footer(text="Note: The content of the deleted message is not available via this event.")
+    embed.timestamp = discord.utils.utcnow()
+
+    # Log to extraordinary logs without pinging the owner.
+    await log_error(
+        guild, 
+        "A message was deleted in the self-bot's private channel.", 
+        embed=embed, 
+        ping_owner=False
+    )
 
 # Add these new classes from ai_cog.py
 class KeywordResponseView(discord.ui.View):
@@ -1542,140 +1718,6 @@ async def _revive_static_list_views():
                 await log_error(guild, f"Error during static list revival for channel #{channel.name}", error=e)
     print("--- Finished Reviving Static List Views ---")
 
-async def _classify_discord_message(message: discord.Message):
-    """
-    Takes a discord.Message, extracts its embed, and classifies it for logging.
-    This is used by the startup catch-up mechanism.
-    """
-    if not message.embeds:
-        return
-
-    embed = message.embeds[0]
-    raw_description = embed.description or ""
-    description = raw_description.replace('\u200b', '').strip().strip('*_`')
-    footer_text = embed.footer.text if embed.footer else None
-    
-    # The patterns are defined in the SelfBotListener, we can't access them directly.
-    # So, we redefine them here for the catch-up logic. A bit of duplication but safer.
-    rarities_pattern = r"(Unique|Super|Ultra|Mythic|Legendary|Epic|Rare|Uncommon|Common)"
-    petal_craft_pattern = re.compile(fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (.+?))?!*$", re.IGNORECASE)
-    mob_defeat_pattern = re.compile(fr"^\s*A {rarities_pattern} (.+?) has been defeated by (.+?)!$", re.IGNORECASE)
-    special_spawn_messages = {
-        "Something mountain-like appears in the distance...": "rock", "A tower of thorns rises from the sands...": "cactus",
-        "A big yellow spot shows up in the distance...": "hornet", "You hear lightning strikes coming from a different realm...": "jellyfish",
-        "There's a bright light in the horizon...": "firefly", "You sense ominous vibrations coming from a different realm...": "beetle_hel",
-        "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
-    }
-
-    item_data: Optional[Dict[str, Any]] = None
-    server = None
-    if footer_text:
-        match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
-        server = match.group(1).upper() if match else None
-
-    match = mob_defeat_pattern.match(description)
-    if match:
-        player_list_str = match.group(3).strip().replace(" and ", ", ")
-        players = [p.strip() for p in player_list_str.split(',') if p.strip()]
-        item_data = {'category': 'super_defeat', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'players': players, 'server': server}
-    
-    if not item_data:
-        match = petal_craft_pattern.match(description)
-        if match:
-            item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
-    
-    if not item_data:
-        for spawn_text, mob_name in special_spawn_messages.items():
-            if spawn_text in description:
-                item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
-                break
-
-    if not item_data:
-        item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
-    
-    if item_data:
-        item_data['message_id'] = str(message.id)
-        item_data['timestamp'] = message.created_at.isoformat()
-        await _handle_self_bot_event(item_data)
-
-async def _catch_up_missed_self_bot_events():
-    """On startup, fetches and processes messages missed while the bot was offline."""
-    global is_catching_up
-    print("--- Starting Self-Bot Catch-up Procedure ---")
-    is_catching_up = True
-
-    try:
-        if not supabase:
-            print("Catch-up: Supabase unavailable, skipping.")
-            return
-
-        # 1. Get the last known message ID from the database
-        last_msg_resp = await run_supabase_sync(
-            lambda: supabase.table("super_craft_logs").select("original_message_id").order("id", desc=True).limit(1).maybe_single().execute()
-        )
-        if last_msg_resp and last_msg_resp.data and last_msg_resp.data.get('original_message_id'):
-            last_message_id = int(last_msg_resp.data['original_message_id'])
-        else:
-            print("Catch-up: No previous craft logs found. Skipping catch-up as there's no starting point.")
-            return
-
-        # 2. Get the channel object
-        try:
-            channel_id = int(SUPER_CRAFT_SELF_BOT_CHANNEL_ID)
-            # Use bot.get_channel first if the bot might be in the guild, then fallback to fetch
-            channel = bot.get_channel(channel_id)
-            if not channel:
-                channel = await bot.fetch_channel(channel_id)
-            
-            if not isinstance(channel, discord.TextChannel):
-                print(f"Catch-up: Channel ID {channel_id} is not a valid text channel.")
-                return
-        except (ValueError, discord.NotFound) as e:
-            print(f"Catch-up ERROR: Could not find self-bot channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). Error: {e}")
-            return
-        except discord.Forbidden:
-            print(f"Catch-up ERROR: 403 Forbidden. The main bot does not have permission to access the self-bot's channel (ID: {SUPER_CRAFT_SELF_BOT_CHANNEL_ID}). This is expected if the channel is private to the self-bot.")
-            return
-
-        print(f"Catch-up: Starting fetch from channel #{channel.name} after message ID {last_message_id}.")
-        last_message_obj = channel.get_partial_message(last_message_id)
-        total_processed = 0
-        
-        # 3. Loop and process messages
-        while True:
-            messages_to_process = []
-            async for message in channel.history(limit=100, after=last_message_obj):
-                messages_to_process.append(message)
-            
-            if not messages_to_process:
-                print("Catch-up: No new messages found to process.")
-                break
-            
-            print(f"Catch-up: Fetched {len(messages_to_process)} new message(s). Processing...")
-            for msg in reversed(messages_to_process): # Process in chronological order
-                await _classify_discord_message(msg)
-                total_processed += 1
-            
-            last_message_obj = messages_to_process[0] # The newest message becomes the 'after' for the next batch
-            
-            if len(messages_to_process) < 100:
-                print("Catch-up: Last batch was less than 100 messages. Assuming we are caught up.")
-                break
-
-            # Cooldown between fetches
-            cooldown = random.uniform(15, 45)
-            print(f"Catch-up: Cooling down for {cooldown:.1f} seconds before next fetch...")
-            await asyncio.sleep(cooldown)
-
-        print(f"--- Self-Bot Catch-up Finished. Processed {total_processed} messages. ---")
-
-    except Exception as e:
-        print(f"CRITICAL ERROR during self-bot catch-up: {e}")
-        traceback.print_exc()
-    finally:
-        is_catching_up = False
-        print("--- Resuming normal self-bot event processing. ---")
-
 async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: str) -> Tuple[Optional[int], Optional[str]]:
     """
     Resolves a user-provided name or ID to a specific role or channel ID.
@@ -2041,7 +2083,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
     category = item.get('category')
     rarity = item.get('rarity')
     server = item.get('server')
-    timestamp = item.get('timestamp')
+    timestamp_str = item.get('timestamp')
     ping_role = False
     text = None
 
@@ -2054,7 +2096,8 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
-        text = f"{region_prefix}**{rarity} {mob}** has spawned {{time}}!"
+        # The {time} placeholder will now be replaced in the calling function.
+        text = f"{region_prefix}**{rarity} {mob}** has spawned! {{time}}"
         ping_role = True
 
     elif category == 'super_defeat':
@@ -2069,7 +2112,19 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
     if rarity == "Unique" and text:
         text = f"✨ **UNIQUE EVENT!** ✨\n{text}"
 
-    return text, ping_role, timestamp
+    # Replace the {time} placeholder if it exists and a valid timestamp is available
+    if text and '{{time}}' in text:
+        if timestamp_str:
+            try:
+                event_dt = date_parse(timestamp_str)
+                unix_ts = int(event_dt.timestamp())
+                text = text.replace('{{time}}', f'<t:{unix_ts}:R>')
+            except (ValueError, TypeError):
+                text = text.replace(' {{time}}', '') # Remove placeholder if parse fails
+        else:
+            text = text.replace(' {{time}}', '') # Remove placeholder if no timestamp
+
+    return text, ping_role, timestamp_str
 
 async def _log_super_defeat_to_db(item: Dict[str, Any]):
     """Logs a super defeat event to the new super_defeats table."""
@@ -2167,110 +2222,9 @@ async def _log_super_craft_to_db(item: Dict[str, Any]):
     except Exception as e:
         await log_error(guild_for_log, f"Failed to log super craft event to database (General Error)", error=e)
 
-async def _handle_self_bot_event(item: Dict[str, Any]):
-    """
-    This coroutine runs in the main bot's event loop. It dispatches an event
-    to multiple systems:
-    1. The rate-limited JSON logging system (via queues).
-    2. The new database logging system for specific events (e.g., super defeats/crafts).
-    3. The new instantaneous, human-friendly ping system (direct webhook send).
-    """
-    if is_catching_up: # Pause live event processing during catch-up
-        print(f"Event received but paused for catch-up: {item.get('category')}")
-        return
-
-    category = item.get('category')
-    print(f"\n--- [Self-Bot Handler] ---")
-    print(f"⚡ Received event: {category}")
-    
-    # --- 1. Dispatch to JSON logging queues (existing system) ---
-    if category == 'super_craft':
-        await craft_queue.put(item)
-    elif category in ['super_spawn', 'super_defeat']:
-        await spawn_defeat_queue.put(item)
-    elif category == 'unclassified':
-        print("   [ACTION] This event could not be classified. Logging to extraordinary logs.")
-        embed = discord.Embed(title="🕵️ Unclassified Self-Bot Event", description=f"```\n{item.get('text', 'No text found.')}\n```", color=discord.Color.orange())
-        embed.add_field(name="Raw Data", value=f"```json\n{json.dumps(item, indent=2)}\n```")
-        await log_error(None, "Unclassified Self-Bot Event", embed=embed)
-    
-    # --- 2. Dispatch to new database logging system (NEW) ---
-    if category == 'super_defeat':
-        await _log_super_defeat_to_db(item)
-    elif category == 'super_craft':
-        await _log_super_craft_to_db(item)
-
-    # --- 3. Dispatch to new instantaneous TEXT ping system (REWORKED) ---
-    if category in ['super_craft', 'super_spawn', 'super_defeat']:
-        ping_template, should_ping_role, event_timestamp_str = await _create_ping_text(item)
-        if not ping_template:
-            print("   [PING FAIL] Could not generate ping text.")
-            return
-
-        final_ping_text = ping_template
-        if '{{time}}' in ping_template and event_timestamp_str:
-            try:
-                event_dt = date_parse(event_timestamp_str)
-                unix_ts = int(event_dt.timestamp())
-                final_ping_text = ping_template.replace('{{time}}', f'<t:{unix_ts}:R>')
-            except (ValueError, TypeError):
-                final_ping_text = ping_template.replace(' {{time}}', '')
-
-        config_key_map = {'super_craft': 'craft_ping_channel_id', 'super_spawn': 'spawn_ping_channel_id', 'super_defeat': 'defeat_ping_channel_id'}
-        webhook_purpose_map = {'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings'}
-        webhook_name_map = {'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings'}
-        
-        config_key = config_key_map.get(category)
-        if not config_key: return
-
-        for guild in bot.guilds:
-            config = await load_server_config(guild.id)
-            channel_id = config.get(config_key)
-            if channel_id:
-                channel = guild.get_channel(channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
-                    if webhook:
-                        content_to_send = final_ping_text
-                        if should_ping_role:
-                            role_id_to_ping = config.get('super_ping_role_id')
-                            if role_id_to_ping:
-                                content_to_send += f"\n<@&{role_id_to_ping}>"
-                        
-                        player_igns = []
-                        if category == 'super_craft' and item.get('player'):
-                            player_igns.append(item.get('player'))
-                        elif category == 'super_defeat':
-                            player_igns.extend(item.get('players', []))
-
-                        if player_igns and supabase:
-                            try:
-                                resp = await run_supabase_sync(
-                                    lambda: supabase.table("florr_players")
-                                                   .select("discord_id")
-                                                   .in_("ingame_name", player_igns)
-                                                   .not_.is_("discord_id", "null")
-                                                   .execute()
-                                )
-                                if resp and resp.data:
-                                    user_mentions = [f"<@{entry['discord_id']}>" for entry in resp.data]
-                                    if user_mentions:
-                                        content_to_send += f"\n\nCongratulations {', '.join(user_mentions)}!"
-                            except Exception as e:
-                                await log_error(guild, "Failed to fetch players for congrats message in ping", error=e)
-
-                        try:
-                            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True, users=True))
-                            print(f"   [PING SUCCESS] Sent '{category}' text ping to #{channel.name} in {guild.name}.")
-                        except Exception as e:
-                            print(f"   [PING FAIL] Failed to send webhook to #{channel.name} in {guild.name}: {e}")
-    
-    print("--------------------------\n")
-
 @bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     """Logs when a message is deleted from the self-bot's channel."""
-    # We only care about deletions in the self-bot's channel
     if str(payload.channel_id) != SUPER_CRAFT_SELF_BOT_CHANNEL_ID:
         return
 
@@ -2288,7 +2242,6 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     embed.set_footer(text="Note: The content of the deleted message is not available via this event.")
     embed.timestamp = discord.utils.utcnow()
 
-    # Log to extraordinary logs without pinging the owner.
     await log_error(
         guild, 
         "A message was deleted in the self-bot's private channel.", 
@@ -3693,37 +3646,6 @@ def find_potential_ign_typos(screenshot_igns: Set[str], db_members: List[Dict[st
     
     potential_typos.sort(key=lambda x: x[3], reverse=True)
     return potential_typos
-
-async def fetch_all_db_florr_players_with_status(guild: Optional[discord.Guild]) -> List[Dict[str, Any]]:
-    """
-    Fetches all HC members from Supabase, including their ingame_name, discord_id, and is_in_hc status.
-    Returns a list of dicts, e.g., {'ingame_name': 'Player1', 'discord_id': '123...', 'is_in_hc': True}
-    """
-    if not supabase:
-        if guild: await log_error(guild, "GuildSync: Supabase unavailable for fetching DB HC members with status.")
-        return []
-    
-    try:
-        resp = await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .select("ingame_name, discord_id, is_in_hc")
-                           # .eq("is_in_hc", True) # Fetch ALL members to check their status, not just active ones
-                           .not_.is_("ingame_name", "null")
-                           .execute()
-        )
-        if resp and hasattr(resp, 'data') and resp.data:
-            return [
-                {
-                    'ingame_name': entry['ingame_name'],
-                    'discord_id': str(entry['discord_id']) if entry.get('discord_id') else None,
-                    'is_in_hc': entry.get('is_in_hc')
-                }
-                for entry in resp.data if entry.get('ingame_name')
-            ]
-        return []
-    except Exception as e:
-        if guild: await log_error(guild, "GuildSync: Error fetching all HC members with status from DB", error=e)
-        return []
 
 async def fetch_all_db_florr_players_for_sync(guild: Optional[discord.Guild]) -> List[str]:
     """Fetches all In-Game Names from florr_players where is_in_hc is TRUE."""
@@ -8031,7 +7953,8 @@ async def on_ready():
     synced_commands = await _sync_app_commands(bot)
 
     await _revive_static_list_views()
-    asyncio.create_task(_catch_up_missed_self_bot_events())
+    # REMOVE THE LINE BELOW
+    # asyncio.create_task(_catch_up_missed_self_bot_events())
     
     await _start_background_tasks(bot)
 
