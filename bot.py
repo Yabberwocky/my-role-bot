@@ -1865,11 +1865,18 @@ class SetupView(discord.ui.View):
 
     async def update_config_and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
         if not self.guild: return
+        
         if len(updates) > 1:
             await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
         
+        # Invalidate the cache to force a reload from the database
+        if self.guild.id in server_settings_cache:
+            del server_settings_cache[self.guild.id]
+        
+        # This call will now fetch fresh data from Supabase and repopulate the cache
         self.config = await load_server_config(self.guild.id)
         
+        # Now update the message with an embed reflecting the new, live configuration
         if self.message:
             await self.message.edit(embed=self.create_embed(), view=self)
 
@@ -5855,9 +5862,9 @@ class HelpPagesView(discord.ui.View):
         self.add_item(self.buttons['general'])
 
         if self.is_staff_view_allowed:
-            self.buttons['customization'] = discord.ui.Button(label="Customization", emoji="⚙️", style=discord.ButtonStyle.primary if self.current_page == 'customization' else discord.ButtonStyle.secondary, custom_id="help_page_customization")
-            self.buttons['customization'].callback = self.switch_page
-            self.add_item(self.buttons['customization'])
+            self.buttons['staff'] = discord.ui.Button(label="Staff", emoji="🛡️", style=discord.ButtonStyle.primary if self.current_page == 'staff' else discord.ButtonStyle.secondary, custom_id="help_page_staff")
+            self.buttons['staff'].callback = self.switch_page
+            self.add_item(self.buttons['staff'])
 
             self.buttons['owner'] = discord.ui.Button(label="Owner", emoji="👑", style=discord.ButtonStyle.primary if self.current_page == 'owner' else discord.ButtonStyle.secondary, custom_id="help_page_owner")
             self.buttons['owner'].callback = self.switch_page
@@ -5872,35 +5879,54 @@ class HelpPagesView(discord.ui.View):
         embed = discord.Embed(title="🤓 FlorrNerd Bot - General Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "Here are commands generally available to users:\n\u200B"
-        embed.add_field(name="✨ Main Commands", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('profile')} · View a player's profile and stats.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('add_note')} · Add a public note to a player's profile.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('connect')} · Link your Discord to an IGN.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('disconnect')} · Unlink your Discord from your IGN.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('hcmembers')} · Show interactive list of guild members.", value="\u200B", inline=False)
+        embed.description = "Here are commands generally available to users.\n\n\u200B"
+        
+        embed.add_field(name="✨ Player & Guild Info", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('profile')} · View a player's full profile and stats.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('hcmembers')} · Show the interactive guild member list.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('servercodes')} · Browse Florr.io server codes.", value="\u200B", inline=False)
-        embed.add_field(name="\u200B\n💬 Messaging & Nicknames", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('message')} · Send a message as the bot (opt. AI).", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('florr')} · Send msg with custom name & Florr pic.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your S.Attempt nickname.", value="\u200B", inline=False)
-        embed.add_field(name="\u200B\n⚙️ Other", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('ping')} · Check bot's latency to Discord.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('discoveries')} · Show secret AI phrase discovery progress.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('nerdhelp')}  · Shows this help message.", value="\u200B", inline=False)
-        embed.set_footer(text="Bot by TheNerd | sweet_honey")
+        
+        embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer
+
+        embed.add_field(name="👤 Account Management", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('connect')} · Link your Discord to a Florr IGN.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('disconnect')} · Unlink your Discord from your IGN.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('add_note')} · Add a public note to a player's profile.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setnickname')} · Manage your auto-updating nickname.", value="\u200B", inline=False)
+        
+        embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer
+
+        embed.add_field(name="⚙️ Utility", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('ping')} · Check the bot's latency.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('nerdhelp')} · Shows this help message.", value="\u200B", inline=False)
+        
+        embed.set_footer(text="Bot by Vibhor | TheNerd")
         return embed
 
-    def _create_customization_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="⚙️ FlorrNerd Bot - Customization Commands", color=NERDY_YELLOW)
+    def _create_staff_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="🛡️ FlorrNerd Bot - Staff Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "These commands require server admin permissions:\n\u200B"
-        embed.add_field(name=f"{get_cmd_mention('setup')} · Interactively configure all bot settings for this server.", value="This is the primary command for setting up roles, channels, and command permissions.", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('verify')} · Manually manage verified/unverified roles for a user.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('setguild')} · Set a user's Florr guild.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('refresh')} · Sync all roles, refresh data.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('active')} / {get_cmd_mention('inactive')} · Manually manage activity logs.", value="\u200B", inline=False)
+        embed.description = "These commands require server admin permissions or a configured staff role.\n\n\u200B"
+        
+        embed.add_field(name="🛠️ Server & Guild Configuration", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setup')} · Interactively configure all bot settings.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setup_guild')} · Manage the server's tracked Florr guilds.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('refresh')} · Sync all data and roles.", value="\u200B", inline=False)
+        
+        embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer
+
+        embed.add_field(name="👤 Member Management", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('verify')} · Manually manage a user's verification.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('setguild')} · Set a user's Florr guild tag in the database.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('wither')} · Temporarily remove a user's roles.", value="\u200B", inline=False)
+        
+        embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer
+
+        embed.add_field(name="💬 Messaging", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('florr')} · Send a message with a custom Florr avatar.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('imitate')} · Send a message appearing as another user.", value="\u200B", inline=False)
+        
         embed.set_footer(text="Use /setup for most configuration needs.")
         return embed
     
@@ -5908,15 +5934,23 @@ class HelpPagesView(discord.ui.View):
         embed = discord.Embed(title="👑 FlorrNerd Bot - Owner Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "These commands can only be run by the bot owner.\n\u200B"
-        embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings (e.g., add global guilds, add IGNs).", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('addkeyword')} · Add AI keyword rule.", value="\u200B", inline=False)
-        embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete N bot messages.", value="\u200B", inline=False)
+        embed.description = "These commands can only be run by the bot owner.\n\n\u200B"
+
+        embed.add_field(name="⚙️ Global Management", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('cleanup_bot_messages')} · Delete the bot's last N messages.", value="\u200B", inline=False)
+        
+        embed.add_field(name="\u200B", value="\u200B", inline=False) # Spacer
+
+        embed.add_field(name="💬 Advanced Messaging", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('message')} · Send, edit, or reply to any message.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('webhook')} · Manage persistent, named webhooks.", value="\u200B", inline=False)
+
         embed.set_footer(text="These commands affect the bot globally.")
         return embed
 
     def get_current_embed(self) -> discord.Embed:
-        if self.current_page == "customization": return self._create_customization_embed()
+        if self.current_page == "staff": return self._create_staff_embed()
         if self.current_page == "owner": return self._create_owner_embed()
         return self._create_general_embed()
 
