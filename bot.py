@@ -689,18 +689,6 @@ class DeleteNoteModal(discord.ui.Modal, title="Delete Player Note"):
             await self.view_ref._fetch_notes_page_data(self.view_ref.notes_current_page)
             await self.view_ref._update_message(interaction)
 
-async def is_module_enabled(interaction: discord.Interaction, module_name: str) -> bool:
-    """Checks if a specific bot module is enabled for the server."""
-    if not interaction.guild:
-        return False # Modules are a guild-level concept
-
-    config = await load_server_config(interaction.guild.id)
-    enabled_modules = config.get('enabled_modules') or [] # Default to empty list
-
-    # If no modules are configured, assume none are enabled for safety.
-    # This forces admins to explicitly enable features.
-    return module_name.lower() in [mod.lower() for mod in enabled_modules]
-
 class SelfBotListener:
     """
     Connects to the Discord Gateway using the raw websockets library and dispatches 
@@ -2518,11 +2506,12 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
         # 3. Handle Ex-Member Role
         ex_member_role = guild.get_role(ex_member_role_id) if ex_member_role_id else None
         if ex_member_role:
-            # Add ex-member role if user is connected but not in a tracked guild
-            if is_connected and not is_in_tracked_guild and ex_member_role not in member.roles and guild.me.top_role > ex_member_role:
+            is_unverified = unverified_role and unverified_role in member.roles
+            # Add ex-member role if user is connected, not in a tracked guild, AND is not considered "unverified".
+            if is_connected and not is_in_tracked_guild and not is_unverified and ex_member_role not in member.roles and guild.me.top_role > ex_member_role:
                 roles_to_add.append(ex_member_role)
-            # Remove ex-member role if user is not connected or has joined a tracked guild
-            elif (not is_connected or is_in_tracked_guild) and ex_member_role in member.roles and guild.me.top_role > ex_member_role:
+            # Remove ex-member role if user is not connected, or has joined a tracked guild, or is currently considered unverified.
+            elif (not is_connected or is_in_tracked_guild or is_unverified) and ex_member_role in member.roles and guild.me.top_role > ex_member_role:
                 roles_to_remove.append(ex_member_role)
 
         # 4. Apply changes
@@ -8163,35 +8152,49 @@ def get_cmd_mention(name: str) -> str:
 @app_commands.checks.bot_has_permissions(manage_roles=True)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
-    if not await is_module_enabled(interaction, "verification"):
-        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=False, thinking=True)
 
     config = await load_server_config(guild.id)
     verified_role_id = config.get('verified_role_id')
     unverified_role_id = config.get('unverified_role_id')
 
-    if not verified_role_id or not unverified_role_id:
-        await interaction.followup.send("❌ This server has not configured a `Verified` and `Unverified` role. Use `/setup`.", ephemeral=True)
+    if not verified_role_id and not unverified_role_id:
+        await interaction.followup.send("❌ This server has not configured any `Verified` or `Unverified` roles. Use `/setup`.", ephemeral=True)
         return
 
-    verified_role = guild.get_role(verified_role_id)
-    unverified_role = guild.get_role(unverified_role_id)
-
-    if not verified_role or not unverified_role:
-        await interaction.followup.send("❌ The configured `Verified` or `Unverified` role was not found in this server.", ephemeral=True)
-        return
+    roles_added_msg = ""
+    roles_removed_msg = ""
 
     try:
-        if verified_role not in user.roles:
-            await user.add_roles(verified_role, reason=f"Manually verified by {interaction.user}")
-        if unverified_role in user.roles:
-            await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
-        
-        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state (added `{verified_role.name}`, removed `{unverified_role.name}`).", ephemeral=False)
+        # Handle adding Verified role
+        if verified_role_id:
+            verified_role = guild.get_role(verified_role_id)
+            if verified_role:
+                if verified_role not in user.roles:
+                    await user.add_roles(verified_role, reason=f"Manually verified by {interaction.user}")
+                    roles_added_msg = f"added `{verified_role.name}`"
+            else:
+                await log_info(guild, f"/verify warning: Configured 'Verified' role (ID: {verified_role_id}) not found.")
+
+        # Handle removing Unverified role
+        if unverified_role_id:
+            unverified_role = guild.get_role(unverified_role_id)
+            if unverified_role:
+                if unverified_role in user.roles:
+                    await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
+                    roles_removed_msg = f"removed `{unverified_role.name}`"
+            else:
+                await log_info(guild, f"/verify warning: Configured 'Unverified' role (ID: {unverified_role_id}) not found.")
+
+        actions_performed = [msg for msg in [roles_added_msg, roles_removed_msg] if msg]
+
+        if not actions_performed:
+            await interaction.followup.send(f"ℹ️ No role changes were needed for {user.mention}. They already appear to be in a verified state.", ephemeral=False)
+            return
+
+        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state ({', '.join(actions_performed)}).", ephemeral=False)
         await log_info(guild, f"{interaction.user.name} manually verified {user.name} using /verify.")
+
     except Exception as e:
         await log_error(guild, "Error during manual /verify", error=e, interaction=interaction)
         await interaction.followup.send("❌ An error occurred while managing roles.", ephemeral=True)
@@ -8203,10 +8206,6 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 async def connect(interaction: discord.Interaction, ingame_name: str, user: Optional[discord.Member] = None):
-    if not await is_module_enabled(interaction, "verification"):
-        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
-        return
-
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -8218,7 +8217,7 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
         await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     cleaned_ign = clean_ign(ingame_name)
     if not cleaned_ign:
@@ -8256,10 +8255,6 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
 @tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
 @app_commands.describe(user="[Staff Only] The user to disconnect.")
 async def disconnect(interaction: discord.Interaction, user: Optional[discord.Member] = None):
-    if not await is_module_enabled(interaction, "verification"):
-        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
-        return
-
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -8271,7 +8266,7 @@ async def disconnect(interaction: discord.Interaction, user: Optional[discord.Me
         await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     try:
         update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(target_user.id)).execute())
@@ -8315,10 +8310,6 @@ async def setguild(
     user: Optional[discord.Member] = None,
     ingame_name: Optional[str] = None
 ):
-    if not await is_module_enabled(interaction, "guild_management"):
-        await interaction.response.send_message("❌ The 'Guild Management' module is not enabled on this server.", ephemeral=True)
-        return
-
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -8327,7 +8318,7 @@ async def setguild(
     if user and ingame_name:
         await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True); return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
     
     config = await load_server_config(guild.id)
