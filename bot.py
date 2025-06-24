@@ -260,6 +260,10 @@ consolidated_event_cache: Dict[str, List[Dict[str, Any]]] = {
     'super_defeat': [],
 }
 consolidation_task: Optional[asyncio.Task] = None
+STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
+STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes
+STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
+EVENT_CONSOLIDATION_WINDOW_SECONDS = 3.0 # Collect events for 3s before posting
 
 
 # --- Supabase Client ---
@@ -515,29 +519,41 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
     firewall to validate and process events from the listener.
     """
     global consolidated_event_cache, consolidation_task
-    # REMOVE THE LINE BELOW
-    # if is_catching_up: return
 
     category = item.get('category')
     timestamp_str = item.get('timestamp')
     message_id = item.get('message_id')
     
-    # --- Gate 1: Timestamp Freshness ---
+    # --- Gate 1: Timestamp Freshness (Now with Conditional Logic) ---
     if not timestamp_str: return
     try:
         event_dt = date_parse(timestamp_str)
-        if (discord.utils.utcnow() - event_dt).total_seconds() > STALE_EVENT_THRESHOLD_SECONDS:
+        now = discord.utils.utcnow()
+        age_seconds = (now - event_dt).total_seconds()
+
+        # Determine the correct threshold based on the event category
+        threshold = STALE_EVENT_THRESHOLD_SECONDS
+        if category == 'super_defeat':
+            threshold = STALE_DEFEAT_EVENT_THRESHOLD_SECONDS
+
+        if age_seconds > threshold:
             embed = discord.Embed(title="🕵️ Stale Event Discarded", color=discord.Color.dark_grey())
-            embed.description = f"An event from the self-bot listener was discarded for being too old (over {STALE_EVENT_THRESHOLD_SECONDS}s)."
+            embed.description = f"An event was discarded for being too old. (Age: {age_seconds:.0f}s, Threshold: {threshold}s)"
             embed.add_field(name="Event Details", value=f"```json\n{json.dumps(item, indent=2)}\n```")
-            await log_error(None, "Stale event discarded", embed=embed, ping_owner=False)
+            await log_error(None, f"Stale {category or 'event'} discarded", embed=embed, ping_owner=False)
             return
     except (ValueError, TypeError):
         return
 
-    # --- Gate 2: Idempotency (Handled by the listener's cache now) ---
-    # This logic has been moved to the listener to be more efficient.
-    # We trust that if an event reaches here, it's unique for its (message_id, category).
+    # --- Gate 2: Idempotency (Handled by the listener's cache) ---
+    # This logic is handled by the listener to be more efficient.
+
+    # --- Populate Private Log Queues ---
+    # This re-enables the private JSON log channels.
+    if category == 'super_craft':
+        await craft_queue.put(item)
+    elif category in ['super_spawn', 'super_defeat']:
+        await spawn_defeat_queue.put(item)
 
     # --- Log to Database (happens regardless of consolidation) ---
     if category == 'super_defeat':
