@@ -154,7 +154,6 @@ from PIL import Image
 import aiohttp
 import contextlib
 import difflib
-from listener import SelfBotListener
 import json
 import random
 import websockets
@@ -402,6 +401,138 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+async def get_note_author_count(guild: Optional[discord.Guild], author_id: str, target_ign: str) -> int:
+    """Counts how many notes a specific author has on a specific target IGN."""
+    if not supabase: return 0
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("player_notes")
+                           .select("id", count='exact')
+                           .eq("author_discord_id", str(author_id))
+                           .eq("target_player_ign", target_ign)
+                           .execute()
+        )
+        return resp.count if resp and hasattr(resp, 'count') and resp.count is not None else 0
+    except Exception as e:
+        await log_error(guild, f"Failed to count notes for author {author_id} on {target_ign}", error=e)
+        return 999 # Return a high number on error to prevent adding more
+
+async def add_player_note(guild: Optional[discord.Guild], author_id: str, target_ign: str, content: str) -> Tuple[bool, str]:
+    """Adds a new player note to the database."""
+    if not supabase: return False, "Database unavailable."
+    try:
+        await run_supabase_sync(
+            lambda: supabase.table("player_notes").insert({
+                "author_discord_id": str(author_id),
+                "target_player_ign": target_ign,
+                "note_content": content
+            }).execute()
+        )
+        return True, "Note added successfully."
+    except Exception as e:
+        await log_error(guild, f"Failed to add note from {author_id} to {target_ign}", error=e)
+        return False, "A database error occurred."
+
+async def get_user_notes(guild: Optional[discord.Guild], ign: str, page: int, per_page: int) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches paginated notes for a given IGN."""
+    if not supabase or not ign: return [], 0
+    offset = page * per_page
+    try:
+        count_resp = await run_supabase_sync(
+            lambda: supabase.table("player_notes").select("id", count='exact').eq("target_player_ign", ign).execute()
+        )
+        total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
+        if total_count == 0: return [], 0
+
+        data_resp = await run_supabase_sync(
+            lambda: supabase.table("player_notes")
+                           .select("*")
+                           .eq("target_player_ign", ign)
+                           .order("created_at", desc=True)
+                           .range(offset, offset + per_page - 1)
+                           .execute()
+        )
+        return (data_resp.data if data_resp and data_resp.data else []), total_count
+    except Exception as e:
+        await log_error(guild, f"Error fetching player notes for {ign}", error=e)
+        return [], 0
+
+async def delete_note_by_id(guild: Optional[discord.Guild], note_id: int) -> Tuple[bool, str]:
+    """Removes a player note entry by its database ID."""
+    if not supabase or not note_id: return False, "Invalid parameters for removing note."
+    try:
+        delete_resp = await run_supabase_sync(lambda: supabase.table("player_notes").delete().eq("id", note_id).execute())
+        if delete_resp.data and len(delete_resp.data) > 0:
+            return True, f"Successfully removed note (ID: {note_id})."
+        else:
+            return False, f"Could not find note (ID: {note_id}) to remove, or it was already gone."
+    except Exception as e:
+        await log_error(guild, f"Error removing note ID {note_id}", error=e)
+        return False, "A database error occurred."
+
+
+class DeleteNoteModal(discord.ui.Modal, title="Delete Player Note"):
+    entry_number_input = discord.ui.TextInput(
+        label="Entry number on this page to remove",
+        placeholder="e.g., 3 (for the 3rd item listed)",
+        min_length=1,
+        max_length=2,
+        style=discord.TextStyle.short,
+        required=True
+    )
+
+    def __init__(self, view_ref: 'ProfilePagesView'):
+        super().__init__(timeout=120.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        try:
+            entry_num_on_page = int(self.entry_number_input.value)
+            if not (1 <= entry_num_on_page <= len(self.view_ref.current_notes)):
+                await interaction.followup.send(f"❌ Invalid entry number. Please enter a number between 1 and {len(self.view_ref.current_notes)}.", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.followup.send("❌ Invalid number entered.", ephemeral=True)
+            return
+
+        entry_to_remove = self.view_ref.current_notes[entry_num_on_page - 1]
+        note_id_to_remove = entry_to_remove.get('id')
+        author_id_of_note = entry_to_remove.get('author_discord_id')
+
+        if not note_id_to_remove:
+            await interaction.followup.send("❌ Error: Could not find the database ID for the selected note.", ephemeral=True)
+            return
+
+        is_admin = await is_admin_or_owner(interaction)
+        is_author = str(interaction.user.id) == str(author_id_of_note)
+
+        if not is_admin and not is_author:
+            await interaction.followup.send("❌ You do not have permission to delete this note. Only the note's author or a server admin can.", ephemeral=True)
+            return
+
+        success, msg = await delete_note_by_id(interaction.guild, note_id_to_remove)
+        
+        feedback_embed = discord.Embed(title="Delete Note Result", description=msg, color=discord.Color.green() if success else discord.Color.orange())
+        await interaction.followup.send(embed=feedback_embed, ephemeral=True)
+
+        if success:
+            await self.view_ref._fetch_notes_page_data(self.view_ref.notes_current_page)
+            await self.view_ref._update_message(interaction)
+
+async def is_module_enabled(interaction: discord.Interaction, module_name: str) -> bool:
+    """Checks if a specific bot module is enabled for the server."""
+    if not interaction.guild:
+        return False # Modules are a guild-level concept
+
+    config = await load_server_config(interaction.guild.id)
+    enabled_modules = config.get('enabled_modules') or [] # Default to empty list
+
+    # If no modules are configured, assume none are enabled for safety.
+    # This forces admins to explicitly enable features.
+    return module_name.lower() in [mod.lower() for mod in enabled_modules]
 
 class SelfBotListener:
     """
@@ -1717,6 +1848,11 @@ class SetupView(discord.ui.View):
         )
         embed.add_field(name="Command Permissions", value=perms_val, inline=False)
 
+        # --- Enabled Modules ---
+        enabled_modules = self.config.get('enabled_modules') or []
+        modules_val = f"`{', '.join(enabled_modules) or 'None'}`"
+        embed.add_field(name="✅ Enabled Modules", value=modules_val, inline=False)
+
         # --- Feature Toggles ---
         toggles_val = (
             f"**Keyword Triggers:** {get_bool_status('keywords_enabled')}\n"
@@ -1729,14 +1865,11 @@ class SetupView(discord.ui.View):
 
     async def update_config_and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
         if not self.guild: return
-        # Only update DB if there are actual changes beyond the guild_id
         if len(updates) > 1:
             await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
         
-        # Reload the config from DB into the view's state and server cache
         self.config = await load_server_config(self.guild.id)
         
-        # Edit the original message with the updated embed
         if self.message:
             await self.message.edit(embed=self.create_embed(), view=self)
 
@@ -1786,19 +1919,20 @@ class SetupView(discord.ui.View):
         current_ai_channels = self.config.get('always_on_ai_channels', [])
         default_str = ', '.join(map(str, current_ai_channels)) if current_ai_channels else ''
         fields = [
-            {
-                'label': "AI Channel Names/IDs (comma-separated)",
-                'id': "always_on_ai_channels",
-                'placeholder': "e.g., general, ai-chat, 123456789...",
-                'default': default_str,
-                'style': discord.TextStyle.paragraph,
-                'max_length': 1024
-            }
+            {'label': "AI Channel Names/IDs (comma-separated)", 'id': "always_on_ai_channels", 'placeholder': "e.g., general, ai-chat, 123456789...", 'default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
         ]
         modal = SetupModal(title="Set Always-On AI Channels", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Set Modules", style=discord.ButtonStyle.secondary, row=1)
+    async def set_modules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_modules = self.config.get('enabled_modules', [])
+        default_str = ', '.join(current_modules) if current_modules else ''
+        fields = [{'label': "Enabled Modules (comma-separated)", 'id': "enabled_modules", 'placeholder': "e.g., verification, guild_management", 'default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}]
+        modal = SetupModal(title="Set Enabled Bot Modules", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=2)
     async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
             {'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) else "no"},
@@ -1807,7 +1941,7 @@ class SetupView(discord.ui.View):
         modal = SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=2)
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=3)
     async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)
         self.stop()
@@ -1856,6 +1990,12 @@ class SetupView(discord.ui.View):
                     errors.extend(temp_errors)
                 continue
 
+            if key == 'enabled_modules':
+                module_inputs = {m.strip().lower() for m in value_stripped.split(',') if m.strip()}
+                updates[key] = sorted(list(module_inputs))
+                resolved_items.append(f"Set `enabled_modules` to: `{', '.join(updates[key]) or 'None'}`.")
+                continue
+
             item_type = 'channel' if 'channel' in key else 'role'
             resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
             
@@ -1878,10 +2018,7 @@ class SetupView(discord.ui.View):
         else:
             feedback_embed.color = discord.Color.green()
         
-        # Save changes to the database and refresh the main setup message
         await self.update_config_and_refresh(interaction, updates)
-        
-        # Send ephemeral confirmation of what just happened
         await interaction.followup.send(embed=feedback_embed, ephemeral=True)
 
     async def on_timeout(self):
@@ -1901,30 +2038,26 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
     ping_role = False
     text = None
 
-    # Add region prefix if available, with a colon for better formatting
     region_prefix = f"**[{server}]**: " if server else ""
 
     if category == 'super_craft':
         petal = item.get('petal')
         player = item.get('player')
-        # Made the phrasing a bit more natural
-        text = f"{region_prefix}A **{rarity} {petal}** was just crafted by **{player or 'Someone'}**!"
+        text = f"{region_prefix}**{rarity} {petal}** was just crafted by **{player or 'Someone'}**!"
 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
-        # The {{time}} placeholder will be replaced by the handler with a dynamic timestamp
-        text = f"{region_prefix}A **{rarity} {mob}** spawned {{time}}!"
-        ping_role = True # Only spawn events should ping the role
+        text = f"{region_prefix}**{rarity} {mob}** has spawned {{time}}!"
+        ping_role = True
 
     elif category == 'super_defeat':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
         players = item.get('players', [])
         if players:
-            # Bolding the players for emphasis
             player_str = f" by **{', '.join(players)}**"
         else:
             player_str = ""
-        text = f"{region_prefix}The **{rarity} {mob}** has been defeated{player_str}!"
+        text = f"{region_prefix}**{rarity} {mob}** has been defeated{player_str}!"
 
     if rarity == "Unique" and text:
         text = f"✨ **UNIQUE EVENT!** ✨\n{text}"
@@ -2067,34 +2200,22 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
             print("   [PING FAIL] Could not generate ping text.")
             return
 
-        # Replace timestamp placeholder with a dynamic Discord timestamp
         final_ping_text = ping_template
         if '{{time}}' in ping_template and event_timestamp_str:
             try:
                 event_dt = date_parse(event_timestamp_str)
                 unix_ts = int(event_dt.timestamp())
-                # Format as a relative timestamp (e.g., "2 seconds ago")
                 final_ping_text = ping_template.replace('{{time}}', f'<t:{unix_ts}:R>')
             except (ValueError, TypeError):
-                # Fallback if timestamp is bad: just remove the placeholder
                 final_ping_text = ping_template.replace(' {{time}}', '')
 
-        config_key_map = {
-            'super_craft': 'craft_ping_channel_id',
-            'super_spawn': 'spawn_ping_channel_id',
-            'super_defeat': 'defeat_ping_channel_id',
-        }
-        webhook_purpose_map = {
-            'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings',
-        }
-        webhook_name_map = {
-            'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings',
-        }
+        config_key_map = {'super_craft': 'craft_ping_channel_id', 'super_spawn': 'spawn_ping_channel_id', 'super_defeat': 'defeat_ping_channel_id'}
+        webhook_purpose_map = {'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings'}
+        webhook_name_map = {'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings'}
         
         config_key = config_key_map.get(category)
         if not config_key: return
 
-        # Iterate through all servers the bot is in to check for configured ping channels
         for guild in bot.guilds:
             config = await load_server_config(guild.id)
             channel_id = config.get(config_key)
@@ -2107,16 +2228,66 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
                         if should_ping_role:
                             role_id_to_ping = config.get('super_ping_role_id')
                             if role_id_to_ping:
-                                # Add the role mention on a new line
                                 content_to_send += f"\n<@&{role_id_to_ping}>"
                         
+                        player_igns = []
+                        if category == 'super_craft' and item.get('player'):
+                            player_igns.append(item.get('player'))
+                        elif category == 'super_defeat':
+                            player_igns.extend(item.get('players', []))
+
+                        if player_igns and supabase:
+                            try:
+                                resp = await run_supabase_sync(
+                                    lambda: supabase.table("florr_players")
+                                                   .select("discord_id")
+                                                   .in_("ingame_name", player_igns)
+                                                   .not_.is_("discord_id", "null")
+                                                   .execute()
+                                )
+                                if resp and resp.data:
+                                    user_mentions = [f"<@{entry['discord_id']}>" for entry in resp.data]
+                                    if user_mentions:
+                                        content_to_send += f"\n\nCongratulations {', '.join(user_mentions)}!"
+                            except Exception as e:
+                                await log_error(guild, "Failed to fetch players for congrats message in ping", error=e)
+
                         try:
-                            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
+                            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True, users=True))
                             print(f"   [PING SUCCESS] Sent '{category}' text ping to #{channel.name} in {guild.name}.")
                         except Exception as e:
                             print(f"   [PING FAIL] Failed to send webhook to #{channel.name} in {guild.name}: {e}")
     
     print("--------------------------\n")
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """Logs when a message is deleted from the self-bot's channel."""
+    # We only care about deletions in the self-bot's channel
+    if str(payload.channel_id) != SUPER_CRAFT_SELF_BOT_CHANNEL_ID:
+        return
+
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+
+    embed = discord.Embed(
+        title="🕵️ Message Deleted in Self-Bot Channel",
+        description="A message was deleted from the self-bot feed channel. This could be due to an edit that replaces the embed or a manual deletion.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Message ID", value=f"`{payload.message_id}`", inline=True)
+    if payload.guild_id:
+        embed.add_field(name="Guild ID", value=f"`{payload.guild_id}`", inline=True)
+    embed.add_field(name="Channel ID", value=f"`{payload.channel_id}`", inline=True)
+    embed.set_footer(text="Note: The content of the deleted message is not available via this event.")
+    embed.timestamp = discord.utils.utcnow()
+
+    # Log to extraordinary logs without pinging the owner.
+    await log_error(
+        guild, 
+        "A message was deleted in the self-bot's private channel.", 
+        embed=embed, 
+        ping_owner=False
+    )
 
 @tasks.loop(seconds=5.0)
 async def aperiodic_craft_poster():
@@ -3993,8 +4164,8 @@ class AddUnknownAttemptsModal(discord.ui.Modal, title="Add Unknown Super Attempt
 
 class RemoveAttemptModal(discord.ui.Modal, title="Remove Super Attempt Log Entry"):
     entry_number_input = discord.ui.TextInput(
-        label="Number of the log entry on THIS PAGE to remove",
-        placeholder="e.g., 3 (for the 3rd item listed on the current page)",
+        label="Entry number on this page to remove",
+        placeholder="e.g., 3 (for the 3rd item listed)",
         min_length=1,
         max_length=2,
         style=discord.TextStyle.short,
@@ -5032,6 +5203,7 @@ class ProfilePagesView(discord.ui.View):
     SUPER_ATTEMPT_LOG_PAGE = "sa_log"
     SUPER_CRAFT_LOG_PAGE = "sc_log"
     SUPER_DEFEAT_LOG_PAGE = "sd_log"
+    NOTES_PAGE = "notes"
     SA_LOG_ENTRIES_PER_PAGE = 50
 
     def __init__(self, interaction: discord.Interaction, target_user_display_data: Dict[str, Any], hc_profile_data: Dict[str, Any],
@@ -5039,7 +5211,8 @@ class ProfilePagesView(discord.ui.View):
                  super_attempt_stats_data: Optional[Dict[str, Any]],
                  initial_craft_logs: List[Dict[str, Any]], total_crafts: int,
                  initial_defeat_logs: List[Dict[str, Any]], total_defeats: int,
-                 today_date_obj: datetime.date, timeout=300.0):
+                 initial_notes: List[Dict[str, Any]], total_notes: int,
+                 today_date_obj: datetime.date, timeout=300.0, start_page: str = "main"):
         super().__init__(timeout=timeout)
         self.original_command_interaction = interaction
         self.target_user_display_data = target_user_display_data
@@ -5052,26 +5225,28 @@ class ProfilePagesView(discord.ui.View):
         self.current_display_year = today_date_obj.year
         self.today_date_obj = today_date_obj
         
-        self.current_page_mode = self.MAIN_PAGE
+        self.current_page_mode = start_page
         self.message: Optional[discord.Message] = None
 
-        # State for Super Attempt Logs
         self.s_attempt_log_current_page = 0
         self.s_attempt_log_total_entries = self.super_attempt_stats_data.get('total_attempts', 0) if self.super_attempt_stats_data else 0
         self.s_attempt_log_total_pages = math.ceil(self.s_attempt_log_total_entries / self.SA_LOG_ENTRIES_PER_PAGE) if self.s_attempt_log_total_entries > 0 else 1
         self.current_s_attempt_log_entries = []
 
-        # State for Super Craft Logs
         self.s_craft_log_current_page = 0
         self.s_craft_log_total_entries = total_crafts
         self.s_craft_log_total_pages = math.ceil(total_crafts / self.SA_LOG_ENTRIES_PER_PAGE) if total_crafts > 0 else 1
         self.current_s_craft_log_entries = initial_craft_logs
         
-        # State for Super Defeat Logs
         self.s_defeat_log_current_page = 0
         self.s_defeat_log_total_entries = total_defeats
         self.s_defeat_log_total_pages = math.ceil(total_defeats / self.SA_LOG_ENTRIES_PER_PAGE) if total_defeats > 0 else 1
         self.current_s_defeat_log_entries = initial_defeat_logs
+
+        self.notes_current_page = 0
+        self.notes_total_entries = total_notes
+        self.notes_total_pages = math.ceil(total_notes / self.SA_LOG_ENTRIES_PER_PAGE) if total_notes > 0 else 1
+        self.current_notes = initial_notes
 
         self.is_fetching_log = False
         self._update_ui_elements()
@@ -5101,6 +5276,10 @@ class ProfilePagesView(discord.ui.View):
                 btn = discord.ui.Button(label="⚔️ View Super Defeats", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_DEFEAT_LOG_PAGE}", row=1)
                 btn.callback = self.navigation_button_callback
                 self.add_item(btn)
+            if self.notes_total_entries > 0:
+                btn = discord.ui.Button(label="📝 View Notes", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.NOTES_PAGE}", row=2)
+                btn.callback = self.navigation_button_callback
+                self.add_item(btn)
 
         elif self.current_page_mode == self.MONTHLY_PAGE:
             self.add_item(ProfileMonthSelect(self.today_date_obj.year, self.today_date_obj.month, self.current_display_year, self.current_display_month))
@@ -5110,7 +5289,7 @@ class ProfilePagesView(discord.ui.View):
             view_log_btn.callback = self.navigation_button_callback
             self.add_item(view_log_btn)
         
-        elif self.current_page_mode in [self.SUPER_ATTEMPT_LOG_PAGE, self.SUPER_CRAFT_LOG_PAGE, self.SUPER_DEFEAT_LOG_PAGE]:
+        elif self.current_page_mode in [self.SUPER_ATTEMPT_LOG_PAGE, self.SUPER_CRAFT_LOG_PAGE, self.SUPER_DEFEAT_LOG_PAGE, self.NOTES_PAGE]:
             self._add_pagination_controls()
 
     def _add_pagination_controls(self):
@@ -5122,6 +5301,8 @@ class ProfilePagesView(discord.ui.View):
             current_page, total_pages = self.s_craft_log_current_page, self.s_craft_log_total_pages
         elif page_mode_prefix == self.SUPER_DEFEAT_LOG_PAGE:
             current_page, total_pages = self.s_defeat_log_current_page, self.s_defeat_log_total_pages
+        elif page_mode_prefix == self.NOTES_PAGE:
+            current_page, total_pages = self.notes_current_page, self.notes_total_pages
 
         prev_btn = discord.ui.Button(label="⬅️ Prev", style=discord.ButtonStyle.blurple, custom_id=f"profile_log_prev_{page_mode_prefix}", row=1, disabled=(current_page == 0 or self.is_fetching_log))
         prev_btn.callback = self.handle_log_pagination
@@ -5142,6 +5323,11 @@ class ProfilePagesView(discord.ui.View):
             remove_btn = discord.ui.Button(label="➖ Remove Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_log))
             remove_btn.callback = self.handle_remove_s_attempt
             self.add_item(remove_btn)
+            
+        if self.current_page_mode == self.NOTES_PAGE:
+            delete_btn = discord.ui.Button(label="🗑️ Delete a Note", style=discord.ButtonStyle.danger, custom_id="profile_notes_delete", row=2, disabled=(not self.current_notes or self.is_fetching_log))
+            delete_btn.callback = self.handle_delete_note
+            self.add_item(delete_btn)
 
     def _create_main_embed(self) -> discord.Embed:
         is_partial_profile = not self.hc_profile_data.get('discord_id')
@@ -5185,11 +5371,14 @@ class ProfilePagesView(discord.ui.View):
             stats_value += f"🛠️ **Crafts:** `{self.s_craft_log_total_entries}`\n"
             has_super_stats = True
         if self.s_defeat_log_total_entries > 0:
-            stats_value += f"⚔️ **Defeats:** `{self.s_defeat_log_total_entries}`"
+            stats_value += f"⚔️ **Defeats:** `{self.s_defeat_log_total_entries}`\n"
+            has_super_stats = True
+        if self.notes_total_entries > 0:
+            stats_value += f"📝 **Notes:** `{self.notes_total_entries}`"
             has_super_stats = True
 
         if has_super_stats:
-            embed.add_field(name="🏆 Super Event Log", value=stats_value.strip(), inline=False)
+            embed.add_field(name="🏆 Super Event Log & Notes", value=stats_value.strip(), inline=False)
         
         embed.set_footer(text=f"Profile generated at {get_formatted_utc_now()}")
         return embed
@@ -5294,6 +5483,54 @@ class ProfilePagesView(discord.ui.View):
         embed.set_footer(text=f"Page {self.s_defeat_log_current_page + 1}/{self.s_defeat_log_total_pages} ({self.s_defeat_log_total_entries} total)")
         return embed
 
+    def _create_notes_embed(self) -> discord.Embed:
+        ign = self.hc_profile_data.get("ingame_name", "N/A")
+        embed = discord.Embed(title=f"📝 Notes for {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
+        if self.is_fetching_log:
+            embed.description = "⏳ Fetching notes..."
+            return embed
+        if not self.current_notes:
+            embed.description = "No notes have been added for this player."
+            return embed
+
+        author_ids = {note['author_discord_id'] for note in self.current_notes if note.get('author_discord_id')}
+        authors_map = {}
+        for author_id_str in author_ids:
+            try:
+                user_obj = bot.get_user(int(author_id_str))
+                if not user_obj:
+                    user_obj = asyncio.run_coroutine_threadsafe(bot.fetch_user(int(author_id_str)), bot.loop).result()
+                authors_map[author_id_str] = user_obj.name
+            except (discord.NotFound, ValueError, AttributeError):
+                authors_map[author_id_str] = f"ID:{author_id_str}"
+        
+        IDX_W, DATE_W, AUTHOR_W, NOTE_W = 4, 11, 15, 45
+        header = f"{'#':<{IDX_W}}{'Date':<{DATE_W}}{'Author':<{AUTHOR_W}}{'Note':<{NOTE_W}}"
+        separator = "-" * len(header)
+        lines = [f"```{header}", separator]
+
+        start_index = self.notes_current_page * self.SA_LOG_ENTRIES_PER_PAGE
+        for i, entry in enumerate(self.current_notes):
+            global_index = start_index + i + 1
+            author_id = entry.get('author_discord_id')
+            author_name = authors_map.get(str(author_id), "Unknown")
+            author_display = (author_name[:AUTHOR_W-1] + '…') if len(author_name) > AUTHOR_W else author_name
+            
+            note_content = entry.get('note_content', '').replace('\n', ' ')
+            note_display = (note_content[:NOTE_W-1] + '…') if len(note_content) > NOTE_W else note_content
+            
+            date_obj = date_parse(entry['created_at']) if entry.get('created_at') else None
+            date_str = format_date_dmy(date_obj) if date_obj else "N/A"
+            
+            index_str = f"{global_index}."
+            line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{author_display:<{AUTHOR_W}}{note_display:<{NOTE_W}}"
+            lines.append(line)
+        
+        lines.append("```")
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Page {self.notes_current_page + 1}/{self.notes_total_pages} ({self.notes_total_entries} total)")
+        return embed
+
     async def _update_message(self, interaction: discord.Interaction):
         self._update_ui_elements()
         embed_map = {
@@ -5303,6 +5540,7 @@ class ProfilePagesView(discord.ui.View):
             self.SUPER_ATTEMPT_LOG_PAGE: self._create_super_attempt_log_embed,
             self.SUPER_CRAFT_LOG_PAGE: self._create_super_craft_log_embed,
             self.SUPER_DEFEAT_LOG_PAGE: self._create_super_defeat_log_embed,
+            self.NOTES_PAGE: self._create_notes_embed,
         }
         embed_to_send = embed_map.get(self.current_page_mode, self._create_main_embed)()
         
@@ -5345,6 +5583,19 @@ class ProfilePagesView(discord.ui.View):
         self.s_defeat_log_current_page = page_num
         self.is_fetching_log = False
 
+    async def _fetch_notes_page_data(self, page_num: int):
+        ign = self.hc_profile_data.get("ingame_name")
+        if not ign:
+            self.current_notes = []
+            return
+        self.is_fetching_log = True
+        entries, total = await get_user_notes(self.original_command_interaction.guild, ign, page_num, self.SA_LOG_ENTRIES_PER_PAGE)
+        self.current_notes = entries
+        self.notes_current_page = page_num
+        self.notes_total_entries = total
+        self.notes_total_pages = math.ceil(total / self.SA_LOG_ENTRIES_PER_PAGE) if total > 0 else 1
+        self.is_fetching_log = False
+
     async def navigation_button_callback(self, interaction: discord.Interaction):
         new_mode = interaction.data['custom_id'].split("profile_nav_")[1]
         if self.current_page_mode == new_mode:
@@ -5355,6 +5606,7 @@ class ProfilePagesView(discord.ui.View):
         if new_mode == self.SUPER_ATTEMPT_LOG_PAGE: await self._fetch_s_attempt_log_page_data(0)
         elif new_mode == self.SUPER_CRAFT_LOG_PAGE: await self._fetch_s_craft_log_page_data(0)
         elif new_mode == self.SUPER_DEFEAT_LOG_PAGE: await self._fetch_s_defeat_log_page_data(0)
+        elif new_mode == self.NOTES_PAGE: await self._fetch_notes_page_data(0)
         
         await self._update_message(interaction)
 
@@ -5375,6 +5627,7 @@ class ProfilePagesView(discord.ui.View):
         if page_mode == self.SUPER_ATTEMPT_LOG_PAGE: current_page, total_pages = self.s_attempt_log_current_page, self.s_attempt_log_total_pages
         elif page_mode == self.SUPER_CRAFT_LOG_PAGE: current_page, total_pages = self.s_craft_log_current_page, self.s_craft_log_total_pages
         elif page_mode == self.SUPER_DEFEAT_LOG_PAGE: current_page, total_pages = self.s_defeat_log_current_page, self.s_defeat_log_total_pages
+        elif page_mode == self.NOTES_PAGE: current_page, total_pages = self.notes_current_page, self.notes_total_pages
         
         new_page = current_page + (1 if action == "next" else -1)
         if not (0 <= new_page < total_pages):
@@ -5385,6 +5638,7 @@ class ProfilePagesView(discord.ui.View):
             self.SUPER_ATTEMPT_LOG_PAGE: self._fetch_s_attempt_log_page_data,
             self.SUPER_CRAFT_LOG_PAGE: self._fetch_s_craft_log_page_data,
             self.SUPER_DEFEAT_LOG_PAGE: self._fetch_s_defeat_log_page_data,
+            self.NOTES_PAGE: self._fetch_notes_page_data,
         }
         await fetch_map[page_mode](new_page)
         await self._update_message(interaction)
@@ -5394,6 +5648,9 @@ class ProfilePagesView(discord.ui.View):
 
     async def handle_remove_s_attempt(self, interaction: discord.Interaction):
         await interaction.response.send_modal(RemoveAttemptModal(view_ref=self))
+
+    async def handle_delete_note(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DeleteNoteModal(view_ref=self))
 
     async def on_timeout(self):
         if self.message:
@@ -5618,6 +5875,7 @@ class HelpPagesView(discord.ui.View):
         embed.description = "Here are commands generally available to users:\n\u200B"
         embed.add_field(name="✨ Main Commands", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('profile')} · View a player's profile and stats.", value="\u200B", inline=False)
+        embed.add_field(name=f"{get_cmd_mention('add_note')} · Add a public note to a player's profile.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('connect')} · Link your Discord to an IGN.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('disconnect')} · Unlink your Discord from your IGN.", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('hcmembers')} · Show interactive list of guild members.", value="\u200B", inline=False)
@@ -7901,14 +8159,18 @@ def get_cmd_mention(name: str) -> str:
 @app_commands.checks.bot_has_permissions(manage_roles=True)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
-    await interaction.response.defer(ephemeral=True)
+    if not await is_module_enabled(interaction, "verification"):
+        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False, thinking=True)
 
     config = await load_server_config(guild.id)
     verified_role_id = config.get('verified_role_id')
     unverified_role_id = config.get('unverified_role_id')
 
     if not verified_role_id or not unverified_role_id:
-        await interaction.followup.send("❌ This server has not configured a `Verified` and `Unverified` role. Use `/customise set_role`.", ephemeral=True)
+        await interaction.followup.send("❌ This server has not configured a `Verified` and `Unverified` role. Use `/setup`.", ephemeral=True)
         return
 
     verified_role = guild.get_role(verified_role_id)
@@ -7924,7 +8186,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         if unverified_role in user.roles:
             await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
         
-        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state (added `{verified_role.name}`, removed `{unverified_role.name}`).", ephemeral=True)
+        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state (added `{verified_role.name}`, removed `{unverified_role.name}`).", ephemeral=False)
         await log_info(guild, f"{interaction.user.name} manually verified {user.name} using /verify.")
     except Exception as e:
         await log_error(guild, "Error during manual /verify", error=e, interaction=interaction)
@@ -7937,6 +8199,10 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 async def connect(interaction: discord.Interaction, ingame_name: str, user: Optional[discord.Member] = None):
+    if not await is_module_enabled(interaction, "verification"):
+        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
+        return
+
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -7956,24 +8222,20 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
         return
 
     try:
-        # Call the database function. It will handle all logic and error checking atomically.
         params = {
             'p_discord_id': str(target_user.id),
             'p_discord_name': str(target_user),
             'p_ign': cleaned_ign
         }
-        # The function now handles everything. If it doesn't raise an error, it succeeded.
         await run_supabase_sync(lambda: supabase.rpc('connect_florr_player', params).execute())
 
-        # If the RPC call was successful, we can proceed with bot-side updates.
         await trigger_global_role_sync_for_user(target_user)
         await load_ign_cache(guild)
         
-        await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=True)
+        await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=False)
         await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`.")
 
     except APIError as e:
-        # Gracefully handle the custom error for taken IGNs.
         if "IGN_TAKEN_BY" in e.message:
             try:
                 conflict_user_id = e.message.split(':')[-1]
@@ -7990,6 +8252,10 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
 @tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
 @app_commands.describe(user="[Staff Only] The user to disconnect.")
 async def disconnect(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    if not await is_module_enabled(interaction, "verification"):
+        await interaction.response.send_message("❌ The 'Verification' module is not enabled on this server.", ephemeral=True)
+        return
+
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -8011,7 +8277,7 @@ async def disconnect(interaction: discord.Interaction, user: Optional[discord.Me
         
         await trigger_global_role_sync_for_user(target_user)
         ign_disconnected = update_resp.data[0].get('ingame_name', 'an IGN')
-        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`. Roles are being updated across all servers.", ephemeral=True)
+        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`. Roles are being updated across all servers.", ephemeral=False)
         await log_info(guild, f"`{interaction.user.name}` disconnected `{target_user.name}`.")
 
     except Exception as e:
@@ -8045,6 +8311,10 @@ async def setguild(
     user: Optional[discord.Member] = None,
     ingame_name: Optional[str] = None
 ):
+    if not await is_module_enabled(interaction, "guild_management"):
+        await interaction.response.send_message("❌ The 'Guild Management' module is not enabled on this server.", ephemeral=True)
+        return
+
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
@@ -8068,21 +8338,17 @@ async def setguild(
         if user:
             target_display = user.mention
             target_member_for_roles = user
-            # When targeting a user, we assume they should already be connected.
-            # We will just update their record. If they don't exist, it will fail gracefully.
             update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
         
         elif ingame_name:
-            # Clean the input IGN to remove backslashes and strip whitespace
             cleaned_ign = clean_ign(ingame_name)
             target_display = f"IGN `{cleaned_ign}`"
-            # Use UPSERT to create the IGN if it doesn't exist, or update it if it does.
             update_resp = await run_supabase_sync(
                 lambda: supabase.table("florr_players")
                                .upsert({"ingame_name": cleaned_ign, "florr_guild_tag": normalized_tag}, on_conflict="ingame_name")
                                .execute()
             )
-            await load_ign_cache(guild) # Refresh cache with the potentially new IGN
+            await load_ign_cache(guild)
             
             if update_resp and update_resp.data and update_resp.data[0].get('discord_id'):
                 discord_id = int(update_resp.data[0]['discord_id'])
@@ -8098,10 +8364,10 @@ async def setguild(
         ign_from_db = update_resp.data[0].get('ingame_name', 'N/A')
         
         if normalized_tag:
-            await interaction.followup.send(f"✅ Set `{ign_from_db}` ({target_display})'s guild to **{normalized_tag}**. Roles updated if applicable.", ephemeral=True)
+            await interaction.followup.send(f"✅ Set `{ign_from_db}` ({target_display})'s guild to **{normalized_tag}**. Roles updated if applicable.", ephemeral=False)
             await log_info(guild, f"`{interaction.user.name}` set guild for {target_display} to {normalized_tag}.")
         else:
-            await interaction.followup.send(f"✅ Removed `{ign_from_db}` ({target_display}) from any tracked guild. Roles updated if applicable.", ephemeral=True)
+            await interaction.followup.send(f"✅ Removed `{ign_from_db}` ({target_display}) from any tracked guild. Roles updated if applicable.", ephemeral=False)
             await log_info(guild, f"`{interaction.user.name}` removed guild from {target_display}.")
             
         for bot_guild in bot.guilds:
@@ -8317,17 +8583,48 @@ async def hcmembers(interaction: discord.Interaction):
         except (discord.NotFound, discord.HTTPException):
             pass
 
+# Add a new helper function right before the /profile command definition
+async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
+    """Fetches just the florr_guild_tag for a given IGN."""
+    if not supabase: return None
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("florr_players")
+                           .select("florr_guild_tag")
+                           .ilike("ingame_name", ign)
+                           .limit(1)
+                           .maybe_single()
+                           .execute()
+        )
+        if resp and resp.data:
+            return resp.data.get('florr_guild_tag')
+        return None
+    except Exception as e:
+        await log_error(guild, f"Failed to fetch guild tag for IGN {ign}", error=e)
+        return None
+
 # Replace the /profile command with this new version
 
 @tree.command(name="profile", description="View Florr.io profile, activity, super attempts, crafts, and defeats.")
 @app_commands.describe(
     user="[Optional] Select a Discord user to view their profile.",
-    ingame_name="[Optional] Or, type an In-Game Name to view its profile."
+    ingame_name="[Optional] Or, type an In-Game Name to view its profile.",
+    start_page="[Optional] Jump directly to a specific page in the profile view."
 )
+@app_commands.choices(start_page=[
+    app_commands.Choice(name="Main", value="main"),
+    app_commands.Choice(name="Activity Calendar", value="monthly"),
+    app_commands.Choice(name="Super Attempt Stats", value="sa_stats"),
+    app_commands.Choice(name="Super Attempt Log", value="sa_log"),
+    app_commands.Choice(name="Super Craft Log", value="sc_log"),
+    app_commands.Choice(name="Super Defeat Log", value="sd_log"),
+    app_commands.Choice(name="Notes", value="notes"),
+])
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 async def profile(interaction: discord.Interaction, 
                   user: Optional[discord.Member] = None, 
-                  ingame_name: Optional[str] = None):
+                  ingame_name: Optional[str] = None,
+                  start_page: Optional[str] = "main"):
     guild = interaction.guild
     
     await interaction.response.defer(thinking=True, ephemeral=False)
@@ -8419,6 +8716,7 @@ async def profile(interaction: discord.Interaction,
     super_attempt_stats_data = await get_user_super_attempt_stats(guild, target_ign)
     initial_craft_logs, craft_total = await get_user_super_craft_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
     initial_defeat_logs, defeat_total = await get_user_super_defeat_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
+    initial_notes, notes_total = await get_user_notes(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
 
     final_hc_profile_data = hc_profile_db_data if hc_profile_db_data else {"ingame_name": partial_profile_ign}
     if 'florr_guild_tag' not in final_hc_profile_data:
@@ -8430,32 +8728,85 @@ async def profile(interaction: discord.Interaction,
         super_attempt_stats_data=super_attempt_stats_data, 
         initial_craft_logs=initial_craft_logs, total_crafts=craft_total,
         initial_defeat_logs=initial_defeat_logs, total_defeats=defeat_total,
-        today_date_obj=today_utc_obj or datetime.date.today()
+        initial_notes=initial_notes, total_notes=notes_total,
+        today_date_obj=today_utc_obj or datetime.date.today(),
+        start_page=start_page or "main"
     )
     
-    initial_embed = profile_view._create_main_embed()
+    embed_creator_map = {
+        profile_view.MAIN_PAGE: profile_view._create_main_embed,
+        profile_view.MONTHLY_PAGE: profile_view._create_monthly_embed,
+        profile_view.SUPER_ATTEMPT_STATS_PAGE: profile_view._create_super_attempt_stats_embed,
+        profile_view.SUPER_ATTEMPT_LOG_PAGE: profile_view._create_super_attempt_log_embed,
+        profile_view.SUPER_CRAFT_LOG_PAGE: profile_view._create_super_craft_log_embed,
+        profile_view.SUPER_DEFEAT_LOG_PAGE: profile_view._create_super_defeat_log_embed,
+        profile_view.NOTES_PAGE: profile_view._create_notes_embed,
+    }
+    creator_func = embed_creator_map.get(profile_view.current_page_mode, profile_view._create_main_embed)
+    initial_embed = creator_func()
+
     await interaction.edit_original_response(embed=initial_embed, view=profile_view)
     profile_view.message = await interaction.original_response()
 
-# Add a new helper function right before the /profile command definition
-async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
-    """Fetches just the florr_guild_tag for a given IGN."""
-    if not supabase: return None
-    try:
-        resp = await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .select("florr_guild_tag")
-                           .ilike("ingame_name", ign)
-                           .limit(1)
-                           .maybe_single()
-                           .execute()
-        )
-        if resp and resp.data:
-            return resp.data.get('florr_guild_tag')
-        return None
-    except Exception as e:
-        await log_error(guild, f"Failed to fetch guild tag for IGN {ign}", error=e)
-        return None
+@tree.command(name="add_note", description="Add a note to a player's profile.")
+@app_commands.describe(
+    note="The content of the note (max 200 characters).",
+    user="[Optional] The Discord user to add a note to.",
+    ingame_name="[Optional] The In-Game Name to add a note to."
+)
+@app_commands.autocomplete(ingame_name=ign_autocomplete)
+async def add_note(
+    interaction: discord.Interaction,
+    note: str,
+    user: Optional[discord.Member] = None,
+    ingame_name: Optional[str] = None
+):
+    guild = interaction.guild
+    if not await check_supabase_available(interaction): return
+
+    if not user and not ingame_name:
+        await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True)
+        return
+    if user and ingame_name:
+        await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True)
+        return
+    
+    if len(note) > 200:
+        await interaction.response.send_message("❌ Your note is too long. The maximum length is 200 characters.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    target_ign: Optional[str] = None
+    if user:
+        target_ign = await get_ign_from_user(guild, user.id)
+        if not target_ign:
+            await interaction.followup.send(f"❌ {user.mention} does not have a linked In-Game Name in the database.", ephemeral=True)
+            return
+    elif ingame_name:
+        profile_data = await fetch_profile_details_by_ign(guild, ingame_name)
+        if not profile_data or not profile_data.get('ingame_name'):
+            await interaction.followup.send(f"❌ Could not find a player with the IGN `{ingame_name}` in the database.", ephemeral=True)
+            return
+        target_ign = profile_data['ingame_name']
+
+    if not target_ign:
+        await interaction.followup.send("❌ Could not determine the target player.", ephemeral=True)
+        return
+
+    author_id = str(interaction.user.id)
+    note_count = await get_note_author_count(guild, author_id, target_ign)
+    if note_count >= 5:
+        await interaction.followup.send(f"❌ You have already added the maximum of 5 notes to `{target_ign}`.", ephemeral=True)
+        return
+
+    success, msg = await add_player_note(guild, author_id, target_ign, note)
+    
+    if success:
+        await interaction.followup.send(f"✅ Note added to profile of `{target_ign}`.")
+        await log_info(guild, f"{interaction.user.name} added a note to {target_ign}.")
+    else:
+        await interaction.followup.send(f"❌ Failed to add note: {msg}")
 
 @tree.command(name="refresh", description="Syncs all roles with the database and refreshes all server-specific data.")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -10097,6 +10448,22 @@ async def restart(interaction: discord.Interaction):
     # that the service has failed and needs to be restarted.
     print("--- EXITING FOR RESTART ---")
     sys.exit(1)
+
+@tree.command(name="help", description="Shows a pointer to the main help command.")
+async def help_command(interaction: discord.Interaction):
+    if not bot.user:
+        await interaction.response.send_message("Bot is not ready, please try again.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Help Information",
+        description=f"Please use the {get_cmd_mention('nerdhelp')} command for a full list of features.",
+        color=NERDY_YELLOW
+    )
+    if bot.user.display_avatar:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 # --- Bot Startup ---
 if __name__ == "__main__":
