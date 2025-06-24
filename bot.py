@@ -2279,8 +2279,8 @@ async def aperiodic_craft_poster():
     webhook = await get_or_create_webhook(target_channel, "craft_notify", "Craft Notify")
     if not webhook: return
     
-    # Exclude category from the final JSON output
-    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k != 'category'}, indent=4)}\n```" for item in items_to_post]
+    # Exclude category and message_id from the final JSON output
+    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k not in ['category', 'message_id']}, indent=4)}\n```" for item in items_to_post]
     full_message = "\n".join(message_content)
     if len(full_message) > 2000: full_message = full_message[:1990] + "\n...```"
         
@@ -2324,7 +2324,8 @@ async def aperiodic_spawn_defeat_poster():
     webhook = await get_or_create_webhook(target_channel, "spawn_defeat_notify", "Spawn Notify")
     if not webhook: return
 
-    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k != 'category'}, indent=4)}\n```" for item in items_to_post]
+    # Exclude category and message_id from the final JSON output
+    message_content = [f"```json\n{json.dumps({k: v for k, v in item.items() if k not in ['category', 'message_id']}, indent=4)}\n```" for item in items_to_post]
     full_message = "\n".join(message_content)
     if len(full_message) > 2000: full_message = full_message[:1990] + "\n...```"
             
