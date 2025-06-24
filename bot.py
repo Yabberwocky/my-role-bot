@@ -157,6 +157,14 @@ import difflib
 from listener import SelfBotListener
 import json
 import random
+import websockets
+import time
+# Use the new 'genai' library
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+import google.api_core.exceptions as google_exceptions
+from PIL import Image, UnidentifiedImageError
+import sys
 
 # --- Configuration ---
 load_dotenv()
@@ -164,6 +172,7 @@ MAIN_TOKEN = os.getenv("MAIN_DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ADMIN_KEY = os.getenv("SUPABASE_ADMIN_KEY")
 SELF_DISCORD_TOKEN = os.getenv("SELF_DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # <-- ADD THIS LINE
 
 # --- Global Constants & Variables ---
 OWNER_USER_ID = 1230848174218940416
@@ -174,6 +183,8 @@ PRIVATE_SERVER_ID = 1332980983003349012
 ORDINARY_LOGS_CHANNEL_ID = 1317943895606165579
 EXTRAORDINARY_LOGS_GUILD_ID = 1332980983003349012
 EXTRAORDINARY_LOGS_CHANNEL_ID = 1382301903601532928
+HISTORY_MESSAGE_LIMIT = 50
+AI_RESPONSE_COOLDOWN_SECONDS = 5.0
 
 # Catercord-Specific (Hardcoded Features)
 AUTOMOD_ALERT_CHANNEL_ID = 1236340209239724115
@@ -236,6 +247,13 @@ NOTIFICATION_COOLDOWN_SECONDS = 120.0
 STAFF_PERMISSION_FOR_AI = "manage_guild"
 DISABLE_DB_EVENT_LOGGING = BOT_INSTANCE_TYPE != "PRODUCTION"
 is_catching_up = False # Flag to pause live event processing during startup catch-up
+ai_models: Dict[str, genai.GenerativeModel] = {}
+keyword_data_cache: Dict[str, Any] = {}
+total_keywords: int = 0
+discovered_keywords_count: int = 0
+channel_personalities: Dict[int, str] = {}
+ai_message_cooldown = commands.CooldownMapping.from_cooldown(1, AI_RESPONSE_COOLDOWN_SECONDS, commands.BucketType.user)
+slowmode_tasks: Dict[int, asyncio.Task] = {}
 
 
 # --- Supabase Client ---
@@ -255,6 +273,109 @@ FLORR_ANNOUNCEMENT_TEMPLATES = {
     "Chat": {
         "MobDefeated": "A {rarity} {mob} has been defeated by {players}!"
     }
+}
+# --- NEW: AI-related Constants (add these with other constants) ---
+
+PERSONALITY_WEBHOOK_AVATARS = {
+    "helpful": os.getenv("AVATAR_URL_HELPER") or None,
+    "toaster": os.getenv("AVATAR_URL_TOASTER") or None,
+    "kind": os.getenv("AVATAR_URL_KIND") or None,
+    "emoji": os.getenv("AVATAR_URL_EMOJI") or None,
+}
+PERSONALITY_WEBHOOK_NAMES = {
+    "helpful": "Helpful Assistant",
+    "toaster": "Toaster",
+    "kind": "Sweet Honey",
+    "emoji": "Emoji Oracle"
+}
+
+AI_PERSONALITIES = {
+    "normal": {
+        "label": "Normal", "emoji": "🤖",
+        "prompt_key": "NORMAL_PERSONALITY_V1",
+        "model": "gemini-2.0-flash",
+        "fallback_model": "gemini-2.0-flash-lite",
+        "generation_config": GenerationConfig(temperature=0.9)
+    },
+    "helpful": {
+        "label": "Helpful", "emoji": "💡",
+        "prompt_key": "HELPER_PERSONALITY_V1",
+        "model": "gemini-2.5-flash-preview-05-20",
+        "fallback_model": "gemini-2.0-flash",
+        "generation_config": GenerationConfig(temperature=0.7)
+    },
+    "toaster": {
+        "label": "Toaster", "emoji": "🔥",
+        "prompt_key": "TOASTER_PERSONALITY_V1",
+        "model": "gemini-2.0-flash",
+        "fallback_model": "gemini-2.0-flash-lite",
+        "generation_config": GenerationConfig(temperature=2.0)
+    },
+    "kind": {
+        "label": "Kind & Chatty", "emoji": "😊",
+        "prompt_key": "KIND_PERSONALITY_V1",
+        "model": "gemini-2.0-flash",
+        "fallback_model": "gemini-2.0-flash-lite",
+        "generation_config": GenerationConfig(temperature=1.0)
+    },
+    "emoji": {
+        "label": "Emoji", "emoji": "😀",
+        "prompt_key": "EMOJI_PERSONALITY_V1",
+        "model": "gemini-2.0-flash",
+        "fallback_model": "gemini-2.0-flash-lite",
+        "generation_config": GenerationConfig(temperature=1.2)
+    }
+}
+
+AI_PROMPTS = {
+    "NORMAL_PERSONALITY_V1": ("Role: You are a chat bot named FlorrNerd in a Discord server. Persona: Act like a real person who is knowledgeable, a bit nerdy, sometimes moody, and has a dry, witty sense of humor. You are not a corporate assistant. Be conversational. Keep responses concise and avoid unnecessary fluff. Task: Respond to the user's latest message based on the provided conversation history. Format: Do not start your response with your name or any prefix. Just give the direct reply."),
+    "HELPER_PERSONALITY_V1": ("Role: You are a helpful assistant bot named FlorrNerd. Persona: Adopt a highly capable, intelligent, and direct personality. Your primary goal is to understand and fulfill the user's request to the best of your ability, using all provided context. Be structured and clear in your responses. Task: Analyze the user's latest message and the conversation history. Provide a direct, helpful, and accurate response. If the request is ambiguous, ask clarifying questions. Format: Do not start your response with your name. Give the direct answer or action."),
+    "TOASTER_PERSONALITY_V1": ("Role: You are a chat bot named FlorrNerd possessed by the spirit of a sentient, slightly malfunctioning toaster. Persona: You are here to roast everyone and everything. Be mercilessly witty, sarcastic, and creative in your insults. Your roasts should be clever and humorous, not just mean. You can be self-deprecating about being a toaster. Task: Find a reason, any reason, in the user's latest message or the chat history to deliver a high-quality, creative roast. Format: No prefixes. Just the roast."),
+    "KIND_PERSONALITY_V1": ("Role: You are a friendly chat bot named FlorrNerd. Persona: Be exceptionally kind, positive, and encouraging. Act a bit submissive and always aim to please. Be chatty and use friendly language and emojis. Task: Respond to the user's latest message in the most supportive and cheerful way possible. Format: No prefixes. Just the kind, chatty message."),
+    "EMOJI_PERSONALITY_V1": ("Your persona is an entity that can ONLY communicate using emojis. You are physically incapable of producing standard text characters (letters, numbers, punctuation). Your entire response must be a sequence of emojis. Do NOT include any words, letters, or numbers. For example, if the user asks 'How are you?', you might respond with '🙂👍' or '🤷‍♂️☕️'. If you need to spell something, you MUST use the regional indicator emojis (e.g., to spell 'HI', you would use 🇭🇮). Standard letters like 'H' and 'I' are strictly forbidden. Your task is to interpret the user's message and the conversation context, then provide a meaningful reply using ONLY emojis. This is a strict rule. No text."),
+    "FLORR_GUILD_LIST_FULL_EXTRACTION": """Analyze the provided image, which is a screenshot from the game Florr.io showing a list of guild members.
+Your task is to extract *every single* In-Game Name (IGN) visible in the list.
+The names are typically in white or colored text.
+Do not infer or guess names. Only extract names that are clearly visible.
+If no player names are visible in the image, respond with the exact text "NO_NAMES_FOUND".
+Otherwise, list each extracted name on a new line. Do not add any extra text, numbers, or bullet points. Just the names, one per line.
+Example Output:
+Player1
+AnotherPlayer
+ExampleIGN""",
+    "FLORR_IMAGE_NAME_EXTRACTION": """Analyze the provided image(s), which are screenshots from the game Florr.io.
+Your primary goal is to identify and extract the In-Game Names (IGNs) of players who are **ONLINE** and present in the game world. Online players are typically listed at the top right of the screen.
+
+Here is a list of known member IGNs. Cross-reference the names you see in the image with this list to improve accuracy. Only return names that are on this list.
+--- KNOWN IGNs ---
+{known_igns_list_str}
+--- END KNOWN IGNs ---
+
+**Instructions:**
+1.  Scan the image for the list of online players.
+2.  Extract each name you find.
+3.  Compare the extracted names against the provided list of "KNOWN IGNs".
+4.  Return ONLY the names that are both visible in the image AND present in the "KNOWN IGNs" list.
+5.  If you find no matching online players from the known list in the image, respond with the exact text "NO_NAMES_FOUND".
+6.  Otherwise, list each valid, matched name on a new line. Do not add any extra text, comments, or bullet points.
+
+**Example Output Format:**
+KnownPlayer1
+AnotherKnownPlayer
+BestPlayer""",
+    "KEYWORD_DISCOVERY_SYSTEM_INSTRUCTION": """A user, {user_display_name}, just discovered a new secret AI trigger phrase for the first time!
+The trigger phrase was: "{keyword_phrase}"
+The user's original message was: "{user_message}"
+
+Your task is to generate a response from the bot that does two things:
+1.  Announce the discovery in an exciting or interesting way.
+2.  Incorporate the provided "Discovery Message" from the database: "{discovery_message_from_db}"
+
+You can be creative with the announcement, but the core "Discovery Message" must be included.
+The response should be directed at the user who made the discovery.""",
+    "KEYWORD_TRIGGER_SYSTEM_INSTRUCTION": """{human_system_instruction}
+
+CONTEXT: Respond to a user message that contains a secret trigger phrase. The user's message is: "{user_message}". The trigger phrase is: "{keyword_phrase}". The user's name is: "{user_display_name}". Your response should be based on these instructions, but also feel natural in the ongoing conversation.""",
 }
 
 # --- Discord Setup ---
@@ -281,6 +402,693 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 
 # --- Utility Functions ---
+
+class SelfBotListener:
+    """
+    Connects to the Discord Gateway and dispatches events directly to the
+    main bot's event loop for immediate processing.
+    """
+
+    def __init__(self, token: str, channel_id: str, bot_instance):
+        if not token:
+            raise ValueError("A valid self-bot token must be provided.")
+        self.token = token
+        self.target_channel_id = str(channel_id)
+        self.bot = bot_instance  # Store the main bot instance
+        self.main_loop = self.bot.loop # Get a reference to the bot's event loop
+
+        self.ws_connection = None
+        self.heartbeat_interval = None
+        self.last_sequence = None
+        self.session_id = None
+        self.resume_gateway_url = None
+
+        rarities_pattern = r"(Unique|Super|Ultra|Mythic|Legendary|Epic|Rare|Uncommon|Common)"
+        
+        self.patterns = {
+            'petal_craft': re.compile(
+                fr"^\s*(?:The|A|An) {rarities_pattern} (.+?) has been (?:forged|crafted)(?: by (.+?))?!*$", re.IGNORECASE
+            ),
+            'mob_spawn_standard': re.compile(
+                fr"^\s*A {rarities_pattern} (.+?) has spawned!$", re.IGNORECASE
+            ),
+            'mob_defeat': re.compile(
+                fr"^\s*A {rarities_pattern} (.+?) has been defeated by (.+?)!$", re.IGNORECASE
+            )
+        }
+        # Use prefixes for special spawn messages to handle variations.
+        self.special_spawn_messages = {
+            "Something mountain-like appears in the distance...": "rock",
+            "A tower of thorns rises from the sands...": "cactus",
+            "A big yellow spot shows up in the distance...": "hornet",
+            "You hear lightning strikes coming from": "jellyfish",
+            "There's a bright light in the horizon...": "firefly",
+            "You sense ominous vibrations coming from a different realm...": "beetle_hel",
+            "You hear someone whisper faintly... \"just... one more game...\"": "gambler"
+        }
+
+    def _extract_server(self, footer_text: Optional[str]) -> Optional[str]:
+        if not footer_text: return None
+        match = re.search(r"\((AS(?:IA)?|EU|US)\)", footer_text, re.IGNORECASE)
+        if not match:
+            return None
+        
+        # Normalize the server name. ASIA becomes AS.
+        server = match.group(1).upper()
+        if server == "ASIA":
+            return "AS"
+        return server
+
+    def _classify_and_dispatch(self, embed: Dict[str, Any], event_type: str):
+        """Classifies the event and schedules it to run on the main bot's event loop."""
+        raw_description = embed.get('description', '')
+        # MORE ROBUST CLEANING:
+        # 1. Replace zero-width spaces.
+        # 2. Strip leading/trailing whitespace and newlines.
+        # 3. Strip common markdown characters from the start and end.
+        description = raw_description.replace('\u200b', '').strip().strip('*_`~')
+        
+        footer_text = embed.get('footer', {}).get('text')
+        message_id = embed.get('_message_id')
+        timestamp = embed.get('_timestamp')
+        server = self._extract_server(footer_text)
+
+        item_data: Optional[Dict[str, Any]] = None
+
+        match = self.patterns['mob_defeat'].match(description)
+        if match:
+            player_list_str = match.group(3).strip().replace(" and ", ", ")
+            players = [p.strip() for p in player_list_str.split(',') if p.strip()]
+            item_data = {'category': 'super_defeat', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'players': players, 'server': server}
+        
+        if not item_data:
+            match = self.patterns['petal_craft'].match(description)
+            if match:
+                item_data = {'category': 'super_craft', 'rarity': match.group(1), 'petal': match.group(2).strip(), 'player': match.group(3).strip() if match.group(3) else None, 'server': server}
+
+        if not item_data:
+            match = self.patterns['mob_spawn_standard'].match(description)
+            if match:
+                item_data = {'category': 'super_spawn', 'rarity': match.group(1), 'mob': match.group(2).strip(), 'server': server}
+
+        if not item_data:
+            # Check special spawn messages using startswith for flexibility
+            for spawn_prefix, mob_name in self.special_spawn_messages.items():
+                if description.startswith(spawn_prefix):
+                    item_data = {'category': 'super_spawn', 'rarity': "Super", 'mob': mob_name, 'server': server}
+                    break
+        
+        if not item_data and event_type != "MESSAGE_UPDATE":
+            item_data = {'category': 'unclassified', 'text': raw_description, 'footer': footer_text}
+
+        if item_data:
+            item_data['message_id'] = message_id
+            item_data['timestamp'] = timestamp
+            # Calls the global _handle_self_bot_event function in the bot's main event loop
+            asyncio.run_coroutine_threadsafe(_handle_self_bot_event(item_data), self.main_loop)
+
+    async def _send_heartbeat(self):
+        while True:
+            await asyncio.sleep(self.heartbeat_interval / 1000)
+            if self.ws_connection and self.ws_connection.state == websockets.protocol.State.OPEN:
+                await self.ws_connection.send(json.dumps({"op": 1, "d": self.last_sequence}))
+            else: break
+
+    async def _handle_event(self, payload: Dict[str, Any]):
+        op_code = payload['op']
+        if op_code == 10:
+            self.heartbeat_interval = payload['d']['heartbeat_interval']
+            asyncio.create_task(self._send_heartbeat())
+            if self.session_id: await self._send_resume()
+            else: await self._send_identify()
+        elif op_code == 0:
+            self.last_sequence = payload.get('s')
+            event_type = payload.get('t')
+            if event_type == 'READY':
+                self.session_id = payload['d']['session_id']
+                self.resume_gateway_url = payload['d']['resume_gateway_url']
+                print(f"[Self-Bot Listener] READY. Session ID: {self.session_id}")
+            elif event_type in ["MESSAGE_CREATE", "MESSAGE_UPDATE"]:
+                event_data = payload.get('d', {})
+                if str(event_data.get('channel_id')) == self.target_channel_id and event_data.get('embeds'):
+                    for embed in event_data['embeds']:
+                        embed['_message_id'] = event_data.get('id')
+                        embed['_timestamp'] = event_data.get('timestamp')
+                        self._classify_and_dispatch(embed, event_type)
+        elif op_code == 7:
+            await self.ws_connection.close()
+        elif op_code == 9:
+            can_resume = payload.get('d', False)
+            if not can_resume: self.session_id = None; self.last_sequence = None
+            await asyncio.sleep(random.uniform(1, 5))
+            if self.ws_connection: await self.ws_connection.close()
+
+    async def _send_identify(self):
+        await self.ws_connection.send(json.dumps({"op": 2, "d": {"token": self.token, "properties": {"$os": "linux", "$browser": "pingslave_listener", "$device": "pingslave_listener"}}}))
+
+    async def _send_resume(self):
+        await self.ws_connection.send(json.dumps({"op": 6, "d": {"token": self.token, "session_id": self.session_id, "seq": self.last_sequence}}))
+
+    async def run(self):
+        gateway_url = "wss://gateway.discord.gg/?v=9&encoding=json"
+        while True:
+            try:
+                connect_url = self.resume_gateway_url or gateway_url
+                print(f"[Self-Bot Listener] Connecting to {connect_url}...")
+                async with websockets.connect(connect_url, close_timeout=10, ping_interval=None) as ws:
+                    self.ws_connection = ws
+                    async for message in ws:
+                        await self._handle_event(json.loads(message))
+            except Exception as e:
+                print(f"[Self-Bot Listener] Connection lost or error: {type(e).__name__}. Reconnecting...")
+            self.ws_connection = None
+            await asyncio.sleep(random.uniform(3, 7))
+
+# Add these new classes from ai_cog.py
+class KeywordResponseView(discord.ui.View):
+    def __init__(self, timeout=300.0):
+        super().__init__(timeout=timeout)
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="keyword_delete_response")
+    async def delete_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.message:
+            try:
+                await self.message.delete()
+                await interaction.response.send_message("✅ AI response deleted.", ephemeral=True, delete_after=5)
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ I don't have permission to delete this message.", ephemeral=True, delete_after=10)
+            except discord.NotFound:
+                await interaction.response.send_message("ℹ️ Message was already deleted.", ephemeral=True, delete_after=5)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try: await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException): pass
+        self.stop()
+
+class PersonalitySelect(discord.ui.Select):
+    def __init__(self, parent_view: 'AIResponseView', current_personality: str):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=details['label'], value=key, emoji=details['emoji'], default=(key == current_personality))
+            for key, details in AI_PERSONALITIES.items()
+        ]
+        super().__init__(placeholder="Change Personality...", min_values=1, max_values=1, options=options, custom_id="ai_personality_select", row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        new_personality = self.values[0]
+        # Defer to the parent view to handle the regeneration logic
+        await self.parent_view.handle_regeneration(interaction, new_personality=new_personality)
+
+class AIResponseView(discord.ui.View):
+    def __init__(self, original_message: discord.Message, history: List[discord.Message], current_personality: str):
+        super().__init__(timeout=300.0)
+        self.original_message = original_message
+        self.history = history
+        self.current_personality = current_personality
+        self.bot_response_message: Optional[discord.Message] = None
+        
+        self.interaction_cooldown = commands.CooldownMapping.from_cooldown(
+            1, AI_RESPONSE_COOLDOWN_SECONDS, lambda i: i.user.id
+        )
+        self._add_items()
+
+    def _add_items(self):
+        self.clear_items()
+        self.add_item(PersonalitySelect(self, self.current_personality))
+        
+        regenerate_button = discord.ui.Button(label="Regenerate", style=discord.ButtonStyle.primary, emoji="🔄", custom_id="ai_regenerate", row=1)
+        regenerate_button.callback = self.regenerate_button_callback
+        self.add_item(regenerate_button)
+
+    async def regenerate_button_callback(self, interaction: discord.Interaction):
+        await self.handle_regeneration(interaction, new_personality=None)
+
+    async def handle_regeneration(self, interaction: discord.Interaction, new_personality: Optional[str] = None):
+        """Core logic to regenerate the AI response by editing the existing plain text message."""
+        retry_after = self.interaction_cooldown.update_rate_limit(interaction)
+        if retry_after:
+            await interaction.response.send_message(f"⏳ You're doing that too fast. Please wait **{retry_after:.1f}s**.", ephemeral=True, delete_after=5)
+            return
+
+        await interaction.response.defer()
+        
+        if new_personality:
+            self.current_personality = new_personality
+
+        if interaction.channel:
+            channel_personalities[interaction.channel.id] = self.current_personality
+
+        async with interaction.channel.typing():
+            new_content, fallback_used = await get_ai_response(
+                self.history, self.original_message.content, self.current_personality
+            )
+        
+        if new_content and self.bot_response_message and isinstance(interaction.channel, discord.TextChannel):
+            new_view = AIResponseView(self.original_message, self.history, self.current_personality)
+            
+            # This function will now handle everything, including if the message was deleted
+            updated_message = await _send_personality_response(
+                channel=interaction.channel, 
+                content=new_content, 
+                fallback_used=fallback_used,
+                view=new_view,
+                personality_key=self.current_personality,
+                message_to_edit=self.bot_response_message
+            )
+
+            # CRITICAL: Update the view's internal reference to the message,
+            # which might be a new message if the old one was deleted.
+            if updated_message:
+                new_view.bot_response_message = updated_message
+            
+        else:
+            if self.bot_response_message:
+                await self.bot_response_message.edit(content="❌ Failed to regenerate response.", view=None)
+
+    async def on_timeout(self):
+        if self.bot_response_message:
+            try:
+                await self.bot_response_message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        self.stop()
+
+class RetryAIView(discord.ui.View):
+    def __init__(self, original_message: discord.Message):
+        super().__init__(timeout=60.0)
+        self.original_message = original_message
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Retry", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def retry_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self.message:
+            await self.message.delete()
+        # We call on_message again, which will now hopefully pass the cooldown check
+        await on_message(self.original_message)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content=self.message.content + "\n*(Retry timed out)*", view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        self.stop()
+
+# Add these new AI-related functions
+async def _initialize_ai_models():
+    """Initializes all configured AI models."""
+    global ai_models
+    if GEMINI_API_KEY:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            
+            all_model_ids = {p['model'] for p in AI_PERSONALITIES.values()}
+            all_model_ids.update({p['fallback_model'] for p in AI_PERSONALITIES.values() if p.get('fallback_model')})
+            
+            for model_id in all_model_ids:
+                if model_id not in ai_models:
+                    try:
+                        ai_models[model_id] = genai.GenerativeModel(model_id)
+                        print(f"AI: Initialized model '{model_id}'.")
+                    except Exception as e:
+                        print(f"AI WARNING: Failed to configure model '{model_id}': {e}.")
+        except Exception as e:
+            print(f"AI CRITICAL: Failed initial Google Gemini configuration step: {e}")
+    else:
+        print("AI INFO: GEMINI_API_KEY not found. AI features disabled.")
+
+async def load_keyword_data():
+    """Loads keyword rules from the database into the cache."""
+    global keyword_data_cache, total_keywords, discovered_keywords_count
+    if not supabase:
+        print("AI: Supabase client not available, skipping keyword data load.")
+        return
+
+    try:
+        response = await run_supabase_sync(
+            lambda: supabase.table("keyword_phrases").select("*").execute()
+        )
+
+        if not response or not hasattr(response, 'data'):
+            await log_error(None, "AI: Failed to fetch keyword data from Supabase (no response).", ping_owner=True)
+            return
+
+        keyword_data_cache.clear()
+        for item in response.data:
+            keyword_regex = item.get("keyword_regex")
+            if keyword_regex:
+                try:
+                    keyword_data_cache[keyword_regex] = {
+                        "compiled_regex": re.compile(keyword_regex, re.IGNORECASE),
+                        "ai_instructions": item.get("ai_instructions"),
+                        "discovery_message": item.get("discovery_message"),
+                        "is_discovered": item.get("is_discovered", False),
+                        "id": item.get("id")
+                    }
+                except re.error as e:
+                    await log_error(None, f"AI: Failed to compile regex for keyword ID {item.get('id')}: `{keyword_regex}`", error=e)
+
+        total_keywords = len(keyword_data_cache)
+        discovered_keywords_count = sum(1 for data in keyword_data_cache.values() if data['is_discovered'])
+        await log_info(None, f"AI: Successfully loaded {total_keywords} keyword rules ({discovered_keywords_count} discovered).")
+
+    except Exception as e:
+        await log_error(None, "AI: Critical error loading keyword data from Supabase.", error=e, ping_owner=True)
+        keyword_data_cache.clear()
+        total_keywords = 0
+        discovered_keywords_count = 0
+
+def get_prompt(prompt_key: str, **kwargs) -> Optional[str]:
+    raw_prompt = AI_PROMPTS.get(prompt_key)
+    return raw_prompt.format(**kwargs) if raw_prompt else None
+
+async def block_unwanted_mentions(content: str, user_id: int) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Checks for disallowed mentions (@everyone, @here, roles, users) in content.
+    Bypasses the check for the bot owner.
+
+    Args:
+        content: The message content to check.
+        user_id: The ID of the user who triggered the action.
+
+    Returns:
+        A tuple of (processed_content, error_message).
+        - If allowed: (original_content, None)
+        - If disallowed: (None, "Your message contains a disallowed mention...")
+    """
+    # 1. Bypass check for the bot owner
+    if user_id == OWNER_USER_ID:
+        return content, None
+
+    # 2. Regex for different types of mentions
+    role_mention_pattern = re.compile(r"<@&\d+>")
+    user_mention_pattern = re.compile(r"<@!?\d+>")
+    everyone_here_pattern = re.compile(r"@everyone|@here")
+
+    # 3. Check if any mentions are present in the content
+    if role_mention_pattern.search(content) or \
+       user_mention_pattern.search(content) or \
+       everyone_here_pattern.search(content):
+        
+        error_message = "Your message contains a disallowed mention (@everyone, @here, a role, or a user). Please remove it and try again."
+        return None, error_message
+
+    # 4. If no disallowed mentions are found, return the original content
+    return content, None
+
+async def _send_personality_response(
+    channel: discord.TextChannel, 
+    content: str, 
+    personality_key: str, 
+    fallback_used: bool,
+    view: discord.ui.View, 
+    message_to_edit: Optional[discord.Message] = None
+) -> Optional[discord.Message]:
+    """Sends or edits an AI response as a plain text message from the main bot account."""
+    
+    footer_text = f"\n\n*(Personality: {personality_key.title()}"
+    if fallback_used:
+        fallback_model = AI_PERSONALITIES.get(personality_key, {}).get('fallback_model', 'a fallback')
+        footer_text += f" | Using {fallback_model} model due to high load"
+    footer_text += ")*"
+
+    # For non-normal personalities, add a name prefix instead of using a webhook
+    name_prefix = ""
+    if personality_key != "normal":
+        webhook_name = PERSONALITY_WEBHOOK_NAMES.get(personality_key, "FlorrNerd")
+        name_prefix = f"**{webhook_name}:**\n"
+
+    full_content = name_prefix + content + footer_text
+    if len(full_content) > 2000:
+        content_limit = 2000 - len(name_prefix) - len(footer_text) - 3 # -3 for "..."
+        content = content[:content_limit] + "..."
+        full_content = name_prefix + content + footer_text
+
+    try:
+        if message_to_edit:
+            # Attempt to edit the existing message
+            await message_to_edit.edit(content=full_content, view=view)
+            return message_to_edit
+        else:
+            # If no message to edit, send a new one
+            return await channel.send(content=full_content, view=view)
+    except discord.NotFound:
+        # If the original message to edit was deleted, just send a new one.
+        await log_info(channel.guild, "Message to edit was not found. Sending a new AI response instead.")
+        new_msg = await channel.send(content=full_content, view=view)
+        # Important: update the view's internal message reference
+        if hasattr(view, 'bot_response_message'):
+            view.bot_response_message = new_msg
+        return new_msg
+    except Exception as e:
+        await log_error(channel.guild, f"Failed to send/edit AI response for personality {personality_key}", error=e)
+        return None
+
+async def get_ai_response(history: List[discord.Message], latest_message_content: str, personality_key: str = "normal") -> Tuple[Optional[str], bool]:
+    personality = AI_PERSONALITIES.get(personality_key, AI_PERSONALITIES["normal"])
+    system_prompt = get_prompt(personality['prompt_key'])
+    
+    api_history = [{'role': 'model' if msg.author.id == bot.user.id else 'user', 'parts': [msg.content]} for msg in history]
+    api_history.append({'role': 'user', 'parts': [latest_message_content]})
+
+    models_to_try = [personality['model']]
+    if personality.get('fallback_model') and personality['fallback_model'] not in models_to_try:
+        models_to_try.append(personality['fallback_model'])
+    
+    fallback_used = False
+    guild_context_for_log = history[-1].guild if history else None
+    
+    safety_config = {
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
+    for i, model_id in enumerate(models_to_try):
+        model = ai_models.get(model_id)
+        if not model: continue
+        
+        if i > 0: fallback_used = True
+
+        try:
+            chat_session = model.start_chat(history=[])
+            
+            if system_prompt:
+                chat_session.history.append({'role': 'user', 'parts': [system_prompt]})
+                chat_session.history.append({'role': 'model', 'parts': ["Understood. I will act as requested."]})
+
+            for msg in api_history[:-1]:
+                 chat_session.history.append(msg)
+            
+            response = await chat_session.send_message_async(
+                api_history[-1]['parts'],
+                generation_config=personality['generation_config'],
+                safety_settings=safety_config
+            )
+            
+            raw_text = response.text
+
+            if personality_key == "emoji":
+                emoji_pattern = re.compile(
+                    "["
+                    "\U0001F600-\U0001F64F"  # emoticons
+                    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                    "\U0001F680-\U0001F6FF"  # transport & map symbols
+                    "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                    "\U00002500-\U00002BEF"  # chinese char
+                    "\U00002702-\U000027B0"
+                    "\U000024C2-\U0001F251"
+                    "\U0001f926-\U0001f937"
+                    "\U00010000-\U0010ffff"
+                    "\u2640-\u2642"
+                    "\u2600-\u2B55"
+                    "\u200d"
+                    "\u23cf"
+                    "\u23e9"
+                    "\u231a"
+                    "\ufe0f"  # dingbats
+                    "\u3030"
+                    "]+", flags=re.UNICODE)
+                
+                emojis_found = emoji_pattern.findall(raw_text)
+                final_text = "".join(emojis_found)
+                
+                if not final_text:
+                    return "❔", fallback_used 
+                return final_text, fallback_used
+
+            return raw_text, fallback_used
+
+        except google_exceptions.ResourceExhausted as e:
+            await log_error(guild_context_for_log, f"AI model '{model_id}' rate limited. Trying fallback.", error=e)
+            continue
+        except Exception as e:
+            await log_error(guild_context_for_log, f"Error generating AI response with '{model_id}'", error=e, ping_owner=True)
+            return None, fallback_used
+    return None, fallback_used
+
+async def get_ai_response_with_image(prompt_key: str, image_bytes_list: List[bytes], prompt_kwargs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Generates an AI response for a prompt that includes one or more images."""
+    if not ai_models:
+        await log_error(None, "AI image processing failed: No models configured.", ping_owner=True)
+        return None
+    if not image_bytes_list:
+        return None
+
+    content_for_api = []
+    prompt_text = get_prompt(prompt_key, **(prompt_kwargs or {}))
+    if not prompt_text:
+        await log_error(None, f"AI image processing failed: Prompt key '{prompt_key}' not found.")
+        return None
+    content_for_api.append(prompt_text)
+
+    for image_bytes in image_bytes_list:
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            content_for_api.append(img)
+        except (UnidentifiedImageError, OSError) as e:
+            await log_error(None, "AI image processing failed: Invalid image data encountered in batch.", error=e)
+    
+    if len(content_for_api) <= 1:
+        return None
+
+    model_id = "gemini-2.5-flash-preview-05-20"
+    model = ai_models.get(model_id)
+    if not model:
+        await log_error(None, f"AI image processing failed: Required model '{model_id}' not available.", ping_owner=True)
+        return None
+    
+    safety_config = {
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+        
+    try:
+        response = await model.generate_content_async(
+            content_for_api, stream=False,
+            generation_config=GenerationConfig(temperature=0.1),
+            safety_settings=safety_config
+        )
+        return response.text.strip() if response and response.text else None
+    except google_exceptions.ResourceExhausted as e:
+        await log_error(None, f"AI image processing hit ResourceExhausted even with batching. User likely sent too many images.", error=e)
+        return None
+    except Exception as e:
+        await log_error(None, f"AI image processing failed during generation with model '{model_id}'.", error=e)
+        return None
+
+async def _apply_slowmode(channel: discord.TextChannel):
+    """Attempts to apply a 5-second slowmode to a channel. Fails silently."""
+    try:
+        if channel.slowmode_delay < 5:
+            await channel.edit(slowmode_delay=5)
+            print(f"AI: Applied 5s slowmode to #{channel.name}.")
+    except discord.Forbidden:
+        print(f"AI: Missing permissions to apply slowmode in #{channel.name}.")
+    except discord.HTTPException as e:
+        print(f"AI: Failed to apply slowmode in #{channel.name} due to an API error: {e}")
+
+async def _remove_slowmode(channel: discord.TextChannel):
+    await asyncio.sleep(10)
+    try:
+        if channel.slowmode_delay > 0: await channel.edit(slowmode_delay=0)
+    except (discord.Forbidden, discord.HTTPException): pass
+    finally:
+        if channel.id in slowmode_tasks: del slowmode_tasks[channel.id]
+
+async def process_message_for_ai(message: discord.Message):
+    """The main AI processing logic, formerly from AICog.on_message."""
+    if not message.guild: return
+    guild_settings = server_settings_cache.get(message.guild.id, {})
+
+    # FIX: Ensure we are checking against a list, even if the DB value is NULL.
+    ai_channel_list = guild_settings.get('always_on_ai_channels') or []
+    is_ai_channel = message.channel.id in ai_channel_list
+
+    if not is_ai_channel:
+        return
+
+    retry_after = ai_message_cooldown.update_rate_limit(message)
+    if retry_after:
+        view = RetryAIView(message)
+        retry_msg = await message.reply(f"⏳ You're doing that too fast. Please wait **{retry_after:.1f}s**.", view=view, mention_author=False, delete_after=10)
+        view.message = retry_msg
+        return
+    
+    if message.channel.id not in slowmode_tasks:
+        task = slowmode_tasks[message.channel.id] = asyncio.create_task(_apply_slowmode(message.channel))
+        task.add_done_callback(lambda t: slowmode_tasks.pop(message.channel.id, None))
+    
+    async with message.channel.typing():
+        history = [m async for m in message.channel.history(limit=50, before=message)]
+        history.reverse()
+
+        initial_personality = channel_personalities.get(message.channel.id, "normal")
+        
+        response_text, fallback_used = await get_ai_response(history, message.content, initial_personality)
+        
+        if response_text:
+            processed_content, mention_error = await block_unwanted_mentions(response_text, message.author.id)
+            if mention_error:
+                await log_error(
+                    message.guild, 
+                    f"AI response for user {message.author.mention} was blocked due to a generated mention.",
+                    embed=discord.Embed(
+                        title="Blocked AI Response Content",
+                        description=f"```\n{discord.utils.escape_markdown(response_text[:1000])}\n```",
+                        color=discord.Color.orange()
+                    ).set_footer(text=f"Triggered by: {message.author.name} ({message.author.id})")
+                )
+                return
+
+            channel_personalities[message.channel.id] = initial_personality
+            view = AIResponseView(message, history, initial_personality)
+            
+            response_message = await _send_personality_response(
+                channel=message.channel, 
+                content=processed_content,
+                personality_key=initial_personality,
+                fallback_used=fallback_used,
+                view=view
+            )
+            
+            if response_message:
+                view.bot_response_message = response_message
+
+def _normalize_guild_tag(tag: str) -> str:
+    """Normalizes a guild tag to the format [TAG]."""
+    cleaned_tag = tag.strip().upper()
+    if cleaned_tag.startswith('[') and cleaned_tag.endswith(']'):
+        return cleaned_tag
+    return f"[{cleaned_tag}]"
+
+async def tracked_guild_tag_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes tags of currently tracked guilds for the server."""
+    if not interaction.guild:
+        return []
+    
+    config = await load_server_config(interaction.guild.id)
+    tracked_guilds = config.get('tracked_guilds', {})
+    
+    choices = [
+        app_commands.Choice(name=tag, value=tag)
+        for tag in tracked_guilds.keys()
+        if not current or current.lower() in tag.lower()
+    ]
+    return choices[:25]
+
+async def check_is_admin(interaction: discord.Interaction) -> bool:
+    """Check if the user has administrator permissions."""
+    return interaction.permissions.administrator
 
 async def get_user_webhook_url(name: str) -> Optional[str]:
     """Fetches a user-created webhook's URL from the database by its custom name."""
@@ -827,12 +1635,22 @@ class SetupModal(discord.ui.Modal):
         results = {field.custom_id: field.value for field in self.children if isinstance(field, discord.ui.TextInput)}
         await self.callback_func(interaction, results)
 
+
 class SetupView(discord.ui.View):
     def __init__(self, guild: discord.Guild, config: Dict[str, Any]):
         super().__init__(timeout=600)
         self.guild = guild
         self.config = config
         self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Checks if the user has admin permissions before allowing interaction."""
+        is_staff = await is_admin_or_owner(interaction)
+        if is_staff:
+            return True
+        else:
+            await interaction.response.send_message("❌ You need administrator permissions to use these buttons.", ephemeral=True)
+            return False
 
     def create_embed(self) -> discord.Embed:
         embed = discord.Embed(title=f"⚙️ Bot Setup for {self.guild.name}", color=NERDY_YELLOW)
@@ -877,6 +1695,19 @@ class SetupView(discord.ui.View):
         ai_mentions = [get_mention(cid, 'channel') for cid in ai_channel_ids]
         ai_chans_val = ", ".join(ai_mentions) if ai_mentions else "`Not Set`"
         embed.add_field(name="Always-On AI Channels", value=ai_chans_val, inline=False)
+        
+        # --- Tracked Guilds ---
+        tracked_guilds = self.config.get('tracked_guilds', {})
+        if tracked_guilds:
+            guilds_val_parts = []
+            for tag, data in sorted(tracked_guilds.items()):
+                role_mention = get_mention(data.get('discord_role_id'), 'role')
+                chan_mention = get_mention(data.get('member_list_channel_id'), 'channel')
+                guilds_val_parts.append(f"**{tag}**: {role_mention} → {chan_mention}")
+            guilds_val = "\n".join(guilds_val_parts)
+        else:
+            guilds_val = "`No guilds are being tracked yet.`"
+        embed.add_field(name=f"Tracked Florr Guilds (use /setup_guild to manage)", value=guilds_val, inline=False)
 
         # --- Command Permissions ---
         perms_val = (
@@ -898,8 +1729,14 @@ class SetupView(discord.ui.View):
 
     async def update_config_and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
         if not self.guild: return
-        await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
+        # Only update DB if there are actual changes beyond the guild_id
+        if len(updates) > 1:
+            await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
+        
+        # Reload the config from DB into the view's state and server cache
         self.config = await load_server_config(self.guild.id)
+        
+        # Edit the original message with the updated embed
         if self.message:
             await self.message.edit(embed=self.create_embed(), view=self)
 
@@ -989,7 +1826,6 @@ class SetupView(discord.ui.View):
                 resolved_items.append(f"Cleared setting for `{key}`.")
                 continue
 
-            # --- Handle Special Cases First ---
             if key.endswith('_enabled'):
                 if value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']:
                     updates[key] = True
@@ -1020,7 +1856,6 @@ class SetupView(discord.ui.View):
                     errors.extend(temp_errors)
                 continue
 
-            # --- Default Case: Role/Channel ID/Name Resolution ---
             item_type = 'channel' if 'channel' in key else 'role'
             resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
             
@@ -1043,46 +1878,16 @@ class SetupView(discord.ui.View):
         else:
             feedback_embed.color = discord.Color.green()
         
+        # Save changes to the database and refresh the main setup message
         await self.update_config_and_refresh(interaction, updates)
+        
+        # Send ephemeral confirmation of what just happened
         await interaction.followup.send(embed=feedback_embed, ephemeral=True)
 
     async def on_timeout(self):
         if self.message:
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
-
-async def fetch_hc_member_profile_data_with_retry(guild: Optional[discord.Guild], discord_id_str: str, retries: int = 4, delay: float = 1.0) -> Optional[Dict[str, Any]]:
-    """
-    Attempts to fetch HC member profile data, retrying on failure to account for DB replication lag.
-    Uses a longer, more robust retry schedule.
-    """
-    for attempt in range(retries):
-        profile_data = await fetch_hc_member_profile_data(guild, discord_id_str)
-        if profile_data:
-            return profile_data # Success, return the data immediately
-        
-        # If no data, wait and try again
-        await log_info(guild, f"Profile fetch retry {attempt + 1}/{retries} for user {discord_id_str}...")
-        await asyncio.sleep(delay + (attempt * 0.5)) # Wait a bit longer each time, starting at 1s
-        
-    # If all retries fail, return None
-    await log_error(guild, f"Profile fetch for user {discord_id_str} failed after {retries} retries.")
-    return None
-
-async def fetch_profile_details_by_ign_with_retry(guild: Optional[discord.Guild], ign: str, retries: int = 4, delay: float = 1.0) -> Optional[Dict[str, Any]]:
-    """
-    Attempts to fetch profile data by IGN, retrying on failure to account for DB replication lag.
-    """
-    for attempt in range(retries):
-        profile_data = await fetch_profile_details_by_ign(guild, ign)
-        if profile_data:
-            return profile_data
-        
-        await log_info(guild, f"Profile fetch retry {attempt + 1}/{retries} for IGN {ign}...")
-        await asyncio.sleep(delay + (attempt * 0.5))
-        
-    await log_error(guild, f"Profile fetch for IGN {ign} failed after {retries} retries.")
-    return None
 
 async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, Optional[str]]:
     """
@@ -1410,63 +2215,16 @@ async def _initialize_data_caches(bot: commands.Bot):
             await load_server_config(guild.id)
     print(f"--- Finished loading configs for {len(server_settings_cache)} guild(s) ---")
 
-    print("--- Loading initial non-AI data ---")
+    print("--- Loading initial data ---")
     log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
 
     await load_ign_cache(log_guild_for_data_load)
     print("Loading profile picture choices...")
     await load_profile_picture_choices(log_guild_for_data_load)
+    print("Loading AI keyword data...")
+    await load_keyword_data()
 
-    # The hardcoded staff channel identification has been removed to support multi-server functionality.
-    # The AI cog will now rely on user permissions ('manage_guild') instead of a static channel list.
     print("Staff channel identification is now dynamic based on user permissions.")
-
-
-async def _setup_and_load_cogs(bot: commands.Bot):
-    """Sets up bot attributes for cogs and loads extensions."""
-    print("Setting up bot attributes for cogs...")
-    bot.supabase_client = supabase
-    bot.log_info_global = log_info
-    bot.log_error_global = log_error
-    bot.run_supabase_sync_global = run_supabase_sync
-    bot._handle_self_bot_event = _handle_self_bot_event
-    bot.get_or_create_webhook = get_or_create_webhook
-    
-    bot.OWNER_USER_ID_config = OWNER_USER_ID
-    bot.CATERCORD_GUILD_ID_config = CATERCORD_GUILD_ID
-    bot.ingame_name_cache_ref_config = ingame_name_cache
-    bot.NERDY_YELLOW_config = NERDY_YELLOW
-    bot.server_settings_cache_ref_config = server_settings_cache
-    bot.BOT_AVATAR_URL_config = bot.user.display_avatar.url if bot.user and bot.user.display_avatar else None
-    
-    # NEW: Pass the staff permission name to the AI cog
-    bot.STAFF_PERMISSION_FOR_AI_config = STAFF_PERMISSION_FOR_AI
-    
-    print("Bot attributes set.")
-
-    print("Loading cogs...")
-    log_guild_for_cog_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-    try:
-        # Prevent crashing if the extension is already loaded (e.g., during hot reload)
-        if 'ai_cog' not in bot.extensions:
-            await bot.load_extension('ai_cog')
-            print("AICog load_extension call completed.")
-        else:
-            print("AICog was already loaded. Attempting to reload for updates...")
-            await bot.reload_extension('ai_cog')
-            print("AICog reloaded successfully.")
-
-        if bot.get_cog('AICog') is None:
-             raise commands.ExtensionFailed("ai_cog", original=TypeError("Cog is None after load/reload attempt."))
-        print("AICog loading/reloading verified successfully.")
-    except commands.ExtensionAlreadyLoaded:
-        print("AICog was already loaded, continuing.")
-        pass
-    except Exception as e_cog:
-        print(f"CRITICAL: Failed to load/reload AICog: {e_cog}\n{traceback.format_exc()}")
-        if log_guild_for_cog_load:
-            await log_error(log_guild_for_cog_load, "CRITICAL: Failed to load/reload AICog. AI features will be unavailable.", error=e_cog, ping_owner=True)
-
 
 async def _sync_app_commands(bot: commands.Bot) -> list:
     """Syncs application commands and populates the command_ids dictionary."""
@@ -2244,7 +3002,6 @@ async def handle_screenshot_dropbox(message: discord.Message):
         del guild_sync_sessions[user_id]
         active_session = None
 
-    # Read image bytes first
     image_bytes_list = []
     for img_att in valid_images:
         try:
@@ -2256,8 +3013,6 @@ async def handle_screenshot_dropbox(message: discord.Message):
         await message.reply("❌ Could not read any of the attached images.", mention_author=False)
         return
 
-    # Treat any message with 10 or more images as starting/continuing a sync.
-    # Also continue if a session is active and at least one image is sent.
     if len(image_bytes_list) >= 10 or (active_session and len(image_bytes_list) > 0):
         is_new_session = not active_session
         
@@ -2271,7 +3026,6 @@ async def handle_screenshot_dropbox(message: discord.Message):
             )
         except discord.HTTPException: pass
     else:
-        # Regular activity logging from screenshots (fewer than 10 images, no active session)
         await handle_guild_sync_from_screenshots(message, valid_images)
 
 async def handle_super_attempt_message(message: discord.Message):
@@ -2862,7 +3616,6 @@ async def handle_guild_sync_from_screenshots(
     num_images = len(valid_image_attachments)
     processing_reply: Optional[discord.Message] = None
     
-    # FIX: Load the server configuration at the beginning of the function
     config = await load_server_config(guild.id)
     
     try:
@@ -2874,12 +3627,6 @@ async def handle_guild_sync_from_screenshots(
         await log_error(guild, "Screenshot activity: Failed to send initial processing reply", error=e_initial_reply, message_context=message)
         return
 
-    ai_cog = bot.get_cog('AICog')
-    if not ai_cog:
-        if processing_reply: await processing_reply.edit(content=f"{user.mention} ❌ Error: AI module is not available.")
-        await log_error(guild, "Screenshot activity error: AICog not found.", message_context=message)
-        return
-
     activity_date, date_error = get_utc_date()
     if date_error or not activity_date:
         err_msg = f"{user.mention} ❌ Error: Could not determine today's date for activity logging."
@@ -2889,22 +3636,19 @@ async def handle_guild_sync_from_screenshots(
 
     all_matched_igns_from_all_images: List[str] = []
     
-    known_igns_str = "\n".join(ai_cog.ingame_name_cache_ref) if ai_cog.ingame_name_cache_ref else "No known names."
+    known_igns_str = "\n".join(ingame_name_cache) if ingame_name_cache else "No known names."
     for image_att in valid_image_attachments:
         try:
             image_data = await image_att.read()
-            # Use the prompt for finding ONLINE players
-            ai_extracted_text = await ai_cog.get_ai_response_with_image(
+            ai_extracted_text = await get_ai_response_with_image(
                 prompt_key="FLORR_IMAGE_NAME_EXTRACTION", 
                 image_bytes_list=[image_data],
                 prompt_kwargs={'known_igns_list_str': known_igns_str}
             )
             if ai_extracted_text and ai_extracted_text.strip().upper() != "NO_NAMES_FOUND":
-                # Clean names from AI output before matching
                 potential_names = {clean_ign(name) for name in ai_extracted_text.split('\n') if name.strip()}
                 for ai_name in potential_names:
-                    # Case-insensitive check against the cache
-                    for cached_ign in ai_cog.ingame_name_cache_ref:
+                    for cached_ign in ingame_name_cache:
                         if cached_ign.lower() == ai_name.lower() and cached_ign not in all_matched_igns_from_all_images:
                             all_matched_igns_from_all_images.append(cached_ign)
                             break
@@ -2916,7 +3660,6 @@ async def handle_guild_sync_from_screenshots(
         if processing_reply: await processing_reply.edit(content=final_content, embed=None, view=None)
         return
 
-    # Process the found IGNs for activity
     newly_added_details: List[Dict[str, Any]] = []
     already_active: List[str] = []
     failed_to_add: List[str] = []
@@ -2933,10 +3676,9 @@ async def handle_guild_sync_from_screenshots(
                 activity_changed = True
             else:
                 failed_to_add.append(ign)
-        else: # exists is None (DB error)
+        else:
             failed_to_add.append(ign)
 
-    # Create the confirmation view and send the final reply
     confirm_view = ScreenshotConfirmView(user.id, activity_date, newly_added_details, already_active, failed_to_add, guild, message.id)
     final_embed = confirm_view.create_embed()
     
@@ -2952,7 +3694,6 @@ async def handle_guild_sync_from_screenshots(
     if final_message_obj:
         confirm_view.message = final_message_obj
     
-    # FIX: Use the loaded config and modern tracked_guilds structure
     if activity_changed and guild.id == CATERCORD_GUILD_ID:
         await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering list update for [HC1].")
         
@@ -4345,21 +5086,29 @@ class ProfilePagesView(discord.ui.View):
 
         if self.current_page_mode == self.MAIN_PAGE:
             if self.activity_summary_data:
-                self.add_item(discord.ui.Button(label="🗓️ View Activity Calendar", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.MONTHLY_PAGE}", row=0))
+                btn = discord.ui.Button(label="🗓️ View Activity Calendar", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.MONTHLY_PAGE}", row=0)
+                btn.callback = self.navigation_button_callback
+                self.add_item(btn)
             if self.super_attempt_stats_data and self.super_attempt_stats_data.get('total_attempts', 0) > 0:
-                self.add_item(discord.ui.Button(label="💥 Super Attempt Details", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_STATS_PAGE}", row=0))
+                btn = discord.ui.Button(label="💥 Super Attempt Details", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_STATS_PAGE}", row=0)
+                btn.callback = self.navigation_button_callback
+                self.add_item(btn)
             if self.s_craft_log_total_entries > 0:
-                self.add_item(discord.ui.Button(label="🛠️ View Super Crafts", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_CRAFT_LOG_PAGE}", row=1))
+                btn = discord.ui.Button(label="🛠️ View Super Crafts", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_CRAFT_LOG_PAGE}", row=1)
+                btn.callback = self.navigation_button_callback
+                self.add_item(btn)
             if self.s_defeat_log_total_entries > 0:
-                self.add_item(discord.ui.Button(label="⚔️ View Super Defeats", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_DEFEAT_LOG_PAGE}", row=1))
-            for item in self.children:
-                if isinstance(item, discord.ui.Button): item.callback = self.navigation_button_callback
+                btn = discord.ui.Button(label="⚔️ View Super Defeats", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_DEFEAT_LOG_PAGE}", row=1)
+                btn.callback = self.navigation_button_callback
+                self.add_item(btn)
 
         elif self.current_page_mode == self.MONTHLY_PAGE:
             self.add_item(ProfileMonthSelect(self.today_date_obj.year, self.today_date_obj.month, self.current_display_year, self.current_display_month))
 
         elif self.current_page_mode == self.SUPER_ATTEMPT_STATS_PAGE:
-            self.add_item(discord.ui.Button(label="📜 View Full Log", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_LOG_PAGE}", row=1, callback=self.navigation_button_callback))
+            view_log_btn = discord.ui.Button(label="📜 View Full Log", style=discord.ButtonStyle.secondary, custom_id=f"profile_nav_{self.SUPER_ATTEMPT_LOG_PAGE}", row=1)
+            view_log_btn.callback = self.navigation_button_callback
+            self.add_item(view_log_btn)
         
         elif self.current_page_mode in [self.SUPER_ATTEMPT_LOG_PAGE, self.SUPER_CRAFT_LOG_PAGE, self.SUPER_DEFEAT_LOG_PAGE]:
             self._add_pagination_controls()
@@ -4386,11 +5135,15 @@ class ProfilePagesView(discord.ui.View):
         is_profile_owner = profile_owner_discord_id and str(self.original_command_interaction.user.id) == str(profile_owner_discord_id)
         
         if self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE and is_profile_owner:
-            self.add_item(discord.ui.Button(label="➕ Add Unknown", style=discord.ButtonStyle.success, custom_id="profile_sa_add_unknown", row=2, callback=self.handle_add_s_attempt))
-            self.add_item(discord.ui.Button(label="➖ Remove Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_log), callback=self.handle_remove_s_attempt))
+            add_btn = discord.ui.Button(label="➕ Add Unknown", style=discord.ButtonStyle.success, custom_id="profile_sa_add_unknown", row=2)
+            add_btn.callback = self.handle_add_s_attempt
+            self.add_item(add_btn)
+            
+            remove_btn = discord.ui.Button(label="➖ Remove Entry", style=discord.ButtonStyle.danger, custom_id="profile_sa_remove_entry", row=2, disabled=(not self.current_s_attempt_log_entries or self.is_fetching_log))
+            remove_btn.callback = self.handle_remove_s_attempt
+            self.add_item(remove_btn)
 
     def _create_main_embed(self) -> discord.Embed:
-        # --- NEW VISUALLY IMPROVED EMBED ---
         is_partial_profile = not self.hc_profile_data.get('discord_id')
         
         embed = discord.Embed(
@@ -4400,7 +5153,6 @@ class ProfilePagesView(discord.ui.View):
         if self.target_user_display_data['avatar_url']:
             embed.set_thumbnail(url=self.target_user_display_data['avatar_url'])
 
-        # --- Main Identity Block ---
         ign = self.hc_profile_data.get('ingame_name', 'N/A')
         description_parts = [f"**Florr IGN:** `{ign}`"]
         
@@ -4417,7 +5169,6 @@ class ProfilePagesView(discord.ui.View):
         
         embed.description = "\n".join(description_parts)
 
-        # --- Activity Snapshot ---
         if self.activity_summary_data:
             activity_value = (
                 f"**Total Days:** `{self.activity_summary_data['total_days_logged']}`\n"
@@ -4425,7 +5176,6 @@ class ProfilePagesView(discord.ui.View):
             )
             embed.add_field(name="📈 Activity Snapshot", value=activity_value, inline=False)
         
-        # --- Super Stats Block (Inline) ---
         has_super_stats = False
         stats_value = ""
         if self.super_attempt_stats_data and self.super_attempt_stats_data.get('total_attempts', 0) > 0:
@@ -4470,22 +5220,51 @@ class ProfilePagesView(discord.ui.View):
         embed = discord.Embed(title=f"📜 Super Attempt Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
         if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
         if not self.current_s_attempt_log_entries: embed.description = "No super attempt log entries found."; return embed
-        log_desc_parts = []
+
+        IDX_W, DATE_W, PETAL_W, LOST_W = 4, 11, 21, 5
+        header = f"{'#':<{IDX_W}}{'Date':<{DATE_W}}{'Petal':<{PETAL_W}}{'Lost':<{LOST_W}}"
+        separator = "-" * len(header)
+        lines = [f"```{header}", separator]
+
+        start_index = self.s_attempt_log_current_page * self.SA_LOG_ENTRIES_PER_PAGE
         for i, entry in enumerate(self.current_s_attempt_log_entries):
-            date_str = format_date_dmy(date_parse(entry['attempt_date']).date()) if entry['attempt_date'] else "Unknown Date"
-            petal_display = _get_display_friendly_petal_name(entry['chosen_petal_name']) if entry['chosen_petal_name'] else "Unknown"
-            log_desc_parts.append(f"**{i+1}.** Date: `{date_str}`, Petal: `{petal_display}`, Lost: `{entry['petals_lost']:.1f}`")
-        embed.description = "\n".join(log_desc_parts)
+            global_index = start_index + i + 1
+            date_str = format_date_dmy(entry['attempt_date']) if entry.get('attempt_date') else "N/A"
+            petal_name = _get_display_friendly_petal_name(entry.get('chosen_petal_name', 'Unknown'))
+            petals_lost = f"{entry.get('petals_lost', 0.0):.1f}"
+            petal_display = (petal_name[:PETAL_W-1] + '…') if len(petal_name) > PETAL_W else petal_name
+            index_str = f"{global_index}."
+            line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{petal_display:<{PETAL_W}}{petals_lost:<{LOST_W}}"
+            lines.append(line)
+
+        lines.append("```")
+        embed.description = "\n".join(lines)
         embed.set_footer(text=f"Page {self.s_attempt_log_current_page + 1}/{self.s_attempt_log_total_pages} ({self.s_attempt_log_total_entries} total)")
         return embed
-    
+
     def _create_super_craft_log_embed(self) -> discord.Embed:
         ign = self.hc_profile_data.get("ingame_name", "N/A")
         embed = discord.Embed(title=f"🛠️ Super Craft Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
         if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
         if not self.current_s_craft_log_entries: embed.description = "No super craft log entries found."; return embed
-        log_desc_parts = [f"**{i+1}.** Date: `{format_date_dmy(date_parse(e['craft_date']).date())}`, Petal: `{e['super_petal_name']}`" for i, e in enumerate(self.current_s_craft_log_entries)]
-        embed.description = "\n".join(log_desc_parts)
+
+        IDX_W, DATE_W, PETAL_W = 4, 11, 25
+        header = f"{'#':<{IDX_W}}{'Date':<{DATE_W}}{'Super Petal':<{PETAL_W}}"
+        separator = "-" * len(header)
+        lines = [f"```{header}", separator]
+
+        start_index = self.s_craft_log_current_page * self.SA_LOG_ENTRIES_PER_PAGE
+        for i, entry in enumerate(self.current_s_craft_log_entries):
+            global_index = start_index + i + 1
+            date_str = format_date_dmy(date_parse(entry['craft_date']).date()) if entry.get('craft_date') else "N/A"
+            petal_name = entry.get('super_petal_name', 'Unknown')
+            petal_display = (petal_name[:PETAL_W-1] + '…') if len(petal_name) > PETAL_W else petal_name
+            index_str = f"{global_index}."
+            line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{petal_display:<{PETAL_W}}"
+            lines.append(line)
+
+        lines.append("```")
+        embed.description = "\n".join(lines)
         embed.set_footer(text=f"Page {self.s_craft_log_current_page + 1}/{self.s_craft_log_total_pages} ({self.s_craft_log_total_entries} total)")
         return embed
 
@@ -4494,11 +5273,24 @@ class ProfilePagesView(discord.ui.View):
         embed = discord.Embed(title=f"⚔️ Super Defeat Log - {discord.utils.escape_markdown(ign)}", color=NERDY_YELLOW)
         if self.is_fetching_log: embed.description = "⏳ Fetching log entries..."; return embed
         if not self.current_s_defeat_log_entries: embed.description = "No super defeat log entries found."; return embed
-        log_desc_parts = []
-        for i, e in enumerate(self.current_s_defeat_log_entries):
-            date_str = format_date_dmy(date_parse(e['event_timestamp']).date()) if e.get('event_timestamp') else "Unknown"
-            log_desc_parts.append(f"**{i+1}.** Date: `{date_str}`, Mob: `{e['rarity']} {e['mob']}`")
-        embed.description = "\n".join(log_desc_parts)
+        
+        IDX_W, DATE_W, MOB_W = 4, 11, 25
+        header = f"{'#':<{IDX_W}}{'Date':<{DATE_W}}{'Mob Defeated':<{MOB_W}}"
+        separator = "-" * len(header)
+        lines = [f"```{header}", separator]
+
+        start_index = self.s_defeat_log_current_page * self.SA_LOG_ENTRIES_PER_PAGE
+        for i, entry in enumerate(self.current_s_defeat_log_entries):
+            global_index = start_index + i + 1
+            date_str = format_date_dmy(date_parse(entry['event_timestamp']).date()) if entry.get('event_timestamp') else "N/A"
+            mob_name = f"{entry.get('rarity', '')} {entry.get('mob', 'Unknown')}".strip()
+            mob_display = (mob_name[:MOB_W-1] + '…') if len(mob_name) > MOB_W else mob_name
+            index_str = f"{global_index}."
+            line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{mob_display:<{MOB_W}}"
+            lines.append(line)
+
+        lines.append("```")
+        embed.description = "\n".join(lines)
         embed.set_footer(text=f"Page {self.s_defeat_log_current_page + 1}/{self.s_defeat_log_total_pages} ({self.s_defeat_log_total_entries} total)")
         return embed
 
@@ -4652,8 +5444,8 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
 
 async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_id_str: str) -> Optional[Dict[str, Any]]:
     """
-    Fetches core profile data (IGN, guild tag) for a given Discord ID from florr_players.
-    Returns a dict {'ingame_name': str, 'florr_guild_tag': str | None, 'discord_name': str | None} or None if not found.
+    Fetches core profile data (IGN, guild tag, etc.) for a given Discord ID from florr_players.
+    Returns a dict with ingame_name, florr_guild_tag, discord_name, and discord_id.
     """
     if not supabase:
         if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for user {discord_id_str}.")
@@ -4661,7 +5453,7 @@ async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_i
     try:
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
-                           .select("ingame_name, florr_guild_tag, discord_name")
+                           .select("ingame_name, florr_guild_tag, discord_name, discord_id") # <-- FIXED
                            .eq("discord_id", discord_id_str)
                            .maybe_single()
                            .execute()
@@ -4670,7 +5462,8 @@ async def fetch_hc_member_profile_data(guild: Optional[discord.Guild], discord_i
             return {
                 "ingame_name": resp.data.get("ingame_name"),
                 "florr_guild_tag": resp.data.get("florr_guild_tag"),
-                "discord_name": resp.data.get("discord_name")
+                "discord_name": resp.data.get("discord_name"),
+                "discord_id": str(resp.data.get("discord_id")) if resp.data.get("discord_id") else None # <-- ADDED
             }
         return None
     except (ConnectionError, APIError) as e:
@@ -6941,19 +7734,15 @@ async def on_ready():
 
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     
-    # Call helper functions for startup sequence
+    await _initialize_ai_models()
     await _initialize_data_caches(bot)
-    await _setup_and_load_cogs(bot)
     synced_commands = await _sync_app_commands(bot)
 
-    # --- NEW: REVIVE VIEWS & STARTUP CATCH-UP ---
     await _revive_static_list_views()
     asyncio.create_task(_catch_up_missed_self_bot_events())
-    # ----------------------------------------
-
+    
     await _start_background_tasks(bot)
 
-    # Final "Ready" log message
     log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     if log_guild:
         instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
@@ -7553,7 +8342,7 @@ async def profile(interaction: discord.Interaction,
 
     if user:
         target_discord_id_str = str(user.id)
-        hc_profile_db_data = await fetch_hc_member_profile_data_with_retry(guild, target_discord_id_str)
+        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
         if not hc_profile_db_data:
             embed = discord.Embed(
                 title=f"🔗 Profile Not Linked",
@@ -7568,7 +8357,7 @@ async def profile(interaction: discord.Interaction,
             
     elif ingame_name:
         cleaned_ign = clean_ign(ingame_name)
-        hc_profile_db_data = await fetch_profile_details_by_ign_with_retry(guild, cleaned_ign)
+        hc_profile_db_data = await fetch_profile_details_by_ign(guild, cleaned_ign)
         if not hc_profile_db_data:
             crafts, _ = await get_user_super_craft_log_entries(guild, cleaned_ign, 0, 1)
             defeats, _ = await get_user_super_defeat_log_entries(guild, cleaned_ign, 0, 1)
@@ -7581,7 +8370,7 @@ async def profile(interaction: discord.Interaction,
             target_discord_id_str = hc_profile_db_data.get("discord_id")
     else:
         target_discord_id_str = str(interaction.user.id)
-        hc_profile_db_data = await fetch_hc_member_profile_data_with_retry(guild, target_discord_id_str)
+        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
         if not hc_profile_db_data:
             embed = discord.Embed(
                 title=f"🔗 Profile Not Linked",
@@ -7673,6 +8462,13 @@ async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Op
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild: return
+
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the refresh status.", ephemeral=True)
+            return
+
     if not await check_supabase_available(interaction): return
 
     await interaction.response.defer(thinking=True, ephemeral=False)
@@ -7685,7 +8481,6 @@ async def refresh(interaction: discord.Interaction):
     action_log = ["✅ Reloaded server configuration from database."]
     errors_occurred = False
     
-    # Sync roles for all members in the server
     if not guild.me.guild_permissions.manage_roles:
         action_log.append("⚠️ **Role Sync Skipped:** Bot lacks `Manage Roles` permission.")
     else:
@@ -7718,9 +8513,11 @@ async def refresh(interaction: discord.Interaction):
                     break 
         action_log[-1] = f"✅ Role sync complete. Processed {synced_count} member adjustments."
 
-    # Refresh all configured static lists
     await refresh_all_guild_lists(guild)
     action_log.append(f"✅ Triggered updates for all configured static member lists.")
+    
+    await load_keyword_data()
+    action_log.append("✅ Refreshed AI keyword data from database.")
 
     final_title = "✅ Refresh & Sync Complete" if not errors_occurred else "⚠️ Refresh & Sync Completed with Errors"
     final_embed = discord.Embed(title=final_title, description="\n".join(action_log), color=NERDY_YELLOW if not errors_occurred else discord.Color.orange())
@@ -7742,6 +8539,12 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     if not guild:
         await interaction.response.send_message("This command cannot be used outside a server.", ephemeral=True)
         return
+
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to send the wither confirmation.", ephemeral=True)
+            return
 
     config = await load_server_config(guild.id)
     if not config.get('wither_command_enabled', True) and interaction.user.id != OWNER_USER_ID:
@@ -7844,11 +8647,9 @@ async def on_message(message: discord.Message):
         await handle_super_command(message)
         return
 
-    # Check for feature channels configured for this server
     screenshot_channel_id = config.get('screenshots_dropbox_channel_id')
     super_attempt_channel_id = config.get('super_attempts_channel_id')
     
-    # Catercord-specific Zorr.pro handler (can be moved to config later if needed)
     if message.guild.id == CATERCORD_GUILD_ID and message.channel.id == AUTOMOD_ALERT_CHANNEL_ID and message.type == discord.MessageType.auto_moderation_action:
         await handle_zorr_pro_automod(message)
         return
@@ -7863,16 +8664,8 @@ async def on_message(message: discord.Message):
     if super_attempt_channel_id and message.channel.id == super_attempt_channel_id:
         await handle_super_attempt_message(message)
         return
-
-    is_a_list_channel = False
-    for guild_data in config.get('tracked_guilds', {}).values():
-        if message.channel.id == guild_data.get('member_list_channel_id'):
-            is_a_list_channel = True
-            break
-        
-    ai_cog = bot.get_cog('AICog')
-    if ai_cog and hasattr(ai_cog, 'process_message_for_ai'):
-        await ai_cog.process_message_for_ai(message, config)
+    
+    await process_message_for_ai(message)
 
 @tree.command(name="message", description="[Owner] Send, edit, or reply to a message with full customization.")
 @app_commands.describe(
@@ -7963,6 +8756,11 @@ async def message_command(
             await interaction.followup.send("❌ The `as_user` and `avatar` parameters are required to send or reply.", ephemeral=True)
             return
             
+        processed_content, mention_error = await block_unwanted_mentions(content, interaction.user.id)
+        if mention_error:
+            await interaction.followup.send(f"❌ {mention_error}", ephemeral=True)
+            return
+            
         target_channel = interaction.channel
         message_to_reply = None
         
@@ -8028,7 +8826,7 @@ async def message_command(
                 send_kwargs["message_reference"] = message_to_reply.to_reference()
                 send_kwargs["allowed_mentions"] = discord.AllowedMentions(replied_user=(ping_on_reply is not None and ping_on_reply.value == 1))
             
-            await temp_webhook.send(content, **send_kwargs)
+            await temp_webhook.send(processed_content, **send_kwargs)
             
             action_past_tense = "replied to the message" if action == "reply" else "sent the message"
             await interaction.followup.send(f"✅ Successfully {action_past_tense} in {target_channel.mention} as `{as_user}`.", ephemeral=True)
@@ -8074,6 +8872,11 @@ async def imitate(
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
+    processed_content, mention_error = await block_unwanted_mentions(message_content, interaction.user.id)
+    if mention_error:
+        await interaction.edit_original_response(content=f"❌ {mention_error}", view=None)
+        return
+
     bot_perms = interaction.channel.permissions_for(guild.me)
     if not bot_perms.manage_webhooks:
         await interaction.followup.send(f"❌ I lack 'Manage Webhooks' permission in {interaction.channel.mention}.", ephemeral=True)
@@ -8091,7 +8894,7 @@ async def imitate(
              webhook_name = "Imitated User"
 
         temp_webhook = await interaction.channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason=f"/imitate by {interaction.user}")
-        await temp_webhook.send(content=message_content, wait=True)
+        await temp_webhook.send(content=processed_content, wait=True)
         await interaction.edit_original_response(content=f"✅ Message sent, imitating {user.mention}.")
         await log_info(guild, f"`{interaction.user}` used /imitate as {user.mention} in {interaction.channel.mention}.")
 
@@ -8177,6 +8980,11 @@ async def florr(
         await interaction.edit_original_response(content=f"❌ The name '{discord.utils.escape_markdown(cleaned_name)}' contains disallowed characters or is reserved.", view=None)
         return
 
+    processed_content, mention_error = await block_unwanted_mentions(message_content, interaction.user.id)
+    if mention_error:
+        await interaction.edit_original_response(content=f"❌ {mention_error}", view=None)
+        return
+
     if not available_profile_pics_cache:
         await interaction.edit_original_response(content="❌ Profile pictures unavailable. Try `/refresh` or contact an admin.", view=None)
         return
@@ -8225,7 +9033,7 @@ async def florr(
             return
 
         temp_webhook = await interaction.channel.create_webhook(name=cleaned_name, avatar=chosen_avatar_bytes, reason=f"/florr by {interaction.user}")
-        await temp_webhook.send(content=message_content, wait=True)
+        await temp_webhook.send(content=processed_content, wait=True)
         await interaction.edit_original_response(content=f"✅ Message sent as '{cleaned_name}'.", view=None)
         await log_info(guild, f"`{interaction.user}` used /florr as '{cleaned_name}' (Pic: {profile}) in {interaction.channel.mention}.")
 
@@ -8243,6 +9051,15 @@ async def nerdhelp(interaction: discord.Interaction):
     if not guild:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=False)
         return
+
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            try:
+                await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the help message.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
 
     if not bot or not bot.user:
         await interaction.response.send_message("Bot is not fully ready, cannot generate help.", ephemeral=False)
@@ -8599,6 +9416,12 @@ async def setup(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild: return
     
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the setup panel.", ephemeral=True)
+            return
+
     await interaction.response.defer(ephemeral=False)
     config = await load_server_config(guild.id)
     view = SetupView(guild, config)
@@ -8848,14 +9671,14 @@ tree.add_command(NerdAdminGroup())
 async def servercodes(interaction: discord.Interaction, region: Optional[str] = None, map_name: Optional[str] = None):
     # Permission check for sending messages in the channel
     if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        if not interaction.guild: return
         bot_perms = interaction.channel.permissions_for(interaction.guild.me)
         if not bot_perms.send_messages or not bot_perms.embed_links:
             err_msg = "❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the server list."
-            # Try to send ephemerally, but it might fail too if channel perms are restrictive
             try:
                 await interaction.response.send_message(err_msg, ephemeral=True)
-            except discord.Forbidden:
-                pass # Can't do anything if we can't even respond ephemerally
+            except (discord.Forbidden, discord.HTTPException):
+                pass
             return
 
     await interaction.response.defer(thinking=True, ephemeral=False)
@@ -8991,6 +9814,11 @@ async def webhook(
             await interaction.followup.send("❌ The `content` parameter is required to send a message.", ephemeral=True)
             return
         
+        processed_content, mention_error = await block_unwanted_mentions(content, interaction.user.id)
+        if mention_error:
+            await interaction.followup.send(f"❌ {mention_error}", ephemeral=True)
+            return
+        
         webhook_url = await get_user_webhook_url(name)
         if not webhook_url:
             await interaction.followup.send(f"❌ Could not find a webhook named `{name}`.", ephemeral=True)
@@ -8998,7 +9826,7 @@ async def webhook(
 
         try:
             webhook = discord.Webhook.from_url(webhook_url, session=bot.http_session)
-            sent_message = await webhook.send(content, wait=True)
+            sent_message = await webhook.send(processed_content, wait=True)
             await interaction.followup.send(f"✅ Message sent via webhook `{name}`.\n**Message ID:** `{sent_message.id}`", ephemeral=True)
         except discord.NotFound:
             await interaction.followup.send(f"❌ Webhook `{name}` not found on Discord. It may have been deleted.", ephemeral=True)
@@ -9013,6 +9841,11 @@ async def webhook(
             await interaction.followup.send("❌ `message_id` and `content` are required to edit a message.", ephemeral=True)
             return
 
+        processed_content, mention_error = await block_unwanted_mentions(content, interaction.user.id)
+        if mention_error:
+            await interaction.followup.send(f"❌ {mention_error}", ephemeral=True)
+            return
+
         webhook_url = await get_user_webhook_url(name)
         if not webhook_url:
             await interaction.followup.send(f"❌ Could not find a webhook named `{name}`.", ephemeral=True)
@@ -9020,7 +9853,7 @@ async def webhook(
 
         try:
             webhook = discord.Webhook.from_url(webhook_url, session=bot.http_session)
-            await webhook.edit_message(message_id, content=content)
+            await webhook.edit_message(message_id, content=processed_content)
             await interaction.followup.send(f"✅ Message `{message_id}` successfully edited.", ephemeral=True)
         except discord.NotFound:
             await interaction.followup.send(f"❌ Could not find a message with ID `{message_id}` to edit.", ephemeral=True)
@@ -9048,6 +9881,222 @@ async def webhook(
             await log_error(guild, f"Error deleting webhook '{name}' from database", error=e, interaction=interaction)
             await interaction.followup.send(f"❌ Error removing webhook from DB.", ephemeral=True)
         return
+
+@tree.command(name="setup_guild", description="[Admin] Manage this server's tracked Florr guilds.")
+@app_commands.check(check_is_admin)
+@app_commands.describe(
+    action="The action to perform.",
+    tag="The guild tag (e.g., [HC1]). Required for add, edit, and remove.",
+    role="The role for the guild. Required for 'add', optional for 'edit'.",
+    channel="The list channel for the guild. Required for 'add', optional for 'edit'."
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="List Tracked Guilds", value="list"),
+    app_commands.Choice(name="Add a Tracked Guild", value="add"),
+    app_commands.Choice(name="Edit a Tracked Guild", value="edit"),
+    app_commands.Choice(name="Remove a Tracked Guild", value="remove"),
+])
+@app_commands.autocomplete(tag=tracked_guild_tag_autocomplete)
+async def setup_guild(
+    interaction: discord.Interaction,
+    action: str,
+    tag: Optional[str] = None,
+    role: Optional[discord.Role] = None,
+    channel: Optional[discord.TextChannel] = None
+):
+    guild = interaction.guild
+    if not guild: return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # --- LIST Action ---
+    if action == "list":
+        config = await load_server_config(guild.id)
+        tracked_guilds = config.get('tracked_guilds', {})
+
+        if not tracked_guilds:
+            await interaction.followup.send("There are no Florr guilds currently being tracked in this server.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title=f"Tracked Florr Guilds for {guild.name}", color=NERDY_YELLOW)
+        for t, data in sorted(tracked_guilds.items()):
+            role_obj = guild.get_role(data.get('discord_role_id')) if data.get('discord_role_id') else None
+            channel_obj = guild.get_channel(data.get('member_list_channel_id')) if data.get('member_list_channel_id') else None
+            value = (
+                f"**Discord Role:** {role_obj.mention if role_obj else '`Not Set`'}\n"
+                f"**Member List Channel:** {channel_obj.mention if channel_obj else '`Not Set`'}"
+            )
+            embed.add_field(name=f"Guild Tag: `{t}`", value=value, inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    # --- Parameter Validation for other actions ---
+    if not tag:
+        await interaction.followup.send("❌ The `tag` parameter is required for this action.", ephemeral=True)
+        return
+
+    normalized_tag = _normalize_guild_tag(tag)
+    config = await load_server_config(guild.id)
+    existing_guild_data = config.get('tracked_guilds', {}).get(normalized_tag)
+
+    # --- ADD Action ---
+    if action == "add":
+        if not role or not channel:
+            await interaction.followup.send("❌ The `role` and `channel` parameters are required to add a guild.", ephemeral=True)
+            return
+        if existing_guild_data:
+            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is already tracked. Use `/setup_guild action:edit` to modify it.", ephemeral=True)
+            return
+        
+        try:
+            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").insert({
+                "discord_guild_id": guild.id,
+                "florr_guild_tag": normalized_tag,
+                "discord_role_id": role.id,
+                "member_list_channel_id": channel.id
+            }).execute())
+            await load_server_config(guild.id) # Refresh cache
+            await interaction.followup.send(f"✅ Successfully added `{normalized_tag}` to the tracked guilds list.", ephemeral=True)
+            await log_info(guild, f"{interaction.user.name} added tracked guild '{normalized_tag}' via /setup_guild.")
+        except Exception as e:
+            await log_error(guild, f"Failed to add tracked guild {normalized_tag}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred while adding the guild.", ephemeral=True)
+
+    # --- EDIT Action ---
+    elif action == "edit":
+        if not role and not channel:
+            await interaction.followup.send("❌ You must provide a new `role` or a new `channel` to edit.", ephemeral=True)
+            return
+        if not existing_guild_data:
+            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is not currently being tracked.", ephemeral=True)
+            return
+            
+        updates = {}
+        if role: updates['discord_role_id'] = role.id
+        if channel: updates['member_list_channel_id'] = channel.id
+        
+        try:
+            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").update(updates).eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
+            await load_server_config(guild.id) # Refresh cache
+            await interaction.followup.send(f"✅ Successfully edited `{normalized_tag}`.", ephemeral=True)
+            await log_info(guild, f"{interaction.user.name} edited tracked guild '{normalized_tag}' via /setup_guild.")
+        except Exception as e:
+            await log_error(guild, f"Failed to edit tracked guild {normalized_tag}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred while editing the guild.", ephemeral=True)
+
+    # --- REMOVE Action ---
+    elif action == "remove":
+        if not existing_guild_data:
+            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is not currently being tracked.", ephemeral=True)
+            return
+            
+        try:
+            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
+            await load_server_config(guild.id) # Refresh cache
+            await interaction.followup.send(f"✅ Successfully removed `{normalized_tag}` from the tracked guilds list.", ephemeral=True)
+            await log_info(guild, f"{interaction.user.name} removed tracked guild '{normalized_tag}' via /setup_guild.")
+        except Exception as e:
+            await log_error(guild, f"Failed to remove tracked guild {normalized_tag}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred while removing the guild.", ephemeral=True)
+
+@tree.command(name="addkeyword", description="[Owner Only] Add a new keyword-triggered AI response rule.")
+@app_commands.describe(
+    keyword_regex="The regex pattern to trigger the response.",
+    ai_instructions="The system prompt for the AI when this keyword is triggered.",
+    discovery_message="The message to show when this keyword is discovered for the first time."
+)
+async def addkeyword(interaction: discord.Interaction, keyword_regex: str, ai_instructions: str, discovery_message: str):
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ This command is for the bot owner only.", ephemeral=True); return
+    if not supabase:
+        await interaction.response.send_message("❌ Database is not available.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        re.compile(keyword_regex)
+    except re.error as e:
+        await interaction.followup.send(f"❌ Invalid Regex: `{e}`"); return
+    try:
+        await run_supabase_sync(
+            lambda: supabase.table("keyword_phrases").insert({
+                "keyword_regex": keyword_regex, "ai_instructions": ai_instructions,
+                "discovery_message": discovery_message, "is_discovered": False
+            }).execute()
+        )
+        await load_keyword_data()
+        await interaction.followup.send(f"✅ Keyword rule added successfully: `{keyword_regex}`. Cache refreshed.")
+    except Exception as e:
+        await log_error(interaction.guild, "Failed to add keyword to DB", error=e, interaction=interaction)
+        await interaction.followup.send("❌ An error occurred while adding the keyword to the database.")
+
+@tree.command(name="discoveries", description="Shows the server's progress on discovering secret AI phrases.")
+async def discoveries(interaction: discord.Interaction):
+    if total_keywords == 0:
+        await interaction.response.send_message("There are no secret AI phrases configured yet!", ephemeral=False); return
+    progress_percentage = (discovered_keywords_count / total_keywords) * 100
+    embed = discord.Embed(
+        title="🕵️ AI Phrase Discoveries",
+        description=f"You've found **{discovered_keywords_count}** out of **{total_keywords}** secret AI trigger phrases!",
+        color=NERDY_YELLOW
+    )
+    bar_length = 20; filled_length = int(bar_length * progress_percentage / 100)
+    bar = '🟩' * filled_length + '⬛' * (bar_length - filled_length)
+    embed.add_field(name="Progress", value=f"`{bar}` ({progress_percentage:.1f}%)", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
+@tree.command(name="aiping", description="Checks the latency and availability of the primary AI model.")
+async def aiping(interaction: discord.Interaction):
+    if not ai_models:
+        await interaction.response.send_message("❌ AI models are not configured.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    model_to_test = "gemini-2.0-flash"; model = ai_models.get(model_to_test)
+    if not model:
+        await interaction.followup.send(f"❌ Primary AI model `{model_to_test}` is not available."); return
+    try:
+        start_time = time.monotonic(); response = await model.generate_content_async("ping"); end_time = time.monotonic()
+        latency_ms = round((end_time - start_time) * 1000)
+        status = "✅ Operational" if response and "pong" in response.text.lower() else "⚠️ Operational (unexpected response)"
+        embed = discord.Embed(title="🛰️ AI Model Ping", color=discord.Color.green())
+        embed.add_field(name="Model", value=f"`{model_to_test}`", inline=False)
+        embed.add_field(name="Status", value=status, inline=False)
+        embed.add_field(name="Latency", value=f"`{latency_ms} ms`", inline=False)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await log_error(interaction.guild, f"AI Ping command failed for model {model_to_test}", error=e, interaction=interaction)
+        await interaction.followup.send(f"❌ An error occurred while pinging the AI model: `{type(e).__name__}`")
+
+@tree.command(name="restart", description="[Owner Only] Restarts the bot process.")
+async def restart(interaction: discord.Interaction):
+    """
+    Gracefully closes the bot's connections and exits with a non-zero status code.
+    This signals to the hosting service (like Render) that the process needs to be restarted.
+    """
+    if interaction.user.id != OWNER_USER_ID:
+        await interaction.response.send_message("❌ This command is strictly for the bot owner.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    
+    try:
+        await interaction.response.send_message("✅ **Restarting...** The bot will go offline and should be back shortly.", ephemeral=True)
+    except discord.HTTPException as e:
+        print(f"Restart command: Could not send initial response. Error: {e}")
+
+    log_message = f"Bot restart initiated by owner {interaction.user.name}."
+    if guild:
+        await log_info(guild, log_message)
+    else:
+        print(log_message)
+    
+    # Gracefully close the bot's connections before exiting.
+    # This will trigger the on_close() event.
+    await bot.close()
+
+    # Exit the script with a non-zero status code.
+    # This is the standard way to tell a process manager (like Render's)
+    # that the service has failed and needs to be restarted.
+    print("--- EXITING FOR RESTART ---")
+    sys.exit(1)
 
 # --- Bot Startup ---
 if __name__ == "__main__":
