@@ -2129,7 +2129,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
         text = f"✨ **UNIQUE EVENT!** ✨\n{text}"
 
     # Replace the {time} placeholder if it exists and a valid timestamp is available
-    if text and '{{time}}' in text:
+    if text and '{time}' in text:
         time_replacement = ""
         if timestamp_str:
             try:
@@ -2140,7 +2140,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
             except (ValueError, TypeError):
                 pass # Keep time_replacement as empty string
         
-        text = text.replace('{{time}}', time_replacement)
+        text = text.replace('{time}', time_replacement)
 
     return text, ping_role, timestamp_str
 
