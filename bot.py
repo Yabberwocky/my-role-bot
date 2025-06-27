@@ -413,6 +413,64 @@ def keep_alive(): flask_thread = threading.Thread(target=run_flask, daemon=True)
 
 # --- Utility Functions ---
 
+async def fetch_all_global_tracked_guilds() -> List[Dict[str, Any]]:
+    """Fetches all tracked guilds from the database, across all Discord servers."""
+    if not supabase:
+        return []
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("tracked_florr_guilds").select("*").execute()
+        )
+        return resp.data if resp and resp.data else []
+    except Exception as e:
+        await log_error(None, "Failed to fetch all global tracked guilds", error=e)
+        return []
+
+async def fetch_guild_member_counts(tags: List[str]) -> Dict[str, int]:
+    """
+    Fetches member counts for a list of guild tags using an RPC call.
+    Requires the 'get_guild_member_counts' function to be created in Supabase.
+    """
+    if not supabase or not tags:
+        return {}
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.rpc('get_guild_member_counts', {'tags': tags}).execute()
+        )
+        if resp and resp.data:
+            return {item['guild_tag']: item['member_count'] for item in resp.data}
+        return {}
+    except Exception as e:
+        # This might fail if the RPC function doesn't exist yet.
+        print(f"RPC Error fetching guild member counts: {e}. Check if 'get_guild_member_counts' function exists in Supabase.")
+        # Fallback to slower method if RPC fails
+        counts = {}
+        for tag in tags:
+            try:
+                count_resp = await run_supabase_sync(
+                    lambda: supabase.table("florr_players").select("ingame_name", count='exact').eq("florr_guild_tag", tag).execute()
+                )
+                counts[tag] = count_resp.count if count_resp and count_resp.count is not None else 0
+            except Exception as e_fallback:
+                await log_error(None, f"Fallback member count failed for tag {tag}", error=e_fallback)
+                counts[tag] = 0
+            await asyncio.sleep(0.1) # Avoid spamming DB
+        return counts
+
+async def global_guild_tag_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes from all globally tracked guilds for the /guilds command."""
+    all_guilds = await fetch_all_global_tracked_guilds()
+    all_tags = sorted(list({g['florr_guild_tag'] for g in all_guilds}))
+    
+    choices = [app_commands.Choice(name="All Guilds (Summary View)", value="--ALL--")]
+    
+    for tag in all_tags:
+        if len(choices) >= 25: break
+        if not current or current.lower() in tag.lower():
+            choices.append(app_commands.Choice(name=tag, value=tag))
+            
+    return choices
+
 async def _format_consolidated_ping(category: str, events: List[Dict[str, Any]]) -> Optional[discord.Embed]:
     """Formats a consolidated embed for a burst of events."""
     if not events:
@@ -463,6 +521,307 @@ async def _format_consolidated_ping(category: str, events: List[Dict[str, Any]])
     embed.set_footer(text=f"Consolidated View | {get_formatted_utc_now()}")
     return embed
 
+async def fetch_all_global_tracked_guilds() -> List[Dict[str, Any]]:
+    """Fetches all tracked guilds from the database, across all Discord servers."""
+    if not supabase:
+        return []
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("tracked_florr_guilds").select("*").execute()
+        )
+        return resp.data if resp and resp.data else []
+    except Exception as e:
+        await log_error(None, "Failed to fetch all global tracked guilds", error=e)
+        return []
+
+async def fetch_guild_member_counts(tags: List[str]) -> Dict[str, int]:
+    """
+    Fetches member counts for a list of guild tags using an RPC call.
+    Requires the 'get_guild_member_counts' function to be created in Supabase.
+    """
+    if not supabase or not tags:
+        return {}
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.rpc('get_guild_member_counts', {'tags': tags}).execute()
+        )
+        if resp and resp.data:
+            return {item['guild_tag']: item['member_count'] for item in resp.data}
+        return {}
+    except Exception as e:
+        # This might fail if the RPC function doesn't exist yet.
+        print(f"RPC Error fetching guild member counts: {e}. Check if 'get_guild_member_counts' function exists in Supabase.")
+        # Fallback to slower method if RPC fails
+        counts = {}
+        for tag in tags:
+            try:
+                count_resp = await run_supabase_sync(
+                    lambda: supabase.table("florr_players").select("ingame_name", count='exact').eq("florr_guild_tag", tag).execute()
+                )
+                counts[tag] = count_resp.count if count_resp and count_resp.count is not None else 0
+            except Exception as e_fallback:
+                await log_error(None, f"Fallback member count failed for tag {tag}", error=e_fallback)
+                counts[tag] = 0
+            await asyncio.sleep(0.1) # Avoid spamming DB
+        return counts
+
+async def global_guild_tag_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocompletes from all globally tracked guilds for the /guilds command."""
+    all_guilds = await fetch_all_global_tracked_guilds()
+    all_tags = sorted(list({g['florr_guild_tag'] for g in all_guilds}))
+    
+    choices = [app_commands.Choice(name="All Guilds (Summary View)", value="--ALL--")]
+    
+    for tag in all_tags:
+        if len(choices) >= 25: break
+        if not current or current.lower() in tag.lower():
+            choices.append(app_commands.Choice(name=tag, value=tag))
+            
+    return choices
+
+class GuildsView(discord.ui.View):
+    # Constants for modes
+    MODE_SUMMARY = "summary"
+    MODE_MEMBERS = "members"
+
+    def __init__(self, interaction: discord.Interaction, is_static_list: bool, start_mode: str, start_tag: Optional[str] = None):
+        super().__init__(timeout=None if is_static_list else 300.0)
+        # Core attributes
+        self.interaction = interaction
+        self.guild = interaction.guild
+        self.is_static_list = is_static_list
+        self.message: Optional[discord.Message] = None
+        
+        # State
+        self.mode = start_mode
+        self.current_guild_tag = start_tag
+        
+        # Data Caches
+        self.summary_data: List[Dict[str, Any]] = []
+        self.member_data: List[Dict[str, Any]] = [] # This is the currently displayed, sorted, and activity-filtered data
+        self.original_member_data: List[Dict[str, Any]] = [] # The raw member data for the currently viewed guild
+        
+        # Member View State
+        self.member_view_mode = VIEW_MODE_ACTIVITY_MONTHLY
+        self.member_sort_mode = SORT_MODE_ACTIVITY
+        self.current_page = 0
+        self.total_pages = 0
+        self.total_members = 0
+
+        # Control flags
+        self.is_fetching = False
+        self.last_interaction_time = discord.utils.utcnow() if is_static_list else None
+    
+    async def initialize_data(self):
+        """Fetches the initial data needed for the starting view."""
+        self.is_fetching = True
+        if self.mode == self.MODE_SUMMARY:
+            guilds_summary = await fetch_all_global_tracked_guilds()
+            tags_to_count = [g['florr_guild_tag'] for g in guilds_summary]
+            counts = await fetch_guild_member_counts(tags_to_count)
+            self.summary_data = [{'tag': g['florr_guild_tag'], 'member_count': counts.get(g['florr_guild_tag'], 0)} for g in guilds_summary]
+            self.summary_data.sort(key=lambda x: x['member_count'], reverse=True)
+
+        elif self.mode == self.MODE_MEMBERS and self.current_guild_tag:
+            self.original_member_data, self.total_members = await fetch_tracked_guild_member_data(self.guild, self.current_guild_tag)
+            await self.fetch_and_set_member_data_for_view_mode(self.member_view_mode)
+            self.sort_member_data()
+        
+        self.is_fetching = False
+
+    async def _update_view(self, interaction: discord.Interaction):
+        """Main method to re-render the view and edit the message."""
+        self.update_ui_elements()
+        embed = await self.create_embed()
+        
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+            if self.is_static_list and self.last_interaction_time:
+                self.last_interaction_time = discord.utils.utcnow()
+        except discord.NotFound:
+            self.stop()
+        except discord.HTTPException as e:
+            if e.code != 10062: # Unknown Interaction
+                await log_error(self.guild, "GuildsView edit fail", error=e, interaction=interaction)
+    
+    def update_ui_elements(self):
+        self.clear_items()
+
+        if self.mode == self.MODE_SUMMARY:
+            if self.summary_data:
+                options = [discord.SelectOption(label=f"{g['tag']} ({g['member_count']} members)", value=g['tag']) for g in self.summary_data[:25]]
+                select = discord.ui.Select(placeholder="Select a guild to view members...", options=options, custom_id="guild_select")
+                select.callback = self.handle_guild_select
+                self.add_item(select)
+
+        elif self.mode == self.MODE_MEMBERS:
+            # Back Button
+            back_btn = discord.ui.Button(label="⬅️ All Guilds", style=discord.ButtonStyle.secondary, custom_id="guild_back_summary", row=0)
+            back_btn.callback = self.handle_back_to_summary
+            self.add_item(back_btn)
+
+            # Pagination
+            prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="guild_prev", row=1, disabled=(self.current_page == 0 or self.is_fetching))
+            prev_btn.callback = self.handle_pagination
+            self.add_item(prev_btn)
+            
+            next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="guild_next", row=1, disabled=(self.current_page >= self.total_pages - 1 or self.is_fetching))
+            next_btn.callback = self.handle_pagination
+            self.add_item(next_btn)
+
+            # Sorting
+            sort_label = "Sort by IGN" if self.member_sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
+            sort_btn = discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="guild_toggle_sort", row=2, disabled=(self.is_fetching or self.member_view_mode == VIEW_MODE_DISCORD))
+            sort_btn.callback = self.handle_sort_toggle
+            self.add_item(sort_btn)
+
+            # View Mode Select
+            options = [
+               discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, emoji="👤", default=self.member_view_mode == VIEW_MODE_DISCORD),
+               discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_DAILY),
+               discord.SelectOption(label="View Activity (Last 7 Days)", value=VIEW_MODE_ACTIVITY_WEEKLY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_WEEKLY),
+               discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_MONTHLY),
+               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, emoji="📊", default=self.member_view_mode == VIEW_MODE_ACTIVITY_ALL),
+            ]
+            view_select = discord.ui.Select(placeholder="Select Member View Mode...", options=options, custom_id="guild_view_select", row=3, disabled=self.is_fetching)
+            view_select.callback = self.handle_view_mode_select
+            self.add_item(view_select)
+
+    async def create_embed(self) -> discord.Embed:
+        if self.is_fetching:
+            return discord.Embed(title="⏳ Loading...", description="Fetching data, please wait.", color=NERDY_YELLOW)
+        
+        if self.mode == self.MODE_SUMMARY:
+            embed = discord.Embed(title="🌐 Guilds Summary", description="Select a guild to view its member list.", color=NERDY_YELLOW)
+            if not self.summary_data:
+                embed.description = "No tracked guilds found."
+            else:
+                lines = [f"**{g['tag']}**: `{g['member_count']}` members" for g in self.summary_data]
+                embed.description = "\n".join(lines)
+            embed.set_footer(text=f"Total Guilds: {len(self.summary_data)} | Updated: {get_formatted_utc_now()}")
+            return embed
+
+        elif self.mode == self.MODE_MEMBERS:
+            embed = discord.Embed(title=f"👥 Members of {self.current_guild_tag}", color=NERDY_YELLOW)
+            start_index = self.current_page * MEMBERS_PER_PAGE
+            page_data = self.member_data[start_index : start_index + MEMBERS_PER_PAGE]
+            
+            if not page_data:
+                embed.description = "No members found for this guild or view."
+            elif self.member_view_mode == VIEW_MODE_DISCORD:
+                lines = []
+                for i, item in enumerate(page_data, start=start_index + 1):
+                    member_obj = item.get('member')
+                    mention = member_obj.mention if member_obj else (f"<@{item['discord_id']}>" if item.get('discord_id') else '`No Discord`')
+                    lines.append(f"{i}. `{item.get('ign', 'N/A')}`: {mention}")
+                embed.description = "\n".join(lines)
+            else: # Activity views
+                lines = ["```"]
+                header = f"{'#':<4}{'IGN':<20}{'Activity':<18}"
+                lines.append(header)
+                lines.append("-" * len(header))
+                for i, item in enumerate(page_data, start=start_index + 1):
+                    ign_disp = item.get('ign', 'N/A')[:18]
+                    act_count = item.get('activity_count', 0)
+                    last_seen_disp = format_date_dmy(item['last_seen']) if item['last_seen'] else "N/A"
+                    act_disp = f"{act_count} ({last_seen_disp})"
+                    lines.append(f"{f'{i}.':<4}{ign_disp:<20}{act_disp:<18}")
+                lines.append("```")
+                embed.description = "\n".join(lines)
+            
+            sort_text = self.member_sort_mode.replace("sort_", "")
+            view_text = self.member_view_mode.replace("_view", "").replace("_", " ")
+            embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total Members: {self.total_members} | View: {view_text.title()} | Sort: {sort_text.title()}")
+            return embed
+        
+        return discord.Embed(title="Error", description="Invalid view state.", color=discord.Color.red())
+
+    # --- Data Handling ---
+    async def fetch_and_set_member_data_for_view_mode(self, mode: str):
+        if mode == VIEW_MODE_DISCORD or mode == VIEW_MODE_ACTIVITY_ALL:
+            self.member_data = list(self.original_member_data)
+            return
+
+        today_utc = datetime.datetime.now(pytz.utc).date()
+        if mode == VIEW_MODE_ACTIVITY_DAILY: start_date, end_date = today_utc, today_utc
+        elif mode == VIEW_MODE_ACTIVITY_WEEKLY: start_date, end_date = today_utc - datetime.timedelta(days=6), today_utc
+        elif mode == VIEW_MODE_ACTIVITY_MONTHLY: start_date, end_date = today_utc - datetime.timedelta(days=29), today_utc
+        else: return
+        
+        all_igns = [item['ign'] for item in self.original_member_data if item.get('ign')]
+        if not all_igns: self.member_data = []; return
+        
+        ranged_activity = await fetch_activity_data(self.guild, all_igns, start_date, end_date)
+        temp_data = []
+        for item in self.original_member_data:
+            new_item = item.copy()
+            new_item['activity_count'] = ranged_activity.get(item['ign'].lower(), {'count': 0})['count']
+            new_item['last_seen'] = ranged_activity.get(item['ign'].lower(), {'last_seen': None})['last_seen']
+            temp_data.append(new_item)
+        self.member_data = temp_data
+
+    def sort_member_data(self):
+        if self.member_sort_mode == SORT_MODE_IGN:
+            self.member_data.sort(key=lambda x: x.get('ign', 'zzz').lower())
+        else: # SORT_MODE_ACTIVITY
+            self.member_data.sort(key=lambda x: (x.get('activity_count', 0) * -1, x.get('ign', 'zzz').lower()))
+        self.total_pages = math.ceil(len(self.member_data) / MEMBERS_PER_PAGE) if self.member_data else 1
+        self.current_page = min(self.current_page, self.total_pages - 1) if self.total_pages > 0 else 0
+
+    # --- Callbacks ---
+    async def handle_guild_select(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.is_fetching = True
+        self.current_guild_tag = interaction.data['values'][0]
+        self.mode = self.MODE_MEMBERS
+        self.member_view_mode = VIEW_MODE_ACTIVITY_MONTHLY # Reset to default
+        self.member_sort_mode = SORT_MODE_ACTIVITY # Reset to default
+        
+        await self.initialize_data()
+        self.is_fetching = False
+        await self._update_view(interaction)
+
+    async def handle_back_to_summary(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.is_fetching = True
+        self.mode = self.MODE_SUMMARY
+        self.current_guild_tag = None
+        
+        await self.initialize_data()
+        self.is_fetching = False
+        await self._update_view(interaction)
+
+    async def handle_pagination(self, interaction: discord.Interaction):
+        action = interaction.data['custom_id'].split('_')[-1]
+        if action == "next" and self.current_page < self.total_pages - 1: self.current_page += 1
+        elif action == "prev" and self.current_page > 0: self.current_page -= 1
+        await self._update_view(interaction)
+
+    async def handle_sort_toggle(self, interaction: discord.Interaction):
+        self.member_sort_mode = SORT_MODE_ACTIVITY if self.member_sort_mode == SORT_MODE_IGN else SORT_MODE_IGN
+        self.sort_member_data()
+        await self._update_view(interaction)
+
+    async def handle_view_mode_select(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.is_fetching = True
+        self.member_view_mode = interaction.data['values'][0]
+        self.current_page = 0 # Reset page on view change
+        
+        await self.fetch_and_set_member_data_for_view_mode(self.member_view_mode)
+        if self.member_view_mode == VIEW_MODE_DISCORD: self.member_sort_mode = SORT_MODE_IGN
+        else: self.member_sort_mode = SORT_MODE_ACTIVITY
+        self.sort_member_data()
+        
+        self.is_fetching = False
+        await self._update_view(interaction)
+        
+    async def on_timeout(self):
+        if self.message and not self.is_static_list:
+            try:
+                await self.message.edit(content="*This interactive list has expired.*", embed=None, view=None)
+            except discord.HTTPException: pass
+        self.stop()
 
 async def _process_consolidated_events():
     """Processes and dispatches all cached events after the debounce window."""
@@ -845,6 +1204,102 @@ class SelfBotListener:
                 print(f"[Self-Bot Listener] Connection lost or error: {type(e).__name__}. Reconnecting...")
             self.ws_connection = None
             await asyncio.sleep(random.uniform(3, 7))
+
+async def update_guilds_list(guild: discord.Guild):
+    """Creates or updates the unified, interactive guild list for a server."""
+    config = await load_server_config(guild.id)
+    channel_id = config.get('guild_list_channel_id')
+    if not channel_id:
+        return # Not configured for this server
+
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        await log_error(guild, f"Guild list update failed: Channel {channel_id} not found or invalid.")
+        return
+
+    # Simplified perms check
+    if not channel.permissions_for(guild.me).send_messages:
+        await log_error(guild, f"Guild list update failed: Missing Send Messages permission in {channel.mention}.")
+        return
+
+    await log_info(guild, f"Updating unified guilds list in {channel.mention}...")
+
+    # Find existing message to edit
+    message_to_edit: Optional[discord.Message] = None
+    try:
+        async for msg in channel.history(limit=20):
+            if msg.author.id == bot.user.id and msg.embeds and "Guilds Summary" in msg.embeds[0].title:
+                message_to_edit = msg
+                break
+    except discord.Forbidden:
+        await log_error(guild, f"Cannot read history in {channel.mention} to find old list message.")
+        return
+
+    try:
+        # The view now starts in summary mode by default for the static list.
+        # It needs an interaction object to be created. We can mock a simple one.
+        # The correct way is to use discord.Object, not discord.utils.Object.
+        mock_interaction = discord.Object(id=0) # ID is required for the object, but its value doesn't matter here.
+        mock_interaction.guild = guild
+        mock_interaction.channel = channel
+        mock_interaction.user = bot.user
+        mock_interaction._session = bot._connection
+        mock_interaction._original_message = None
+
+        view = GuildsView(
+            interaction=mock_interaction,
+            is_static_list=True,
+            start_mode=GuildsView.MODE_SUMMARY,
+            start_tag=None
+        )
+        await view.initialize_data()
+        embed = await view.create_embed()
+        
+        if message_to_edit:
+            await message_to_edit.edit(embed=embed, view=view)
+            view.message = message_to_edit
+        else:
+            new_message = await channel.send(embed=embed, view=view)
+            view.message = new_message
+            
+        active_static_list_views[channel.id] = view # Store the view instance itself
+
+    except Exception as e:
+        await log_error(guild, "Failed to update unified guilds list", error=e)
+
+@tasks.loop(minutes=1.0)
+async def check_guilds_view_timeout():
+    """Background task to reset static GuildsView instances after a period of inactivity."""
+    await bot.wait_until_ready()
+    
+    channel_ids_to_check = list(active_static_list_views.keys())
+
+    for channel_id in channel_ids_to_check:
+        view = active_static_list_views.get(channel_id)
+        if not isinstance(view, GuildsView) or view.is_finished() or not view.last_interaction_time:
+            if channel_id in active_static_list_views: del active_static_list_views[channel_id]
+            continue
+        
+        time_since_active = discord.utils.utcnow() - view.last_interaction_time
+        if time_since_active.total_seconds() > (STATIC_LIST_RESET_TIMEOUT_MINUTES * 60):
+            print(f"Resetting static GuildsView in channel {channel_id} due to inactivity.")
+            try:
+                # Reset the view back to summary mode
+                view.mode = GuildsView.MODE_SUMMARY
+                view.current_guild_tag = None
+                view.is_fetching = True
+                await view.initialize_data()
+                view.is_fetching = False
+
+                if view.message:
+                    view.update_ui_elements()
+                    embed = await view.create_embed()
+                    await view.message.edit(embed=embed, view=view)
+                    view.last_interaction_time = discord.utils.utcnow()
+                else:
+                    print(f"Could not reset view in {channel_id}, message object is missing.")
+            except Exception as e:
+                await log_error(view.guild, f"Error resetting static GuildsView in channel {channel_id}", error=e)
 
 @bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
@@ -1688,39 +2143,15 @@ async def get_user_super_defeat_log_entries(
         return [], 0
 
 async def _revive_static_list_views():
-    """On startup, finds old static list messages and attaches new, live views."""
-    print("--- Reviving Static List Views ---")
+    """On startup, finds and updates any existing unified guild list messages."""
+    print("--- Reviving Unified Guild List Views ---")
     for guild in bot.guilds:
-        config = server_settings_cache.get(guild.id)
-        if not config: continue
-
-        tracked_guilds = config.get('tracked_guilds', {})
-        for tag, tracked_config in tracked_guilds.items():
-            channel_id = tracked_config.get("member_list_channel_id")
-            if not channel_id: continue
-
-            channel = guild.get_channel(channel_id)
-            if not isinstance(channel, discord.TextChannel):
-                print(f"Revive Views: Skipping channel {channel_id} in {guild.name} (not a text channel).")
-                continue
-
-            print(f"Revive Views: Scanning #{channel.name} in {guild.name} for list message...")
-            embed_title_to_find = f"**{tag} Guild Members**"
-            
-            try:
-                async for msg in channel.history(limit=20):
-                    if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == embed_title_to_find and msg.components:
-                        print(f"Revive Views: Found zombie view for '{tag}' (Msg ID: {msg.id}). Reviving...")
-                        # We found an old list. Let's update it with a fresh view.
-                        # This re-uses the same logic as a full refresh.
-                        await update_single_tracked_guild_list(guild, tracked_config)
-                        # We only expect one list per channel, so we can break after finding it.
-                        break
-            except discord.Forbidden:
-                print(f"Revive Views: Lacking permissions to read history in #{channel.name} ({guild.name}).")
-            except Exception as e:
-                await log_error(guild, f"Error during static list revival for channel #{channel.name}", error=e)
-    print("--- Finished Reviving Static List Views ---")
+        config = await load_server_config(guild.id)
+        if config.get('guild_list_channel_id'):
+            print(f"Reviving list for guild: {guild.name}")
+            # The update_guilds_list function now handles finding and editing the old message.
+            await update_guilds_list(guild)
+    print("--- Finished Reviving Guild List Views ---")
 
 async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: str) -> Tuple[Optional[int], Optional[str]]:
     """
@@ -1854,7 +2285,8 @@ class SetupView(discord.ui.View):
         # --- Channels ---
         chans_val = (
             f"**Screenshots:** {get_mention(self.config.get('screenshots_dropbox_channel_id'), 'channel')}\n"
-            f"**Super Attempts:** {get_mention(self.config.get('super_attempts_channel_id'), 'channel')}"
+            f"**Super Attempts:** {get_mention(self.config.get('super_attempts_channel_id'), 'channel')}\n"
+            f"**Unified Guild List:** {get_mention(self.config.get('guild_list_channel_id'), 'channel')}"
         )
         embed.add_field(name="Feature Channels", value=chans_val, inline=False)
         
@@ -1879,8 +2311,9 @@ class SetupView(discord.ui.View):
             guilds_val_parts = []
             for tag, data in sorted(tracked_guilds.items()):
                 role_mention = get_mention(data.get('discord_role_id'), 'role')
-                chan_mention = get_mention(data.get('member_list_channel_id'), 'channel')
-                guilds_val_parts.append(f"**{tag}**: {role_mention} → {chan_mention}")
+                # The per-guild list channel is no longer used, so we don't display it here.
+                # Just show the role associated with the tag.
+                guilds_val_parts.append(f"**{tag}**: Role -> {role_mention}")
             guilds_val = "\n".join(guilds_val_parts)
         else:
             guilds_val = "`No guilds are being tracked yet.`"
@@ -1942,6 +2375,7 @@ class SetupView(discord.ui.View):
         fields = [
             {'label': "Screenshots Channel Name/ID", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
             {'label': "Super Attempts Channel Name/ID", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
+            {'label': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str(self.config.get('guild_list_channel_id') or '')},
         ]
         modal = SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
@@ -2386,7 +2820,7 @@ async def _start_background_tasks(bot: commands.Bot):
     """Initializes and starts all background tasks and listeners."""
     print("Starting background tasks...")
 
-    if not check_static_view_timeout.is_running(): check_static_view_timeout.start()
+    if not check_guilds_view_timeout.is_running(): check_guilds_view_timeout.start()
     if not m28_server_scraper.is_running(): m28_server_scraper.start()
     if not aperiodic_craft_poster.is_running(): aperiodic_craft_poster.start()
     if not aperiodic_spawn_defeat_poster.is_running(): aperiodic_spawn_defeat_poster.start()
@@ -2527,12 +2961,8 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
 
 async def refresh_all_guild_lists(guild: discord.Guild):
     """Iterates through all configured tracked guilds and updates their static lists."""
-    config = await load_server_config(guild.id)
-    tracked_guilds = config.get('tracked_guilds', {})
-    for tag, tracked_config in tracked_guilds.items():
-        if tracked_config.get("member_list_channel_id"):
-            await update_single_tracked_guild_list(guild, tracked_config)
-            await asyncio.sleep(2) # Be gentle with Discord API
+    # This function is now simpler, it just calls the one update function.
+    await update_guilds_list(guild)
 
 async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag: str) -> Tuple[List[Dict[str, Any]], int]:
     """
@@ -3165,6 +3595,7 @@ async def handle_screenshot_dropbox(message: discord.Message):
             )
         except discord.HTTPException: pass
     else:
+        # This is where the standard activity logging happens now.
         await handle_guild_sync_from_screenshots(message, valid_images)
 
 async def handle_super_attempt_message(message: discord.Message):
@@ -3802,16 +4233,10 @@ async def handle_guild_sync_from_screenshots(
     if final_message_obj:
         confirm_view.message = final_message_obj
     
-    if activity_changed and guild.id == CATERCORD_GUILD_ID:
-        await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering list update for [HC1].")
-        
-        tracked_guilds = config.get('tracked_guilds', {})
-        hc1_config = tracked_guilds.get('[HC1]')
-        
-        if hc1_config and hc1_config.get('member_list_channel_id'):
-            await update_single_tracked_guild_list(guild, hc1_config)
-        else:
-            await log_info(guild, "Could not trigger list update for [HC1]: Config for tag '[HC1]' or its member_list_channel_id not found.")
+    if activity_changed:
+        # Now triggers the unified list update for the entire server
+        await log_info(guild, f"Screenshot by {user.name} logged new activity. Triggering unified guild list update.")
+        await update_guilds_list(guild)
 
 async def get_user_super_attempt_stats(guild: Optional[discord.Guild], ign: str) -> Dict[str, Any]:
     """
@@ -6018,6 +6443,7 @@ def get_formatted_utc_now() -> str:
 
 # --- Screenshot Activity Confirmation View & Buttons ---
 
+
 class ScreenshotActionButton(discord.ui.Button):
     def __init__(self, ign: str, is_undo: bool, row: int, original_uploader_id: int, activity_date: datetime.date):
         self.ign = ign
@@ -6098,11 +6524,10 @@ class ScreenshotActionButton(discord.ui.Button):
         if action_performed_successfully:
             await view.refresh_message(interaction.message) # Pass the message to edit
             # Trigger static list update if an activity status actually changed
-            asyncio.create_task(update_static_list_message(guild))
+            await update_guilds_list(guild)
 
         # Send an ephemeral follow-up to the user who clicked the button
         await interaction.followup.send(action_message, ephemeral=True)
-
 
 class ScreenshotConfirmView(View):
     # Max 5 buttons per row. Max 5 rows. Total 25 components.
@@ -6277,712 +6702,6 @@ async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
 
 
         # IMPORTANT: Do NOT update view.last_interaction_time here to prevent view reset timer from being affected by this deprecated feature.
-
-# --- Buttons and Views for the NEW Static List ---
-
-class InfoButton(discord.ui.Button):
-    """Button to toggle the info display on the static list."""
-    def __init__(self, is_info_active: bool, row: int):
-        label = "Back to List" if is_info_active else "Info / Help"
-        style = discord.ButtonStyle.secondary if is_info_active else discord.ButtonStyle.primary
-        emoji = "⬅️" if is_info_active else "ℹ️"
-        super().__init__(label=label, style=style, emoji=emoji, custom_id="static_toggle_info", row=row)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: StaticHCPagesView = self.view
-        if view:
-            await view.toggle_info_mode(interaction)
-
-
-class MyProfileButton(discord.ui.Button):
-     """Button to show the 'My Profile' WIP message."""
-     def __init__(self, row: int):
-          super().__init__(label="My Profile", style=discord.ButtonStyle.blurple, emoji="👤", custom_id="static_my_profile", row=row) # Changed style
-
-     async def callback(self, interaction: discord.Interaction):
-          view: StaticHCPagesView = self.view
-          if view:
-               await view.show_my_profile(interaction)
-
-# --- Static List View (REVISED Class) ---
-# Inherits directly from View, copies logic as needed.
-class StaticHCPagesView(View):
-
-    # --- Data Update Method (Unchanged) ---
-    async def update_data_and_refresh(self, new_original_data: List[Dict[str, Any]], new_initial_display_data: List[Dict[str, Any]], new_total_members: int):
-        """Updates the view's internal data and refreshes its display."""
-        print(f"[Static View {self.message_id}] Updating internal data and refreshing.")
-        self.original_data = new_original_data
-        self.current_data = new_initial_display_data # Use the new pre-fetched data
-        self.total_members = new_total_members
-
-        # Reset state to default view/sort/page
-        self.current_page = 0
-        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY
-        self.sort_mode = SORT_MODE_ACTIVITY
-        self.info_mode_active = False
-        self.is_fetching_activity = False # Ensure lock is released
-
-        self.sort_data() # Sort the new initial data
-
-        # Recalculate total pages
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-
-        # Now, edit the message with the updated state
-        if self.message_id and self.guild:
-            channel_id_to_find = self.channel_id # Use the stored channel_id
-            channel = self.guild.get_channel(channel_id_to_find)
-            if channel and isinstance(channel, discord.TextChannel):
-                message_to_edit: Optional[discord.Message] = None
-                try:
-                    message_to_edit = await channel.fetch_message(self.message_id)
-                    # Directly edit the message object, not an interaction
-                    await self.edit_message_object(message=message_to_edit)
-                    self.last_interaction_time = discord.utils.utcnow() # Update timestamp on successful refresh
-                except discord.NotFound:
-                    print(f"[Static View Update] Message {self.message_id} not found during data update. Stopping view.")
-                    self.stop()
-                    if self.guild.id in active_static_list_views: del active_static_list_views[self.guild.id]
-                except Exception as e:
-                    print(f"[Static View Update] Error editing message {self.message_id} during data update: {e}")
-                    await log_error(self.guild, f"Static View: Error editing message {self.message_id} during data update", error=e)
-            else:
-                print(f"[Static View Update] Could not find channel {channel_id_to_find} during data update.")
-        else:
-            print("[Static View Update] Cannot edit message: Missing message ID or guild context.")
-
-
-    # --- __init__ (MODIFIED) ---
-    def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: discord.Guild, channel_id: int, embed_title: str, message: Optional[discord.Message] = None, timeout=None):
-        super().__init__(timeout=timeout)
-        self.original_data = original_data
-        self.current_data = initial_display_data
-        self.total_members = total_members
-        self.current_page = 0
-        self.message: Optional[discord.Message] = message
-        self.message_id: Optional[int] = message.id if message else None
-        self.guild = guild
-        self.is_target_guild = True
-        self.bot_owner_id = OWNER_USER_ID
-        self.channel_id = channel_id
-        self.embed_title = embed_title # Store the custom title
-
-        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY
-        self.sort_mode = SORT_MODE_ACTIVITY
-        self.info_mode_active = False
-        self.is_fetching_activity = False
-        self.last_interaction_time = discord.utils.utcnow()
-
-        self.sort_data()
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-        self.update_ui_elements()
-
-    async def fetch_and_set_data_for_mode(self, mode: str, start_date: Optional[datetime.date] = None, end_date: Optional[datetime.date] = None):
-        """Fetches activity if needed and sets self.current_data. Now ASYNC."""
-        print(f"[Static View] Async setting data for mode: {mode}")
-        
-        if start_date is None and end_date is None:
-             today_utc = datetime.datetime.now(pytz.utc).date()
-             if mode == VIEW_MODE_ACTIVITY_DAILY:
-                 start_date = end_date = today_utc
-             elif mode == VIEW_MODE_ACTIVITY_WEEKLY:
-                 end_date = today_utc
-                 start_date = today_utc - datetime.timedelta(days=6)
-             elif mode == VIEW_MODE_ACTIVITY_MONTHLY:
-                 end_date = today_utc
-                 start_date = today_utc - datetime.timedelta(days=29)
-
-        if mode in [VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-            all_igns = [item['ign'] for item in self.original_data if item.get('ign')]
-            if not all_igns:
-                print("[Static View] No IGNs found in original data.")
-                self.current_data = list(self.original_data)
-                return
-            try:
-                 ranged_activity_data = await fetch_activity_data(self.guild, all_igns, start_date, end_date)
-            except Exception as e:
-                  print(f"[Static View] Error fetching activity data: {e}")
-                  await log_error(self.guild, f"Static View: Error fetching activity data for mode {mode}", error=e)
-                  self.current_data = list(self.original_data)
-                  return
-
-            temp_data = []
-            for item in self.original_data:
-                ign_lower = item.get('ign', '').lower()
-                activity_info = ranged_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                updated_item = item.copy()
-                updated_item['activity_count'] = activity_info['count']
-                updated_item['last_seen'] = activity_info['last_seen']
-                temp_data.append(updated_item)
-            self.current_data = temp_data
-            print(f"[Static View] Updated current_data with ranged activity.")
-
-        elif mode == VIEW_MODE_ACTIVITY_ALL:
-            self.current_data = list(self.original_data)
-            print("[Static View] Set to All-Time activity view.")
-        else:
-            self.current_data = list(self.original_data)
-            print("[Static View] Set to Discord view.")
-
-
-    def sort_data(self):
-        """Sorts self.current_data based on self.sort_mode."""
-        stored_page = self.current_page
-
-        if self.view_mode == VIEW_MODE_DISCORD:
-            if self.sort_mode == SORT_MODE_DISCORD_NAME:
-                def sort_key_discord(item):
-                    member = item.get('member')
-                    db_name = item.get('discord_name')
-                    if member:
-                        key_part = (member.name.lower(), member.discriminator)
-                        is_none_equivalent = False
-                    elif db_name:
-                        key_part = (db_name.lower(),)
-                        is_none_equivalent = False
-                    else:
-                        key_part = ('zzz',)
-                        is_none_equivalent = True
-                    return (is_none_equivalent, key_part)
-                self.current_data.sort(key=sort_key_discord)
-            else:
-                self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
-        elif self.sort_mode == SORT_MODE_ACTIVITY:
-            self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
-        else:
-             self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
-
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-        self.current_page = min(stored_page, max(0, self.total_pages - 1))
-
-    def update_ui_elements(self):
-        """Clears and explicitly re-adds UI elements based on the current state."""
-        self.clear_items()
-
-        if self.info_mode_active:
-            back_button = InfoButton(is_info_active=True, row=0)
-            back_button.callback = self.toggle_info_mode
-            self.add_item(back_button)
-        else:
-            prev_button = discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="static_prev", row=0, disabled=self.current_page == 0 or self.is_fetching_activity)
-            prev_button.callback = self.previous_button_callback
-            self.add_item(prev_button)
-
-            next_button = discord.ui.Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="static_next", row=0, disabled=self.current_page >= self.total_pages - 1 or self.is_fetching_activity)
-            next_button.callback = self.next_button_callback
-            self.add_item(next_button)
-
-            sort_button_disabled = self.is_fetching_activity
-            if self.view_mode == VIEW_MODE_DISCORD:
-                sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_DISCORD_NAME else "Sort by Discord Name"
-            else:
-                sort_label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
-
-            sort_button = discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="static_toggle_sort", row=1, disabled=sort_button_disabled)
-            sort_button.callback = self.sort_button_callback
-            self.add_item(sort_button)
-
-            info_button = InfoButton(is_info_active=False, row=1)
-            info_button.callback = self.toggle_info_mode
-            self.add_item(info_button)
-
-            profile_button = MyProfileButton(row=2)
-            profile_button.callback = self.show_my_profile
-            self.add_item(profile_button)
-
-            options = [
-               discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, description="Show Discord usernames and IGNs.", emoji="👤"),
-               discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, description="Show IGNs active today.", emoji="📅"),
-               discord.SelectOption(label="View Activity (Last 7 Days)", value=VIEW_MODE_ACTIVITY_WEEKLY, description="Show IGNs active in the last week.", emoji="📅"),
-               discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, description="Show IGNs active in the last 30 days.", emoji="📅"),
-               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, description="Show IGNs and total activity count.", emoji="📊"),
-            ]
-            for option in options: option.default = option.value == self.view_mode
-
-            view_select = discord.ui.Select(
-                placeholder="Select View Mode...", min_values=1, max_values=1, options=options,
-                custom_id="static_view_select", row=3, disabled=self.is_fetching_activity
-            )
-            view_select.callback = self.view_select_callback
-            self.add_item(view_select)
-
-    # --- create_page_embed (MODIFIED) ---
-    def create_page_embed(self) -> discord.Embed:
-        """Creates embed based on current view_mode, sort_mode, and context."""
-        if hasattr(self, 'info_mode_active') and self.info_mode_active:
-             info_description = (
-                 f"This is an interactive list of members in the **{self.embed_title}**.\n\n"
-                 "**Features:**\n"
-                 f"• **Pagination:** Use `Previous`/`Next` buttons.\n"
-                 f"• **View Modes:** Use the dropdown to see different activity periods (Today, 7/30 days, All-Time) or Discord names.\n"
-                 f"• **Sorting:** Toggle between sorting by IGN (A-Z) or Activity (most active first) using the `Sort by...` button (only in Activity views).\n"
-                 f"• **Actions:** Use `Activate Myself Today` or check the WIP `My Profile`.\n\n"
-                 f"**Activity Tracking:**\n"
-                 f"• Activity means a member was marked present on a given day using bot commands.\n"
-                 f"• The `Activity` column shows: `Count (Last Seen DD/MM/YY)` within the selected view period.\n\n"
-                 f"*This message automatically resets to the default view ({VIEW_MODE_ACTIVITY_MONTHLY.replace('_view','')}) after {STATIC_LIST_RESET_TIMEOUT_MINUTES} minutes of inactivity.*\n"
-             )
-             embed = discord.Embed(
-                  title=f"ℹ️ About the {self.embed_title} List",
-                  description=info_description,
-                  color=NERDY_YELLOW
-             )
-             embed.set_footer(text=f"Info Mode | Updated: {get_formatted_utc_now()}")
-             return embed
-
-        start = self.current_page * MEMBERS_PER_PAGE
-        page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
-        idx = start + 1
-        desc_lines = []
-
-        if not page_data:
-            desc_lines = ["No members found matching criteria."]
-        elif self.view_mode == VIEW_MODE_DISCORD:
-            IDX_WIDTH = 3
-            IGN_DISPLAY_WIDTH = 18
-            for item_dict in page_data:
-                ign = item_dict.get('ign', 'Unknown')
-                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} "
-                user_id_str: Optional[str] = None
-                member = item_dict.get('member')
-                if member: user_id_str = str(member.id)
-                else: user_id_str = item_dict.get("discord_id")
-                mention_display = f"<@!{user_id_str}>" if user_id_str else "`[No Discord]`"
-                ign_display = ign if len(ign) <= IGN_DISPLAY_WIDTH else ign[:IGN_DISPLAY_WIDTH-1] + "…"
-                line = f"{index_str}`{ign_display:<{IGN_DISPLAY_WIDTH}}` {mention_display}"
-                desc_lines.append(line)
-                idx += 1
-        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-            IDX_WIDTH = 3; SPACE_WIDTH = 1; IDX_PLUS_SPACE_WIDTH = IDX_WIDTH + SPACE_WIDTH; CONTENT_WIDTH = 34;
-            ACT_WIDTH = 18; IGN_WIDTH = 16; TOTAL_WIDTH = IDX_PLUS_SPACE_WIDTH + CONTENT_WIDTH
-            header = f"{'#':<{IDX_WIDTH}} {'IGN':<{IGN_WIDTH}}{'Activity':<{ACT_WIDTH}}"; separator = "-" * TOTAL_WIDTH
-            desc_lines.append("```"); desc_lines.append(header); desc_lines.append(separator)
-            for item_dict in page_data:
-                ign = item_dict.get('ign', 'Unknown')
-                activity_count = item_dict.get('activity_count', 0)
-                last_seen_date = item_dict.get('last_seen')
-                activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
-                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} "
-                ign_display = ign if len(ign) <= IGN_WIDTH else ign[:IGN_WIDTH-1] + "…"
-                if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
-                line = f"{index_str}{ign_display:<{IGN_WIDTH}}{activity_display:<{ACT_WIDTH}}"; desc_lines.append(line)
-                idx += 1
-            desc_lines.append("```")
-        else:
-            desc_lines = ["Error: Invalid View Mode"]
-
-        title = self.embed_title # Use the stored title
-        embed = discord.Embed(title=title, description="\n".join(desc_lines), color=NERDY_YELLOW)
-
-        sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
-        view_text_map = {
-            VIEW_MODE_DISCORD: "IGN+Discord", VIEW_MODE_ACTIVITY_ALL: "Activity (All)",
-            VIEW_MODE_ACTIVITY_DAILY: "Activity (Today)", VIEW_MODE_ACTIVITY_WEEKLY: "Activity (7d)",
-            VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
-        }
-        view_text = view_text_map.get(self.view_mode, "Unknown View")
-        footer_text = f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | View: {view_text} | Sort: {sort_text}"
-        if hasattr(self, 'is_fetching_activity') and self.is_fetching_activity: footer_text += " | Fetching data..."
-        footer_text += f" | Updated: {get_formatted_utc_now()}"
-        embed.set_footer(text=footer_text)
-        return embed
-
-    async def edit_message_object(self, message: Optional[discord.Message] = None):
-        """Edits the view's underlying message object."""
-        message_to_edit = message or self.message
-        if not message_to_edit:
-            print(f"[Static View {self.message_id}] Error: edit_message_object called without a message.")
-            return
-        self.update_ui_elements()
-        embed = self.create_page_embed()
-        try:
-            await message_to_edit.edit(embed=embed, view=self)
-        except discord.NotFound:
-            print(f"[Static View] Message edit fail: Message {message_to_edit.id} not found.")
-            self.stop()
-            if self.guild and self.message_id and self.channel_id in active_static_list_views and active_static_list_views[self.channel_id]['message_id'] == self.message_id:
-                 del active_static_list_views[self.channel_id]
-                 print(f"[Static View] Removed view tracking for message {self.message_id} as it was not found.")
-        except discord.HTTPException as e:
-            if e.status != 404: await log_error(self.guild, f"Static list Message edit fail (HTTP {e.status})", error=e)
-        except Exception as e:
-            await log_error(self.guild, f"Static list Message edit fail (General) for {message_to_edit.id}", error=e)
-
-    async def respond_to_interaction(self, interaction: discord.Interaction):
-        """Handles the initial edit response for an interaction."""
-        if interaction.response.is_done():
-            print(f"[Static View] Warning: respond_to_interaction called for already responded interaction {interaction.id}")
-            try: await self.edit_message_object(await interaction.original_response())
-            except Exception as e_edit_orig: print(f"[Static View] Failed to edit original response after double-response warning: {e_edit_orig}")
-            return
-        self.update_ui_elements(); embed = self.create_page_embed()
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-            if not self.message:
-                 try: self.message = await interaction.original_response(); self.message_id = self.message.id
-                 except (discord.NotFound, discord.HTTPException): print(f"[Static View] Failed to fetch original response for interaction {interaction.id} after edit.")
-        except discord.NotFound: self.stop()
-        except discord.HTTPException as e:
-            if e.code != 10062: await log_error(self.guild, "Interaction edit fail (HTTP)", error=e, interaction=interaction)
-        except Exception as e:
-             await log_error(self.guild, "Interaction edit fail (General)", error=e, interaction=interaction)
-
-    async def previous_button_callback(self, interaction: discord.Interaction):
-        """Callback for the Previous button."""
-        if self.current_page > 0 and not self.is_fetching_activity:
-            self.current_page -= 1
-            self.last_interaction_time = discord.utils.utcnow()
-            await self.respond_to_interaction(interaction)
-        else: await interaction.response.defer()
-
-    async def next_button_callback(self, interaction: discord.Interaction):
-        """Callback for the Next button."""
-        if self.current_page < self.total_pages - 1 and not self.is_fetching_activity:
-            self.current_page += 1
-            self.last_interaction_time = discord.utils.utcnow()
-            await self.respond_to_interaction(interaction)
-        else: await interaction.response.defer()
-
-    async def sort_button_callback(self, interaction: discord.Interaction):
-        """Callback for the Sort button."""
-        if self.is_fetching_activity: await interaction.response.defer(); return
-        self.last_interaction_time = discord.utils.utcnow()
-        if self.view_mode == VIEW_MODE_DISCORD: self.sort_mode = SORT_MODE_IGN if self.sort_mode == SORT_MODE_DISCORD_NAME else SORT_MODE_DISCORD_NAME
-        else: self.sort_mode = SORT_MODE_ACTIVITY if self.sort_mode == SORT_MODE_IGN else SORT_MODE_IGN
-        self.sort_data()
-        await self.respond_to_interaction(interaction)
-
-    async def view_select_callback(self, interaction: discord.Interaction):
-        """Callback for the View Mode Select dropdown."""
-        try: new_mode = interaction.data['values'][0]
-        except (KeyError, IndexError): await interaction.response.defer(); return
-        if self.view_mode == new_mode or self.is_fetching_activity: await interaction.response.defer(); return
-        self.last_interaction_time = discord.utils.utcnow()
-        self.is_fetching_activity = True; self.view_mode = new_mode
-        await self.respond_to_interaction(interaction)
-        if not self.message:
-             try: self.message = await interaction.original_response(); self.message_id = self.message.id
-             except (discord.NotFound, discord.HTTPException) as e:
-                  print(f"[Static View] Error fetching original response in view_select: {e}. Cannot perform final update.")
-                  self.is_fetching_activity = False
-                  try: await interaction.followup.send("❌ Error preparing view update.", ephemeral=True)
-                  except Exception: pass
-                  return
-        try:
-            await self.fetch_and_set_data_for_mode(new_mode)
-            self.sort_mode = SORT_MODE_IGN if new_mode == VIEW_MODE_DISCORD else SORT_MODE_ACTIVITY
-            self.sort_data()
-        except Exception as e:
-            await log_error(self.guild, f"Error changing static list view mode to {new_mode}", error=e, interaction=interaction)
-            self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY; await self.fetch_and_set_data_for_mode(self.view_mode)
-            self.sort_mode = SORT_MODE_ACTIVITY; self.sort_data()
-            try: await interaction.followup.send("❌ Error fetching data for view.", ephemeral=True)
-            except Exception: pass
-        finally:
-            self.is_fetching_activity = False
-            await self.edit_message_object()
-
-    async def toggle_info_mode(self, interaction: discord.Interaction):
-        """Callback for the InfoButton."""
-        self.last_interaction_time = discord.utils.utcnow()
-        self.info_mode_active = not self.info_mode_active
-        await self.respond_to_interaction(interaction)
-
-    async def show_my_profile(self, interaction: discord.Interaction):
-        """Callback for the MyProfileButton. Shows the user's profile ephemerally."""
-        guild = interaction.guild
-        if not guild: await interaction.response.send_message("Error: Guild context lost for profile.", ephemeral=True); return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        if not await check_supabase_available(interaction):
-            try: await interaction.edit_original_response(content="❌ Database connection unavailable. Cannot fetch profile data.", view=None)
-            except (discord.NotFound, discord.HTTPException): pass
-            return
-        target_user_for_display = interaction.user; target_discord_id_str = str(interaction.user.id)
-        hc_profile_db_data = await fetch_hc_member_profile_data(guild, target_discord_id_str)
-        target_ign_from_db: Optional[str] = hc_profile_db_data.get("ingame_name") if hc_profile_db_data else None
-        if not target_ign_from_db:
-            await interaction.followup.send(f"❌ {interaction.user.mention}, I couldn't find a linked In-Game Name (IGN) for you. Use {get_cmd_mention('guild')} or {get_cmd_mention('verify')}.", ephemeral=True)
-            return
-        display_name_for_view: str = target_user_for_display.display_name
-        avatar_url_for_view: Optional[str] = target_user_for_display.display_avatar.url if target_user_for_display.display_avatar else target_user_for_display.default_avatar.url
-        mention_or_status_for_view: str = target_user_for_display.mention
-        actual_member_object_ref: Optional[discord.Member] = target_user_for_display if isinstance(target_user_for_display, discord.Member) else None
-        target_user_display_data_for_view = {"name": display_name_for_view, "avatar_url": avatar_url_for_view, "mention_or_status": mention_or_status_for_view, "_member_object_ref": actual_member_object_ref, "_discord_id_for_sa_management": target_discord_id_str}
-        activity_summary_for_view: Optional[Dict[str, Any]] = None; initial_monthly_dates_for_view: Set[datetime.date] = set(); super_attempt_stats_data_for_view: Optional[Dict[str, Any]] = None
-        today_utc_obj, _ = get_utc_date()
-        if target_ign_from_db and today_utc_obj:
-            ign_lower = target_ign_from_db.lower()
-            is_active_today = await check_activity_exists(guild, ign_lower, today_utc_obj)
-            active_today_disp = "✅ `Yes`" if is_active_today is True else ("❌ `No`" if is_active_today is False else "❔ `N/A (DB Error)`")
-            all_time_summary = await fetch_activity_data(guild, [ign_lower]); ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
-            activity_summary_for_view = {"active_today_display": active_today_disp, "total_days_logged": ign_all_time_data['count'], "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"}
-            first_day_current_month = today_utc_obj.replace(day=1)
-            first_day_next_month = first_day_current_month.replace(year=today_utc_obj.year + 1, month=1) if today_utc_obj.month == 12 else first_day_current_month.replace(month=today_utc_obj.month + 1)
-            last_day_current_month = first_day_next_month - datetime.timedelta(days=1)
-            initial_monthly_dates_for_view = await fetch_activity_dates_in_range(guild, ign_lower, first_day_current_month, last_day_current_month)
-            super_attempt_stats_data_for_view = await get_user_super_attempt_stats(guild, target_ign_from_db)
-        if not today_utc_obj: await log_error(guild, "Static List Profile: Failed to get today's date object.", interaction=interaction)
-        profile_view_instance = ProfilePagesView(interaction=interaction, target_user_display_data=target_user_display_data_for_view, hc_profile_data=hc_profile_db_data, activity_summary_data=activity_summary_for_view, initial_monthly_active_dates=initial_monthly_dates_for_view, super_attempt_stats_data=super_attempt_stats_data_for_view, today_date_obj=today_utc_obj if today_utc_obj else datetime.date.today())
-        initial_profile_embed = profile_view_instance._create_main_embed()
-        try:
-            profile_message = await interaction.followup.send(embed=initial_profile_embed, view=profile_view_instance, ephemeral=True)
-            profile_view_instance.message = profile_message
-        except discord.HTTPException as e_send_profile:
-            await log_error(guild, "Failed to send ephemeral profile from static list button", error=e_send_profile, interaction=interaction)
-            try: await interaction.edit_original_response(content="❌ Error displaying your profile. Please try again later.", view=None)
-            except (discord.NotFound, discord.HTTPException): pass
-
-    async def on_timeout(self):
-        print(f"[Static View] Default on_timeout triggered for view on message {self.message_id}. Disabling items.")
-        self.update_ui_elements()
-        self.stop()
-        await self.edit_message_object()
-
-    async def reset_view(self):
-        """Resets the view state to default (called by background task)."""
-        print(f"[Static View] Resetting view state for message {self.message_id} due to inactivity.")
-        self.current_page = 0; self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY; self.sort_mode = SORT_MODE_ACTIVITY;
-        self.info_mode_active = False; self.is_fetching_activity = True
-        if not self.guild: self.is_fetching_activity = False; return
-        channel = self.guild.get_channel(self.channel_id)
-        if not isinstance(channel, discord.TextChannel): self.is_fetching_activity = False; return
-        message_to_edit: Optional[discord.Message] = None
-        try:
-            if self.message_id: message_to_edit = await channel.fetch_message(self.message_id); self.message = message_to_edit
-            await self.fetch_and_set_data_for_mode(self.view_mode)
-            self.sort_data()
-        except discord.NotFound:
-             if self.channel_id in active_static_list_views: del active_static_list_views[self.channel_id]
-             self.stop(); return
-        except Exception as e:
-             await log_error(self.guild, "[Static View] Reset Error during data/message fetch", error=e)
-             self.is_fetching_activity = False; return
-        finally: self.is_fetching_activity = False
-        if message_to_edit:
-            try:
-                await self.edit_message_object(message=message_to_edit)
-                self.last_interaction_time = discord.utils.utcnow()
-            except Exception as e_edit: print(f"[Static View] Reset Error: {e_edit}")
-
-async def update_single_tracked_guild_list(guild: discord.Guild, tracked_guild_config: Dict[str, Any]):
-    """Creates or updates the interactive list for a single tracked Florr guild."""
-    list_channel_id = tracked_guild_config.get('member_list_channel_id')
-    role_id = tracked_guild_config.get('discord_role_id')
-    tag = tracked_guild_config.get('florr_guild_tag', '[GUILD]')
-    embed_title = f"**{tag} Guild Members**"
-
-    if not all([list_channel_id, role_id]):
-        await log_error(guild, f"Skipping static list update for guild '{tag}': Missing channel or role ID in config.")
-        return
-
-    chan = guild.get_channel(list_channel_id)
-    if not isinstance(chan, discord.TextChannel):
-        await log_error(guild, f"Static list update for '{tag}' failed: Channel {list_channel_id} invalid.")
-        return
-    if not bot or not bot.user:
-        await log_error(guild, "Static list update failed: Bot not ready."); return
-    if not chan.permissions_for(guild.me).send_messages:
-        await log_error(guild, f"Static list update for '{tag}' failed: Bot missing Send/Embed/History/ManageMessages perms in {chan.mention}.")
-        return
-
-    await log_info(guild, f"Updating interactive static list for '{tag}' in {chan.mention}...")
-
-    try:
-        member_data, total_count = await fetch_tracked_guild_member_data(guild, tag)
-    except Exception as e:
-        await log_error(guild, f"Static list update for '{tag}' failed: Error fetching member data.", error=e)
-        return
-
-    try:
-        await load_ign_cache(guild)
-    except Exception as e:
-        await log_error(guild, f"Static list update for '{tag}' proceeding, but IGN cache refresh failed.", error=e)
-
-    initial_display_data = list(member_data)
-    try:
-        today_utc = datetime.datetime.now(pytz.utc).date()
-        start_date = today_utc - datetime.timedelta(days=29)
-        all_igns = [item['ign'] for item in member_data if item.get('ign')]
-        if all_igns:
-            activity_data = await fetch_activity_data(guild, all_igns, start_date, today_utc)
-            temp_data = []
-            for item in member_data:
-                ign_lower = item.get('ign', '').lower()
-                activity_info = activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                updated_item = item.copy()
-                updated_item.update({'activity_count': activity_info['count'], 'last_seen': activity_info['last_seen']})
-                temp_data.append(updated_item)
-            initial_display_data = temp_data
-    except Exception as e:
-        await log_error(guild, f"[Static Update for {tag}] Failed to fetch initial monthly activity", error=e)
-
-    active_view_data = active_static_list_views.get(list_channel_id)
-    tracked_message_obj: Optional[discord.Message] = None
-    tracked_view_instance: Optional[StaticHCPagesView] = None
-
-    if active_view_data:
-        msg_id = active_view_data.get('message_id')
-        view_instance = active_view_data.get('view')
-        if msg_id and isinstance(view_instance, StaticHCPagesView) and not view_instance.is_finished():
-            try:
-                fetched_msg = await chan.fetch_message(msg_id)
-                if fetched_msg.components:
-                    tracked_message_obj = fetched_msg; tracked_view_instance = view_instance
-                    if not tracked_view_instance.message: tracked_view_instance.message = fetched_msg
-            except (discord.NotFound, Exception): pass
-        if not tracked_message_obj:
-            if list_channel_id in active_static_list_views: del active_static_list_views[list_channel_id]
-
-    message_from_history: Optional[discord.Message] = None
-    if not tracked_message_obj:
-        async for msg in chan.history(limit=20):
-            if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == embed_title and msg.components:
-                message_from_history = msg; break
-
-    final_updated_message: Optional[discord.Message] = None
-    try:
-        if tracked_message_obj and tracked_view_instance:
-            await tracked_view_instance.update_data_and_refresh(member_data, initial_display_data, total_count)
-            final_updated_message = tracked_message_obj
-        elif message_from_history:
-            new_view = StaticHCPagesView(member_data, initial_display_data, total_count, guild, list_channel_id, embed_title, message=message_from_history)
-            initial_embed = new_view.create_page_embed()
-            await message_from_history.edit(embed=initial_embed, view=new_view)
-            active_static_list_views[list_channel_id] = {'view': new_view, 'message_id': message_from_history.id}
-            final_updated_message = message_from_history
-        else:
-            new_view = StaticHCPagesView(member_data, initial_display_data, total_count, guild, list_channel_id, embed_title)
-            initial_embed = new_view.create_page_embed()
-            sent_message = await chan.send(embed=initial_embed, view=new_view)
-            new_view.message = sent_message; new_view.message_id = sent_message.id
-            active_static_list_views[list_channel_id] = {'view': new_view, 'message_id': sent_message.id}
-            final_updated_message = sent_message
-
-        if final_updated_message:
-            cleaned_count = 0
-            async for old_msg in chan.history(limit=30):
-                if old_msg.author.id == bot.user.id and old_msg.id != final_updated_message.id and old_msg.embeds and old_msg.embeds[0].title == embed_title:
-                    try: await old_msg.delete(); cleaned_count += 1
-                    except Exception: break
-            if cleaned_count > 0: await log_info(guild, f"Static list cleanup for '{tag}': Deleted {cleaned_count} old message(s).")
-    except Exception as e:
-        await log_error(guild, f"Static list update for '{tag}' failed: Unexpected error during send/edit/update.", error=e)
-
-    if not check_static_view_timeout.is_running(): check_static_view_timeout.start()
-
-async def fetch_all_supabase_hc_data(guild_for_log: Optional[discord.Guild]) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Fetches HC member data (where is_in_hc = TRUE) directly from Supabase (IGN, Discord ID/Name)
-    and correlates with ALL activity data. Used when Discord context is unavailable/irrelevant.
-    Returns a list of dicts: [{'discord_id': str | None, 'discord_name': str | None, 'ign': str, 'activity_count': int, 'last_seen': date | None, 'is_in_hc': bool}]
-    and the total count. Sorted by IGN case-insensitive.
-    """
-    print("Fetch All Supabase Data (is_in_hc=TRUE): Starting fetch...")
-    if not supabase:
-        await log_error(guild_for_log, "fetch_all_supabase_hc_data failed: Supabase client unavailable.", ping_owner=True)
-        return [], 0
-
-    # 1. Fetch members from florr_players table where is_in_hc is TRUE
-    active_florr_players_data = []
-    try:
-        print("Fetch All Supabase Data: Fetching from florr_players where is_in_hc = TRUE...")
-        resp_members = await run_supabase_sync(
-            lambda: supabase.table("florr_players")
-                           .select("discord_id, discord_name, ingame_name, is_in_hc") # Added is_in_hc
-                           .eq("is_in_hc", True)  # <-- ADDED THIS FILTER
-                           .execute()
-        )
-        if resp_members and hasattr(resp_members, 'data') and resp_members.data:
-            active_florr_players_data = resp_members.data
-            print(f"Fetch All Supabase Data: Found {len(active_florr_players_data)} entries in florr_players with is_in_hc = TRUE.")
-        else:
-            print("Fetch All Supabase Data: No data returned from florr_players (is_in_hc=TRUE).")
-            return [], 0
-
-    except (ConnectionError, APIError, Exception) as e:
-        await log_error(guild_for_log, "Failed to fetch data from Supabase florr_players (is_in_hc=TRUE)", error=e, ping_owner=True)
-        return [], 0
-
-    # 2. Fetch all activity data (for the IGNs found)
-    activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
-    all_igns_in_db = [entry['ingame_name'] for entry in active_florr_players_data if entry.get('ingame_name')]
-
-    if not all_igns_in_db:
-         print("Fetch All Supabase Data: No IGNs found in fetched member data (is_in_hc=TRUE). Skipping activity fetch.")
-    else:
-        print(f"Fetch All Supabase Data: Fetching all-time activity for {len(all_igns_in_db)} IGNs (is_in_hc=TRUE)...")
-        try:
-            activity_summary = await fetch_activity_data(guild_for_log, all_igns_in_db)
-            print(f"Fetch All Supabase Data: Fetched activity summary for {len(activity_summary)} IGNs.")
-        except Exception as e_act:
-             await log_error(guild_for_log, "Failed during all-time activity fetch in fetch_all_supabase_hc_data", error=e_act, ping_owner=True)
-
-    # 3. Combine Member and Activity Data
-    final_data: List[Dict[str, Any]] = []
-    for member_entry in active_florr_players_data:
-        ign = member_entry.get("ingame_name")
-        if not ign: continue
-
-        ign_lower = ign.lower()
-        activity = activity_summary.get(ign_lower, {'count': 0, 'last_seen': None})
-
-        final_data.append({
-            "discord_id": member_entry.get("discord_id"),
-            "discord_name": member_entry.get("discord_name"),
-            "ign": ign,
-            "activity_count": activity.get('count', 0),
-            "last_seen": activity.get('last_seen'),
-            "is_in_hc": member_entry.get("is_in_hc", True) # Should always be true due to query
-        })
-
-    # 4. Sort by IGN (case-insensitive) as default
-    final_data.sort(key=lambda item: item['ign'].lower())
-
-    total_members = len(final_data)
-    print(f"Fetch All Supabase Data (is_in_hc=TRUE): Finished. Total entries prepared: {total_members}.")
-    return final_data, total_members
-
-    # 2. Fetch all activity data
-    activity_summary: Dict[str, Dict[str, Any]] = {} # ign_lower -> {'count': int, 'last_seen': date}
-    all_igns_in_db = [entry['ingame_name'] for entry in all_members_data if entry.get('ingame_name')]
-
-    if not all_igns_in_db:
-         print("Fetch All Supabase Data: No IGNs found in fetched member data. Skipping activity fetch.")
-    else:
-        print(f"Fetch All Supabase Data: Fetching all-time activity for {len(all_igns_in_db)} IGNs...")
-        try:
-            # Use fetch_activity_data with no date range to get all-time counts/last_seen
-            activity_summary = await fetch_activity_data(guild_for_log, all_igns_in_db)
-            print(f"Fetch All Supabase Data: Fetched activity summary for {len(activity_summary)} IGNs.")
-        except Exception as e_act:
-             # Log error but proceed, activity will be 0
-             await log_error(guild_for_log, "Failed during all-time activity fetch in fetch_all_supabase_hc_data", error=e_act, ping_owner=True)
-
-
-    # 3. Combine Member and Activity Data
-    final_data: List[Dict[str, Any]] = []
-    for member_entry in all_members_data:
-        ign = member_entry.get("ingame_name")
-        if not ign: continue # Skip entries without an IGN (shouldn't happen based on fetch)
-
-        ign_lower = ign.lower()
-        activity = activity_summary.get(ign_lower, {'count': 0, 'last_seen': None})
-
-        final_data.append({
-            "discord_id": member_entry.get("discord_id"), # Can be None
-            "discord_name": member_entry.get("discord_name"), # Can be None
-            "ign": ign,
-            "activity_count": activity.get('count', 0),
-            "last_seen": activity.get('last_seen') # date object or None
-            # No 'member' object here
-        })
-
-    # 4. Sort by IGN (case-insensitive) as default
-    final_data.sort(key=lambda item: item['ign'].lower())
-
-    total_members = len(final_data)
-    print(f"Fetch All Supabase Data: Finished. Total entries prepared: {total_members}.")
-    return final_data, total_members
 
 async def activity_date_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Provides autocomplete choices for activity dates: Today, Yesterday, Last 7 days (D/M/YYYY format)."""
@@ -7424,540 +7143,293 @@ async def log_error(
     else:
         print(f"CRITICAL: Extraordinary log guild {EXTRAORDINARY_LOGS_GUILD_ID} not found.")
 
-# --- Embed Pagination View ---
+class GuildsView(discord.ui.View):
+    # Constants for modes
+    MODE_SUMMARY = "summary"
+    MODE_MEMBERS = "members"
 
-class ActivitySortButton(Button):
-     def __init__(self, current_sort: str, row: int):
-          # Determine label and style based on current sort
-          label = "Sort by IGN" if current_sort == SORT_MODE_ACTIVITY else "Sort by Activity"
-          style = discord.ButtonStyle.success # Or choose another style
-          super().__init__(label=label, style=style, custom_id="hc_toggle_sort", row=row)
-
-     async def callback(self, interaction: discord.Interaction):
-          # Tell the view to handle the sort toggle
-          view: HCPagesView = self.view # Type hint for clarity
-          if view:
-               await view.toggle_sort(interaction)
-
-
-
-class ViewModeSelect(discord.ui.Select):
-     def __init__(self, current_mode: str, row: int):
-          options = [
-               discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, description="Show Discord usernames and IGNs.", emoji="👤"),
-               discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, description="Show IGNs active today.", emoji="📅"),
-               discord.SelectOption(label="View Activity (Last 7 Days)", value=VIEW_MODE_ACTIVITY_WEEKLY, description="Show IGNs active in the last week.", emoji="📅"),
-               discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, description="Show IGNs active in the last 30 days.", emoji="📅"), # Or use a calendar month emoji
-               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, description="Show IGNs and total activity count.", emoji="📊"),
-          ]
-          # Ensure the current mode is set as default
-          for option in options:
-                option.default = option.value == current_mode
-
-          super().__init__(placeholder="Select View Mode...", min_values=1, max_values=1, options=options, custom_id="hc_view_select", row=row)
-
-     async def callback(self, interaction: discord.Interaction):
-          view: HCPagesView = self.view
-          if view:
-               selected_mode = self.values[0]
-               # Let the view handle the mode change and potential data refetching
-               await view.change_view_mode(interaction, selected_mode)
-
-
-class HCPagesView(View):
-    # Data is List[Dict[str, Any]] from fetch_hc_member_data (includes ALL-TIME activity)
-    def __init__(self, original_data: List[Dict[str, Any]], initial_display_data: List[Dict[str, Any]], total_members: int, guild: Optional[discord.Guild], is_catercord_context: bool, timeout=300.0):
-        super().__init__(timeout=timeout)
-        # original_data holds the base info fetched for the context
-        self.original_data = original_data
-        # current_data is initialized with the pre-fetched data for the default view
-        self.current_data = initial_display_data # Use the passed initial data
-        self.total_members = total_members
-        self.current_page = 0
+    def __init__(self, interaction: discord.Interaction, is_static_list: bool, start_mode: str, start_tag: Optional[str] = None):
+        super().__init__(timeout=None if is_static_list else 300.0)
+        # Core attributes
+        self.interaction = interaction
+        self.guild = interaction.guild
+        self.is_static_list = is_static_list
         self.message: Optional[discord.Message] = None
-        self.guild = guild # Store guild if needed later (e.g., for logging inside view)
-        self.is_catercord_context = is_catercord_context # Store the context flag
+        
+        # State
+        self.mode = start_mode
+        self.current_guild_tag = start_tag
+        
+        # Data Caches
+        self.summary_data: List[Dict[str, Any]] = []
+        self.member_data: List[Dict[str, Any]] = [] # This is the currently displayed, sorted, and activity-filtered data
+        self.original_member_data: List[Dict[str, Any]] = [] # The raw member data for the currently viewed guild
+        
+        # Member View State
+        self.member_view_mode = VIEW_MODE_ACTIVITY_MONTHLY
+        self.member_sort_mode = SORT_MODE_ACTIVITY
+        self.current_page = 0
+        self.total_pages = 0
+        self.total_members = 0
 
-        # --- State ---
-        # Set default view based on context
-        # If in Catercord, default to monthly. If outside, default to all-time activity.
-        self.view_mode = VIEW_MODE_ACTIVITY_MONTHLY if is_catercord_context else VIEW_MODE_ACTIVITY_ALL
-        # Default sort depends on default view - activity seems reasonable for both contexts
-        self.sort_mode = SORT_MODE_ACTIVITY
-        self.is_fetching_activity = False # Lock to prevent concurrent fetches
+        # Control flags
+        self.is_fetching = False
+        self.last_interaction_time = discord.utils.utcnow() if is_static_list else None
+    
+    async def initialize_data(self):
+        """Fetches the initial data needed for the starting view."""
+        self.is_fetching = True
+        if self.mode == self.MODE_SUMMARY:
+            # FIX: De-duplicate guild tags for the summary view.
+            all_tracked_guilds_with_duplicates = await fetch_all_global_tracked_guilds()
+            
+            # 1. Get a unique set of tags
+            unique_tags = sorted(list({g['florr_guild_tag'] for g in all_tracked_guilds_with_duplicates}))
+            
+            # 2. Fetch counts only for the unique tags
+            counts = await fetch_guild_member_counts(unique_tags)
+            
+            # 3. Build summary data from unique tags
+            self.summary_data = [{'tag': tag, 'member_count': counts.get(tag, 0)} for tag in unique_tags]
+            
+            # 4. Sort by member count
+            self.summary_data.sort(key=lambda x: x['member_count'], reverse=True)
 
-        # --- Initial Sort ---
-        # Sort the initial data based on the default sort mode
-        self.sort_data() # This sorts self.current_data
+        elif self.mode == self.MODE_MEMBERS and self.current_guild_tag:
+            self.original_member_data, self.total_members = await fetch_tracked_guild_member_data(self.guild, self.current_guild_tag)
+            await self.fetch_and_set_member_data_for_view_mode(self.member_view_mode)
+            self.sort_member_data()
+        
+        # After data is loaded, populate the UI elements before rendering.
+        self.update_ui_elements()
+        self.is_fetching = False
 
-        # --- Recalculate total pages AFTER initial sort ---
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-
-        # --- Add UI Elements ---
-        # Pass the INITIAL sort mode to the button
-        self.add_item(ActivitySortButton(current_sort=self.sort_mode, row=1))
-        # Pass the INITIAL view mode to the select menu
-        self.add_item(ViewModeSelect(current_mode=self.view_mode, row=2))
-        # Buttons added via decorators (@discord.ui.button)
-
-        # Update UI elements based on the initial state
-        self.update_buttons_and_ui()
-
-    def sort_data(self):
-        """Sorts self.current_data based on self.sort_mode and retains page number if valid."""
-        # --- Store current page before sorting ---
-        stored_page = self.current_page
-
-        # Ensure activity_count exists, default to 0 if missing
-        if self.sort_mode == SORT_MODE_IGN:
-            self.current_data.sort(key=lambda item: item.get('ign', 'zzz').lower())
-        elif self.sort_mode == SORT_MODE_ACTIVITY:
-            # Sort descending by count, then ascending by IGN as tie-breaker
-            self.current_data.sort(key=lambda item: (item.get('activity_count', 0) * -1, item.get('ign', 'zzz').lower()))
-
-        # --- Recalculate total pages ---
-        self.total_pages = math.ceil(len(self.current_data) / MEMBERS_PER_PAGE) if self.current_data else 1
-
-        # --- Restore or adjust current page ---
-        if stored_page < self.total_pages:
-            # If stored page is still valid in the new page range, keep it
-            self.current_page = stored_page
-        else:
-            # Otherwise, go to the last available page (or page 0 if no pages)
-            self.current_page = max(0, self.total_pages - 1)
-
-
-    def update_buttons_and_ui(self):
-        """Updates UI elements based on state."""
-        # --- Update Page Buttons ---
-        prev_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_prev_interactive', self.children)
-        next_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_next_interactive', self.children)
-        if isinstance(prev_button, Button): prev_button.disabled = self.current_page == 0 or self.is_fetching_activity
-        if isinstance(next_button, Button): next_button.disabled = self.current_page >= self.total_pages - 1 or self.is_fetching_activity
-
-        # --- Update Sort Button ---
-        sort_button = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_toggle_sort', self.children)
-        if isinstance(sort_button, Button):
-             sort_button.label = "Sort by IGN" if self.sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
-             # Disable sort button while fetching data or if in discord view
-             sort_button.disabled = self.is_fetching_activity or self.view_mode == VIEW_MODE_DISCORD
-
-        # --- Update Select Default & Disable ---
-        select_menu = discord.utils.find(lambda i: hasattr(i, 'custom_id') and i.custom_id == 'hc_view_select', self.children)
-        if isinstance(select_menu, discord.ui.Select):
-             select_menu.disabled = self.is_fetching_activity # Disable dropdown during fetch
-             for option in select_menu.options:
-                  option.default = option.value == self.view_mode
-
-    # --- REVISED create_page_embed (within HCPagesView class) ---
-    def create_page_embed(self) -> discord.Embed:
-        """Creates embed based on current view_mode, sort_mode, and context."""
-        start = self.current_page * MEMBERS_PER_PAGE
-        page_data = self.current_data[start : start + MEMBERS_PER_PAGE]
-        desc_lines = []
-        idx = start + 1
-
-        # Define a shared IGN display width
-        IGN_DISPLAY_WIDTH = 18 # Consistent with static list
-        IDX_WIDTH = 3 # Consistent with static list
-
-        if not page_data:
-            # Keep code block for "No members" for all views to maintain similar look for empty state
-            desc_lines = ["```\nNo members found matching criteria.\n```"]
-        elif self.view_mode == VIEW_MODE_DISCORD:
-            # Format: #. `IGN` DiscordMention (Mention is OUTSIDE code block)
-            # No header, no overall code block for this view mode's content lines
-            for item_dict in page_data:
-                ign = item_dict.get('ign', 'Unknown IGN')
-                index_str = f"{str(idx)+'.':<{IDX_WIDTH}} "
-
-                member_obj = item_dict.get('member') # discord.Member object or None
-                user_id_for_mention: Optional[str] = None
-                display_name_for_fallback: Optional[str] = None
-
-                if member_obj:
-                    user_id_for_mention = str(member_obj.id)
-                elif item_dict.get('discord_id'):
-                    user_id_for_mention = str(item_dict['discord_id'])
-                    display_name_for_fallback = item_dict.get('discord_name') # Stored name if user not in server
-
-                # Construct mention or fallback text
-                if user_id_for_mention:
-                    mention_display = f"<@!{user_id_for_mention}>"
-                elif display_name_for_fallback: # User ID was linked, but member object not found
-                    mention_display = f"`{discord.utils.escape_markdown(display_name_for_fallback)} (Not in server)`"
-                else: # No Discord ID linked at all (e.g., hconly entry)
-                    mention_display = "`[No Discord Link]`"
-
-                # Truncate IGN
-                ign_display = ign
-                if len(ign_display) > IGN_DISPLAY_WIDTH:
-                     ign_display = ign_display[:IGN_DISPLAY_WIDTH-1] + "…"
-
-                line = f"{index_str}`{ign_display:<{IGN_DISPLAY_WIDTH}}` {mention_display}"
-                desc_lines.append(line)
-                idx += 1
-
-        # All activity views use the same layout now (within a code block)
-        elif self.view_mode in [VIEW_MODE_ACTIVITY_ALL, VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-             # Format: ``` #. IGN Activity ``` (Uses fixed-width code block)
-             # Re-use widths from static list for consistency if desired, or keep HCPagesView specific
-             # Static list uses: IGN_WIDTH = 16, ACT_WIDTH = 18 (ACTIVITY_COLUMN_WIDTH)
-             # HCPagesView currently uses: IGN_WIDTH = 20, ACT_WIDTH = ACTIVITY_COLUMN_WIDTH
-             # Let's align them for better consistency if possible. Static list's total width is tighter.
-             # Sticking to HCPagesView's current widths for activity for now unless specified.
-             IGN_WIDTH_ACTIVITY = 20 # Keep as is for HCPagesView
-             ACT_WIDTH = ACTIVITY_COLUMN_WIDTH
-             TOTAL_WIDTH = IDX_WIDTH + 1 + IGN_WIDTH_ACTIVITY + ACT_WIDTH # +1 for space after index
-             header = (f"{'#':<{IDX_WIDTH}} {'IGN':<{IGN_WIDTH_ACTIVITY}}{'Activity':<{ACT_WIDTH}}")
-             separator = "-" * (TOTAL_WIDTH -1) # Adjust separator to match content width
-
-             desc_lines.append("```")
-             desc_lines.append(header)
-             desc_lines.append(separator)
-
-             for item_dict in page_data:
-                ign = item_dict.get('ign', 'Unknown')
-                activity_count = item_dict.get('activity_count', 0)
-                last_seen_date = item_dict.get('last_seen') # date object or None
-                activity_display = f"{activity_count} ({format_date_dmy(last_seen_date)})"
-
-                index_str_activity = f"{str(idx)+'.':<{IDX_WIDTH}} " # Pad index and add space
-
-                ign_display_activity = ign
-                if len(ign_display_activity) > IGN_WIDTH_ACTIVITY: ign_display_activity = ign_display_activity[:IGN_WIDTH_ACTIVITY-1] + "…"
-                if len(activity_display) > ACT_WIDTH: activity_display = activity_display[:ACT_WIDTH-1] + "…"
-
-                line = (f"{index_str_activity}{ign_display_activity:<{IGN_WIDTH_ACTIVITY}}{activity_display:<{ACT_WIDTH}}")
-                desc_lines.append(line)
-                idx += 1
-             desc_lines.append("```")
-        else: # Fallback
-             desc_lines = ["```Error: Invalid View Mode```"]
-
-
-        title = HC_LIST_EMBED_TITLE if self.is_catercord_context else "HC Database Members (All)"
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(desc_lines), # Join the constructed lines
-            color=NERDY_YELLOW
-        )
-
-        # Footer Update (Remains the same logic)
-        sort_text = "IGN" if self.sort_mode == SORT_MODE_IGN else "Activity"
-        # For Discord View, sort button is disabled, so text doesn't matter as much
-        # but if it were enabled, sort_mode could be 'discord_name' vs 'ign'
-        if self.view_mode == VIEW_MODE_DISCORD:
-            # If you implement sorting for Discord view later, this text might change
-            sort_text = "IGN" # Default assumption for this view if sort button was active
-
-        view_text_map = {
-            VIEW_MODE_DISCORD: "Discord+IGN",
-            VIEW_MODE_ACTIVITY_ALL: "Activity (All)",
-            VIEW_MODE_ACTIVITY_DAILY: "Activity (Today)",
-            VIEW_MODE_ACTIVITY_WEEKLY: "Activity (7d)",
-            VIEW_MODE_ACTIVITY_MONTHLY: "Activity (30d)",
-        }
-        view_text = view_text_map.get(self.view_mode, "Unknown View")
-        footer_text = (
-            f"Page {self.current_page + 1}/{self.total_pages} | Total: {self.total_members} | "
-            f"View: {view_text} | Sort: {sort_text}"
-        )
-        if self.is_fetching_activity:
-             footer_text += " | Fetching data..."
-        footer_text += f" | {get_formatted_utc_now()}"
-        embed.set_footer(text=footer_text)
-        return embed
-
-
-    async def edit_message(self, interaction: discord.Interaction, show_loading: bool = False):
-        """Updates the message embed and view components. Optionally shows loading state."""
-        # Update button states etc. *before* creating embed
-        self.update_buttons_and_ui()
-        embed = self.create_page_embed() # Embed reflects current state (incl. loading footer if show_loading=True)
+    async def _update_view(self, interaction: discord.Interaction):
+        """Main method to re-render the view and edit the message."""
+        self.update_ui_elements()
+        embed = await self.create_embed()
+        
         try:
+            # This is the correct way to edit the message a component is on.
+            # It works for both deferred and non-deferred interactions from components.
             await interaction.response.edit_message(embed=embed, view=self)
+
+            if self.is_static_list and self.last_interaction_time:
+                self.last_interaction_time = discord.utils.utcnow()
         except discord.NotFound:
-            print(f"Paginator edit fail: Interaction {interaction.id} or message not found.")
             self.stop()
         except discord.HTTPException as e:
-            guild = interaction.guild or (self.message.guild if self.message else None)
-            # Avoid logging interaction cancelled errors if user was quick
             if e.code != 10062: # Unknown Interaction
-                 await log_error(guild, "Paginator edit fail (HTTP)", error=e, interaction=interaction)
-        except Exception as e:
-            guild = interaction.guild or (self.message.guild if self.message else None)
-            await log_error(guild, "Paginator edit fail (General)", error=e, interaction=interaction)
+                await log_error(self.guild, "GuildsView edit fail", error=e, interaction=interaction)
+    
+    def update_ui_elements(self):
+        self.clear_items()
 
-    # --- Button Callbacks (No changes needed) ---
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="hc_prev_interactive", row=0)
-    async def previous_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page > 0 and not self.is_fetching_activity:
-            self.current_page -= 1
-            await self.edit_message(interaction)
-        else:
-            await interaction.response.defer() # Ack the interaction
+        if self.mode == self.MODE_SUMMARY:
+            if self.summary_data:
+                options = [discord.SelectOption(label=f"{g['tag']} ({g['member_count']} members)", value=g['tag']) for g in self.summary_data[:25]]
+                select = discord.ui.Select(placeholder="Select a guild to view members...", options=options, custom_id="guild_select")
+                select.callback = self.handle_guild_select
+                self.add_item(select)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.blurple, custom_id="hc_next_interactive", row=0)
-    async def next_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page < self.total_pages - 1 and not self.is_fetching_activity:
-            self.current_page += 1
-            await self.edit_message(interaction)
-        else:
-            await interaction.response.defer() # Ack
+        elif self.mode == self.MODE_MEMBERS:
+            # Back Button
+            back_btn = discord.ui.Button(label="⬅️ All Guilds", style=discord.ButtonStyle.secondary, custom_id="guild_back_summary", row=0)
+            back_btn.callback = self.handle_back_to_summary
+            self.add_item(back_btn)
 
-    # --- Sort Callback (Disable during fetch) ---
-    async def toggle_sort(self, interaction: discord.Interaction):
-        """Called by the ActivitySortButton."""
-        if self.is_fetching_activity:
-             await interaction.response.defer() # Ignore if fetching
-             return
+            # Pagination
+            prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="guild_prev", row=1, disabled=(self.current_page == 0 or self.is_fetching))
+            prev_btn.callback = self.handle_pagination
+            self.add_item(prev_btn)
+            
+            next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.blurple, custom_id="guild_next", row=1, disabled=(self.current_page >= self.total_pages - 1 or self.is_fetching))
+            next_btn.callback = self.handle_pagination
+            self.add_item(next_btn)
 
-        if self.view_mode == VIEW_MODE_DISCORD:
-             # Maybe allow sorting by discord name/ign? For now, just ack.
-             await interaction.response.send_message("Sorting is only available in Activity views.", ephemeral=True)
-             return
+            # Sorting
+            sort_label = "Sort by IGN" if self.member_sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
+            sort_btn = discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="guild_toggle_sort", row=2, disabled=(self.is_fetching or self.member_view_mode == VIEW_MODE_DISCORD))
+            sort_btn.callback = self.handle_sort_toggle
+            self.add_item(sort_btn)
 
-        if self.sort_mode == SORT_MODE_IGN:
-            self.sort_mode = SORT_MODE_ACTIVITY
-        else:
-            self.sort_mode = SORT_MODE_IGN
-        self.sort_data() # Re-sort the current data
-        await self.edit_message(interaction) # Update the message
+            # View Mode Select
+            options = [
+               discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, emoji="👤", default=self.member_view_mode == VIEW_MODE_DISCORD),
+               discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_DAILY),
+               discord.SelectOption(label="View Activity (Last 7 Days)", value=VIEW_MODE_ACTIVITY_WEEKLY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_WEEKLY),
+               discord.SelectOption(label="View Activity (Last 30 Days)", value=VIEW_MODE_ACTIVITY_MONTHLY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_MONTHLY),
+               discord.SelectOption(label="View Activity (All-Time)", value=VIEW_MODE_ACTIVITY_ALL, emoji="📊", default=self.member_view_mode == VIEW_MODE_ACTIVITY_ALL),
+            ]
+            view_select = discord.ui.Select(placeholder="Select Member View Mode...", options=options, custom_id="guild_view_select", row=3, disabled=self.is_fetching)
+            view_select.callback = self.handle_view_mode_select
+            self.add_item(view_select)
 
-# --- REVISED change_view_mode (within HCPagesView class) ---
-    async def change_view_mode(self, interaction: discord.Interaction, new_mode: str):
-        """Called by the ViewModeSelect. Handles data fetching for activity views."""
-        if self.view_mode == new_mode or self.is_fetching_activity:
-            await interaction.response.defer() # Ack if mode didn't change or already fetching
+    async def create_embed(self) -> discord.Embed:
+        if self.is_fetching:
+            return discord.Embed(title="⏳ Loading...", description="Fetching data, please wait.", color=NERDY_YELLOW)
+        
+        if self.mode == self.MODE_SUMMARY:
+            embed = discord.Embed(title="🌐 Guilds Summary", description="Select a guild from the dropdown to view its member list.", color=NERDY_YELLOW)
+            if not self.summary_data:
+                embed.description = "No tracked guilds found."
+            else:
+                lines = [f"**{g['tag']}**: `{g['member_count']}` members" for g in self.summary_data]
+                embed.description = "\n".join(lines)
+            embed.set_footer(text=f"Total Unique Guilds: {len(self.summary_data)} | Updated: {get_formatted_utc_now()}")
+            return embed
+
+        elif self.mode == self.MODE_MEMBERS:
+            embed = discord.Embed(title=f"👥 Members of {self.current_guild_tag}", color=NERDY_YELLOW)
+            start_index = self.current_page * MEMBERS_PER_PAGE
+            page_data = self.member_data[start_index : start_index + MEMBERS_PER_PAGE]
+            
+            if not page_data:
+                embed.description = "No members found for this guild or view."
+            elif self.member_view_mode == VIEW_MODE_DISCORD:
+                lines = []
+                for i, item in enumerate(page_data, start=start_index + 1):
+                    member_obj = item.get('member')
+                    mention = member_obj.mention if member_obj else (f"<@{item['discord_id']}>" if item.get('discord_id') else '`No Discord`')
+                    lines.append(f"{i}. `{item.get('ign', 'N/A')}`: {mention}")
+                embed.description = "\n".join(lines)
+            else: # Activity views
+                lines = ["```"]
+                header = f"{'#':<4}{'IGN':<20}{'Activity':<18}"
+                lines.append(header)
+                lines.append("-" * len(header))
+                for i, item in enumerate(page_data, start=start_index + 1):
+                    ign_disp = item.get('ign', 'N/A')[:18]
+                    act_count = item.get('activity_count', 0)
+                    last_seen_disp = format_date_dmy(item['last_seen']) if item['last_seen'] else "N/A"
+                    act_disp = f"{act_count} ({last_seen_disp})"
+                    lines.append(f"{f'{i}.':<4}{ign_disp:<20}{act_disp:<18}")
+                lines.append("```")
+                embed.description = "\n".join(lines)
+            
+            sort_text = self.member_sort_mode.replace("sort_", "")
+            view_text = self.member_view_mode.replace("_view", "").replace("_", " ")
+            embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} | Total Members: {self.total_members} | View: {view_text.title()} | Sort: {sort_text.title()}")
+            return embed
+        
+        return discord.Embed(title="Error", description="Invalid view state.", color=discord.Color.red())
+
+    # --- Data Handling ---
+    async def fetch_and_set_member_data_for_view_mode(self, mode: str):
+        if mode == VIEW_MODE_DISCORD or mode == VIEW_MODE_ACTIVITY_ALL:
+            self.member_data = list(self.original_member_data)
             return
 
-        # --- Set Loading State ---
-        self.is_fetching_activity = True
-        self.view_mode = new_mode # Update mode immediately for UI feedback
-        # This is the FIRST response to the interaction - OK
-        await self.edit_message(interaction, show_loading=True)
+        today_utc = datetime.datetime.now(pytz.utc).date()
+        if mode == VIEW_MODE_ACTIVITY_DAILY: start_date, end_date = today_utc, today_utc
+        elif mode == VIEW_MODE_ACTIVITY_WEEKLY: start_date, end_date = today_utc - datetime.timedelta(days=6), today_utc
+        elif mode == VIEW_MODE_ACTIVITY_MONTHLY: start_date, end_date = today_utc - datetime.timedelta(days=29), today_utc
+        else: return
+        
+        all_igns = [item['ign'] for item in self.original_member_data if item.get('ign')]
+        if not all_igns: self.member_data = []; return
+        
+        ranged_activity = await fetch_activity_data(self.guild, all_igns, start_date, end_date)
+        temp_data = []
+        for item in self.original_member_data:
+            new_item = item.copy()
+            new_item['activity_count'] = ranged_activity.get(item['ign'].lower(), {'count': 0})['count']
+            new_item['last_seen'] = ranged_activity.get(item['ign'].lower(), {'last_seen': None})['last_seen']
+            temp_data.append(new_item)
+        self.member_data = temp_data
 
-        guild = interaction.guild # Needed for logging/fetching
+    def sort_member_data(self):
+        if self.member_sort_mode == SORT_MODE_IGN:
+            self.member_data.sort(key=lambda x: x.get('ign', 'zzz').lower())
+        else: # SORT_MODE_ACTIVITY
+            self.member_data.sort(key=lambda x: (x.get('activity_count', 0) * -1, x.get('ign', 'zzz').lower()))
+        self.total_pages = math.ceil(len(self.member_data) / MEMBERS_PER_PAGE) if self.member_data else 1
+        self.current_page = min(self.current_page, self.total_pages - 1) if self.total_pages > 0 else 0
 
-        try:
-            # ... [Keep all the data fetching logic exactly as it is] ...
-            start_date: Optional[datetime.date] = None
-            end_date: Optional[datetime.date] = None
-            today_utc = datetime.datetime.now(pytz.utc).date()
+    # --- Callbacks ---
+    async def handle_guild_select(self, interaction: discord.Interaction):
+        await interaction.response.defer() # Defer here for slow data loading
+        self.is_fetching = True
+        self.current_guild_tag = interaction.data['values'][0]
+        self.mode = self.MODE_MEMBERS
+        self.member_view_mode = VIEW_MODE_ACTIVITY_MONTHLY
+        self.member_sort_mode = SORT_MODE_ACTIVITY
+        
+        await self.initialize_data()
+        self.is_fetching = False
 
-            # Determine date range based on new mode
-            if new_mode == VIEW_MODE_ACTIVITY_DAILY:
-                start_date = end_date = today_utc
-            elif new_mode == VIEW_MODE_ACTIVITY_WEEKLY:
-                end_date = today_utc
-                start_date = today_utc - datetime.timedelta(days=6)
-            elif new_mode == VIEW_MODE_ACTIVITY_MONTHLY:
-                end_date = today_utc
-                start_date = today_utc - datetime.timedelta(days=29)
-            # VIEW_MODE_ACTIVITY_ALL and VIEW_MODE_DISCORD don't need specific range fetch here
+        embed = await self.create_embed()
+        await interaction.edit_original_response(embed=embed, view=self)
 
-            # --- Fetch and Update Data ---
-            if new_mode in [VIEW_MODE_ACTIVITY_DAILY, VIEW_MODE_ACTIVITY_WEEKLY, VIEW_MODE_ACTIVITY_MONTHLY]:
-                # Fetch activity data ONLY for the required range
-                all_igns = [item['ign'] for item in self.original_data if item.get('ign')]
-                if not all_igns:
-                     print("Change View Mode: No IGNs found in original data.")
-                     self.current_data = list(self.original_data) # Reset to original
-                else:
-                    print(f"Change View Mode: Fetching activity for {len(all_igns)} IGNs between {start_date} and {end_date}")
-                    ranged_activity_data = await fetch_activity_data(guild, all_igns, start_date, end_date)
-                    print(f"Change View Mode: Fetched {len(ranged_activity_data)} activity results.")
+    async def handle_back_to_summary(self, interaction: discord.Interaction):
+        await interaction.response.defer() # Defer here for slow data loading
+        self.is_fetching = True
+        self.mode = self.MODE_SUMMARY
+        self.current_guild_tag = None
+        
+        await self.initialize_data()
+        self.is_fetching = False
 
-                    # Update self.current_data with the new activity counts/dates
-                    temp_data = []
-                    for item in self.original_data:
-                        ign_lower = item.get('ign', '').lower()
-                        activity_info = ranged_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                        # Create a new dict to avoid modifying original_data
-                        updated_item = item.copy()
-                        updated_item['activity_count'] = activity_info['count']
-                        updated_item['last_seen'] = activity_info['last_seen']
-                        temp_data.append(updated_item)
-                    self.current_data = temp_data
-                    print(f"Change View Mode: Updated current_data with ranged activity.")
+        embed = await self.create_embed()
+        await interaction.edit_original_response(embed=embed, view=self)
 
-            elif new_mode == VIEW_MODE_ACTIVITY_ALL:
-                # Reset to the all-time activity data stored in original_data
-                self.current_data = list(self.original_data) # Make a fresh copy
-                print("Change View Mode: Reset to All-Time activity view.")
-            else: # VIEW_MODE_DISCORD
-                # Reset to original data, activity counts are irrelevant here but keep structure
-                self.current_data = list(self.original_data)
-                print("Change View Mode: Reset to Discord view.")
+    async def handle_pagination(self, interaction: discord.Interaction):
+        action = interaction.data['custom_id'].split('_')[-1]
+        if action == "next" and self.current_page < self.total_pages - 1: self.current_page += 1
+        elif action == "prev" and self.current_page > 0: self.current_page -= 1
+        await self._update_view(interaction)
 
+    async def handle_sort_toggle(self, interaction: discord.Interaction):
+        self.member_sort_mode = SORT_MODE_ACTIVITY if self.member_sort_mode == SORT_MODE_IGN else SORT_MODE_IGN
+        self.sort_member_data()
+        await self._update_view(interaction)
 
-            # --- Finalize Update ---
-            # Set appropriate sort mode for the new view
-            if new_mode == VIEW_MODE_DISCORD:
-                 self.sort_mode = SORT_MODE_IGN # Default sort for discord view
-            else: # All activity views default to sorting by activity
-                 self.sort_mode = SORT_MODE_ACTIVITY
-
-            self.sort_data() # Sort the newly updated data
-
-        except Exception as e:
-            # Handle errors during data fetch/processing
-            await log_error(guild, f"Error changing view mode to {new_mode}", error=e, interaction=interaction)
-            # Reset to a safe state (e.g., Discord view) and notify user
-            self.view_mode = VIEW_MODE_DISCORD
-            self.current_data = list(self.original_data)
-            self.sort_mode = SORT_MODE_IGN
-            self.sort_data()
-            self.is_fetching_activity = False # Release lock on error
-
-            # --- EDIT BLOCK IN ERROR CASE ---
-            # Update UI state (buttons etc.) before creating final embed
-            self.update_buttons_and_ui()
-            # Create the embed reflecting the error/reset state
-            embed = self.create_page_embed()
-            # Edit the original message directly
-            if self.message:
-                 try:
-                      await self.message.edit(embed=embed, view=self)
-                 except (discord.NotFound, discord.HTTPException) as edit_err:
-                      await log_error(guild, "Failed to edit message in view change error handler", error=edit_err)
-            # --- END EDIT BLOCK ---
-
-            # Send a follow-up error message
-            try:
-                # Use edit_original_response if the initial response was just a deferral,
-                # otherwise use followup. Since we already sent an edit_message, use followup.
-                await interaction.followup.send("❌ An error occurred while fetching data for the selected view.", ephemeral=True)
-            except Exception: pass # Ignore if followup fails
-            return # Stop further processing
-
-        finally:
-            # --- Release Loading State ---
-            self.is_fetching_activity = False
-
-            # --- START MODIFIED BLOCK ---
-            # Edit message one last time to remove loading state and show final data
-            # Update the view's UI state (buttons, select default etc.) BEFORE creating embed
-            self.update_buttons_and_ui()
-            # Create the final embed reflecting the loaded data and correct state
-            final_embed = self.create_page_embed()
-            # Edit the MESSAGE OBJECT directly, not the interaction response again
-            if self.message:
-                try:
-                    await self.message.edit(embed=final_embed, view=self)
-                except discord.NotFound:
-                    print(f"Paginator edit fail: Message {self.message.id} not found in finally block.")
-                    self.stop() # Stop view if message gone
-                except discord.HTTPException as e:
-                    # Log HTTP errors during the final edit
-                    await log_error(guild, "Paginator final edit fail (HTTP)", error=e, interaction=interaction)
-                except Exception as e:
-                     # Log any other errors during the final edit
-                     await log_error(guild, "Paginator final edit fail (General)", error=e, interaction=interaction)
-            else:
-                 print("Warning: self.message object was None in change_view_mode finally block. Cannot update view.")
-            # --- END MODIFIED BLOCK ---
-
-
-    # --- on_timeout (Disable lock) ---
+    async def handle_view_mode_select(self, interaction: discord.Interaction):
+        await interaction.response.defer() # Defer here for slow data loading
+        self.is_fetching = True
+        self.member_view_mode = interaction.data['values'][0]
+        self.current_page = 0
+        
+        await self.fetch_and_set_member_data_for_view_mode(self.member_view_mode)
+        if self.member_view_mode == VIEW_MODE_DISCORD: self.member_sort_mode = SORT_MODE_IGN
+        else: self.member_sort_mode = SORT_MODE_ACTIVITY
+        self.sort_member_data()
+        
+        self.is_fetching = False
+        
+        embed = await self.create_embed()
+        await interaction.edit_original_response(embed=embed, view=self)
+        
     async def on_timeout(self):
-        self.is_fetching_activity = False # Ensure lock is released on timeout
-        if self.message:
+        if self.message and not self.is_static_list:
             try:
-                for item in self.children:
-                    if hasattr(item, 'disabled'):
-                         item.disabled = True
-                await self.message.edit(view=self)
-                print(f"Paginator timeout: Disabled components on message {self.message.id}")
-            except discord.NotFound: print(f"Paginator timeout edit fail: Message {self.message.id} not found.")
-            except discord.HTTPException as e:
-                 if e.status != 404: await log_error(self.message.guild, f"Paginator timeout edit HTTP fail", error=e)
-            except Exception as e:
-                 await log_error(self.message.guild, f"Paginator timeout edit general fail", error=e)
+                await self.message.edit(content="*This interactive list has expired.*", embed=None, view=None)
+            except discord.HTTPException: pass
         self.stop()
-
-# --- REVISED fetch_hc_member_data (Adding logs for scenario 2) ---
-async def fetch_hc_member_data(guild: discord.Guild) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    DEPRECATED WRAPPER. Fetches members for the primary [HC1] guild.
-    New features should use fetch_tracked_guild_member_data.
-    """
-    if guild.id == CATERCORD_GUILD_ID:
-        return await fetch_tracked_guild_member_data(guild, "[HC1]")
-    
-    await log_info(guild, "fetch_hc_member_data (deprecated) called on a non-primary guild. Returning empty.")
-    return [], 0
-
-# --- Background Task for Static List Reset ---
-
-@tasks.loop(minutes=1.0) # Check every minute
-async def check_static_view_timeout():
-    await bot.wait_until_ready() # Wait until the bot is ready
-
-    channel_ids_to_check = list(active_static_list_views.keys())
-
-    for channel_id in channel_ids_to_check:
-        view_data = active_static_list_views.get(channel_id)
-        # ... (keep checks for view_data, view_instance, message_id, is_finished) ...
-        if not view_data: continue
-        view_instance = view_data.get('view')
-        message_id = view_data.get('message_id')
-        if not view_instance or not message_id or not isinstance(view_instance, StaticHCPagesView):
-            print(f"[Task Loop] Invalid data found for channel {channel_id}. Cleaning up.")
-            if channel_id in active_static_list_views: del active_static_list_views[channel_id]
-            continue
-        if view_instance.is_finished():
-             print(f"[Task Loop] View for message {message_id} already finished. Cleaning up.")
-             if channel_id in active_static_list_views: del active_static_list_views[channel_id]
-             continue
-
-        now = discord.utils.utcnow()
-        last_active = view_instance.last_interaction_time
-        time_since_last_active = now - last_active
-
-        if time_since_last_active.total_seconds() > (STATIC_LIST_RESET_TIMEOUT_MINUTES * 60):
-            if not view_instance.info_mode_active:
-                try:
-                    # --- Directly await the async reset method ---
-                    await view_instance.reset_view()
-                    # --- Update timestamp AFTER reset ---
-                    # (reset_view should ideally update this internally upon success,
-                    # but doing it here is a safety measure if reset_view fails early)
-                    # Let's rely on reset_view updating it upon successful edit.
-                    # view_instance.last_interaction_time = discord.utils.utcnow() # Removed for now
-                except Exception as e:
-                    print(f"[Task Loop] Error occurred during view reset for message {message_id}: {e}")
-                    # Log error properly
-                    guild = bot.get_guild(view_instance.guild.id) if view_instance.guild else None
-                    await log_error(guild, f"Task Loop: Error during view reset for message {message_id}", error=e)
-            # else: keep comment about skipping if info mode active
 
 # --- Ensure task is stopped on cleanup (optional but good practice) ---
 @bot.event
 async def on_close():
      print("Closing bot connection. Stopping tasks...")
-     if check_static_view_timeout.is_running():
-          check_static_view_timeout.cancel()
-          print(" Static view timeout checker task stopped.")
+     if check_guilds_view_timeout.is_running():
+          check_guilds_view_timeout.cancel()
+          print(" Guilds view timeout checker task stopped.")
           
-     # --- THIS IS THE NEW PART ---
-     # Close the persistent aiohttp session.
+     if m28_server_scraper.is_running():
+        m28_server_scraper.cancel()
+        print(" M28 server scraper task stopped.")
+
+     if aperiodic_craft_poster.is_running():
+        aperiodic_craft_poster.cancel()
+        print(" Aperiodic craft poster task stopped.")
+        
+     if aperiodic_spawn_defeat_poster.is_running():
+        aperiodic_spawn_defeat_poster.cancel()
+        print(" Aperiodic spawn/defeat poster task stopped.")
+
      if hasattr(bot, 'http_session') and not bot.http_session.closed:
          await bot.http_session.close()
          print("Closed persistent aiohttp ClientSession.")
-     # --- END NEW PART ---
-
-# --- REVISED update_static_list_message Function ---
-
-async def update_static_list_message(guild: discord.Guild):
-    """
-    DEPRECATED. Static lists are now updated via /refresh, which calls update_single_tracked_guild_list.
-    This function is kept for backward compatibility but does nothing.
-    """
-    # This function is now a no-op to prevent outdated logic from running.
-    # All list updates should be triggered via the more generic refresh_all_guild_lists.
-    pass
 
 # --- Discord Events ---
 @bot.event
@@ -7989,8 +7461,6 @@ async def on_ready():
     synced_commands = await _sync_app_commands(bot)
 
     await _revive_static_list_views()
-    # REMOVE THE LINE BELOW
-    # asyncio.create_task(_catch_up_missed_self_bot_events())
     
     await _start_background_tasks(bot)
 
@@ -8283,6 +7753,37 @@ async def disconnect(interaction: discord.Interaction, user: Optional[discord.Me
         await log_error(guild, f"Error during /disconnect for {target_user.name}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
+@tree.command(name="guilds", description="View an interactive list of members in tracked Florr guilds.")
+@app_commands.describe(tag="[Optional] A specific guild tag to view directly.")
+@app_commands.autocomplete(tag=global_guild_tag_autocomplete)
+async def guilds(interaction: discord.Interaction, tag: Optional[str] = None):
+    guild = interaction.guild
+    if not guild: return
+    
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    
+    start_mode = GuildsView.MODE_SUMMARY
+    start_tag = None
+    
+    if tag and tag != "--ALL--":
+        start_mode = GuildsView.MODE_MEMBERS
+        start_tag = tag
+    elif not tag:
+        # If no tag is provided, try to find the user's guild
+        user_ign = await get_ign_from_user(guild, interaction.user.id)
+        if user_ign:
+            user_guild_tag = await get_guild_tag_from_ign(guild, user_ign)
+            if user_guild_tag:
+                start_mode = GuildsView.MODE_MEMBERS
+                start_tag = user_guild_tag
+    
+    view = GuildsView(interaction, is_static_list=False, start_mode=start_mode, start_tag=start_tag)
+    await view.initialize_data()
+    embed = await view.create_embed()
+    
+    message = await interaction.followup.send(embed=embed, view=view)
+    view.message = message
+
 async def setguild_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     choices = [app_commands.Choice(name="None (Remove from guild)", value="--NONE--")]
     if not interaction.guild: return choices
@@ -8373,103 +7874,6 @@ async def setguild(
         await log_error(guild, f"Error during /setguild for {user.name if user else ingame_name}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
-# --- REVISED /hcmembers Command ---
-@tree.command(name="hcmembers", description="Show interactive list of [HC1] members (Discord/DB data).")
-async def hcmembers(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not await check_supabase_available(interaction):
-        try:
-            if interaction.response.is_done(): await interaction.edit_original_response(content="❌ Operation cancelled: Database unavailable.", embed=None, view=None)
-        except (discord.NotFound, discord.HTTPException): pass
-        return
-    if not guild:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-        return
-
-    # --- MODIFIED PART ---
-    # Load server config to get the correct channel ID
-    config = await load_server_config(guild.id)
-    # Check if bot is disabled
-    if not config.get('bot_enabled', True) and interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ The bot is currently disabled in this server.", ephemeral=True)
-        return
-
-    hcmembers_channel_id = config.get('hcmembers_channel_id')
-
-    # Allow command if it's in the designated channel, or if no channel is set, or if user is owner
-    is_in_correct_channel = (not hcmembers_channel_id) or (interaction.channel_id == hcmembers_channel_id)
-    if not is_in_correct_channel and interaction.user.id != OWNER_USER_ID:
-        hcmembers_channel = guild.get_channel(hcmembers_channel_id)
-        channel_mention = hcmembers_channel.mention if hcmembers_channel else f"the configured channel (ID: {hcmembers_channel_id})"
-        await interaction.response.send_message(f"❌ This command can only be used in {channel_mention}.", ephemeral=True)
-        return
-    # --- END MODIFIED PART ---
-
-    await interaction.response.defer(thinking=True, ephemeral=False)
-
-    is_target_guild = guild.id == CATERCORD_GUILD_ID
-
-    try:
-        data_for_view = []
-        total_count = 0
-        original_data_param = []
-
-        if is_target_guild:
-            original_data, total_count = await fetch_hc_member_data(guild)
-            if not original_data:
-                await interaction.edit_original_response(embed=create_embed(title=HC_LIST_EMBED_TITLE, description="No HC members found.", color=discord.Color.orange()), view=None)
-                return
-
-            initial_display_data = list(original_data)
-            try:
-                today_utc = datetime.datetime.now(pytz.utc).date()
-                end_date_monthly = today_utc
-                start_date_monthly = today_utc - datetime.timedelta(days=29)
-                all_igns = [item['ign'] for item in original_data if item.get('ign')]
-
-                if all_igns:
-                    monthly_activity_data = await fetch_activity_data(guild, all_igns, start_date_monthly, end_date_monthly)
-                    temp_data = []
-                    for item in original_data:
-                        ign_lower = item.get('ign', '').lower()
-                        activity_info = monthly_activity_data.get(ign_lower, {'count': 0, 'last_seen': None})
-                        updated_item = item.copy()
-                        updated_item['activity_count'] = activity_info['count']
-                        updated_item['last_seen'] = activity_info['last_seen']
-                        temp_data.append(updated_item)
-                    initial_display_data = temp_data
-            except Exception as fetch_err:
-                 await log_error(guild, "Failed initial monthly activity for /hcmembers", error=fetch_err, interaction=interaction)
-                 initial_display_data = list(original_data)
-
-            data_for_view = initial_display_data
-            original_data_param = original_data
-
-        else:
-            supabase_only_data, total_count = await fetch_all_supabase_hc_data(guild)
-            if not supabase_only_data:
-                await interaction.edit_original_response(embed=create_embed(title="HC Database Members (All)", description="No members found in DB.", color=discord.Color.orange()), view=None)
-                return
-            data_for_view = supabase_only_data
-            original_data_param = supabase_only_data
-
-        view = HCPagesView(
-            original_data=original_data_param,
-            initial_display_data=data_for_view,
-            total_members=total_count,
-            guild=guild,
-            is_catercord_context=is_target_guild
-        )
-        initial_embed = view.create_page_embed()
-        message = await interaction.edit_original_response(embed=initial_embed, view=view)
-        view.message = message
-
-    except Exception as e:
-        await log_error(guild, "Unhandled /hcmembers error", error=e, interaction=interaction, ping_owner=True)
-        try:
-            await interaction.edit_original_response(content=None, embed=create_embed("❌ An unexpected error occurred.", discord.Color.red()), view=None)
-        except (discord.NotFound, discord.HTTPException):
-            pass
 
 # Add a new helper function right before the /profile command definition
 async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
@@ -9995,8 +9399,7 @@ async def webhook(
 @app_commands.describe(
     action="The action to perform.",
     tag="The guild tag (e.g., [HC1]). Required for add, edit, and remove.",
-    role="The role for the guild. Required for 'add', optional for 'edit'.",
-    channel="The list channel for the guild. Required for 'add', optional for 'edit'."
+    role="The role for the guild. Required for 'add', optional for 'edit'."
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="List Tracked Guilds", value="list"),
@@ -10009,8 +9412,7 @@ async def setup_guild(
     interaction: discord.Interaction,
     action: str,
     tag: Optional[str] = None,
-    role: Optional[discord.Role] = None,
-    channel: Optional[discord.TextChannel] = None
+    role: Optional[discord.Role] = None
 ):
     guild = interaction.guild
     if not guild: return
@@ -10029,10 +9431,8 @@ async def setup_guild(
         embed = discord.Embed(title=f"Tracked Florr Guilds for {guild.name}", color=NERDY_YELLOW)
         for t, data in sorted(tracked_guilds.items()):
             role_obj = guild.get_role(data.get('discord_role_id')) if data.get('discord_role_id') else None
-            channel_obj = guild.get_channel(data.get('member_list_channel_id')) if data.get('member_list_channel_id') else None
             value = (
-                f"**Discord Role:** {role_obj.mention if role_obj else '`Not Set`'}\n"
-                f"**Member List Channel:** {channel_obj.mention if channel_obj else '`Not Set`'}"
+                f"**Discord Role:** {role_obj.mention if role_obj else '`Not Set`'}"
             )
             embed.add_field(name=f"Guild Tag: `{t}`", value=value, inline=False)
         
@@ -10050,8 +9450,8 @@ async def setup_guild(
 
     # --- ADD Action ---
     if action == "add":
-        if not role or not channel:
-            await interaction.followup.send("❌ The `role` and `channel` parameters are required to add a guild.", ephemeral=True)
+        if not role:
+            await interaction.followup.send("❌ The `role` parameter is required to add a guild.", ephemeral=True)
             return
         if existing_guild_data:
             await interaction.followup.send(f"❌ The guild `{normalized_tag}` is already tracked. Use `/setup_guild action:edit` to modify it.", ephemeral=True)
@@ -10062,9 +9462,9 @@ async def setup_guild(
                 "discord_guild_id": guild.id,
                 "florr_guild_tag": normalized_tag,
                 "discord_role_id": role.id,
-                "member_list_channel_id": channel.id
+                "member_list_channel_id": None # This is now obsolete
             }).execute())
-            await load_server_config(guild.id) # Refresh cache
+            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
             await interaction.followup.send(f"✅ Successfully added `{normalized_tag}` to the tracked guilds list.", ephemeral=True)
             await log_info(guild, f"{interaction.user.name} added tracked guild '{normalized_tag}' via /setup_guild.")
         except Exception as e:
@@ -10073,20 +9473,18 @@ async def setup_guild(
 
     # --- EDIT Action ---
     elif action == "edit":
-        if not role and not channel:
-            await interaction.followup.send("❌ You must provide a new `role` or a new `channel` to edit.", ephemeral=True)
+        if not role:
+            await interaction.followup.send("❌ You must provide a new `role` to edit.", ephemeral=True)
             return
         if not existing_guild_data:
             await interaction.followup.send(f"❌ The guild `{normalized_tag}` is not currently being tracked.", ephemeral=True)
             return
             
-        updates = {}
-        if role: updates['discord_role_id'] = role.id
-        if channel: updates['member_list_channel_id'] = channel.id
+        updates = {'discord_role_id': role.id}
         
         try:
             await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").update(updates).eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
-            await load_server_config(guild.id) # Refresh cache
+            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
             await interaction.followup.send(f"✅ Successfully edited `{normalized_tag}`.", ephemeral=True)
             await log_info(guild, f"{interaction.user.name} edited tracked guild '{normalized_tag}' via /setup_guild.")
         except Exception as e:
@@ -10101,7 +9499,7 @@ async def setup_guild(
             
         try:
             await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
-            await load_server_config(guild.id) # Refresh cache
+            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
             await interaction.followup.send(f"✅ Successfully removed `{normalized_tag}` from the tracked guilds list.", ephemeral=True)
             await log_info(guild, f"{interaction.user.name} removed tracked guild '{normalized_tag}' via /setup_guild.")
         except Exception as e:
