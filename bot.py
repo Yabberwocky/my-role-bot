@@ -2297,7 +2297,7 @@ class SetupView(discord.ui.View):
             f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}\n"
             f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}"
         )
-        embed.add_field(name="Self-Bot Ping Settings", value=ping_chans_val, inline=False)
+        embed.add_field(name="Super Ping Settings", value=ping_chans_val, inline=False)
 
         # --- AI Channels ---
         ai_channel_ids = self.config.get('always_on_ai_channels') or []
