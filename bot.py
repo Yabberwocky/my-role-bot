@@ -53,7 +53,7 @@
 # (This information is for your understanding and may be useful for generating accurate code.)
 #
 # Bot Name: TheNerd's FlorrNerd (also referred to as Sweet Honey Bot by the user)
-# Owner: Vibhor / TheNerd / sweet_honey (Discord ID: 1230848174218940416)
+# Developer: Vibhor / TheNerd / sweet_honey (Discord ID: 1230848174218940416)
 # Target Server: Catercord (This bot is primarily intended for use only in this specific server)
 # Primary Purpose: Manage verification and information related to the "[HC1]" guild within the game Florr.io.
 #   - "[HC1]" is a guild in Florr.io.
@@ -113,7 +113,7 @@
 #     - The `setup()` function in `ai_cog.py` receives the `bot` instance and a `config` dictionary.
 #     - This `config` dictionary is populated in `bot.py`'s `on_ready` with various constants and references:
 #       - `GEMINI_API_KEY`.
-#       - Discord IDs: `OWNER_USER_ID`, `CATERCORD_GUILD_ID`, etc.
+#       - Discord IDs: `DEVELOPER_USER_ID`, `CATERCORD_GUILD_ID`, etc.
 #       - Channel collections/IDs: `ALWAYS_ON_AI_CHANNELS`, `STAFF_CHANNELS`, etc.
 #       - Bot utilities: `COMMAND_PREFIX`, `NERDY_YELLOW`.
 #       - Shared data/paths: `ingame_name_cache_ref`, `MOBS_FOLDER_PATH_config`.
@@ -174,7 +174,7 @@ SELF_DISCORD_TOKEN = os.getenv("SELF_DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # <-- ADD THIS LINE
 
 # --- Global Constants & Variables ---
-OWNER_USER_ID = 1230848174218940416
+DEVELOPER_USER_ID = 1230848174218940416
 CATERCORD_GUILD_ID = 1200476681803137024
 HC1_ROLE_ID = 1230235110415274004
 RANDOM_SERVER_ID = 1318657897550577776
@@ -252,14 +252,7 @@ discovered_keywords_count: int = 0
 channel_personalities: Dict[int, str] = {}
 ai_message_cooldown = commands.CooldownMapping.from_cooldown(1, AI_RESPONSE_COOLDOWN_SECONDS, commands.BucketType.user)
 slowmode_tasks: Dict[int, asyncio.Task] = {}
-STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes
-EVENT_CONSOLIDATION_WINDOW_SECONDS = 3.0 # Collect events for 3s before posting
-consolidated_event_cache: Dict[str, List[Dict[str, Any]]] = {
-    'super_craft': [],
-    'super_spawn': [],
-    'super_defeat': [],
-}
-consolidation_task: Optional[asyncio.Task] = None
+STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes]
 STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
 STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes
 STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
@@ -470,56 +463,6 @@ async def global_guild_tag_autocomplete(interaction: discord.Interaction, curren
             choices.append(app_commands.Choice(name=tag, value=tag))
             
     return choices
-
-async def _format_consolidated_ping(category: str, events: List[Dict[str, Any]]) -> Optional[discord.Embed]:
-    """Formats a consolidated embed for a burst of events."""
-    if not events:
-        return None
-
-    title_map = {
-        'super_craft': "🛠️ Super Crafts Detected",
-        'super_spawn': "✨ Super Spawns Detected",
-        'super_defeat': "🛡️ Super Defeats Detected",
-    }
-    
-    embed = discord.Embed(
-        title=f"Event Burst: {title_map.get(category, 'Multiple Events')}",
-        description=f"Detected **{len(events)}** recent events:",
-        color=NERDY_YELLOW
-    )
-
-    lines = []
-    for event in events[:15]: # Limit to 15 entries to keep embed clean
-        server = f"[{event.get('server')}] " if event.get('server') else ""
-        if category == 'super_craft':
-            player = f"by **{event.get('player', 'Someone')}**" if event.get('player') else ""
-            line = f"{server}**{event.get('rarity')} {event.get('petal')}** {player}"
-        elif category == 'super_spawn':
-            mob = event.get('mob', 'Unknown').replace('_', ' ').title()
-            timestamp_str = event.get('timestamp')
-            time_display = ""
-            if timestamp_str:
-                try:
-                    event_dt = date_parse(timestamp_str)
-                    unix_ts = int(event_dt.timestamp())
-                    time_display = f" <t:{unix_ts}:R>"
-                except (ValueError, TypeError): pass
-            line = f"{server}**{event.get('rarity')} {mob}**{time_display}"
-        elif category == 'super_defeat':
-            mob = event.get('mob', 'Unknown').replace('_', ' ').title()
-            players = event.get('players', [])
-            player_str = f"by **{', '.join(players)}**" if players else ""
-            line = f"{server}**{event.get('rarity')} {mob}** {player_str}"
-        else:
-            continue
-        lines.append(f"- {line}")
-    
-    if len(events) > 15:
-        lines.append(f"- ...and {len(events) - 15} more.")
-
-    embed.add_field(name=f"Event Details", value="\n".join(lines), inline=False)
-    embed.set_footer(text=f"Consolidated View | {get_formatted_utc_now()}")
-    return embed
 
 async def fetch_all_global_tracked_guilds() -> List[Dict[str, Any]]:
     """Fetches all tracked guilds from the database, across all Discord servers."""
@@ -823,61 +766,12 @@ class GuildsView(discord.ui.View):
             except discord.HTTPException: pass
         self.stop()
 
-async def _process_consolidated_events():
-    """Processes and dispatches all cached events after the debounce window."""
-    global consolidated_event_cache, consolidation_task
-    # Wait for the consolidation window to pass
-    await asyncio.sleep(EVENT_CONSOLIDATION_WINDOW_SECONDS)
-
-    for category, events in consolidated_event_cache.items():
-        if not events:
-            continue
-
-        config_key_map = {'super_craft': 'craft_ping_channel_id', 'super_spawn': 'spawn_ping_channel_id', 'super_defeat': 'defeat_ping_channel_id'}
-        webhook_purpose_map = {'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings'}
-        webhook_name_map = {'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings'}
-        
-        config_key = config_key_map.get(category)
-        if not config_key: continue
-
-        for guild in bot.guilds:
-            config = await load_server_config(guild.id)
-            channel_id = config.get(config_key)
-            if not channel_id: continue
-            
-            channel = guild.get_channel(channel_id)
-            if not isinstance(channel, discord.TextChannel): continue
-            
-            webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
-            if not webhook: continue
-
-            # If only one event, send the simple text ping
-            if len(events) == 1:
-                ping_template, should_ping_role, _ = await _create_ping_text(events[0])
-                if ping_template:
-                    content_to_send = ping_template
-                    if should_ping_role and config.get('super_ping_role_id'):
-                        content_to_send += f"\n<@&{config.get('super_ping_role_id')}>"
-                    await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
-            
-            # If multiple events, send the consolidated embed
-            else:
-                embed = await _format_consolidated_ping(category, events)
-                if embed:
-                    content_to_send = f"<@&{config.get('super_ping_role_id')}>" if category == 'super_spawn' and config.get('super_ping_role_id') else None
-                    await webhook.send(content=content_to_send, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
-
-    # Clear the cache and task tracker
-    consolidated_event_cache = { 'super_craft': [], 'super_spawn': [], 'super_defeat': [] }
-    consolidation_task = None
-
-
 async def _handle_self_bot_event(item: Dict[str, Any]):
     """
     This coroutine runs in the main bot's event loop. It implements a 3-layer
     firewall to validate and process events from the listener.
     """
-    global consolidated_event_cache, consolidation_task
+    # Note: Event consolidation has been removed. Events are now dispatched immediately.
 
     category = item.get('category')
     timestamp_str = item.get('timestamp')
@@ -896,10 +790,8 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
             threshold = STALE_DEFEAT_EVENT_THRESHOLD_SECONDS
 
         if age_seconds > threshold:
-            embed = discord.Embed(title="🕵️ Stale Event Discarded", color=discord.Color.dark_grey())
-            embed.description = f"An event was discarded for being too old. (Age: {age_seconds:.0f}s, Threshold: {threshold}s)"
-            embed.add_field(name="Event Details", value=f"```json\n{json.dumps(item, indent=2)}\n```")
-            await log_error(None, f"Stale {category or 'event'} discarded", embed=embed, ping_owner=False)
+            # Stale event logging is now only to console as requested.
+            print(f"Stale Event Discarded: An event was discarded for being too old. (Age: {age_seconds:.0f}s, Threshold: {threshold}s, Category: {category})")
             return
     except (ValueError, TypeError):
         return
@@ -914,19 +806,56 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
     elif category in ['super_spawn', 'super_defeat']:
         await spawn_defeat_queue.put(item)
 
-    # --- Log to Database (happens regardless of consolidation) ---
+    # --- Log to Database (happens regardless of pinging) ---
     if category == 'super_defeat':
         await _log_super_defeat_to_db(item)
     elif category == 'super_craft':
         await _log_super_craft_to_db(item)
 
-    # --- Gate 3: Debounce & Consolidate ---
-    if category in consolidated_event_cache:
-        consolidated_event_cache[category].append(item)
+    # --- Dispatch Ping Immediately (Replaces Consolidation Logic) ---
+    await _dispatch_single_event_ping(item)
+
+async def _dispatch_single_event_ping(item: Dict[str, Any]):
+    """Dispatches a single event ping to all configured servers."""
+    category = item.get('category')
+    if not category:
+        return
+
+    config_key_map = {'super_craft': 'craft_ping_channel_id', 'super_spawn': 'spawn_ping_channel_id', 'super_defeat': 'defeat_ping_channel_id'}
+    webhook_purpose_map = {'super_craft': 'craft_pings', 'super_spawn': 'spawn_pings', 'super_defeat': 'defeat_pings'}
+    webhook_name_map = {'super_craft': 'Craft Pings', 'super_spawn': 'Spawn Pings', 'super_defeat': 'Defeat Pings'}
+    
+    config_key = config_key_map.get(category)
+    if not config_key:
+        return
+
+    ping_template, should_ping_role, _ = await _create_ping_text(item)
+    if not ping_template:
+        return
+
+    for guild in bot.guilds:
+        config = await load_server_config(guild.id)
+        channel_id = config.get(config_key)
+        if not channel_id:
+            continue
+            
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            continue
         
-        # If no consolidation task is running, start one.
-        if consolidation_task is None or consolidation_task.done():
-            consolidation_task = asyncio.create_task(_process_consolidated_events())
+        webhook = await get_or_create_webhook(channel, webhook_purpose_map[category], webhook_name_map[category])
+        if not webhook:
+            continue
+        
+        content_to_send = ping_template
+        ping_role_id = config.get('super_ping_role_id')
+        if should_ping_role and ping_role_id:
+            content_to_send += f"\n<@&{config['super_ping_role_id']}>"
+        
+        try:
+            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
+        except Exception as e:
+            await log_error(guild, f"Failed to send single event ping for {category}", error=e)
 
 async def get_note_author_count(guild: Optional[discord.Guild], author_id: str, target_ign: str) -> int:
     """Counts how many notes a specific author has on a specific target IGN."""
@@ -1032,7 +961,7 @@ class DeleteNoteModal(discord.ui.Modal, title="Delete Player Note"):
             await interaction.followup.send("❌ Error: Could not find the database ID for the selected note.", ephemeral=True)
             return
 
-        is_admin = await is_admin_or_owner(interaction)
+        is_admin = await is_admin_or_developer(interaction)
         is_author = str(interaction.user.id) == str(author_id_of_note)
 
         if not is_admin and not is_author:
@@ -1322,12 +1251,12 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     embed.set_footer(text="Note: The content of the deleted message is not available via this event.")
     embed.timestamp = discord.utils.utcnow()
 
-    # Log to extraordinary logs without pinging the owner.
+    # Log to extraordinary logs without pinging the developer.
     await log_error(
         guild, 
         "A message was deleted in the self-bot's private channel.", 
         embed=embed, 
-        ping_owner=False
+        ping_developer=False
     )
 
 # Add these new classes from ai_cog.py
@@ -1466,6 +1395,184 @@ class RetryAIView(discord.ui.View):
                 pass
         self.stop()
 
+class DevSetupView(discord.ui.View):
+    def __init__(self, initial_guilds: List[Dict[str, Any]]):
+        super().__init__(timeout=600)
+        self.guilds_data = initial_guilds
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == DEVELOPER_USER_ID:
+            return True
+        else:
+            await interaction.response.send_message("❌ You are not authorized to use these buttons.", ephemeral=True)
+            return False
+
+    def create_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="👑 Developer Setup Panel", color=NERDY_YELLOW)
+        embed.description = "Global settings for the bot. Use buttons to manage features."
+        
+        # --- Globally Available Guilds ---
+        if self.guilds_data:
+            guilds_val_parts = []
+            # Sort case-insensitively for a more natural order
+            for g in sorted(self.guilds_data, key=lambda x: x['guild_tag'].lower()):
+                guilds_val_parts.append(f"**`{g['guild_tag']}`**: {g['description']}")
+            guilds_val = "\n".join(guilds_val_parts)
+        else:
+            guilds_val = "`No global guilds are configured.`"
+        embed.add_field(name="🌐 Globally Available Guilds", value=guilds_val, inline=False)
+        
+        embed.set_footer(text="These settings affect the bot across all servers.")
+        return embed
+
+    async def refresh_view(self, interaction: discord.Interaction):
+        """Fetches fresh data and updates the view's message."""
+        self.guilds_data = await fetch_globally_available_guilds()
+        embed = self.create_embed()
+        if self.message:
+            await self.message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label="Add Guild", style=discord.ButtonStyle.success, emoji="➕", row=0)
+    async def add_guild_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = AddGlobalGuildModal(self)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Delete Guild", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+    async def delete_guild_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = DeleteGlobalGuildModal(self)
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.secondary, row=1)
+    async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.message: await self.message.edit(content="✅ Developer setup complete.", embed=None, view=None)
+        self.stop()
+        
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children: item.disabled = True
+            try: await self.message.edit(content="Developer setup timed out.", embed=None, view=self)
+            except discord.HTTPException: pass
+        self.stop()
+
+class AddGlobalGuildModal(discord.ui.Modal, title="Add Global Guild"):
+    tag_input = discord.ui.TextInput(
+        label="Guild Tag",
+        placeholder="e.g., [XYZ]",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=15
+    )
+    description_input = discord.ui.TextInput(
+        label="Guild Description",
+        placeholder="A short description of the guild.",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=100
+    )
+
+    def __init__(self, view_ref: DevSetupView):
+        super().__init__(timeout=300.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        # Use the tag with its original casing.
+        tag_to_add = self.tag_input.value.strip()
+        description = self.description_input.value.strip()
+
+        # Perform a case-insensitive check for existence.
+        all_guilds = await fetch_globally_available_guilds()
+        existing_tag_match = None
+        for g in all_guilds:
+            if g['guild_tag'].lower() == tag_to_add.lower():
+                existing_tag_match = g['guild_tag']
+                break
+
+        # If a tag exists with different casing, block the add.
+        # If the exact tag exists, the upsert will just perform an update, which is acceptable.
+        if existing_tag_match and existing_tag_match != tag_to_add:
+            await interaction.followup.send(f"❌ A guild with this tag already exists (case-insensitive): `{existing_tag_match}`. Please use a different tag.", ephemeral=True)
+            return
+
+        # Proceed with upsert using the original casing.
+        try:
+            await run_supabase_sync(lambda: supabase.table("globally_available_guilds").upsert({
+                "guild_tag": tag_to_add,
+                "description": description
+            }).execute())
+            await interaction.followup.send(f"✅ Successfully added/updated global guild: **{tag_to_add}**.", ephemeral=True)
+            await self.view_ref.refresh_view(interaction)
+        except Exception as e:
+            await log_error(interaction.guild, f"Failed to add/update global guild {tag_to_add}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred.", ephemeral=True)
+
+class DeleteGlobalGuildModal(discord.ui.Modal, title="Delete Global Guild"):
+    tag_input = discord.ui.TextInput(
+        label="Guild Tag to Delete",
+        placeholder="e.g., [XYZ]",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=15
+    )
+
+    def __init__(self, view_ref: DevSetupView):
+        super().__init__(timeout=300.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        # Get user input with original casing.
+        tag_to_delete = self.tag_input.value.strip()
+
+        # Find the actual tag from the database case-insensitively.
+        all_guilds = await fetch_globally_available_guilds()
+        actual_tag_in_db = None
+        for g in all_guilds:
+            if g['guild_tag'].lower() == tag_to_delete.lower():
+                actual_tag_in_db = g['guild_tag']
+                break
+
+        # Handle if not found.
+        if not actual_tag_in_db:
+            await interaction.followup.send(f"❌ No guild with the tag `{tag_to_delete}` was found (checked case-insensitively).", ephemeral=True)
+            return
+
+        # Proceed with deletion using the exact tag from the DB.
+        try:
+            delete_resp = await run_supabase_sync(lambda: supabase.table("globally_available_guilds").delete().eq("guild_tag", actual_tag_in_db).execute())
+            
+            if delete_resp and delete_resp.data:
+                await interaction.followup.send(f"✅ Successfully removed global guild: **{actual_tag_in_db}**.", ephemeral=True)
+                await self.view_ref.refresh_view(interaction)
+            else:
+                await interaction.followup.send(f"⚠️ Could not confirm deletion for `{actual_tag_in_db}`. It may have been removed by another process.", ephemeral=True)
+                await self.view_ref.refresh_view(interaction)
+
+        except Exception as e:
+            await log_error(interaction.guild, f"Failed to remove global guild {actual_tag_in_db}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred during deletion.", ephemeral=True)
+
+@tree.command(name="dev_setup", description="[Developer] Interactively configure global bot settings.")
+@app_commands.check(lambda i: i.user.id == DEVELOPER_USER_ID)
+async def dev_setup(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild: return
+    
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions here.", ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=False)
+    
+    initial_guilds = await fetch_globally_available_guilds()
+    view = DevSetupView(initial_guilds)
+    
+    message = await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=False)
+    view.message = message
+
 # Add these new AI-related functions
 async def _initialize_ai_models():
     """Initializes all configured AI models."""
@@ -1502,7 +1609,7 @@ async def load_keyword_data():
         )
 
         if not response or not hasattr(response, 'data'):
-            await log_error(None, "AI: Failed to fetch keyword data from Supabase (no response).", ping_owner=True)
+            await log_error(None, "AI: Failed to fetch keyword data from Supabase (no response).", ping_developer=True)
             return
 
         keyword_data_cache.clear()
@@ -1525,7 +1632,7 @@ async def load_keyword_data():
         await log_info(None, f"AI: Successfully loaded {total_keywords} keyword rules ({discovered_keywords_count} discovered).")
 
     except Exception as e:
-        await log_error(None, "AI: Critical error loading keyword data from Supabase.", error=e, ping_owner=True)
+        await log_error(None, "AI: Critical error loading keyword data from Supabase.", error=e, ping_developer=True)
         keyword_data_cache.clear()
         total_keywords = 0
         discovered_keywords_count = 0
@@ -1537,7 +1644,7 @@ def get_prompt(prompt_key: str, **kwargs) -> Optional[str]:
 async def block_unwanted_mentions(content: str, user_id: int) -> Tuple[Optional[str], Optional[str]]:
     """
     Checks for disallowed mentions (@everyone, @here, roles, users) in content.
-    Bypasses the check for the bot owner.
+    Bypasses the check for the bot developer.
 
     Args:
         content: The message content to check.
@@ -1548,8 +1655,8 @@ async def block_unwanted_mentions(content: str, user_id: int) -> Tuple[Optional[
         - If allowed: (original_content, None)
         - If disallowed: (None, "Your message contains a disallowed mention...")
     """
-    # 1. Bypass check for the bot owner
-    if user_id == OWNER_USER_ID:
+    # 1. Bypass check for the bot developer
+    if user_id == DEVELOPER_USER_ID:
         return content, None
 
     # 2. Regex for different types of mentions
@@ -1696,14 +1803,14 @@ async def get_ai_response(history: List[discord.Message], latest_message_content
             await log_error(guild_context_for_log, f"AI model '{model_id}' rate limited. Trying fallback.", error=e)
             continue
         except Exception as e:
-            await log_error(guild_context_for_log, f"Error generating AI response with '{model_id}'", error=e, ping_owner=True)
+            await log_error(guild_context_for_log, f"Error generating AI response with '{model_id}'", error=e, ping_developer=True)
             return None, fallback_used
     return None, fallback_used
 
 async def get_ai_response_with_image(prompt_key: str, image_bytes_list: List[bytes], prompt_kwargs: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Generates an AI response for a prompt that includes one or more images."""
     if not ai_models:
-        await log_error(None, "AI image processing failed: No models configured.", ping_owner=True)
+        await log_error(None, "AI image processing failed: No models configured.", ping_developer=True)
         return None
     if not image_bytes_list:
         return None
@@ -1728,7 +1835,7 @@ async def get_ai_response_with_image(prompt_key: str, image_bytes_list: List[byt
     model_id = "gemini-2.5-flash-preview-05-20"
     model = ai_models.get(model_id)
     if not model:
-        await log_error(None, f"AI image processing failed: Required model '{model_id}' not available.", ping_owner=True)
+        await log_error(None, f"AI image processing failed: Required model '{model_id}' not available.", ping_developer=True)
         return None
     
     safety_config = {
@@ -1947,7 +2054,7 @@ class ConnectUserModal(discord.ui.Modal, title="Connect Florr IGN"):
 
     async def on_submit(self, interaction: discord.Interaction):
         # Double-check permissions on submit
-        is_staff = await is_admin_or_owner(interaction)
+        is_staff = await is_admin_or_developer(interaction)
         if interaction.user.id != self.target_user.id and not is_staff:
             await interaction.response.send_message("❌ You are not authorized to connect this user.", ephemeral=True)
             return
@@ -1989,7 +2096,7 @@ class ProfileNotFoundView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Allow the target user OR a staff member to interact
-        is_staff = await is_admin_or_owner(interaction)
+        is_staff = await is_admin_or_developer(interaction)
         if interaction.user.id == self.target_user.id or is_staff:
             return True
         else:
@@ -2253,7 +2360,7 @@ class SetupView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Checks if the user has admin permissions before allowing interaction."""
-        is_staff = await is_admin_or_owner(interaction)
+        is_staff = await is_admin_or_developer(interaction)
         if is_staff:
             return True
         else:
@@ -2686,7 +2793,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
         guild, 
         "A message was deleted in the self-bot's private channel.", 
         embed=embed, 
-        ping_owner=False
+        ping_developer=False
     )
 
 @tasks.loop(seconds=5.0)
@@ -2815,6 +2922,17 @@ async def _sync_app_commands(bot: commands.Bot) -> list:
         print(f"Command Sync failed: {e}\n{traceback.format_exc()}")
     return synced_commands
 
+async def fetch_globally_available_guilds() -> List[Dict[str, Any]]:
+    """Fetches all globally available guilds from the database."""
+    if not supabase: return []
+    try:
+        resp = await run_supabase_sync(
+            lambda: supabase.table("globally_available_guilds").select("*").execute()
+        )
+        return resp.data if resp and resp.data else []
+    except Exception as e:
+        await log_error(None, "Failed to fetch globally available guilds", error=e)
+        return []
 
 async def _start_background_tasks(bot: commands.Bot):
     """Initializes and starts all background tasks and listeners."""
@@ -2971,7 +3089,7 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
     """
     print(f"Fetch DB-First Data ({guild.name}, Tag: {florr_guild_tag}): Starting fetch...")
     if not supabase:
-        await log_error(guild, f"Tracked guild data fetch for '{florr_guild_tag}' failed: Supabase client unavailable.", ping_owner=True)
+        await log_error(guild, f"Tracked guild data fetch for '{florr_guild_tag}' failed: Supabase client unavailable.", ping_developer=True)
         return [], 0
 
     # 1. Fetch all members from the DB matching the specified guild tag
@@ -2989,7 +3107,7 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
         else:
             return [], 0
     except Exception as e:
-        await log_error(guild, f"Failed to fetch members for tag '{florr_guild_tag}' from Supabase", error=e, ping_owner=True)
+        await log_error(guild, f"Failed to fetch members for tag '{florr_guild_tag}' from Supabase", error=e, ping_developer=True)
         return [], 0
     
     # 2. Get all-time activity for the fetched members
@@ -3088,7 +3206,7 @@ def _normalize_guild_tag(tag: str) -> str:
     return f"[{cleaned_tag}]"
 
 async def handle_super_command(message: discord.Message):
-    """Handles the owner-only //super command to fetch the next 10 craft notifications."""
+    """Handles the developer-only //super command to fetch the next 10 craft notifications."""
     CRAFT_NOTIFY_GUILD_ID = 1332980983003349012
     CRAFT_NOTIFY_CHANNEL_ID = 1382246434513879091
     
@@ -3154,9 +3272,9 @@ async def handle_super_command(message: discord.Message):
             await message.remove_reaction("⏳", bot.user)
             await message.add_reaction("🔥")
 
-async def is_admin_or_owner(interaction: discord.Interaction) -> bool:
-    """Check if the user is a server admin or the bot owner."""
-    if interaction.user.id == OWNER_USER_ID:
+async def is_admin_or_developer(interaction: discord.Interaction) -> bool:
+    """Check if the user is a server admin or the bot developer."""
+    if interaction.user.id == DEVELOPER_USER_ID:
         return True
     if interaction.guild and isinstance(interaction.user, discord.Member):
         return interaction.user.guild_permissions.administrator
@@ -3207,7 +3325,7 @@ async def load_server_config(guild_id: int) -> Dict[str, Any]:
         return config_data
     except Exception as e:
         print(f"CRITICAL: Failed to load/create server config for guild {guild_id}: {e}")
-        await log_error(bot.get_guild(guild_id), "Failed to load server config", error=e, ping_owner=True)
+        await log_error(bot.get_guild(guild_id), "Failed to load server config", error=e, ping_developer=True)
         return {'tracked_guilds': {}} # Return safe default # Return safe default
 
 class ServerCodeView(discord.ui.View):
@@ -3513,7 +3631,7 @@ async def handle_zorr_pro_automod(message: discord.Message):
         elif field.name == "channel_id":
             try: original_channel_id_from_fields = int(field.value)
             except (ValueError, TypeError):
-                await log_error(guild, f"ZorrRedirect: Could not parse channel_id '{field.value}' from embed field.", ping_owner=True)
+                await log_error(guild, f"ZorrRedirect: Could not parse channel_id '{field.value}' from embed field.", ping_developer=True)
                 return
         elif field.name == "rule_name":
             rule_name_from_fields = str(field.value).strip()
@@ -3532,7 +3650,7 @@ async def handle_zorr_pro_automod(message: discord.Message):
     designated_channel = guild.get_channel(ZORR_PRO_DESIGNATED_CHANNEL_ID)
 
     if not isinstance(designated_channel, discord.TextChannel):
-        await log_error(guild, f"ZorrRedirect: Designated channel {ZORR_PRO_DESIGNATED_CHANNEL_ID} invalid.", ping_owner=True)
+        await log_error(guild, f"ZorrRedirect: Designated channel {ZORR_PRO_DESIGNATED_CHANNEL_ID} invalid.", ping_developer=True)
         return
 
     info_message = f"{actual_message_author.mention}, your message related to zorr.pro was blocked in {original_channel_name}. Please discuss here in {designated_channel.mention}. I'll re-post your message:"
@@ -3551,7 +3669,7 @@ async def handle_zorr_pro_automod(message: discord.Message):
         temp_webhook = await designated_channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason="Zorr.pro AutoMod relay")
         await temp_webhook.send(content=original_message_content[:2000], wait=True)
     except Exception as e:
-        await log_error(guild, "ZorrRedirect: Error during imitation.", error=e, ping_owner=True)
+        await log_error(guild, "ZorrRedirect: Error during imitation.", error=e, ping_developer=True)
     finally:
         if temp_webhook:
             try: await temp_webhook.delete(reason="Zorr.pro AutoMod relay cleanup")
@@ -3673,7 +3791,7 @@ async def handle_super_attempt_message(message: discord.Message):
             if isinstance(message.author, discord.Member):
                 await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
         except Exception as e:
-            await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_owner=True)
+            await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_developer=True)
             try:
                 await message.reply("Error logging attempt. Admin notified.")
             except discord.HTTPException:
@@ -3719,7 +3837,7 @@ async def handle_super_attempt_message(message: discord.Message):
             if isinstance(message.author, discord.Member):
                 await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
         except Exception as e:
-            await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_owner=True)
+            await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_developer=True)
             try:
                 await message.reply("Error logging unknown petal. Admin notified.")
             except discord.HTTPException:
@@ -4665,8 +4783,8 @@ async def update_custom_nickname_on_attempt(
             return
 
         bot_member = guild.me
-        if user.id == guild.owner_id:
-            await log_info(guild, f"Nickname update skipped for {user.mention}: Cannot manage the server owner's nickname.")
+        if user.id == guild.developer_id:
+            await log_info(guild, f"Nickname update skipped for {user.mention}: Cannot manage the server developer's nickname.")
             return
         if bot_member.top_role <= user.top_role:
             await log_info(guild, f"Nickname update skipped for {user.mention}: Bot hierarchy too low.")
@@ -4818,7 +4936,7 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                     fallback_query_attempts += 1
                 
                 if new_attempt_db_id is None:
-                    await log_error(guild, f"SuperAttempt Log: Fallback query also failed to retrieve ID for {self.author_ign}, msg_id {self.original_user_message.id}.", ping_owner=True)
+                    await log_error(guild, f"SuperAttempt Log: Fallback query also failed to retrieve ID for {self.author_ign}, msg_id {self.original_user_message.id}.", ping_developer=True)
 
 
             if not new_attempt_db_id:
@@ -4826,7 +4944,7 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                 # If it reaches here, it means both insert return and fallback query failed.
                 error_message = "Error: Could not confirm database ID for the logged attempt. Undo might not work. Please report this."
                 await interaction.followup.send(error_message, ephemeral=True)
-                await log_error(guild, f"Super Attempt Disambiguation: Failed to get DB ID after insert and fallback for {self.author_ign}, chosen {button.chosen_petal_data['display_friendly_name']}", message_context=self.original_user_message, ping_owner=True)
+                await log_error(guild, f"Super Attempt Disambiguation: Failed to get DB ID after insert and fallback for {self.author_ign}, chosen {button.chosen_petal_data['display_friendly_name']}", message_context=self.original_user_message, ping_developer=True)
                 
                 # Send a simplified success message without the Undo button, as we don't have the ID.
                 confirm_embed = discord.Embed(
@@ -4868,7 +4986,7 @@ class SuperAttemptDisambiguationView(discord.ui.View):
                 await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, all_time_attempts_count)
 
         except Exception as e:
-            await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message, ping_owner=True) # Ping owner on critical errors
+            await log_error(guild, f"Error handling disambiguation choice for {self.author_ign}", error=e, message_context=self.original_user_message, ping_developer=True) # Ping developer on critical errors
             try: 
                 if not interaction.response.is_done():
                     await interaction.response.send_message("An error occurred while processing your choice. Admins notified.", ephemeral=True)
@@ -5675,10 +5793,10 @@ class ProfilePagesView(discord.ui.View):
         next_btn.callback = self.handle_log_pagination
         self.add_item(next_btn)
 
-        profile_owner_discord_id = self.target_user_display_data.get("_discord_id_for_sa_management")
-        is_profile_owner = profile_owner_discord_id and str(self.original_command_interaction.user.id) == str(profile_owner_discord_id)
+        profile_developer_discord_id = self.target_user_display_data.get("_discord_id_for_sa_management")
+        is_profile_developer = profile_developer_discord_id and str(self.original_command_interaction.user.id) == str(profile_developer_discord_id)
         
-        if self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE and is_profile_owner:
+        if self.current_page_mode == self.SUPER_ATTEMPT_LOG_PAGE and is_profile_developer:
             add_btn = discord.ui.Button(label="➕ Add Unknown", style=discord.ButtonStyle.success, custom_id="profile_sa_add_unknown", row=2)
             add_btn.callback = self.handle_add_s_attempt
             self.add_item(add_btn)
@@ -6249,9 +6367,9 @@ class HelpPagesView(discord.ui.View):
             self.buttons['staff'].callback = self.switch_page
             self.add_item(self.buttons['staff'])
 
-            self.buttons['owner'] = discord.ui.Button(label="Owner", emoji="👑", style=discord.ButtonStyle.primary if self.current_page == 'owner' else discord.ButtonStyle.secondary, custom_id="help_page_owner")
-            self.buttons['owner'].callback = self.switch_page
-            self.add_item(self.buttons['owner'])
+            self.buttons['developer'] = discord.ui.Button(label="Developer", emoji="👑", style=discord.ButtonStyle.primary if self.current_page == 'developer' else discord.ButtonStyle.secondary, custom_id="help_page_developer")
+            self.buttons['developer'].callback = self.switch_page
+            self.add_item(self.buttons['developer'])
 
     async def switch_page(self, interaction: discord.Interaction):
         self.current_page = interaction.data['custom_id'].split('_')[-1]
@@ -6313,11 +6431,11 @@ class HelpPagesView(discord.ui.View):
         embed.set_footer(text="Use /setup for most configuration needs.")
         return embed
     
-    def _create_owner_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="👑 FlorrNerd Bot - Owner Commands", color=NERDY_YELLOW)
+    def _create_developer_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="👑 FlorrNerd Bot - Developer Commands", color=NERDY_YELLOW)
         if self.bot_user and self.bot_user.display_avatar:
             embed.set_thumbnail(url=self.bot_user.display_avatar.url)
-        embed.description = "These commands can only be run by the bot owner.\n\n\u200B"
+        embed.description = "These commands can only be run by the bot developer.\n\n\u200B"
 
         embed.add_field(name="⚙️ Global Management", value="\u200B", inline=False)
         embed.add_field(name=f"{get_cmd_mention('nerd_admin')} · Manage global bot settings.", value="\u200B", inline=False)
@@ -6334,7 +6452,7 @@ class HelpPagesView(discord.ui.View):
 
     def get_current_embed(self) -> discord.Embed:
         if self.current_page == "staff": return self._create_staff_embed()
-        if self.current_page == "owner": return self._create_owner_embed()
+        if self.current_page == "developer": return self._create_developer_embed()
         return self._create_general_embed()
 
     async def on_timeout(self):
@@ -6432,7 +6550,7 @@ async def fetch_avatar_bytes(session: aiohttp.ClientSession, url: str) -> Option
         return None
 
 async def can_manage_guild_or_is_bypass_user(interaction: discord.Interaction) -> bool:
-    if interaction.user.id == OWNER_USER_ID:
+    if interaction.user.id == DEVELOPER_USER_ID:
         return True  # Bypass user, allow command
     return interaction.permissions.manage_guild
 
@@ -6660,7 +6778,7 @@ async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
     """Loads all In-Game Names from Supabase into cache."""
     global ingame_name_cache
     if not supabase:
-        await log_error(guild_for_log, "IGN Cache loading failed: Supabase unavailable.", ping_owner=True)
+        await log_error(guild_for_log, "IGN Cache loading failed: Supabase unavailable.", ping_developer=True)
         ingame_name_cache = []
         return
 
@@ -6686,7 +6804,7 @@ async def load_ign_cache(guild_for_log: Optional[discord.Guild]):
         await log_info(guild_for_log, f"Successfully loaded {len(ingame_name_cache)} IGNs into local cache.")
 
     except (APIError, ConnectionError, Exception) as e:
-        await log_error(guild_for_log, "Failed to load IGN cache from Supabase", error=e, ping_owner=True)
+        await log_error(guild_for_log, "Failed to load IGN cache from Supabase", error=e, ping_developer=True)
         ingame_name_cache = [] # Clear cache on error # Clear cache on error
 
 
@@ -7080,13 +7198,13 @@ async def log_error(
     error: Optional[Exception] = None, 
     interaction: Optional[discord.Interaction] = None, 
     embed: Optional[discord.Embed] = None, 
-    ping_owner: bool = False,
+    ping_developer: bool = False,
     message_context: Optional[discord.Message] = None
 ):
     log_prefix = f"[{guild.name if guild else 'No Guild'}] ERROR:"
     
     if not embed:
-        title_prefix = f"🚨 Bot {'Critical ' if ping_owner else ''}Error"
+        title_prefix = f"🚨 Bot {'Critical ' if ping_developer else ''}Error"
         embed = discord.Embed(title=title_prefix, description=message, color=discord.Color.red())
         embed.timestamp = discord.utils.utcnow()
         if guild: embed.set_footer(text=f"Server: {guild.name} ({guild.id})")
@@ -7131,7 +7249,7 @@ async def log_error(
         if isinstance(log_channel, discord.TextChannel):
             webhook = await get_or_create_webhook(log_channel, "extraordinary_logs", "Extraordinary Logger", bot.user.display_avatar.url if bot.user else None)
             if webhook:
-                content_to_send = f"<@{OWNER_USER_ID}>" if ping_owner else None
+                content_to_send = f"<@{DEVELOPER_USER_ID}>" if ping_developer else None
                 try:
                     await webhook.send(content=content_to_send, embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
                 except Exception as e_webhook:
@@ -7180,19 +7298,10 @@ class GuildsView(discord.ui.View):
         """Fetches the initial data needed for the starting view."""
         self.is_fetching = True
         if self.mode == self.MODE_SUMMARY:
-            # FIX: De-duplicate guild tags for the summary view.
             all_tracked_guilds_with_duplicates = await fetch_all_global_tracked_guilds()
-            
-            # 1. Get a unique set of tags
             unique_tags = sorted(list({g['florr_guild_tag'] for g in all_tracked_guilds_with_duplicates}))
-            
-            # 2. Fetch counts only for the unique tags
             counts = await fetch_guild_member_counts(unique_tags)
-            
-            # 3. Build summary data from unique tags
             self.summary_data = [{'tag': tag, 'member_count': counts.get(tag, 0)} for tag in unique_tags]
-            
-            # 4. Sort by member count
             self.summary_data.sort(key=lambda x: x['member_count'], reverse=True)
 
         elif self.mode == self.MODE_MEMBERS and self.current_guild_tag:
@@ -7200,20 +7309,16 @@ class GuildsView(discord.ui.View):
             await self.fetch_and_set_member_data_for_view_mode(self.member_view_mode)
             self.sort_member_data()
         
-        # After data is loaded, populate the UI elements before rendering.
-        self.update_ui_elements()
         self.is_fetching = False
+        self.update_ui_elements()
 
     async def _update_view(self, interaction: discord.Interaction):
-        """Main method to re-render the view and edit the message."""
+        """Main method to re-render the view and edit the message for non-deferred interactions."""
         self.update_ui_elements()
         embed = await self.create_embed()
         
         try:
-            # This is the correct way to edit the message a component is on.
-            # It works for both deferred and non-deferred interactions from components.
             await interaction.response.edit_message(embed=embed, view=self)
-
             if self.is_static_list and self.last_interaction_time:
                 self.last_interaction_time = discord.utils.utcnow()
         except discord.NotFound:
@@ -7233,12 +7338,10 @@ class GuildsView(discord.ui.View):
                 self.add_item(select)
 
         elif self.mode == self.MODE_MEMBERS:
-            # Back Button
             back_btn = discord.ui.Button(label="⬅️ All Guilds", style=discord.ButtonStyle.secondary, custom_id="guild_back_summary", row=0)
             back_btn.callback = self.handle_back_to_summary
             self.add_item(back_btn)
 
-            # Pagination
             prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="guild_prev", row=1, disabled=(self.current_page == 0 or self.is_fetching))
             prev_btn.callback = self.handle_pagination
             self.add_item(prev_btn)
@@ -7247,13 +7350,11 @@ class GuildsView(discord.ui.View):
             next_btn.callback = self.handle_pagination
             self.add_item(next_btn)
 
-            # Sorting
             sort_label = "Sort by IGN" if self.member_sort_mode == SORT_MODE_ACTIVITY else "Sort by Activity"
             sort_btn = discord.ui.Button(label=sort_label, style=discord.ButtonStyle.success, custom_id="guild_toggle_sort", row=2, disabled=(self.is_fetching or self.member_view_mode == VIEW_MODE_DISCORD))
             sort_btn.callback = self.handle_sort_toggle
             self.add_item(sort_btn)
 
-            # View Mode Select
             options = [
                discord.SelectOption(label="View Discord Names + IGN", value=VIEW_MODE_DISCORD, emoji="👤", default=self.member_view_mode == VIEW_MODE_DISCORD),
                discord.SelectOption(label="View Activity (Today)", value=VIEW_MODE_ACTIVITY_DAILY, emoji="📅", default=self.member_view_mode == VIEW_MODE_ACTIVITY_DAILY),
@@ -7314,7 +7415,6 @@ class GuildsView(discord.ui.View):
         
         return discord.Embed(title="Error", description="Invalid view state.", color=discord.Color.red())
 
-    # --- Data Handling ---
     async def fetch_and_set_member_data_for_view_mode(self, mode: str):
         if mode == VIEW_MODE_DISCORD or mode == VIEW_MODE_ACTIVITY_ALL:
             self.member_data = list(self.original_member_data)
@@ -7348,7 +7448,7 @@ class GuildsView(discord.ui.View):
 
     # --- Callbacks ---
     async def handle_guild_select(self, interaction: discord.Interaction):
-        await interaction.response.defer() # Defer here for slow data loading
+        await interaction.response.defer()
         self.is_fetching = True
         self.current_guild_tag = interaction.data['values'][0]
         self.mode = self.MODE_MEMBERS
@@ -7356,20 +7456,18 @@ class GuildsView(discord.ui.View):
         self.member_sort_mode = SORT_MODE_ACTIVITY
         
         await self.initialize_data()
-        self.is_fetching = False
-
+        
         embed = await self.create_embed()
         await interaction.edit_original_response(embed=embed, view=self)
 
     async def handle_back_to_summary(self, interaction: discord.Interaction):
-        await interaction.response.defer() # Defer here for slow data loading
+        await interaction.response.defer()
         self.is_fetching = True
         self.mode = self.MODE_SUMMARY
         self.current_guild_tag = None
         
         await self.initialize_data()
-        self.is_fetching = False
-
+        
         embed = await self.create_embed()
         await interaction.edit_original_response(embed=embed, view=self)
 
@@ -7385,7 +7483,7 @@ class GuildsView(discord.ui.View):
         await self._update_view(interaction)
 
     async def handle_view_mode_select(self, interaction: discord.Interaction):
-        await interaction.response.defer() # Defer here for slow data loading
+        await interaction.response.defer()
         self.is_fetching = True
         self.member_view_mode = interaction.data['values'][0]
         self.current_page = 0
@@ -7397,6 +7495,8 @@ class GuildsView(discord.ui.View):
         
         self.is_fetching = False
         
+        # Manually perform the update logic using edit_original_response
+        self.update_ui_elements()
         embed = await self.create_embed()
         await interaction.edit_original_response(embed=embed, view=self)
         
@@ -7680,7 +7780,7 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
     guild = interaction.guild
 
     target_user = user or interaction.user
-    if user and interaction.user.id != user.id and not await is_admin_or_owner(interaction):
+    if user and interaction.user.id != user.id and not await is_admin_or_developer(interaction):
         await interaction.response.send_message("❌ You need to be a server admin to connect another user's account.", ephemeral=True)
         return
     if not isinstance(target_user, discord.Member):
@@ -7729,7 +7829,7 @@ async def disconnect(interaction: discord.Interaction, user: Optional[discord.Me
     guild = interaction.guild
 
     target_user = user or interaction.user
-    if user and interaction.user.id != user.id and not await is_admin_or_owner(interaction):
+    if user and interaction.user.id != user.id and not await is_admin_or_developer(interaction):
         await interaction.response.send_message("❌ You need to be a server admin to disconnect another user's account.", ephemeral=True)
         return
     if not isinstance(target_user, discord.Member):
@@ -8193,13 +8293,13 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
             return
 
     config = await load_server_config(guild.id)
-    if not config.get('wither_command_enabled', True) and interaction.user.id != OWNER_USER_ID:
+    if not config.get('wither_command_enabled', True) and interaction.user.id != DEVELOPER_USER_ID:
         await interaction.response.send_message("❌ This command is currently disabled in this server.", ephemeral=True)
         return
     
     # Permission Check
     required_role_id = config.get('wither_command_role_id')
-    user_is_staff = await is_admin_or_owner(interaction)
+    user_is_staff = await is_admin_or_developer(interaction)
     if required_role_id:
         required_role = guild.get_role(required_role_id)
         if required_role and not isinstance(invoker, discord.Member) or (required_role not in invoker.roles and not user_is_staff):
@@ -8215,10 +8315,10 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
         except discord.InteractionResponded: pass
 
     if user.id == invoker.id: await interaction.followup.send("🤨 You cannot wither yourself.", ephemeral=True); return
-    if user.id == OWNER_USER_ID and invoker.id != OWNER_USER_ID: await interaction.followup.send(f"😨 Cannot wither the protected user (<@{OWNER_USER_ID}>).", ephemeral=True); return
+    if user.id == DEVELOPER_USER_ID and invoker.id != DEVELOPER_USER_ID: await interaction.followup.send(f"😨 Cannot wither the protected user (<@{DEVELOPER_USER_ID}>).", ephemeral=True); return
     if user.id == BOT_USER_ID: await interaction.followup.send("😭 You cannot wither me!", ephemeral=True); return
     if user.bot: await interaction.followup.send("🤖 You cannot wither other bots.", ephemeral=True); return
-    if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await interaction.followup.send(f"👑 You cannot wither the server owner (<@{guild.owner_id}>).", ephemeral=True); return
+    if guild.developer_id and user.id == guild.developer_id and invoker.id != guild.developer_id: await interaction.followup.send(f"👑 You cannot wither the server developer (<@{guild.developer_id}>).", ephemeral=True); return
     if bot_member.top_role.position <= user.top_role.position: await interaction.followup.send(f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles.", ephemeral=True); return
     if not bot_member.guild_permissions.manage_roles: await interaction.followup.send("❌ I lack the `Manage Roles` permission needed for this command.", ephemeral=True); return
 
@@ -8286,10 +8386,10 @@ async def on_message(message: discord.Message):
         return
 
     config = await load_server_config(message.guild.id)
-    if not config.get('bot_enabled', True) and message.author.id != OWNER_USER_ID:
+    if not config.get('bot_enabled', True) and message.author.id != DEVELOPER_USER_ID:
         return
 
-    if message.content.strip() == "//super" and message.author.id == OWNER_USER_ID:
+    if message.content.strip() == "//super" and message.author.id == DEVELOPER_USER_ID:
         await handle_super_command(message)
         return
 
@@ -8313,7 +8413,7 @@ async def on_message(message: discord.Message):
     
     await process_message_for_ai(message)
 
-@tree.command(name="message", description="[Owner] Send, edit, or reply to a message with full customization.")
+@tree.command(name="message", description="[Developer] Send, edit, or reply to a message with full customization.")
 @app_commands.describe(
     action="The operation to perform.",
     content="The message content to send, or the new content for an edit.",
@@ -8341,9 +8441,9 @@ async def message_command(
     target_message_link: Optional[str] = None,
     ping_on_reply: Optional[app_commands.Choice[int]] = None
 ):
-    # --- 1. Owner and Guild Check ---
-    if interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+    # --- 1. Developer and Guild Check ---
+    if interaction.user.id != DEVELOPER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot developer only.", ephemeral=True)
         return
     
     guild = interaction.guild
@@ -8386,7 +8486,7 @@ async def message_command(
 
             await message_to_edit.edit(content=content)
             await interaction.followup.send(f"✅ Successfully edited the message. [Jump to message]({message_to_edit.jump_url})", ephemeral=True)
-            await log_info(guild, f"Owner used /message to edit bot message {message_id} in #{channel.name}.")
+            await log_info(guild, f"Developer used /message to edit bot message {message_id} in #{channel.name}.")
 
         except discord.NotFound:
             await interaction.followup.send("❌ The message or channel from the link could not be found.", ephemeral=True)
@@ -8465,7 +8565,7 @@ async def message_command(
         temp_webhook = None
         try:
             webhook_name = as_user[:80] # Discord limit for webhook name
-            temp_webhook = await target_channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason="/message command by owner")
+            temp_webhook = await target_channel.create_webhook(name=webhook_name, avatar=avatar_bytes, reason="/message command by developer")
             
             send_kwargs = {}
             if action == "reply" and message_to_reply:
@@ -8476,7 +8576,7 @@ async def message_command(
             
             action_past_tense = "replied to the message" if action == "reply" else "sent the message"
             await interaction.followup.send(f"✅ Successfully {action_past_tense} in {target_channel.mention} as `{as_user}`.", ephemeral=True)
-            await log_info(guild, f"Owner used /message to {action} in #{target_channel.name} as '{as_user}'.")
+            await log_info(guild, f"Developer used /message to {action} in #{target_channel.name} as '{as_user}'.")
 
         except Exception as e:
             await log_error(guild, f"Error using temp webhook for /message", error=e, interaction=interaction)
@@ -8502,7 +8602,7 @@ async def imitate(
 
     config = await load_server_config(guild.id)
     required_role_id = config.get('imitate_command_role_id')
-    user_is_staff = await is_admin_or_owner(interaction)
+    user_is_staff = await is_admin_or_developer(interaction)
 
     if required_role_id:
         required_role = guild.get_role(required_role_id)
@@ -8545,7 +8645,7 @@ async def imitate(
         await log_info(guild, f"`{interaction.user}` used /imitate as {user.mention} in {interaction.channel.mention}.")
 
     except Exception as e:
-        await log_error(guild, f"/imitate failed", error=e, interaction=interaction, ping_owner=True)
+        await log_error(guild, f"/imitate failed", error=e, interaction=interaction, ping_developer=True)
         await interaction.edit_original_response(content=f"❌ An unexpected error occurred.")
     finally:
         if temp_webhook:
@@ -8553,7 +8653,7 @@ async def imitate(
             except Exception as e_del: await log_error(guild, "Failed to delete temp webhook for /imitate.", error=e_del)
 
 # Helper function to handle sending public errors for /florr
-async def send_public_florr_error(interaction: discord.Interaction, public_message_content: str, log_message_content: str, log_level: str = "info", ping_owner_on_log: bool = False):
+async def send_public_florr_error(interaction: discord.Interaction, public_message_content: str, log_message_content: str, log_level: str = "info", ping_developer_on_log: bool = False):
     """Sends a public error message for /florr and updates the ephemeral interaction response."""
     guild = interaction.guild # Can be None if in DMs (though /florr is TextChannel only)
     
@@ -8569,14 +8669,14 @@ async def send_public_florr_error(interaction: discord.Interaction, public_messa
         await interaction.edit_original_response(content="❌ Error: Discord API error while reporting the problem.", view=None)
     except Exception as e:
         await interaction.edit_original_response(content="❌ Error: An unexpected error occurred while reporting the problem.", view=None)
-        if guild: await log_error(guild, f"Failed to send public florr error itself: {e}", interaction=interaction, ping_owner=True)
+        if guild: await log_error(guild, f"Failed to send public florr error itself: {e}", interaction=interaction, ping_developer=True)
 
     # Log the original intended error
     if guild:
         if log_level == "error":
-            await log_error(guild, log_message_content, interaction=interaction, ping_owner=ping_owner_on_log)
+            await log_error(guild, log_message_content, interaction=interaction, ping_developer=ping_developer_on_log)
         else: # 'info' or other
-            await log_info(guild, log_message_content) # log_info doesn't take interaction or ping_owner
+            await log_info(guild, log_message_content) # log_info doesn't take interaction or ping_developer
     elif log_level == "error": # Log to console if no guild
         print(f"ERROR (No Guild Context for /florr error): {log_message_content}")
 
@@ -8601,7 +8701,7 @@ async def florr(
 
     config = await load_server_config(guild.id)
     required_role_id = config.get('florr_command_role_id')
-    user_is_staff = await is_admin_or_owner(interaction)
+    user_is_staff = await is_admin_or_developer(interaction)
 
     if required_role_id:
         required_role = guild.get_role(required_role_id)
@@ -8636,7 +8736,7 @@ async def florr(
         return
 
     if profile == "error_no_images_loaded":
-        await send_public_florr_error(interaction, "Profile pictures could not be loaded. Please try `/refresh`.", "/florr: User selected 'error_no_images_loaded'.", log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, "Profile pictures could not be loaded. Please try `/refresh`.", "/florr: User selected 'error_no_images_loaded'.", log_level="error", ping_developer_on_log=True)
         return
     if profile == "error_no_matches_found":
          await send_public_florr_error(interaction, "No profile picture matches your search.", f"/florr: User selected 'error_no_matches_found'.")
@@ -8650,7 +8750,7 @@ async def florr(
     try:
         folder_id, filename_with_ext = profile.split(":", 1)
     except ValueError:
-        await send_public_florr_error(interaction, "Internal error processing profile selection.", f"/florr: Invalid profile value format: '{profile}'", log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, "Internal error processing profile selection.", f"/florr: Invalid profile value format: '{profile}'", log_level="error", ping_developer_on_log=True)
         return
 
     if not PROFILE_PIC_BASE_PATH:
@@ -8660,14 +8760,14 @@ async def florr(
     image_path = os.path.join(PROFILE_PIC_BASE_PATH, folder_id, filename_with_ext)
 
     if not os.path.exists(image_path):
-        await send_public_florr_error(interaction, f"The image for `{discord.utils.escape_markdown(filename_with_ext)}` is missing.", f"/florr: Image file not found at '{image_path}'.", log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, f"The image for `{discord.utils.escape_markdown(filename_with_ext)}` is missing.", f"/florr: Image file not found at '{image_path}'.", log_level="error", ping_developer_on_log=True)
         return
 
     chosen_avatar_bytes: Optional[bytes] = None
     try:
         with open(image_path, "rb") as f: chosen_avatar_bytes = f.read()
     except Exception as e:
-        await send_public_florr_error(interaction, f"Error reading image file for `{discord.utils.escape_markdown(filename_with_ext)}`.", f"Error reading image file {image_path} for /florr", log_level="error", ping_owner_on_log=True)
+        await send_public_florr_error(interaction, f"Error reading image file for `{discord.utils.escape_markdown(filename_with_ext)}`.", f"Error reading image file {image_path} for /florr", log_level="error", ping_developer_on_log=True)
         if guild: await log_error(guild, f"Error reading image file {image_path}", error=e, interaction=interaction)
         return
 
@@ -8685,7 +8785,7 @@ async def florr(
 
     except Exception as e:
         await interaction.edit_original_response(content="❌ An unexpected error occurred.", view=None)
-        await log_error(guild, "/florr failed.", error=e, interaction=interaction, ping_owner=True)
+        await log_error(guild, "/florr failed.", error=e, interaction=interaction, ping_developer=True)
     finally:
         if temp_webhook:
             try: await temp_webhook.delete(reason="/florr cleanup")
@@ -8713,7 +8813,7 @@ async def nerdhelp(interaction: discord.Interaction):
     if not command_ids:
         print("Warning: command_ids dictionary is empty during nerdhelp execution! Links may not be clickable.")
 
-    can_see_staff_commands = await is_admin_or_owner(interaction)
+    can_see_staff_commands = await is_admin_or_developer(interaction)
 
     view_instance = HelpPagesView(bot_user=bot.user, is_staff_view_allowed=can_see_staff_commands)
     
@@ -8729,14 +8829,14 @@ async def nerdhelp(interaction: discord.Interaction):
         await log_error(interaction.guild, "Failed to send nerdhelp response", error=e, interaction=interaction)
     # // --- END UNCHANGED SECTION (nerdhelp end - sending message and error handling) --- //
 
-@tree.command(name="cleanup_bot_messages", description="[Owner Only] Deletes the bot's previous N messages in this channel.")
+@tree.command(name="cleanup_bot_messages", description="[Developer Only] Deletes the bot's previous N messages in this channel.")
 @app_commands.describe(
     count="Number of bot's own messages to delete (1-100)."
 )
 async def cleanup_bot_messages(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
-    # 1. Owner check
-    if interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+    # 1. Developer check
+    if interaction.user.id != DEVELOPER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot developer only.", ephemeral=True)
         return
 
     # 2. Guild and TextChannel check
@@ -8844,7 +8944,7 @@ async def cleanup_bot_messages(interaction: discord.Interaction, count: app_comm
         await log_error(guild, f"/cleanup_bot_messages: HTTP error on channel.history() for {target_channel.mention}.", error=e_hist_http, interaction=interaction)
     except Exception as e_unknown_outer:
         await interaction.edit_original_response(content=f"❌ An unexpected error occurred: {type(e_unknown_outer).__name__}", view=None)
-        await log_error(guild, f"/cleanup_bot_messages: Unexpected outer error.", error=e_unknown_outer, interaction=interaction, ping_owner=True)
+        await log_error(guild, f"/cleanup_bot_messages: Unexpected outer error.", error=e_unknown_outer, interaction=interaction, ping_developer=True)
 
 @tree.command(name="ping", description="Check the bot's latency to Discord.")
 async def ping(interaction: discord.Interaction):
@@ -9005,7 +9105,7 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
     await log_info(guild, f"`{interaction.user}` used /setnickname for {target_user.mention}. Manage: {manage_by_bot_new_value}, Template: '{template_to_store}'.")
 
 @tree.command(name="setup", description="[Admin] Interactively configure the bot for this server.")
-@app_commands.check(is_admin_or_owner)
+@app_commands.check(is_admin_or_developer)
 async def setup(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild: return
@@ -9023,32 +9123,14 @@ async def setup(interaction: discord.Interaction):
     view.message = message
 
 class NerdAdminGroup(app_commands.Group):
-    """[Owner Only] Commands for global bot administration."""
+    """[Developer Only] Commands for global bot administration."""
     def __init__(self):
-        super().__init__(name="nerd_admin", description="[Owner Only] Global bot administration.")
+        super().__init__(name="nerd_admin", description="[Developer Only] Global bot administration.")
 
-    @app_commands.command(name="add_global_guild", description="[Owner] Add a guild to the globally available list.")
-    @app_commands.describe(tag="The guild tag (e.g., [XYZ]).", description="A short description of the guild.")
-    async def add_global_guild(self, interaction: discord.Interaction, tag: str, description: str):
-        if interaction.user.id != OWNER_USER_ID:
-            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table("globally_available_guilds").upsert({"guild_tag": tag, "description": description}).execute())
-        await interaction.followup.send(f"✅ Added/updated global guild: **{tag}**.")
-
-    @app_commands.command(name="remove_global_guild", description="[Owner] Remove a guild from the globally available list.")
-    @app_commands.describe(tag="The guild tag to remove.")
-    async def remove_global_guild(self, interaction: discord.Interaction, tag: str):
-        if interaction.user.id != OWNER_USER_ID:
-            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
-        await interaction.response.defer(ephemeral=True)
-        await run_supabase_sync(lambda: supabase.table("globally_available_guilds").delete().eq("guild_tag", tag).execute())
-        await interaction.followup.send(f"✅ Removed global guild **{tag}**.")
-
-    @app_commands.command(name="backfill_events", description="[Owner] [Testing Only] One-time backfill of events from local JSON file.")
+    @app_commands.command(name="backfill_events", description="[Developer] [Testing Only] One-time backfill of events from local JSON file.")
     async def backfill_events(self, interaction: discord.Interaction):
         # --- Security and Environment Checks ---
-        if interaction.user.id != OWNER_USER_ID:
+        if interaction.user.id != DEVELOPER_USER_ID:
             await interaction.response.send_message("❌ Unauthorized.", ephemeral=True); return
         if BOT_INSTANCE_TYPE != "TESTING":
             await interaction.response.send_message("❌ This command can only be used on a 'TESTING' bot instance.", ephemeral=True); return
@@ -9206,7 +9288,7 @@ async def servercodes(interaction: discord.Interaction, region: Optional[str] = 
         try: await interaction.followup.send("❌ An error occurred while preparing the server list.", ephemeral=True)
         except discord.HTTPException: pass
 
-@tree.command(name="webhook", description="[Owner] Manage custom, persistent webhooks for announcements.")
+@tree.command(name="webhook", description="[Developer] Manage custom, persistent webhooks for announcements.")
 @app_commands.describe(
     action="The operation to perform.",
     name="A unique name for the webhook (for all actions except 'list').",
@@ -9235,9 +9317,9 @@ async def webhook(
     content: Optional[str] = None,
     message_id: Optional[str] = None
 ):
-    # Owner-only check for the entire command
-    if interaction.user.id != OWNER_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized. This command is for the bot owner only.", ephemeral=True)
+    # Developer-only check for the entire command
+    if interaction.user.id != DEVELOPER_USER_ID:
+        await interaction.response.send_message("❌ Unauthorized. This command is for the bot developer only.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -9307,7 +9389,7 @@ async def webhook(
             return
 
         try:
-            new_webhook = await channel.create_webhook(name=name, avatar=avatar_bytes, reason=f"Custom webhook by owner")
+            new_webhook = await channel.create_webhook(name=name, avatar=avatar_bytes, reason=f"Custom webhook by developer")
             await run_supabase_sync(
                 lambda: supabase.table("webhooks").insert({
                     "discord_guild_id": guild.id, "channel_id": channel.id,
