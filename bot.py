@@ -1944,21 +1944,6 @@ def _normalize_guild_tag(tag: str) -> str:
         return cleaned_tag
     return f"[{cleaned_tag}]"
 
-async def tracked_guild_tag_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocompletes tags of currently tracked guilds for the server."""
-    if not interaction.guild:
-        return []
-    
-    config = await load_server_config(interaction.guild.id)
-    tracked_guilds = config.get('tracked_guilds', {})
-    
-    choices = [
-        app_commands.Choice(name=tag, value=tag)
-        for tag in tracked_guilds.keys()
-        if not current or current.lower() in tag.lower()
-    ]
-    return choices[:25]
-
 async def check_is_admin(interaction: discord.Interaction) -> bool:
     """Check if the user has administrator permissions."""
     return interaction.permissions.administrator
@@ -2430,7 +2415,7 @@ class SetupView(discord.ui.View):
             guilds_val = "\n".join(guilds_val_parts)
         else:
             guilds_val = "`No guilds are being tracked yet.`"
-        embed.add_field(name=f"Tracked Florr Guilds (use /setup_guild to manage)", value=guilds_val, inline=False)
+        embed.add_field(name=f"Tracked Florr Guilds", value=guilds_val, inline=False)
 
         # --- Command Permissions ---
         perms_val = (
@@ -2461,11 +2446,17 @@ class SetupView(discord.ui.View):
         if len(updates) > 1:
             await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
         
+        await self.refresh_view(interaction)
+    
+    async def refresh_view(self, interaction: discord.Interaction):
+        """Reloads the config from DB and updates the message embed."""
+        if not self.guild: return
+        # Force a reload from DB
         if self.guild.id in server_settings_cache:
             del server_settings_cache[self.guild.id]
-        
         self.config = await load_server_config(self.guild.id)
         
+        # Update the message with the fresh embed
         if self.message:
             await self.message.edit(embed=self.create_embed(), view=self)
 
@@ -2533,7 +2524,15 @@ class SetupView(discord.ui.View):
         modal = SetupModal(title="Set Enabled Bot Modules", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Add Tracked Guild", style=discord.ButtonStyle.success, row=2)
+    async def add_tracked_guild_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddTrackedGuildModal(self))
+
+    @discord.ui.button(label="Remove Tracked Guild", style=discord.ButtonStyle.danger, row=2)
+    async def remove_tracked_guild_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RemoveTrackedGuildModal(self))
+
+    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=3)
     async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
             {'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) else "no"},
@@ -2542,7 +2541,7 @@ class SetupView(discord.ui.View):
         modal = SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=3)
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=4)
     async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)
         self.stop()
@@ -2558,7 +2557,7 @@ class SetupView(discord.ui.View):
             
             if not value_stripped:
                 # For array types, set to an empty array; for others, set to None
-                updates[key] = [] if key.endswith('_ids') else None
+                updates[key] = [] if key.endswith('_ids') or key.endswith('_channels') else None
                 resolved_items.append(f"Cleared setting for `{key}`.")
                 continue
 
@@ -3049,14 +3048,13 @@ async def _format_announcement(data: Dict[str, Any]) -> str:
     return "Could not format announcement."
 
 async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Member):
-    """Syncs a single user's roles based on their database state (connection, guild tag, and ex-member status)."""
+    """Syncs a single user's roles based on their database state (connection, guild tag). Ex-member role is handled separately."""
     if not supabase or not guild.me.guild_permissions.manage_roles:
         return
 
     config = await load_server_config(guild.id)
     verified_role_id = config.get('verified_role_id')
     unverified_role_id = config.get('unverified_role_id')
-    ex_member_role_id = config.get('ex_member_role_id')
     tracked_guilds_config = config.get('tracked_guilds', {})
     
     roles_to_add = []
@@ -3078,7 +3076,7 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
                 roles_to_add.append(verified_role)
             if unverified_role and unverified_role in member.roles and guild.me.top_role > unverified_role:
                 roles_to_remove.append(unverified_role)
-        else:
+        else: # Not connected
             if unverified_role and unverified_role not in member.roles and guild.me.top_role > unverified_role:
                 roles_to_add.append(unverified_role)
             if verified_role and verified_role in member.roles and guild.me.top_role > verified_role:
@@ -3102,24 +3100,18 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
                 if role_obj and role_obj in member.roles and guild.me.top_role > role_obj:
                     roles_to_remove.append(role_obj)
 
-        # 3. Handle Ex-Member Role
-        ex_member_role = guild.get_role(ex_member_role_id) if ex_member_role_id else None
-        if ex_member_role:
-            is_unverified = unverified_role and unverified_role in member.roles
-            # Add ex-member role if user is connected, not in a tracked guild, AND is not considered "unverified".
-            if is_connected and not is_in_tracked_guild and not is_unverified and ex_member_role not in member.roles and guild.me.top_role > ex_member_role:
-                roles_to_add.append(ex_member_role)
-            # Remove ex-member role if user is not connected, or has joined a tracked guild, or is currently considered unverified.
-            elif (not is_connected or is_in_tracked_guild or is_unverified) and ex_member_role in member.roles and guild.me.top_role > ex_member_role:
-                roles_to_remove.append(ex_member_role)
+        # Ex-member role logic is now handled exclusively by /setguild.
 
-        # 4. Apply changes
+        # 3. Apply changes
         if roles_to_add or roles_to_remove:
-            final_roles = [r for r in member.roles if r not in roles_to_remove] + roles_to_add
-            await member.edit(roles=final_roles, reason="Automatic role sync with database")
-            add_names = [r.name for r in roles_to_add]
-            rem_names = [r.name for r in roles_to_remove]
-            await log_info(guild, f"Synced roles for {member.mention}. Added: {add_names or 'None'}. Removed: {rem_names or 'None'}.")
+            current_roles = set(member.roles)
+            final_roles = (current_roles - set(roles_to_remove)) | set(roles_to_add)
+
+            if final_roles != current_roles:
+                await member.edit(roles=list(final_roles), reason="Automatic role sync with database")
+                add_names = [r.name for r in roles_to_add]
+                rem_names = [r.name for r in roles_to_remove]
+                await log_info(guild, f"Synced roles for {member.mention}. Added: {add_names or 'None'}. Removed: {rem_names or 'None'}.")
 
     except Exception as e:
         await log_error(guild, f"Failed to sync roles for {member.mention}", error=e)
@@ -7998,6 +7990,21 @@ async def setguild(
                 return
 
     await interaction.response.defer(ephemeral=False)
+    
+    # Get current guild status BEFORE update
+    current_db_guild_tag: Optional[str] = None
+    target_member_for_roles: Optional[discord.Member] = user
+
+    if user:
+        user_db_resp = await run_supabase_sync(lambda: supabase.table("florr_players").select("florr_guild_tag").eq("discord_id", str(user.id)).maybe_single().execute())
+        if user_db_resp and user_db_resp.data:
+            current_db_guild_tag = user_db_resp.data.get('florr_guild_tag')
+    elif ingame_name:
+        profile_data = await fetch_profile_details_by_ign(guild, ingame_name)
+        current_db_guild_tag = profile_data.get('florr_guild_tag') if profile_data else None
+        if profile_data and profile_data.get('discord_id'):
+            target_member_for_roles = guild.get_member(int(profile_data['discord_id']))
+
     normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
     
     config = await load_server_config(guild.id)
@@ -8007,11 +8014,9 @@ async def setguild(
     try:
         update_resp = None
         target_display = ""
-        target_member_for_roles: Optional[discord.Member] = None
 
         if user:
             target_display = user.mention
-            target_member_for_roles = user
             update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"florr_guild_tag": normalized_tag}).eq("discord_id", str(user.id)).execute())
         
         elif ingame_name:
@@ -8024,13 +8029,33 @@ async def setguild(
             )
             await load_ign_cache(guild)
             
-            if update_resp and update_resp.data and update_resp.data[0].get('discord_id'):
+            if not target_member_for_roles and update_resp and update_resp.data and update_resp.data[0].get('discord_id'):
                 discord_id = int(update_resp.data[0]['discord_id'])
                 target_member_for_roles = guild.get_member(discord_id)
         
         if not update_resp or not update_resp.data:
             await interaction.followup.send(f"❌ Could not find or create a database record for {target_display}. If targeting a user, use `/connect` first.", ephemeral=True)
             return
+
+        # Handle Ex-Member Role Logic
+        if target_member_for_roles:
+            ex_member_role_id = config.get('ex_member_role_id')
+            ex_member_role = guild.get_role(ex_member_role_id) if ex_member_role_id else None
+
+            if ex_member_role and guild.me.top_role > ex_member_role:
+                tracked_guilds_config = config.get('tracked_guilds', {})
+                was_in_tracked_guild = current_db_guild_tag and current_db_guild_tag in tracked_guilds_config
+                is_now_in_tracked_guild = normalized_tag and normalized_tag in tracked_guilds_config
+
+                if was_in_tracked_guild and not is_now_in_tracked_guild:
+                    if ex_member_role not in target_member_for_roles.roles:
+                        await target_member_for_roles.add_roles(ex_member_role, reason="Left a tracked guild (via /setguild)")
+                        await log_info(guild, f"Added Ex-Member role to {target_member_for_roles.name} via /setguild.")
+                
+                elif is_now_in_tracked_guild:
+                    if ex_member_role in target_member_for_roles.roles:
+                        await target_member_for_roles.remove_roles(ex_member_role, reason="Joined a tracked guild (via /setguild)")
+                        await log_info(guild, f"Removed Ex-Member role from {target_member_for_roles.name} via /setguild.")
 
         if target_member_for_roles:
             await trigger_global_role_sync_for_user(target_member_for_roles)
@@ -9554,117 +9579,131 @@ async def webhook(
             await interaction.followup.send(f"❌ Error removing webhook from DB.", ephemeral=True)
         return
 
-@tree.command(name="setup_guild", description="[Admin] Manage this server's tracked Florr guilds.")
-@app_commands.check(check_is_admin)
-@app_commands.describe(
-    action="The action to perform.",
-    tag="The guild tag (e.g., [HC1]). Required for add, edit, and remove.",
-    role="The role for the guild. Required for 'add', optional for 'edit'."
-)
-@app_commands.choices(action=[
-    app_commands.Choice(name="List Tracked Guilds", value="list"),
-    app_commands.Choice(name="Add a Tracked Guild", value="add"),
-    app_commands.Choice(name="Edit a Tracked Guild", value="edit"),
-    app_commands.Choice(name="Remove a Tracked Guild", value="remove"),
-])
-@app_commands.autocomplete(tag=tracked_guild_tag_autocomplete)
-async def setup_guild(
-    interaction: discord.Interaction,
-    action: str,
-    tag: Optional[str] = None,
-    role: Optional[discord.Role] = None
-):
-    guild = interaction.guild
-    if not guild: return
+async def find_global_guild_by_input(user_input: str) -> Optional[Dict[str, Any]]:
+    """
+    Finds a single globally available guild based on case-insensitive, bracket-agnostic user input.
+    Returns the full guild data dict if a unique match is found, otherwise None.
+    """
+    if not user_input:
+        return None
+    
+    # Normalize user input: remove brackets, lowercase, strip whitespace
+    normalized_input = user_input.strip().replace('[', '').replace(']', '').lower()
 
-    await interaction.response.defer(ephemeral=True)
+    all_global_guilds = await fetch_globally_available_guilds()
+    if not all_global_guilds:
+        return None
 
-    # --- LIST Action ---
-    if action == "list":
-        config = await load_server_config(guild.id)
-        tracked_guilds = config.get('tracked_guilds', {})
+    # Exact match first
+    for guild_data in all_global_guilds:
+        db_tag = guild_data['guild_tag']
+        normalized_db_tag = db_tag.strip().replace('[', '').replace(']', '').lower()
+        if normalized_db_tag == normalized_input:
+            return guild_data
+            
+    # If no exact match, try fuzzy matching (helps with small typos)
+    # This part is more for robustness, the primary logic is the exact match above
+    searchable_names = [g['guild_tag'].strip().replace('[', '').replace(']', '') for g in all_global_guilds]
+    closest_matches = difflib.get_close_matches(normalized_input, searchable_names, n=1, cutoff=0.8)
+    
+    if closest_matches:
+        # Find the original guild_data for the matched name
+        for guild_data in all_global_guilds:
+            if guild_data['guild_tag'].strip().replace('[', '').replace(']', '') == closest_matches[0]:
+                return guild_data
 
-        if not tracked_guilds:
-            await interaction.followup.send("There are no Florr guilds currently being tracked in this server.", ephemeral=True)
+    return None # No unique match found
+
+class AddTrackedGuildModal(discord.ui.Modal, title="Add Tracked Guild"):
+    tag_input = discord.ui.TextInput(
+        label="Guild Tag to Add",
+        placeholder="e.g., HC1 (must be a globally available guild)",
+        style=discord.TextStyle.short,
+        required=True,
+    )
+    role_input = discord.ui.TextInput(
+        label="Associated Role Name/ID",
+        placeholder="e.g., HC1 Members",
+        style=discord.TextStyle.short,
+        required=True,
+    )
+
+    def __init__(self, view_ref: 'SetupView'):
+        super().__init__(timeout=300.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+
+        global_guild_data = await find_global_guild_by_input(self.tag_input.value)
+        if not global_guild_data:
+            await interaction.followup.send(f"❌ Could not find a unique global guild matching '{self.tag_input.value}'. Make sure it's been added via `/dev_setup` first.", ephemeral=True)
+            return
+            
+        canonical_tag = global_guild_data['guild_tag']
+        if canonical_tag in self.view_ref.config.get('tracked_guilds', {}):
+            await interaction.followup.send(f"❌ The guild `{canonical_tag}` is already being tracked on this server.", ephemeral=True)
             return
 
-        embed = discord.Embed(title=f"Tracked Florr Guilds for {guild.name}", color=NERDY_YELLOW)
-        for t, data in sorted(tracked_guilds.items()):
-            role_obj = guild.get_role(data.get('discord_role_id')) if data.get('discord_role_id') else None
-            value = (
-                f"**Discord Role:** {role_obj.mention if role_obj else '`Not Set`'}"
-            )
-            embed.add_field(name=f"Guild Tag: `{t}`", value=value, inline=False)
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-
-    # --- Parameter Validation for other actions ---
-    if not tag:
-        await interaction.followup.send("❌ The `tag` parameter is required for this action.", ephemeral=True)
-        return
-
-    normalized_tag = _normalize_guild_tag(tag)
-    config = await load_server_config(guild.id)
-    existing_guild_data = config.get('tracked_guilds', {}).get(normalized_tag)
-
-    # --- ADD Action ---
-    if action == "add":
-        if not role:
-            await interaction.followup.send("❌ The `role` parameter is required to add a guild.", ephemeral=True)
+        role_id, role_error = await resolve_name_to_id(guild, self.role_input.value, 'role')
+        if not role_id:
+            await interaction.followup.send(f"❌ Could not resolve the role: {role_error}", ephemeral=True)
             return
-        if existing_guild_data:
-            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is already tracked. Use `/setup_guild action:edit` to modify it.", ephemeral=True)
-            return
-        
+
         try:
             await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").insert({
                 "discord_guild_id": guild.id,
-                "florr_guild_tag": normalized_tag,
-                "discord_role_id": role.id,
-                "member_list_channel_id": None # This is now obsolete
+                "florr_guild_tag": canonical_tag,
+                "discord_role_id": role_id
             }).execute())
-            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
-            await interaction.followup.send(f"✅ Successfully added `{normalized_tag}` to the tracked guilds list.", ephemeral=True)
-            await log_info(guild, f"{interaction.user.name} added tracked guild '{normalized_tag}' via /setup_guild.")
-        except Exception as e:
-            await log_error(guild, f"Failed to add tracked guild {normalized_tag}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database error occurred while adding the guild.", ephemeral=True)
-
-    # --- EDIT Action ---
-    elif action == "edit":
-        if not role:
-            await interaction.followup.send("❌ You must provide a new `role` to edit.", ephemeral=True)
-            return
-        if not existing_guild_data:
-            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is not currently being tracked.", ephemeral=True)
-            return
             
-        updates = {'discord_role_id': role.id}
+            await self.view_ref.refresh_view(interaction)
+            await interaction.followup.send(f"✅ Successfully added `{canonical_tag}` to the tracked guilds list.", ephemeral=True)
+            await log_info(guild, f"{interaction.user.name} added tracked guild '{canonical_tag}'.")
+
+        except Exception as e:
+            await log_error(guild, f"Failed to add tracked guild {canonical_tag}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred.", ephemeral=True)
+
+class RemoveTrackedGuildModal(discord.ui.Modal, title="Remove Tracked Guild"):
+    tag_input = discord.ui.TextInput(
+        label="Guild Tag to Remove",
+        placeholder="e.g., HC1",
+        style=discord.TextStyle.short,
+        required=True
+    )
+
+    def __init__(self, view_ref: 'SetupView'):
+        super().__init__(timeout=300.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+
+        normalized_input = self.tag_input.value.strip().replace('[', '').replace(']', '').lower()
+        server_tracked_guilds = self.view_ref.config.get('tracked_guilds', {})
         
-        try:
-            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").update(updates).eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
-            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
-            await interaction.followup.send(f"✅ Successfully edited `{normalized_tag}`.", ephemeral=True)
-            await log_info(guild, f"{interaction.user.name} edited tracked guild '{normalized_tag}' via /setup_guild.")
-        except Exception as e:
-            await log_error(guild, f"Failed to edit tracked guild {normalized_tag}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database error occurred while editing the guild.", ephemeral=True)
+        tag_to_remove = None
+        for tracked_tag in server_tracked_guilds.keys():
+            if tracked_tag.strip().replace('[', '').replace(']', '').lower() == normalized_input:
+                tag_to_remove = tracked_tag
+                break
 
-    # --- REMOVE Action ---
-    elif action == "remove":
-        if not existing_guild_data:
-            await interaction.followup.send(f"❌ The guild `{normalized_tag}` is not currently being tracked.", ephemeral=True)
+        if not tag_to_remove:
+            await interaction.followup.send(f"❌ The guild `{self.tag_input.value}` is not currently being tracked on this server.", ephemeral=True)
             return
-            
+
         try:
-            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", guild.id).eq("florr_guild_tag", normalized_tag).execute())
-            if guild.id in server_settings_cache: del server_settings_cache[guild.id]
-            await interaction.followup.send(f"✅ Successfully removed `{normalized_tag}` from the tracked guilds list.", ephemeral=True)
-            await log_info(guild, f"{interaction.user.name} removed tracked guild '{normalized_tag}' via /setup_guild.")
+            await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").delete().eq("discord_guild_id", guild.id).eq("florr_guild_tag", tag_to_remove).execute())
+            await self.view_ref.refresh_view(interaction)
+            await interaction.followup.send(f"✅ Successfully removed `{tag_to_remove}` from the tracked guilds list.", ephemeral=True)
+            await log_info(guild, f"{interaction.user.name} removed tracked guild '{tag_to_remove}'.")
+
         except Exception as e:
-            await log_error(guild, f"Failed to remove tracked guild {normalized_tag}", error=e, interaction=interaction)
-            await interaction.followup.send("❌ A database error occurred while removing the guild.", ephemeral=True)
+            await log_error(guild, f"Failed to remove tracked guild {tag_to_remove}", error=e, interaction=interaction)
+            await interaction.followup.send("❌ A database error occurred.", ephemeral=True)
 
 @tree.command(name="help", description="Shows a pointer to the main help command.")
 async def help_command(interaction: discord.Interaction):
