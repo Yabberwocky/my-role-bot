@@ -4783,7 +4783,7 @@ async def update_custom_nickname_on_attempt(
             return
 
         bot_member = guild.me
-        if user.id == guild.developer_id:
+        if user.id == guild.owner_id:
             await log_info(guild, f"Nickname update skipped for {user.mention}: Cannot manage the server developer's nickname.")
             return
         if bot_member.top_role <= user.top_role:
@@ -8318,7 +8318,7 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     if user.id == DEVELOPER_USER_ID and invoker.id != DEVELOPER_USER_ID: await interaction.followup.send(f"😨 Cannot wither the protected user (<@{DEVELOPER_USER_ID}>).", ephemeral=True); return
     if user.id == BOT_USER_ID: await interaction.followup.send("😭 You cannot wither me!", ephemeral=True); return
     if user.bot: await interaction.followup.send("🤖 You cannot wither other bots.", ephemeral=True); return
-    if guild.developer_id and user.id == guild.developer_id and invoker.id != guild.developer_id: await interaction.followup.send(f"👑 You cannot wither the server developer (<@{guild.developer_id}>).", ephemeral=True); return
+    if guild.owner_id and user.id == guild.owner_id and invoker.id != guild.owner_id: await interaction.followup.send(f"👑 You cannot wither the server owner (<@{guild.owner_id}>).", ephemeral=True); return
     if bot_member.top_role.position <= user.top_role.position: await interaction.followup.send(f"❌ My highest role ('{bot_member.top_role.name}') is not high enough to manage {user.mention}'s roles.", ephemeral=True); return
     if not bot_member.guild_permissions.manage_roles: await interaction.followup.send("❌ I lack the `Manage Roles` permission needed for this command.", ephemeral=True); return
 
