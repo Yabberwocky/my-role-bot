@@ -2271,19 +2271,21 @@ async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: s
     # 1. Check if it's already a valid ID
     if name_or_id.isdigit():
         item_id = int(name_or_id)
-        if item_type == 'role' and guild.get_role(item_id):
-            return item_id, None
-        if item_type == 'channel' and guild.get_channel(item_id):
-            return item_id, None
+        if item_type == 'role':
+            if guild.get_role(item_id):
+                return item_id, None
+        elif item_type == 'channel':
+            if guild.get_channel(item_id):
+                return item_id, None
     
     # 2. Fuzzy match against names
     search_space = guild.roles if item_type == 'role' else guild.text_channels
     name_lower = name_or_id.lower()
     
     # Exact match (case-insensitive)
-    exact_matches = [item for item in search_space if item.name.lower() == name_lower]
-    if len(exact_matches) == 1:
-        return exact_matches[0].id, None
+    for item in search_space:
+        if item.name.lower() == name_lower:
+            return item.id, None
 
     # Partial match (starts with)
     partial_matches = [item for item in search_space if item.name.lower().startswith(name_lower)]
@@ -2291,23 +2293,24 @@ async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: s
         return partial_matches[0].id, None
 
     # Difflib fuzzy match as a last resort
-    closest_matches = difflib.get_close_matches(name_lower, [item.name.lower() for item in search_space], n=2, cutoff=0.7)
+    closest_matches = difflib.get_close_matches(name_lower, [item.name for item in search_space], n=2, cutoff=0.7)
     if len(closest_matches) == 1:
+        # We need to find the item object from the matched name
+        # Using discord.utils.get is perfect for this.
         matched_item = discord.utils.get(search_space, name=closest_matches[0])
         if matched_item:
             return matched_item.id, None
     
     # 3. Handle failure cases
-    if not closest_matches and not partial_matches and not exact_matches:
-        return None, f"⚠️ No role/channel found for '{name_or_id}'."
+    possible_matches = set()
+    if partial_matches: possible_matches.update(i.name for i in partial_matches)
+    if closest_matches: possible_matches.update(i for i in closest_matches)
+
+    if not possible_matches:
+        return None, f"⚠️ No {item_type} found for '{name_or_id}'."
     else:
         # Ambiguous match
-        all_possible = set()
-        if exact_matches: all_possible.update(i.name for i in exact_matches)
-        if partial_matches: all_possible.update(i.name for i in partial_matches)
-        if closest_matches: all_possible.update(i for i in closest_matches)
-
-        return None, f"❓ Ambiguous. Could be: {', '.join(f'`{n}`' for n in list(all_possible)[:3])}."
+        return None, f"❓ Ambiguous. Could be: {', '.join(f'`{n}`' for n in list(possible_matches)[:3])}."
 
 async def trigger_global_role_sync_for_user(user: discord.Member):
     """
@@ -2381,11 +2384,16 @@ class SetupView(discord.ui.View):
             return "✅ Enabled" if self.config.get(key, True) else "❌ Disabled"
 
         # --- Roles ---
+        mod_role_ids = self.config.get('moderator_role_ids') or []
+        mod_mentions = [get_mention(rid, 'role') for rid in mod_role_ids]
+        mod_val = ", ".join(mod_mentions) if mod_mentions else "`Not Set`"
+        
         roles_val = (
             f"**Verified:** {get_mention(self.config.get('verified_role_id'), 'role')}\n"
             f"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
             f"**Withered:** {get_mention(self.config.get('withered_role_id'), 'role')}\n"
-            f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}"
+            f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}\n"
+            f"**Moderators:** {mod_val}"
         )
         embed.add_field(name="Core Roles", value=roles_val, inline=False)
         
@@ -2418,8 +2426,6 @@ class SetupView(discord.ui.View):
             guilds_val_parts = []
             for tag, data in sorted(tracked_guilds.items()):
                 role_mention = get_mention(data.get('discord_role_id'), 'role')
-                # The per-guild list channel is no longer used, so we don't display it here.
-                # Just show the role associated with the tag.
                 guilds_val_parts.append(f"**{tag}**: Role -> {role_mention}")
             guilds_val = "\n".join(guilds_val_parts)
         else:
@@ -2455,26 +2461,27 @@ class SetupView(discord.ui.View):
         if len(updates) > 1:
             await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
         
-        # Invalidate the cache to force a reload from the database
         if self.guild.id in server_settings_cache:
             del server_settings_cache[self.guild.id]
         
-        # This call will now fetch fresh data from Supabase and repopulate the cache
         self.config = await load_server_config(self.guild.id)
         
-        # Now update the message with an embed reflecting the new, live configuration
         if self.message:
             await self.message.edit(embed=self.create_embed(), view=self)
 
     @discord.ui.button(label="Set Roles", style=discord.ButtonStyle.primary, row=0)
     async def set_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_mod_roles = self.config.get('moderator_role_ids', [])
+        default_mod_roles_str = ', '.join(map(str, current_mod_roles)) if current_mod_roles else ''
+
         fields = [
             {'label': "Verified Role Name/ID", 'id': "verified_role_id", 'default': str(self.config.get('verified_role_id') or '')},
             {'label': "Unverified Role Name/ID", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
             {'label': "Withered Role Name/ID", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
             {'label': "Ex-Member Role Name/ID", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
+            {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'placeholder': "e.g., Mod, Staff, 123456789...", 'default': default_mod_roles_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
         ]
-        modal = SetupModal(title="Set Core Roles", fields=fields, callback_func=self.handle_modal_submit)
+        modal = SetupModal(title="Set Core & Moderator Roles", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=0)
@@ -2550,8 +2557,31 @@ class SetupView(discord.ui.View):
             value_stripped = value.strip()
             
             if not value_stripped:
-                updates[key] = None
+                # For array types, set to an empty array; for others, set to None
+                updates[key] = [] if key.endswith('_ids') else None
                 resolved_items.append(f"Cleared setting for `{key}`.")
+                continue
+
+            # Handle comma-separated lists for roles and channels
+            if key in ['always_on_ai_channels', 'moderator_role_ids']:
+                item_type = 'channel' if key == 'always_on_ai_channels' else 'role'
+                inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]
+                resolved_ids = []
+                temp_errors = []
+                for item_input in inputs:
+                    resolved_id, status_msg = await resolve_name_to_id(self.guild, item_input, item_type)
+                    if resolved_id:
+                        resolved_ids.append(resolved_id)
+                    else:
+                        temp_errors.append(f"Could not resolve '{item_input}': {status_msg}")
+                
+                if not temp_errors:
+                    updates[key] = resolved_ids
+                    mention_prefix = '#' if item_type == 'channel' else '@&'
+                    mentions = [f"<{mention_prefix}{cid}>" for cid in resolved_ids]
+                    resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
+                else:
+                    errors.extend(temp_errors)
                 continue
 
             if key.endswith('_enabled'):
@@ -2563,25 +2593,6 @@ class SetupView(discord.ui.View):
                     resolved_items.append(f"Set `{key}` to ❌ Disabled.")
                 else:
                     errors.append(f"For `{key}`: Invalid input. Please use 'yes' or 'no'.")
-                continue
-
-            if key == 'always_on_ai_channels':
-                channel_inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]
-                resolved_ids = []
-                temp_errors = []
-                for channel_input in channel_inputs:
-                    resolved_id, status_msg = await resolve_name_to_id(self.guild, channel_input, 'channel')
-                    if resolved_id:
-                        resolved_ids.append(resolved_id)
-                    else:
-                        temp_errors.append(f"Could not resolve '{channel_input}': {status_msg}")
-                
-                if not temp_errors:
-                    updates[key] = resolved_ids
-                    mentions = [f"<#{cid}>" for cid in resolved_ids]
-                    resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
-                else:
-                    errors.extend(temp_errors)
                 continue
 
             if key == 'enabled_modules':
@@ -2619,6 +2630,42 @@ class SetupView(discord.ui.View):
         if self.message:
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
+
+async def check_is_staff(interaction: discord.Interaction) -> Tuple[bool, Optional[str]]:
+    """
+    Checks if a user has staff permissions.
+    
+    Permissions are granted if:
+    1. The invoker is the bot developer.
+    2. The invoker has a configured moderator role.
+    3. The invoker has 'Manage Server' permission.
+
+    Returns:
+        Tuple[bool, Optional[str]]: (is_staff, error_message)
+    """
+    invoker = interaction.user
+    
+    # 1. Developer is always staff.
+    if invoker.id == DEVELOPER_USER_ID:
+        return True, None
+        
+    if not isinstance(invoker, discord.Member):
+        return False, "This check requires you to be a member of the server."
+
+    # 2. Check for configured moderator roles.
+    config = await load_server_config(interaction.guild.id)
+    mod_role_ids = config.get('moderator_role_ids')
+    if mod_role_ids:
+        invoker_role_ids = {role.id for role in invoker.roles}
+        if any(mod_id in invoker_role_ids for mod_id in mod_role_ids):
+            return True, None
+    
+    # 3. Check for 'Manage Server' permission.
+    if invoker.guild_permissions.manage_guild:
+        return True, None
+
+    error_message = "You need to be a server administrator or have a designated moderator role to perform this action on others."
+    return False, error_message
 
 async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, Optional[str]]:
     """
@@ -7716,12 +7763,21 @@ def get_cmd_mention(name: str) -> str:
 # --- Slash Commands ---
 
 # --- Verify Command ---
-@tree.command(name="verify", description="[Staff Only] Manually sets a user's verification roles.")
+@tree.command(name="verify", description="[Staff] Manually sets a user's verification roles.")
 @app_commands.describe(user="The user to manage roles for.")
-@app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.checks.bot_has_permissions(manage_roles=True)
 async def verify(interaction: discord.Interaction, user: discord.Member):
     guild = interaction.guild
+
+    is_staff, error_msg = await check_is_staff(interaction)
+    if not is_staff:
+        await interaction.response.send_message(f"❌ {error_msg}", ephemeral=True)
+        return
+
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot verify yourself.", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=False, thinking=True)
 
     config = await load_server_config(guild.id)
@@ -7772,7 +7828,7 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
 @tree.command(name="connect", description="Connect your Discord account to your Florr IGN.")
 @app_commands.describe(
     ingame_name="Your exact in-game name.",
-    user="[Staff Only] The user to connect."
+    user="[Optional] The user to connect. Staff can target others."
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
 async def connect(interaction: discord.Interaction, ingame_name: str, user: Optional[discord.Member] = None):
@@ -7780,9 +7836,14 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
     guild = interaction.guild
 
     target_user = user or interaction.user
-    if user and interaction.user.id != user.id and not await is_admin_or_developer(interaction):
-        await interaction.response.send_message("❌ You need to be a server admin to connect another user's account.", ephemeral=True)
-        return
+
+    is_self_action = (target_user.id == interaction.user.id)
+    if not is_self_action:
+        is_staff, error_msg = await check_is_staff(interaction)
+        if not is_staff:
+            await interaction.response.send_message(f"❌ {error_msg}", ephemeral=True)
+            return
+
     if not isinstance(target_user, discord.Member):
         await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
         return
@@ -7823,15 +7884,20 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 @tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
-@app_commands.describe(user="[Staff Only] The user to disconnect.")
+@app_commands.describe(user="[Optional] The user to disconnect. Staff can target others.")
 async def disconnect(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
     target_user = user or interaction.user
-    if user and interaction.user.id != user.id and not await is_admin_or_developer(interaction):
-        await interaction.response.send_message("❌ You need to be a server admin to disconnect another user's account.", ephemeral=True)
-        return
+
+    is_self_action = (target_user.id == interaction.user.id)
+    if not is_self_action:
+        is_staff, error_msg = await check_is_staff(interaction)
+        if not is_staff:
+            await interaction.response.send_message(f"❌ {error_msg}", ephemeral=True)
+            return
+
     if not isinstance(target_user, discord.Member):
         await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
         return
@@ -7897,14 +7963,13 @@ async def setguild_autocomplete(interaction: discord.Interaction, current: str) 
             choices.append(app_commands.Choice(name=tag, value=tag))
     return choices
 
-@tree.command(name="setguild", description="[Staff Only] Set a user's tracked Florr guild by Discord or IGN.")
+@tree.command(name="setguild", description="[Staff/Self] Set a user's tracked Florr guild by Discord or IGN.")
 @app_commands.describe(
     guild_tag="The guild to assign them to, or 'None' to remove.",
     user="[Optional] The Discord user to modify.",
     ingame_name="[Optional] The In-Game Name to modify."
 )
 @app_commands.autocomplete(guild_tag=setguild_autocomplete, ingame_name=ign_autocomplete)
-@app_commands.checks.has_permissions(manage_roles=True)
 async def setguild(
     interaction: discord.Interaction, 
     guild_tag: str,
@@ -7918,6 +7983,19 @@ async def setguild(
         await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True); return
     if user and ingame_name:
         await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True); return
+
+    # Permission Check
+    is_staff, staff_error_msg = await check_is_staff(interaction)
+    if not is_staff:
+        # If not staff, check if they are acting on themselves
+        if user and user.id != interaction.user.id:
+            await interaction.response.send_message(f"❌ {staff_error_msg}", ephemeral=True)
+            return
+        if ingame_name:
+            user_s_ign = await get_ign_from_user(guild, interaction.user.id)
+            if not user_s_ign or clean_ign(ingame_name).lower() != user_s_ign.lower():
+                await interaction.response.send_message("❌ You can only set the guild for your own linked IGN. To act on others, you need staff permissions.", ephemeral=True)
+                return
 
     await interaction.response.defer(ephemeral=False)
     normalized_tag = _normalize_guild_tag(guild_tag) if guild_tag != "--NONE--" else None
