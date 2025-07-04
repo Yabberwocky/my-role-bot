@@ -2352,530 +2352,270 @@ class SetupModal(discord.ui.Modal):
 
 
 class SetupView(discord.ui.View):
-    def __n"
-            f"**Moderators:** {mod_val}"
-        )
-        embed.add_init__(self, guild: discord.Guild, config: Dict[str, Any]):
+    def __init__(self, guild: discord.Guild, config: Dict[str, Any]):
         super().__init__(timeout=600)
         self.guild = guild
         self.config = config
         self.message: Optional[discord.Message] = None
 
-    async def interaction_check(self, interaction: discord.field(name="Core Roles", value=roles_val, inline=False)
-        
-        # --- ChannelsInteraction) -> bool:
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Checks if the user has admin permissions before allowing interaction."""
         is_staff = await is_admin_or_developer(interaction)
         if is_staff:
             return True
         else:
             await interaction.response.send_message("❌ You need administrator permissions to use these buttons.", ephemeral=True)
- ---
-        chans_val = (
-            f"**Screenshots:** {get_mention(self.config            return False
+            return False
 
     def create_embed(self) -> discord.Embed:
         embed = discord.Embed(title=f"⚙️ Bot Setup for {self.guild.name}", color=NERDY_YELLOW)
-        embed.description = "Use the buttons below to configure the bot for this server. All settings are optional.".get('screenshots_dropbox_channel_id'), 'channel')}\n"
-            f"**Super Attempts:** {get
+        embed.description = "Use the buttons below to configure the bot for this server. All settings are optional."
         
         def get_mention(item_id, item_type):
             if not item_id: return "`Not Set`"
             if item_type == 'role': item_obj = self.guild.get_role(item_id)
-            else: item_obj = self.guild.get_channel_mention(self.config.get('super_attempts_channel_id'), 'channel')}\n"
-(item_id)
+            else: item_obj = self.guild.get_channel(item_id)
             return item_obj.mention if item_obj else f"⚠️ `Not Found (ID: {item_id})`"
             
         def get_bool_status(key: str) -> str:
-            return "✅ Enabled" if self.config.get(key, True) else "            f"**Unified Guild List:** {get_mention(self.config.get('guild_list_channel❌ Disabled"
+            return "✅ Enabled" if self.config.get(key, True) else "❌ Disabled"
 
         # --- Roles ---
         roles_val = (
             f"**Verified:** {get_mention(self.config.get('verified_role_id'), 'role')}\n"
-            _id'), 'channel')}"
-        )
-        embed.add_field(name="Feature Channels", valuef"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
+            f"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
             f"**Withered:** {get_mention(self.config.get('withered_role_id'), 'role')}\n"
-            f"**Ex-Member=chans_val, inline=False)
-        
-        # --- Ping Channels ---
-        ping_ch:** {get_mention(self.config.get('ex_member_role_id'), 'role')}"
+            f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}"
         )
         embed.add_field(name="Core Roles", value=roles_val, inline=False)
         
-        # --- Moderator Roles ---
-        mod_role_ids = self.config.get('ans_val = (
-            f"**Craft Pings:** {get_mention(self.config.get('craft_moderator_roles_id') or []
-        mod_mentions = [get_mention(rid, 'role') for rid in mod_role_ids]
-        mod_roles_val = ", ".join(mod_mentions) if mod_mentions else "`Not Set`"
-        embed.add_field(name="🛡️ Moderator Roles", value=mod_roles_val, inline=False)
-        
         # --- Channels ---
         chans_val = (
-            f"**Screenshots:** {get_mention(self.config.getping_channel_id'), 'channel')}\n"
-            f"**Spawn Pings:** {get_('screenshots_dropbox_channel_id'), 'channel')}\n"
-            f"**Super Attempts:** {mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
-            get_mention(self.config.get('super_attempts_channel_id'), 'channel')}\n"
-            f"**Unified Guild List:** {get_mention(self.config.get('guild_list_f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}\n"
-            f"**Super Ping Role:** {get_mention(selfchannel_id'), 'channel')}"
+            f"**Screenshots:** {get_mention(self.config.get('screenshots_dropbox_channel_id'), 'channel')}\n"
+            f"**Super Attempts:** {get_mention(self.config.get('super_attempts_channel_id'), 'channel')}\n"
+            f"**Unified Guild List:** {get_mention(self.config.get('guild_list_channel_id'), 'channel')}"
         )
         embed.add_field(name="Feature Channels", value=chans_val, inline=False)
         
         # --- Ping Channels ---
-        ping_.config.get('super_ping_role_id'), 'role')}"
-        )
-        embed.add_fieldchans_val = (
-            f"**Craft Pings:** {get_mention(self.config.get(name="Super Ping Settings", value=ping_chans_val, inline=False)
-
-        # ---('craft_ping_channel_id'), 'channel')}\n"
-            f"**Spawn Pings:** AI Channels ---
-        ai_channel_ids = self.config.get('always_on_ai_channels {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n') or []
-        ai_mentions = [get_mention(cid, 'channel') for cid in ai_channel_ids]
-        ai_chans_val = ", ".join(ai_mentions) if"
-            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ ai_mentions else "`Not Set`"
-        embed.add_field(name="Always-On AI Channelsping_channel_id'), 'channel')}\n"
+        ping_chans_val = (
+            f"**Craft Pings:** {get_mention(self.config.get('craft_ping_channel_id'), 'channel')}\n"
+            f"**Spawn Pings:** {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
+            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}\n"
             f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}"
         )
-", value=ai_chans_val, inline=False)
-        
-        # --- Tracked Guilds ---
-                embed.add_field(name="Super Ping Settings", value=ping_chans_val, inline=tracked_guilds = self.config.get('tracked_guilds', {})
-        if tracked_guilds:
-False)
+        embed.add_field(name="Super Ping Settings", value=ping_chans_val, inline=False)
 
         # --- AI Channels ---
-        ai_channel_ids = self.config.get('always_on            guilds_val_parts = []
-            for tag, data in sorted(tracked_guilds.items()):
-                _ai_channels') or []
-        ai_mentions = [get_mention(cid, 'channel')role_mention = get_mention(data.get('discord_role_id'), 'role')
-                guild for cid in ai_channel_ids]
-        ai_chans_val = ", ".join(ai_s_val_parts.append(f"**{tag}**: Role -> {role_mention}")
-            mentions) if ai_mentions else "`Not Set`"
-        embed.add_field(name="Alwaysguilds_val = "\n".join(guilds_val_parts)
-        else:
-            guilds_-On AI Channels", value=ai_chans_val, inline=False)
+        ai_channel_ids = self.config.get('always_on_ai_channels') or []
+        ai_mentions = [get_mention(cid, 'channel') for cid in ai_channel_ids]
+        ai_chans_val = ", ".join(ai_mentions) if ai_mentions else "`Not Set`"
+        embed.add_field(name="Always-On AI Channels", value=ai_chans_val, inline=False)
         
-        # --- Tracked Guildval = "`No guilds are being tracked yet.`"
-        embed.add_field(name=f"Tracks ---
+        # --- Tracked Guilds ---
         tracked_guilds = self.config.get('tracked_guilds', {})
-        if tracked_ed Florr Guilds (use /setup_guild to manage)", value=guilds_val, inline=False)guilds:
+        if tracked_guilds:
             guilds_val_parts = []
-            for tag, data in sorted(tracked_guilds.
-
-        # --- Command Permissions ---
-        perms_val = (
-            f"**/florr:** {get_mention(self.config.get('florr_command_role_id'), 'role')}\n"items()):
+            for tag, data in sorted(tracked_guilds.items()):
                 role_mention = get_mention(data.get('discord_role_id'), 'role')
-            f"**/imitate:** {get_mention(self.config.get('imitate_command_
+                # The per-guild list channel is no longer used, so we don't display it here.
+                # Just show the role associated with the tag.
                 guilds_val_parts.append(f"**{tag}**: Role -> {role_mention}")
-            role_id'), 'role')}\n"
-            f"**/wither:** {get_mention(selfguilds_val = "\n".join(guilds_val_parts)
+            guilds_val = "\n".join(guilds_val_parts)
         else:
-            guild.config.get('wither_command_role_id'), 'role')}"
-        )
-        embeds_val = "`No guilds are being tracked yet.`"
-        embed.add_field(name=f"Tracked.add_field(name="Command Permissions", value=perms_val, inline=False)
-
-        # --- Florr Guilds (use /setup_guild to manage)", value=guilds_val, inline=False) Enabled Modules ---
-        enabled_modules = self.config.get('enabled_modules') or []
-        modules_val =
+            guilds_val = "`No guilds are being tracked yet.`"
+        embed.add_field(name=f"Tracked Florr Guilds (use /setup_guild to manage)", value=guilds_val, inline=False)
 
         # --- Command Permissions ---
         perms_val = (
-            f"**/florr:** {get f"`{', '.join(enabled_modules) or 'None'}`"
-        embed.add_field_mention(self.config.get('florr_command_role_id'), 'role')}\n"(name="✅ Enabled Modules", value=modules_val, inline=False)
-
-        # --- Feature Toggles
-            f"**/imitate:** {get_mention(self.config.get('imitate_command_ ---
-        toggles_val = (
-            f"**Keyword Triggers:** {get_bool_status('keywordsrole_id'), 'role')}\n"
-            f"**/wither:** {get_mention(self_enabled')}\n"
-            f"**/wither Command:** {get_bool_status('wither.config.get('wither_command_role_id'), 'role')}"
+            f"**/florr:** {get_mention(self.config.get('florr_command_role_id'), 'role')}\n"
+            f"**/imitate:** {get_mention(self.config.get('imitate_command_role_id'), 'role')}\n"
+            f"**/wither:** {get_mention(self.config.get('wither_command_role_id'), 'role')}"
         )
         embed.add_field(name="Command Permissions", value=perms_val, inline=False)
 
-        # ---_command_enabled')}"
+        # --- Enabled Modules ---
+        enabled_modules = self.config.get('enabled_modules') or []
+        modules_val = f"`{', '.join(enabled_modules) or 'None'}`"
+        embed.add_field(name="✅ Enabled Modules", value=modules_val, inline=False)
+
+        # --- Feature Toggles ---
+        toggles_val = (
+            f"**Keyword Triggers:** {get_bool_status('keywords_enabled')}\n"
+            f"**/wither Command:** {get_bool_status('wither_command_enabled')}"
         )
         embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
 
-        embed.set_footer(text="Enter a name or Enabled Modules ---
-        enabled_modules = self.config.get('enabled_modules') or []
-        modules_val = ID in the modals. Leave blank to clear a setting.")
+        embed.set_footer(text="Enter a name or ID in the modals. Leave blank to clear a setting.")
         return embed
 
-    async def update_config_ f"`{', '.join(enabled_modules) or 'None'}`"
-        embed.add_fieldand_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
-        if not self.guild(name="✅ Enabled Modules", value=modules_val, inline=False)
-
-        # --- Feature Toggles: return
+    async def update_config_and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
+        if not self.guild: return
         
         if len(updates) > 1:
-            await run_supabase_sync( ---
-        toggles_val = (
-            f"**Keyword Triggers:** {get_bool_status('keywords_enabled')}\n"
-            f"**/wither Command:** {get_bool_status('witherlambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
+            await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="guild_id").execute())
         
+        # Invalidate the cache to force a reload from the database
         if self.guild.id in server_settings_cache:
-_command_enabled')}"
-        )
-        embed.add_field(name="Feature Toggles", value            del server_settings_cache[self.guild.id]
+            del server_settings_cache[self.guild.id]
         
-        self.config = await load=toggles_val, inline=False)
-
-        embed.set_footer(text="Enter a name or_server_config(self.guild.id)
+        # This call will now fetch fresh data from Supabase and repopulate the cache
+        self.config = await load_server_config(self.guild.id)
         
+        # Now update the message with an embed reflecting the new, live configuration
         if self.message:
-            await self ID in the modals. Leave blank to clear a setting.")
-        return embed
+            await self.message.edit(embed=self.create_embed(), view=self)
 
-    async def update_config_.message.edit(embed=self.create_embed(), view=self)
-
-    @discord.ui.and_refresh(self, interaction: discord.Interaction, updates: Dict[str, Any]):
-        if not self.guildbutton(label="Set Roles", style=discord.ButtonStyle.primary, row=0)
-    async def set: return
-        
-        if len(updates) > 1:
-            await run_supabase_sync(_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        currentlambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates, on_conflict="_mod_roles = self.config.get('moderator_role_ids', [])
-        default_mod_rolesguild_id").execute())
-        
-        if self.guild.id in server_settings_cache:
-_str = ', '.join(map(str, current_mod_roles)) if current_mod_roles else            del server_settings_cache[self.guild.id]
-        
-        self.config = await load ''
-
+    @discord.ui.button(label="Set Roles", style=discord.ButtonStyle.primary, row=0)
+    async def set_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
-            {'label': "Verified Role Name/ID", 'id': "verified__server_config(self.guild.id)
-        
-        if self.message:
-            await selfrole_id", 'default': str(self.config.get('verified_role_id') or '')},.message.edit(embed=self.create_embed(), view=self)
-
-    @discord.ui.
-            {'label': "Unverified Role Name/ID", 'id': "unverified_role_id",button(label="Set Roles", style=discord.ButtonStyle.primary, row=0)
-    async def set 'default': str(self.config.get('unverified_role_id') or '')},
-            {'_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fieldslabel': "Withered Role Name/ID", 'id': "withered_role_id", ' = [
-            {'label': "Verified Role Name/ID", 'id': "verified_role_id",default': str(self.config.get('withered_role_id') or '')},
-            {' 'default': str(self.config.get('verified_role_id') or '')},
-            {'labellabel': "Ex-Member Role Name/ID", 'id': "ex_member_role_id", '': "Unverified Role Name/ID", 'id': "unverified_role_id", 'default': strdefault': str(self.config.get('ex_member_role_id') or '')},
-            {'(self.config.get('unverified_role_id') or '')},
-            {'label': "Wlabel': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'placeholderithered Role Name/ID", 'id': "withered_role_id", 'default': str(': "e.g., Mod, Staff, 123456789...", 'default':self.config.get('withered_role_id') or '')},
-            {'label': "Ex default_mod_roles_str, 'style': discord.TextStyle.paragraph, 'max_length': 1-Member Role Name/ID", 'id': "ex_member_role_id", 'default': str(024}
+            {'label': "Verified Role Name/ID", 'id': "verified_role_id", 'default': str(self.config.get('verified_role_id') or '')},
+            {'label': "Unverified Role Name/ID", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
+            {'label': "Withered Role Name/ID", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
+            {'label': "Ex-Member Role Name/ID", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
         ]
-        modal = SetupModal(title="Set Core Roles", fields=fields,self.config.get('ex_member_role_id') or '')},
-        ]
-        modal = callback_func=self.handle_modal_submit)
-        await interaction.response.send_modal(modal SetupModal(title="Set Core Roles", fields=fields, callback_func=self.handle_modal_submit)
-
-    @discord.ui.button(label="Set Feature Channels", style=discord.ButtonStyle.primary,)
+        modal = SetupModal(title="Set Core Roles", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label row=0)
-    async def set_channels_button(self, interaction: discord.Interaction, button:="Set Feature Channels", style=discord.ButtonStyle.primary, row=0)
-    async def set_channels discord.ui.Button):
+    @discord.ui.button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=0)
+    async def set_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
-            {'label': "Screenshots Channel Name/ID",_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = [ 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots
-            {'label': "Screenshots Channel Name/ID", 'id': "screenshots_dropbox_channel_id",_dropbox_channel_id') or '')},
-            {'label': "Super Attempts Channel Name/ID", ' 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
-            id': "super_attempts_channel_id", 'default': str(self.config.get('super_{'label': "Super Attempts Channel Name/ID", 'id': "super_attempts_channel_id", 'attempts_channel_id') or '')},
-            {'label': "Unified Guild List Channel", 'id': "default': str(self.config.get('super_attempts_channel_id') or '')},
-            {'guild_list_channel_id", 'default': str(self.config.get('guild_list_channellabel': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str_id') or '')},
+            {'label': "Screenshots Channel Name/ID", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
+            {'label': "Super Attempts Channel Name/ID", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
+            {'label': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str(self.config.get('guild_list_channel_id') or '')},
         ]
-        modal = SetupModal(title="Set Feature Channels", fields=(self.config.get('guild_list_channel_id') or '')},
-        ]
-        modalfields, callback_func=self.handle_modal_submit)
-        await interaction.response.send_modal = SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_(modal)
-
-    @discord.ui.button(label="Set Command Permissions", style=discord.ButtonStyle.submit)
+        modal = SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(primary, row=0)
-    async def set_perms_button(self, interaction: discord.Interaction,label="Set Command Permissions", style=discord.ButtonStyle.primary, row=0)
-    async def set_ button: discord.ui.Button):
+    @discord.ui.button(label="Set Command Permissions", style=discord.ButtonStyle.primary, row=0)
+    async def set_perms_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
-            {'label': "/florr Command Role Nameperms_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields =/ID", 'id': "florr_command_role_id", 'default': str(self.config [
-            {'label': "/florr Command Role Name/ID", 'id': "florr_command_role_id.get('florr_command_role_id') or '')},
-            {'label': "/imitate Command", 'default': str(self.config.get('florr_command_role_id') or '')}, Role Name/ID", 'id': "imitate_command_role_id", 'default': str(self
-            {'label': "/imitate Command Role Name/ID", 'id': "imitate_command_role_id",.config.get('imitate_command_role_id') or '')},
-            {'label': "/w 'default': str(self.config.get('imitate_command_role_id') or '')},
-ither Command Role Name/ID", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')},
+            {'label': "/florr Command Role Name/ID", 'id': "florr_command_role_id", 'default': str(self.config.get('florr_command_role_id') or '')},
+            {'label': "/imitate Command Role Name/ID", 'id': "imitate_command_role_id", 'default': str(self.config.get('imitate_command_role_id') or '')},
+            {'label': "/wither Command Role Name/ID", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')},
         ]
-                    {'label': "/wither Command Role Name/ID", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')modal = SetupModal(title="Set Command Roles", fields=fields, callback_func=self.handle_modal},
-        ]
-        modal = SetupModal(title="Set Command Roles", fields=fields, callback_func_submit)
+        modal = SetupModal(title="Set Command Roles", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button=self.handle_modal_submit)
-        await interaction.response.send_modal(modal)
-
-    (label="Set Ping Settings", style=discord.ButtonStyle.secondary, row=1)
-    async def set@discord.ui.button(label="Set Ping Settings", style=discord.ButtonStyle.secondary, row=1_ping_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-)
-    async def set_ping_channels_button(self, interaction: discord.Interaction, button: discord        fields = [
-            {'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", '.ui.Button):
+    @discord.ui.button(label="Set Ping Settings", style=discord.ButtonStyle.secondary, row=1)
+    async def set_ping_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
-            {'label': "Craft Ping Channel", 'id': "craftdefault': str(self.config.get('craft_ping_channel_id') or '')},
-            {'_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(id') or '')},
-            {'label': "Spawn Ping Channel", 'id': "spawn_ping_channelself.config.get('spawn_ping_channel_id') or '')},
-            {'label': "Def_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')eat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config},
-            {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id",.get('defeat_ping_channel_id') or '')},
-            {'label': "Super Spawn Ping Role", ' 'default': str(self.config.get('defeat_ping_channel_id') or '')},
-            id': "super_ping_role_id", 'default': str(self.config.get('super_{'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(ping_role_id') or '')},
+            {'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
+            {'label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
+            {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')},
+            {'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')},
         ]
-        modal = SetupModal(title="Set Self-Bot Ping Settingsself.config.get('super_ping_role_id') or '')},
-        ]
-        modal =", fields=fields, callback_func=self.handle_modal_submit)
+        modal = SetupModal(title="Set Self-Bot Ping Settings", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set AI Channels", style=discord SetupModal(title="Set Self-Bot Ping Settings", fields=fields, callback_func=self.handle_modal_submit)
-        await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label.ButtonStyle.secondary, row=1)
-    async def set_ai_channels_button(self, interaction="Set AI Channels", style=discord.ButtonStyle.secondary, row=1)
-    async def set_ai: discord.Interaction, button: discord.ui.Button):
-        current_ai_channels = self.config_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        current.get('always_on_ai_channels', [])
-        default_str = ', '.join(map(str, current_ai_channels = self.config.get('always_on_ai_channels', [])
-        default_str =_ai_channels)) if current_ai_channels else ''
+    @discord.ui.button(label="Set AI Channels", style=discord.ButtonStyle.secondary, row=1)
+    async def set_ai_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_ai_channels = self.config.get('always_on_ai_channels', [])
+        default_str = ', '.join(map(str, current_ai_channels)) if current_ai_channels else ''
         fields = [
-            {'label': " ', '.join(map(str, current_ai_channels)) if current_ai_channels else ''
-        fields =AI Channel Names/IDs (comma-separated)", 'id': "always_on_ai_channels", 'placeholder [
-            {'label': "AI Channel Names/IDs (comma-separated)", 'id': "always_on_ai_': "e.g., general, ai-chat, 123456789...", 'default':channels", 'placeholder': "e.g., general, ai-chat, 123456789 default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
+            {'label': "AI Channel Names/IDs (comma-separated)", 'id': "always_on_ai_channels", 'placeholder': "e.g., general, ai-chat, 123456789...", 'default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
         ]
-        modal = SetupModal(title="Set Always-On AI Channels", fields=fields, callback...", 'default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
-        ]
-        modal = SetupModal(title="Set Always-On AI Channels", fields_func=self.handle_modal_submit)
-        await interaction.response.send_modal(modal)=fields, callback_func=self.handle_modal_submit)
-        await interaction.response.send_
+        modal = SetupModal(title="Set Always-On AI Channels", fields=fields, callback_func=self.handle_modal_submit)
+        await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Set Modules", style=discord.ButtonStyle.secondary, row=1)
-    async def set_modules_button(self, interaction: discord.Interaction, button: discord.uimodal(modal)
-
-    @discord.ui.button(label="Set Modules", style=discord.ButtonStyle.secondary, row=1)
-    async def set_modules_button(self, interaction: discord.Interaction,.Button):
+    async def set_modules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         current_modules = self.config.get('enabled_modules', [])
-        default_str = ', button: discord.ui.Button):
-        current_modules = self.config.get('enabled_modules', [])
-         '.join(current_modules) if current_modules else ''
-        fields = [{'label': "Enabled Modules (default_str = ', '.join(current_modules) if current_modules else ''
-        fields = [{'labelcomma-separated)", 'id': "enabled_modules", 'placeholder': "e.g., verification, guild_management", '': "Enabled Modules (comma-separated)", 'id': "enabled_modules", 'placeholder': "e.gdefault': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 102., verification, guild_management", 'default': default_str, 'style': discord.TextStyle.paragraph, '4}]
-        modal = SetupModal(title="Set Enabled Bot Modules", fields=fields, callback_func=max_length': 1024}]
-        modal = SetupModal(title="Set Enabled Bot Modules",self.handle_modal_submit)
+        default_str = ', '.join(current_modules) if current_modules else ''
+        fields = [{'label': "Enabled Modules (comma-separated)", 'id': "enabled_modules", 'placeholder': "e.g., verification, guild_management", 'default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}]
+        modal = SetupModal(title="Set Enabled Bot Modules", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-    @ fields=fields, callback_func=self.handle_modal_submit)
-        await interaction.response.senddiscord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=2)
-_modal(modal)
-
-    @discord.ui.button(label="Set Moderator Roles", style=discord.    async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui.ButtonButtonStyle.secondary, row=2)
-    async def set_moderator_roles_button(self, interaction):
+    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = [
-            {'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True): discord.Interaction, button: discord.ui.Button):
-        current_mod_roles = self.config else "no"},
-            {'label': "/wither Command Enabled (yes/no)", 'id': "w.get('moderator_roles_id', [])
-        default_str = ', '.join(map(str, current_mod_roles)) if current_mod_roles else ''
-        fields = [
-            {'labelither_command_enabled", 'default': "yes" if self.config.get('wither_command_': "Moderator Role Names/IDs (comma-separated)", 'id': "moderator_roles_id", 'placeholder': "e.g., Mod, Staff, 987654321...", 'enabled', True) else "no"},
+            {'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) else "no"},
+            {'label': "/wither Command Enabled (yes/no)", 'id': "wither_command_enabled", 'default': "yes" if self.config.get('wither_command_enabled', True) else "no"},
         ]
         modal = SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit)
-        await interaction.response.send_default': default_str, 'style': discord.TextStyle.paragraph, 'max_length': 102modal(modal)
-
-    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=4}
-        ]
-        modal = SetupModal(title="Set Moderator Roles", fields=fields, callback_3)
-    async def done_button(self, interaction: discord.Interaction, button: discord.ui.func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
-Button):
-        await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)    @discord.ui.button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=2
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.success, row=3)
+    async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)
         self.stop()
 
-    async def handle_modal_submit(self, interaction: discord.Interaction,)
-    async def toggle_features_button(self, interaction: discord.Interaction, button: discord.ui results: Dict[str, str]):
-        await interaction.response.defer(thinking=True, ephemeral=True.Button):
-        fields = [
-            {'label': "Keyword Triggers Enabled (yes/no)", 'id':)
+    async def handle_modal_submit(self, interaction: discord.Interaction, results: Dict[str, str]):
+        await interaction.response.defer(thinking=True, ephemeral=True)
         updates = {"guild_id": self.guild.id}
         errors = []
-        resolved_items = "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) []
-
-        for key, value in results.items():
-            value_stripped = value.strip()
-             else "no"},
-            {'label': "/wither Command Enabled (yes/no)", 'id': "w
-            if not value_stripped:
-                updates[key] = None
-                resolved_items.append(ither_command_enabled", 'default': "yes" if self.config.get('wither_command_f"Cleared setting for `{key}`.")
-                continue
-
-            if key.endswith('_enabled'):
-                ifenabled', True) else "no"},
-        ]
-        modal = SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit)
-        await interaction.response.send_ value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']:
-                    updates[key] = True
-                    resolved_items.append(f"Set `{key}` to ✅ Enabled.")modal(modal)
-
-    @discord.ui.button(label="Done", style=discord.ButtonStyle.success
-                elif value_stripped.lower() in ['no', 'false', '0', 'off', 'disabled, row=3)
-    async def done_button(self, interaction: discord.Interaction, button: discord']:
-                    updates[key] = False
-                    resolved_items.append(f"Set `{key}` to.ui.Button):
-        await interaction.response.edit_message(content="✅ Setup complete.", embed= ❌ Disabled.")
-                else:
-                    errors.append(f"For `{key}`: Invalid input.None, view=None)
-        self.stop()
-
-    async def handle_modal_submit(self, Please use 'yes' or 'no'.")
-                continue
-
-            if key == 'always_on_ai interaction: discord.Interaction, results: Dict[str, str]):
-        await interaction.response.defer(thinking_channels':
-                channel_inputs = [name.strip() for name in value_stripped.split(',') if=True, ephemeral=True)
-        updates = {"guild_id": self.guild.id}
-         name.strip()]
-                resolved_ids = []
-                temp_errors = []
-                for channel_input in channelerrors = []
         resolved_items = []
 
         for key, value in results.items():
-            value_inputs:
-                    resolved_id, status_msg = await resolve_name_to_id(self._stripped = value.strip()
+            value_stripped = value.strip()
             
             if not value_stripped:
-                updates[key] =guild, channel_input, 'channel')
-                    if resolved_id:
-                        resolved_ids.append( None
+                updates[key] = None
                 resolved_items.append(f"Cleared setting for `{key}`.")
                 continue
 
-            ifresolved_id)
-                    else:
-                        temp_errors.append(f"Could not resolve '{channel_ key == 'moderator_roles_id':
-                role_inputs = [name.strip() for name ininput}': {status_msg}")
-                
-                if not temp_errors:
-                    updates[key] value_stripped.split(',') if name.strip()]
-                resolved_ids = []
-                temp_errors = []
-                for role_input in role_inputs:
-                    resolved_id, status_msg = await resolve = resolved_ids
-                    mentions = [f"<#{cid}>" for cid in resolved_ids]
-                    resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'_name_to_id(self.guild, role_input, 'role')
-                    if resolved_id}.")
-                else:
-                    errors.extend(temp_errors)
-                continue
-
-            if key == ':
-                        resolved_ids.append(resolved_id)
-                    else:
-                        temp_errors.append(f"Could not resolve role '{role_input}': {status_msg}")
-                
-                if notmoderator_role_ids':
-                role_inputs = [name.strip() for name in value_stripped temp_errors:
-                    updates[key] = resolved_ids
-                    mentions = [f"<@&.split(',') if name.strip()]
-                resolved_ids = []
-                temp_errors = []
-                for role_input in role_inputs:
-                    resolved_id, status_msg = await resolve_name_{rid}>" for rid in resolved_ids]
-                    resolved_items.append(f"Set `moderator_roles_id` to: {', '.join(mentions) or 'None'}.")
-                elseto_id(self.guild, role_input, 'role')
-                    if resolved_id:
-                        resolved_ids.append(resolved_id)
-                    else:
-                        temp_errors.append(f":
-                    errors.extend(temp_errors)
-                continue
-
             if key.endswith('_enabled'):
-Could not resolve role '{role_input}': {status_msg}")
-                
-                if not temp_errors                if value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']::
-                    updates[key] = resolved_ids
-                    mentions = [f"<@&{rid}>" for rid
+                if value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']:
                     updates[key] = True
                     resolved_items.append(f"Set `{key}` to ✅ Enabled.")
- in resolved_ids]
-                    resolved_items.append(f"Set `{key}` to: {', '.                elif value_stripped.lower() in ['no', 'false', '0', 'off', 'disabled']:join(mentions) or 'None'}.")
-                else:
-                    errors.extend(temp_errors)
+                elif value_stripped.lower() in ['no', 'false', '0', 'off', 'disabled']:
                     updates[key] = False
                     resolved_items.append(f"Set `{key}` to ❌ Disabled.")
-                continue
-
-            if key == 'enabled_modules':
-                module_inputs = {m.strip().
                 else:
-                    errors.append(f"For `{key}`: Invalid input. Please use 'yeslower() for m in value_stripped.split(',') if m.strip()}
-                updates[key] = sorted(list(' or 'no'.")
+                    errors.append(f"For `{key}`: Invalid input. Please use 'yes' or 'no'.")
                 continue
 
             if key == 'always_on_ai_channels':
-                channel_inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]module_inputs))
-                resolved_items.append(f"Set `enabled_modules` to: `{', '.join(
+                channel_inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]
                 resolved_ids = []
                 temp_errors = []
                 for channel_input in channel_inputs:
-updates[key]) or 'None'}`.")
-                continue
-
-            item_type = 'channel' if '                    resolved_id, status_msg = await resolve_name_to_id(self.guild, channel_channel' in key else 'role'
-            resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
-            
-            if resolved_id:input, 'channel')
+                    resolved_id, status_msg = await resolve_name_to_id(self.guild, channel_input, 'channel')
                     if resolved_id:
                         resolved_ids.append(resolved_id)
                     else:
-                        temp_errors.append(f"Could not resolve '{channel_input}': {
-                updates[key] = resolved_id
-                item_obj = self.guild.get_role(resolved_id) if item_type == 'role' else self.guild.get_channel(resolved_idstatus_msg}")
+                        temp_errors.append(f"Could not resolve '{channel_input}': {status_msg}")
                 
                 if not temp_errors:
-                    updates[key] = resolved_ids)
-                resolved_items.append(f"Set `{key}` to {item_obj.mention}.")
-            else:
+                    updates[key] = resolved_ids
                     mentions = [f"<#{cid}>" for cid in resolved_ids]
-                    resolved_items.append(
-                errors.append(f"For `{key}`: {status_msg}")
-
-        feedback_embed =f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
-                else discord.Embed(title="Setup Update Confirmation", color=NERDY_YELLOW)
-        
-        if resolved_items:
-:
+                    resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
+                else:
                     errors.extend(temp_errors)
                 continue
 
             if key == 'enabled_modules':
-                module_inputs = {m.strip().lower() for m in value_stripped.split(',') if m            feedback_embed.add_field(name="✅ Changes Applied", value="\n".join(resolved_items), inline.strip()}
+                module_inputs = {m.strip().lower() for m in value_stripped.split(',') if m.strip()}
                 updates[key] = sorted(list(module_inputs))
-                resolved_items.=False)
-        
-        if errors:
-            feedback_embed.add_field(name="❌ Errorsappend(f"Set `enabled_modules` to: `{', '.join(updates[key]) or 'None'}` / Unchanged", value="\n".join(errors), inline=False)
-            feedback_embed.color = discord.Color.orange()
-            feedback_embed.set_footer(text="Settings with errors were not saved..")
+                resolved_items.append(f"Set `enabled_modules` to: `{', '.join(updates[key]) or 'None'}`.")
                 continue
 
             item_type = 'channel' if 'channel' in key else 'role'
-            resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item Try again with valid names/IDs.")
-        else:
-            feedback_embed.color = discord.Color.green()
-_type)
+            resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
             
             if resolved_id:
                 updates[key] = resolved_id
-                        
-        await self.update_config_and_refresh(interaction, updates)
-        await interaction.followitem_obj = self.guild.get_role(resolved_id) if item_type == 'role'up.send(embed=feedback_embed, ephemeral=True)
+                item_obj = self.guild.get_role(resolved_id) if item_type == 'role' else self.guild.get_channel(resolved_id)
+                resolved_items.append(f"Set `{key}` to {item_obj.mention}.")
+            else:
+                errors.append(f"For `{key}`: {status_msg}")
 
-    async def on_timeout(self): else self.guild.get_channel(resolved_id)
-                resolved_items.append(f"Set `{key
+        feedback_embed = discord.Embed(title="Setup Update Confirmation", color=NERDY_YELLOW)
+        
+        if resolved_items:
+            feedback_embed.add_field(name="✅ Changes Applied", value="\n".join(resolved_items), inline=False)
+        
+        if errors:
+            feedback_embed.add_field(name="❌ Errors / Unchanged", value="\n".join(errors), inline=False)
+            feedback_embed.color = discord.Color.orange()
+            feedback_embed.set_footer(text="Settings with errors were not saved. Try again with valid names/IDs.")
+        else:
+            feedback_embed.color = discord.Color.green()
+        
+        await self.update_config_and_refresh(interaction, updates)
+        await interaction.followup.send(embed=feedback_embed, ephemeral=True)
+
+    async def on_timeout(self):
         if self.message:
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
