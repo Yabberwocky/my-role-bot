@@ -1227,6 +1227,9 @@ async def check_guilds_view_timeout():
                     view.last_interaction_time = discord.utils.utcnow()
                 else:
                     print(f"Could not reset view in {channel_id}, message object is missing.")
+            except (aiohttp.ClientError, discord.HTTPException, asyncio.TimeoutError) as e:
+                # These are often transient network issues. Log them to console but don't spam the error channel.
+                print(f"NETWORK WARNING in check_guilds_view_timeout: Could not reset view in channel {channel_id} due to a network-related error: {type(e).__name__} - {e}")
             except Exception as e:
                 await log_error(view.guild, f"Error resetting static GuildsView in channel {channel_id}", error=e)
 
@@ -2172,9 +2175,9 @@ async def get_user_super_craft_log_entries(
 
     offset = page * per_page
     try:
-        # Use ilike for case-insensitive matching
+        # Use lower() on the column and the input value for a case-insensitive, indexed query.
         count_resp = await run_supabase_sync(
-            lambda: supabase.table("super_craft_logs").select("id", count='exact').ilike("player_ign", ign).execute()
+            lambda: supabase.table("super_craft_logs").select("id", count='exact').eq(lower('player_ign'), ign.lower()).execute()
         )
         total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
         if total_count == 0:
@@ -2183,7 +2186,7 @@ async def get_user_super_craft_log_entries(
         data_resp = await run_supabase_sync(
             lambda: supabase.table("super_craft_logs")
                            .select("id, craft_date, super_petal_name")
-                           .ilike("player_ign", ign) # Use ilike here as well
+                           .eq(lower('player_ign'), ign.lower()) # Use eq with lower()
                            .order("craft_date", desc=True)
                            .order("id", desc=True)
                            .range(offset, offset + per_page - 1)
@@ -6223,10 +6226,11 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
         if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for IGN '{input_ign}'.")
         return None
     try:
+        # Use lower() on the column and eq() on the lowercased input for an exact, case-insensitive match.
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .select("ingame_name, discord_id, florr_guild_tag, discord_name")
-                           .ilike("ingame_name", input_ign)
+                           .eq(lower("ingame_name"), input_ign.lower())
                            .limit(1)
                            .maybe_single()
                            .execute()
@@ -8083,10 +8087,11 @@ async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Op
     """Fetches just the florr_guild_tag for a given IGN."""
     if not supabase: return None
     try:
+        # Use lower() on the column and eq() on the lowercased input for an exact, case-insensitive match.
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .select("florr_guild_tag")
-                           .ilike("ingame_name", ign)
+                           .eq(lower("ingame_name"), ign.lower())
                            .limit(1)
                            .maybe_single()
                            .execute()
