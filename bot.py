@@ -2175,9 +2175,9 @@ async def get_user_super_craft_log_entries(
 
     offset = page * per_page
     try:
-        # Use lower() on the column and the input value for a case-insensitive, indexed query.
+        # Use ilike for a case-insensitive, indexed query.
         count_resp = await run_supabase_sync(
-            lambda: supabase.table("super_craft_logs").select("id", count='exact').eq(lower('player_ign'), ign.lower()).execute()
+            lambda: supabase.table("super_craft_logs").select("id", count='exact').ilike('player_ign', ign).execute()
         )
         total_count = count_resp.count if count_resp and hasattr(count_resp, 'count') else 0
         if total_count == 0:
@@ -2186,7 +2186,7 @@ async def get_user_super_craft_log_entries(
         data_resp = await run_supabase_sync(
             lambda: supabase.table("super_craft_logs")
                            .select("id, craft_date, super_petal_name")
-                           .eq(lower('player_ign'), ign.lower()) # Use eq with lower()
+                           .ilike('player_ign', ign) # Use ilike for case-insensitive match
                            .order("craft_date", desc=True)
                            .order("id", desc=True)
                            .range(offset, offset + per_page - 1)
@@ -2381,7 +2381,8 @@ class SetupView(discord.ui.View):
             f"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
             f"**Withered:** {get_mention(self.config.get('withered_role_id'), 'role')}\n"
             f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}\n"
-            f"**Moderators:** {mod_val}"
+            f"**Moderators:** {mod_val}\n"
+            f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}"
         )
         embed.add_field(name="Core Roles", value=roles_val, inline=False)
         
@@ -2397,10 +2398,9 @@ class SetupView(discord.ui.View):
         ping_chans_val = (
             f"**Craft Pings:** {get_mention(self.config.get('craft_ping_channel_id'), 'channel')}\n"
             f"**Spawn Pings:** {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
-            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}\n"
-            f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}"
+            f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}"
         )
-        embed.add_field(name="Super Ping Settings", value=ping_chans_val, inline=False)
+        embed.add_field(name="Super Ping Settings (Dev Only)", value=ping_chans_val, inline=False)
 
         # --- AI Channels ---
         ai_channel_ids = self.config.get('always_on_ai_channels') or []
@@ -2473,9 +2473,10 @@ class SetupView(discord.ui.View):
             {'label': "Unverified Role Name/ID", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
             {'label': "Withered Role Name/ID", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
             {'label': "Ex-Member Role Name/ID", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
-            {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'placeholder': "e.g., Mod, Staff, 123456789...", 'default': default_mod_roles_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024}
+            {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'placeholder': "e.g., Mod, Staff, 123456789...", 'default': default_mod_roles_str, 'style': discord.TextStyle.paragraph, 'max_length': 1024},
+            {'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')},
         ]
-        modal = SetupModal(title="Set Core & Moderator Roles", fields=fields, callback_func=self.handle_modal_submit)
+        modal = SetupModal(title="Set Core, Moderator & Ping Roles", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=0)
@@ -2500,13 +2501,16 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="Set Ping Settings", style=discord.ButtonStyle.secondary, row=1)
     async def set_ping_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != DEVELOPER_USER_ID:
+            await interaction.response.send_message("❌ This setting can only be modified by the bot developer.", ephemeral=True)
+            return
+
         fields = [
             {'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
             {'label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
             {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')},
-            {'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')},
         ]
-        modal = SetupModal(title="Set Self-Bot Ping Settings", fields=fields, callback_func=self.handle_modal_submit)
+        modal = SetupModal(title="Set Self-Bot Ping Channels (Dev Only)", fields=fields, callback_func=self.handle_modal_submit)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Set AI Channels", style=discord.ButtonStyle.secondary, row=1)
@@ -3760,15 +3764,90 @@ async def handle_screenshot_dropbox(message: discord.Message):
 
 async def handle_super_attempt_message(message: discord.Message):
     """Processes a message to check for and log a super attempt."""
-    # This function contains all the logic previously in on_message for this feature
     guild = message.guild
     msg_content = message.content.strip()
+
+    # First, check for the new successful craft format
+    if msg_content in ["+1", "-0", "-5"]:
+        petals_lost = 1
+        chosen_petal_name_for_db = "Successful Super Craft"
+        display_friendly_name_for_reply = "Successful Super Craft"
+
+        author_ign = await get_ign_from_user(guild, message.author.id)
+        if not author_ign:
+            try:
+                await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
+            except discord.HTTPException:
+                pass
+            return
+
+        attempt_date_obj, date_error_msg = get_utc_date()
+        if date_error_msg or not attempt_date_obj:
+            try:
+                await message.reply("Sorry, error determining date.")
+            except discord.HTTPException:
+                pass
+            await log_error(guild, f"Super Attempt Log: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
+            return
+
+        if not await check_supabase_available(message.channel): # type: ignore
+            await log_info(guild, f"Super Attempt Log for '{msg_content}': Supabase unavailable.")
+            return
+
+        try:
+            insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({
+                "ingame_name": author_ign, 
+                "discord_user_id": str(message.author.id),
+                "attempt_date": attempt_date_obj.isoformat(), 
+                "petals_lost": petals_lost,
+                "message_id": str(message.id), 
+                "channel_id": str(message.channel.id),
+                "chosen_petal_name": chosen_petal_name_for_db
+            }).execute())
+            
+            attempt_db_id = None
+            if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
+                attempt_db_id = insert_resp.data[0]['id']
+            
+            if not attempt_db_id:
+                fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
+
+            if not attempt_db_id:
+                await log_error(guild, f"Super Attempt (success craft): Failed to get DB ID for {author_ign}", message_context=message)
+                try:
+                    await message.reply("Error saving (no DB ID). Admin notified.")
+                except discord.HTTPException:
+                    pass
+                await _update_reactions(message, "error")
+                return
+
+            all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+            sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
+            embed = sa_view.create_embed()
+            bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+            sa_view.message = bot_reply_msg
+            await _update_reactions(message, "success")
+            await log_info(guild, f"Super attempt by `{author_ign}`: Logged '{msg_content}' as a successful craft. All-time: {all_time_attempts_count}.")
+            
+            if isinstance(message.author, discord.Member):
+                await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+        except Exception as e:
+            await log_error(guild, f"Error logging successful super craft for {author_ign}", error=e, message_context=message, ping_developer=True)
+            try:
+                await message.reply("Error logging attempt. Admin notified.")
+            except discord.HTTPException:
+                pass
+            await _update_reactions(message, "error")
+        
+        return # Explicitly return after handling the new format
+
+    # If not the new format, check for the old petal loss format
     attempt_match = re.fullmatch(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", msg_content, re.IGNORECASE)
-
     if not attempt_match:
-        return # Not a super attempt message
+        return # Not a recognized super attempt message at all
 
-    # --- Start of Super Attempt Logic (copied from on_message) ---
+    # --- Start of Super Attempt Logic for old format ---
     petals_lost_str = attempt_match.group("petals")
     petal_query_str = attempt_match.group("petal_query").strip()
     try:
@@ -3803,7 +3882,6 @@ async def handle_super_attempt_message(message: discord.Message):
     bot_reply_msg: Optional[discord.Message] = None
 
     if len(ultra_candidates) == 1:
-        # ... (rest of single candidate logic from on_message)
         chosen_petal_data = ultra_candidates[0]
         chosen_petal_name_for_db = chosen_petal_data['original_full_name']
         display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
@@ -3841,7 +3919,6 @@ async def handle_super_attempt_message(message: discord.Message):
             await _update_reactions(message, "error")
 
     elif len(ultra_candidates) > 1:
-        # ... (rest of ambiguous candidate logic from on_message)
         disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
         sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj)
         bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
@@ -3849,7 +3926,6 @@ async def handle_super_attempt_message(message: discord.Message):
         await _update_reactions(message, "disambiguation")
 
     else:
-        # ... (rest of "Unknown" logic from on_message)
         chosen_petal_name_for_db = "Unknown Ultra Petal"
         display_friendly_name_for_reply = "Unknown Ultra"
         await log_info(guild, f"Super Attempt: No Ultra match for '{petal_query_str}' by {author_ign}. Logging as Unknown.")
@@ -5078,21 +5154,29 @@ class SuperAttemptConfirmView(discord.ui.View):
         self.add_item(UndoSuperAttemptButton(attempt_db_id, original_user_message, row=0))
 
     def create_embed(self) -> discord.Embed:
-        # // --- UNCHANGED SECTION (create_embed) --- //
         if self.is_undone:
+            if self.petal_display_name == "Successful Super Craft":
+                description = f"↩️ Super attempt log for a successful craft (by {self.author_ign}) has been **undone**."
+            else:
+                description = f"↩️ Super attempt log for {self.petals_lost}x Ultra {self.petal_display_name} (by {self.author_ign}) has been **undone**."
+            
             return discord.Embed(
-                description=f"↩️ Super attempt log for {self.petals_lost}x Ultra {self.petal_display_name} (by {self.author_ign}) has been **undone**.",
+                description=description,
                 color=discord.Color.orange()
             )
         else:
-            return discord.Embed(
-                description=(
+            if self.petal_display_name == "Successful Super Craft":
+                description = f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign}. This successful craft has been recorded."
+            else:
+                description = (
                     f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign} "
                     f"(lost {self.petals_lost}x Ultra {self.petal_display_name})."
-                ),
+                )
+            
+            return discord.Embed(
+                description=description,
                 color=discord.Color.green()
             )
-        # // --- END UNCHANGED SECTION (create_embed) --- //
 
     async def handle_undo(self, interaction: discord.Interaction, attempt_db_id_from_button: int, original_user_msg_obj: discord.Message):
         # // --- UNCHANGED SECTION (handle_undo) --- //
@@ -5943,7 +6027,12 @@ class ProfilePagesView(discord.ui.View):
             global_index = start_index + i + 1
             date_str = format_date_dmy(entry['attempt_date']) if entry.get('attempt_date') else "N/A"
             petal_name = _get_display_friendly_petal_name(entry.get('chosen_petal_name', 'Unknown'))
-            petals_lost = f"{entry.get('petals_lost', 0.0):.1f}"
+            
+            if petal_name == "Successful Super Craft":
+                petals_lost = "+1"
+            else:
+                petals_lost = f"{entry.get('petals_lost', 0.0):.1f}"
+            
             petal_display = (petal_name[:PETAL_W-1] + '…') if len(petal_name) > PETAL_W else petal_name
             index_str = f"{global_index}."
             line = f"{index_str:<{IDX_W}}{date_str:<{DATE_W}}{petal_display:<{PETAL_W}}{petals_lost:<{LOST_W}}"
@@ -6226,11 +6315,11 @@ async def fetch_profile_details_by_ign(guild: Optional[discord.Guild], input_ign
         if guild: await log_error(guild, f"Profile: Supabase unavailable fetching data for IGN '{input_ign}'.")
         return None
     try:
-        # Use lower() on the column and eq() on the lowercased input for an exact, case-insensitive match.
+        # Use ilike for an exact, case-insensitive match.
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .select("ingame_name, discord_id, florr_guild_tag, discord_name")
-                           .eq(lower("ingame_name"), input_ign.lower())
+                           .ilike("ingame_name", input_ign)
                            .limit(1)
                            .maybe_single()
                            .execute()
@@ -8087,11 +8176,11 @@ async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Op
     """Fetches just the florr_guild_tag for a given IGN."""
     if not supabase: return None
     try:
-        # Use lower() on the column and eq() on the lowercased input for an exact, case-insensitive match.
+        # Use ilike() for an exact, case-insensitive match.
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
                            .select("florr_guild_tag")
-                           .eq(lower("ingame_name"), ign.lower())
+                           .ilike("ingame_name", ign)
                            .limit(1)
                            .maybe_single()
                            .execute()
