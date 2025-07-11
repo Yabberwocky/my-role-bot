@@ -68,7 +68,6 @@
 # Database: Supabase (PostgreSQL) used for:
 #   - `florr_players`: Stores HC member IGNs linked to Discord IDs and names.
 #   - `activity_log`: Tracks daily member activity.
-#   - `keyword_phrases`: Stores configurations for AI keyword-triggered responses (managed by `ai_cog.py`).
 # Key Features (not exhaustive, check `/nerdhelp` in code for command list):
 #   - Verification & HC Management: `/verify`, `/unverify`, `/guild`, `/hconly`, `/hcleave`.
 #   - Listing & Activity: Interactive static list in `HC_MEMBER_LIST_CHANNEL_ID` (updated by `update_static_list_message`),
@@ -246,9 +245,6 @@ NOTIFICATION_COOLDOWN_SECONDS = 120.0
 STAFF_PERMISSION_FOR_AI = "manage_guild"
 DISABLE_DB_EVENT_LOGGING = BOT_INSTANCE_TYPE != "PRODUCTION"
 ai_models: Dict[str, genai.GenerativeModel] = {}
-keyword_data_cache: Dict[str, Any] = {}
-total_keywords: int = 0
-discovered_keywords_count: int = 0
 channel_personalities: Dict[int, str] = {}
 ai_message_cooldown = commands.CooldownMapping.from_cooldown(1, AI_RESPONSE_COOLDOWN_SECONDS, commands.BucketType.user)
 slowmode_tasks: Dict[int, asyncio.Task] = {}
@@ -296,36 +292,36 @@ AI_PERSONALITIES = {
     "normal": {
         "label": "Normal", "emoji": "🤖",
         "prompt_key": "NORMAL_PERSONALITY_V1",
-        "model": "gemini-2.0-flash",
-        "fallback_model": "gemini-2.0-flash-lite",
+        "model": "gemini-2.5-flash-lite-preview-06-17",
+        "fallback_model": "gemini-2.0-flash",
         "generation_config": GenerationConfig(temperature=0.9)
     },
     "helpful": {
         "label": "Helpful", "emoji": "💡",
         "prompt_key": "HELPER_PERSONALITY_V1",
-        "model": "gemini-2.5-flash-preview-05-20",
-        "fallback_model": "gemini-2.0-flash",
+        "model": "gemini-2.5-flash",
+        "fallback_model": "gemini-2.5-flash-lite-preview-06-17",
         "generation_config": GenerationConfig(temperature=0.7)
     },
     "toaster": {
         "label": "Toaster", "emoji": "🔥",
         "prompt_key": "TOASTER_PERSONALITY_V1",
-        "model": "gemini-2.0-flash",
-        "fallback_model": "gemini-2.0-flash-lite",
+        "model": "gemini-2.5-flash-lite-preview-06-17",
+        "fallback_model": "gemini-2.0-flash",
         "generation_config": GenerationConfig(temperature=2.0)
     },
     "kind": {
         "label": "Kind & Chatty", "emoji": "😊",
         "prompt_key": "KIND_PERSONALITY_V1",
-        "model": "gemini-2.0-flash",
-        "fallback_model": "gemini-2.0-flash-lite",
+        "model": "gemini-2.5-flash-lite-preview-06-17",
+        "fallback_model": "gemini-2.0-flash",
         "generation_config": GenerationConfig(temperature=1.0)
     },
     "emoji": {
         "label": "Emoji", "emoji": "😀",
         "prompt_key": "EMOJI_PERSONALITY_V1",
-        "model": "gemini-2.0-flash",
-        "fallback_model": "gemini-2.0-flash-lite",
+        "model": "gemini-2.5-flash-lite-preview-06-17",
+        "fallback_model": "gemini-2.0-flash",
         "generation_config": GenerationConfig(temperature=1.2)
     }
 }
@@ -926,6 +922,12 @@ async def delete_note_by_id(guild: Optional[discord.Guild], note_id: int) -> Tup
         await log_error(guild, f"Error removing note ID {note_id}", error=e)
         return False, "A database error occurred."
 
+async def get_mention(item_id: Optional[int], item_type: str, guild: discord.Guild) -> str:
+    """Gets a mention string for a role or channel, or a status message."""
+    if not item_id: return "`Not Set`"
+    if item_type == 'role': item_obj = guild.get_role(item_id)
+    else: item_obj = guild.get_channel(item_id)
+    return item_obj.mention if item_obj else f"⚠️ `Not Found (ID: {item_id})`"
 
 class DeleteNoteModal(discord.ui.Modal, title="Delete Player Note"):
     entry_number_input = discord.ui.TextInput(
@@ -1213,9 +1215,10 @@ async def check_guilds_view_timeout():
         if time_since_active.total_seconds() > (STATIC_LIST_RESET_TIMEOUT_MINUTES * 60):
             print(f"Resetting static GuildsView in channel {channel_id} due to inactivity.")
             try:
-                # Reset the view back to summary mode
-                view.mode = GuildsView.MODE_SUMMARY
-                view.current_guild_tag = None
+                # Reset the view back to its original start mode
+                view.mode = view.initial_start_mode
+                # If it's a dedicated member list, it already has the tag.
+                # If it's a summary list, tag will be None.
                 view.is_fetching = True
                 await view.initialize_data()
                 view.is_fetching = False
@@ -1572,7 +1575,7 @@ class AddGlobalGuildModal(discord.ui.Modal, title="Add Global Guild"):
         max_length=100
     )
 
-    def __init__(self, view_ref: 'SetupView'):
+    def __init__(self, view_ref: DevSetupView):
         super().__init__(timeout=300.0)
         self.view_ref = view_ref
 
@@ -1608,7 +1611,7 @@ class DeleteGlobalGuildModal(discord.ui.Modal, title="Delete Global Guild"):
         max_length=15
     )
 
-    def __init__(self, view_ref: 'SetupView'):
+    def __init__(self, view_ref: DevSetupView):
         super().__init__(timeout=300.0)
         self.view_ref = view_ref
 
@@ -1658,47 +1661,6 @@ async def _initialize_ai_models():
     else:
         print("AI INFO: GEMINI_API_KEY not found. AI features disabled.")
 
-async def load_keyword_data():
-    """Loads keyword rules from the database into the cache."""
-    global keyword_data_cache, total_keywords, discovered_keywords_count
-    if not supabase:
-        print("AI: Supabase client not available, skipping keyword data load.")
-        return
-
-    try:
-        response = await run_supabase_sync(
-            lambda: supabase.table("keyword_phrases").select("*").execute()
-        )
-
-        if not response or not hasattr(response, 'data'):
-            await log_error(None, "AI: Failed to fetch keyword data from Supabase (no response).", ping_developer=True)
-            return
-
-        keyword_data_cache.clear()
-        for item in response.data:
-            keyword_regex = item.get("keyword_regex")
-            if keyword_regex:
-                try:
-                    keyword_data_cache[keyword_regex] = {
-                        "compiled_regex": re.compile(keyword_regex, re.IGNORECASE),
-                        "ai_instructions": item.get("ai_instructions"),
-                        "discovery_message": item.get("discovery_message"),
-                        "is_discovered": item.get("is_discovered", False),
-                        "id": item.get("id")
-                    }
-                except re.error as e:
-                    await log_error(None, f"AI: Failed to compile regex for keyword ID {item.get('id')}: `{keyword_regex}`", error=e)
-
-        total_keywords = len(keyword_data_cache)
-        discovered_keywords_count = sum(1 for data in keyword_data_cache.values() if data['is_discovered'])
-        await log_info(None, f"AI: Successfully loaded {total_keywords} keyword rules ({discovered_keywords_count} discovered).")
-
-    except Exception as e:
-        await log_error(None, "AI: Critical error loading keyword data from Supabase.", error=e, ping_developer=True)
-        keyword_data_cache.clear()
-        total_keywords = 0
-        discovered_keywords_count = 0
-
 def get_prompt(prompt_key: str, **kwargs) -> Optional[str]:
     raw_prompt = AI_PROMPTS.get(prompt_key)
     return raw_prompt.format(**kwargs) if raw_prompt else None
@@ -1747,7 +1709,7 @@ async def _send_personality_response(
 ) -> Optional[discord.Message]:
     """Sends or edits an AI response as a plain text message from the main bot account."""
     
-    footer_text = f"\n\n*(Personality: {personality_key.title()}"
+    footer_text = ""
     if fallback_used:
         fallback_model = AI_PERSONALITIES.get(personality_key, {}).get('fallback_model', 'a fallback')
         footer_text += f" | Using {fallback_model} model due to high load"
@@ -1759,11 +1721,11 @@ async def _send_personality_response(
         webhook_name = PERSONALITY_WEBHOOK_NAMES.get(personality_key, "FlorrNerd")
         name_prefix = f"**{webhook_name}:**\n"
 
-    full_content = name_prefix + content + footer_text
+    full_content = content
     if len(full_content) > 2000:
-        content_limit = 2000 - len(name_prefix) - len(footer_text) - 3 # -3 for "..."
+        content_limit = 2000 - 3 # -3 for "..."
         content = content[:content_limit] + "..."
-        full_content = name_prefix + content + footer_text
+        full_content = content
 
     try:
         if message_to_edit:
@@ -1894,7 +1856,7 @@ async def get_ai_response_with_image(prompt_key: str, image_bytes_list: List[byt
     if len(content_for_api) <= 1:
         return None
 
-    model_id = "gemini-2.5-flash-preview-05-20"
+    model_id = "gemini-2.5-flash"
     model = ai_models.get(model_id)
     if not model:
         await log_error(None, f"AI image processing failed: Required model '{model_id}' not available.", ping_developer=True)
@@ -1939,6 +1901,20 @@ async def _remove_slowmode(channel: discord.TextChannel):
     except (discord.Forbidden, discord.HTTPException): pass
     finally:
         if channel.id in slowmode_tasks: del slowmode_tasks[channel.id]
+
+async def _show_dev_setup_view(interaction: discord.Interaction):
+    """Core logic to display the developer setup view."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=False)
+
+    view = DevSetupView(interaction)
+    view._add_buttons() 
+    for item in view.children:
+        if isinstance(item, discord.ui.Button):
+            item.callback = view.dispatch_callback
+
+    message = await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=False)
+    view.message = message
 
 async def process_message_for_ai(message: discord.Message):
     """The main AI processing logic, formerly from AICog.on_message."""
@@ -2322,9 +2298,21 @@ async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: s
             if guild.get_role(item_id):
                 return item_id, None
         elif item_type == 'channel':
+            # For channels, also check for mentions like <#12345>
             if guild.get_channel(item_id):
                 return item_id, None
     
+    # Check for channel/role mention format
+    mention_match = re.match(r"<[#@&]+(\d+)>", name_or_id)
+    if mention_match:
+        item_id = int(mention_match.group(1))
+        if item_type == 'role':
+            if guild.get_role(item_id):
+                return item_id, None
+        elif item_type == 'channel':
+            if guild.get_channel(item_id):
+                return item_id, None
+
     # 2. Fuzzy match against names
     search_space = guild.roles if item_type == 'role' else guild.text_channels
     name_lower = name_or_id.lower()
@@ -2342,13 +2330,10 @@ async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: s
     # Difflib fuzzy match as a last resort
     closest_matches = difflib.get_close_matches(name_lower, [item.name for item in search_space], n=2, cutoff=0.7)
     if len(closest_matches) == 1:
-        # We need to find the item object from the matched name
-        # Using discord.utils.get is perfect for this.
         matched_item = discord.utils.get(search_space, name=closest_matches[0])
         if matched_item:
             return matched_item.id, None
     
-    # 3. Handle failure cases
     possible_matches = set()
     if partial_matches: possible_matches.update(i.name for i in partial_matches)
     if closest_matches: possible_matches.update(i for i in closest_matches)
@@ -2356,7 +2341,6 @@ async def resolve_name_to_id(guild: discord.Guild, name_or_id: str, item_type: s
     if not possible_matches:
         return None, f"⚠️ No {item_type} found for '{name_or_id}'."
     else:
-        # Ambiguous match
         return None, f"❓ Ambiguous. Could be: {', '.join(f'`{n}`' for n in list(possible_matches)[:3])}."
 
 async def trigger_global_role_sync_for_user(user: discord.Member):
@@ -2407,241 +2391,166 @@ class SetupView(discord.ui.View):
         self.guild = interaction.guild
         self.config = config
         self.message: Optional[discord.Message] = None
-        self.mode = 'admin' # Start in 'admin' mode
         self.original_interaction_user_id = interaction.user.id
-        self.global_guilds_data: List[Dict[str, Any]] = [] # For dev view
-        self._update_ui_elements()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Checks permissions for button interactions."""
-        # The toggle button has its own check
-        if interaction.data.get('custom_id') == 'setup_toggle_dev_view':
-            if interaction.user.id != DEVELOPER_USER_ID:
-                await interaction.response.send_message("❌ You are not authorized to toggle the developer view.", ephemeral=True)
-                return False
-            return True
+        if interaction.data.get('custom_id') == 'setup_switch_to_dev':
+             if interaction.user.id == DEVELOPER_USER_ID: return True
+             else:
+                 await interaction.response.send_message("❌ Only the bot developer can switch to this view.", ephemeral=True)
+                 return False
         
-        # All other buttons require admin perms
         is_staff = await is_admin_or_developer(interaction)
         if not is_staff:
             await interaction.response.send_message("❌ You need administrator permissions to use these buttons.", ephemeral=True)
             return False
         return True
 
-    def _update_ui_elements(self):
-        """Re-creates all UI components based on the current mode."""
-        self.clear_items()
-        
-        # --- Row 0: Core Admin Settings ---
-        self.add_item(discord.ui.Button(label="Set Roles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_roles"))
-        self.add_item(discord.ui.Button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_feature_chans"))
-        self.add_item(discord.ui.Button(label="Set Command Permissions", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_cmd_perms"))
-
-        # --- Row 1: Module/Optional Settings ---
-        self.add_item(discord.ui.Button(label="Set AI Channels", style=discord.ButtonStyle.secondary, row=1, custom_id="setup_btn_ai_chans"))
-        self.add_item(discord.ui.Button(label="Set Modules", style=discord.ButtonStyle.secondary, row=1, custom_id="setup_btn_modules"))
-        self.add_item(discord.ui.Button(label="Toggle Features", style=discord.ButtonStyle.secondary, row=1, custom_id="setup_btn_toggles"))
-
-        # --- Row 2: Tracked Guilds (Server-Specific) ---
-        self.add_item(discord.ui.Button(label="Add Tracked Guild", style=discord.ButtonStyle.success, row=2, custom_id="setup_btn_add_guild"))
-        self.add_item(discord.ui.Button(label="Remove Tracked Guild", style=discord.ButtonStyle.danger, row=2, custom_id="setup_btn_remove_guild"))
-
-        # --- Row 3: Developer-Only Buttons ---
-        if self.mode == 'dev':
-            self.add_item(discord.ui.Button(label="Set Ping Channels", style=discord.ButtonStyle.danger, row=3, custom_id="setup_btn_ping_chans"))
-            self.add_item(discord.ui.Button(label="Add Global Guild", style=discord.ButtonStyle.success, row=3, custom_id="setup_btn_add_global_guild"))
-            self.add_item(discord.ui.Button(label="Delete Global Guild", style=discord.ButtonStyle.danger, row=3, custom_id="setup_btn_delete_global_guild"))
-
-        # --- Row 4: Control Buttons ---
-        # Add the dev view toggle button if the original interactor is the developer
-        if self.original_interaction_user_id == DEVELOPER_USER_ID:
-            toggle_label = "Switch to Admin View" if self.mode == 'dev' else "Switch to Developer View"
-            toggle_emoji = "🛡️" if self.mode == 'dev' else "👑"
-            self.add_item(discord.ui.Button(label=toggle_label, emoji=toggle_emoji, style=discord.ButtonStyle.secondary, row=4, custom_id="setup_toggle_dev_view"))
-        
-        self.add_item(discord.ui.Button(label="Done", style=discord.ButtonStyle.success, row=4, custom_id="setup_btn_done"))
-
-        # Assign callbacks to all buttons dynamically
-        for child in self.children:
-            if isinstance(child, discord.ui.Button): child.callback = self.dispatch_button_callback
-
     async def create_embed(self) -> discord.Embed:
-        view_title = "Developer" if self.mode == 'dev' else "Admin"
-        embed = discord.Embed(title=f"⚙️ Bot Setup ({view_title} View) for {self.guild.name}", color=NERDY_YELLOW)
-        embed.description = "Use the buttons below to configure the bot for this server. All settings are optional."
-        
-        def get_mention(item_id, item_type):
-            if not item_id: return "`Not Set`"
-            if item_type == 'role': item_obj = self.guild.get_role(item_id)
-            else: item_obj = self.guild.get_channel(item_id)
-            return item_obj.mention if item_obj else f"⚠️ `Not Found (ID: {item_id})`"
-            
+        embed = discord.Embed(title=f"🛡️ Admin Setup for {self.guild.name}", color=NERDY_YELLOW)
+        embed.description = "Use the buttons below to configure the bot for this server."
+
         def get_bool_status(key: str) -> str:
             return "✅ Enabled" if self.config.get(key, True) else "❌ Disabled"
 
-        # --- Always Visible Sections ---
+        # --- Roles Section ---
+        verified_roles_list = self.config.get('verified_role_ids') or []
+        verified_mentions = ", ".join([await get_mention(rid, 'role', self.guild) for rid in verified_roles_list]) or "`Not Set`"
         mod_role_ids = self.config.get('moderator_role_ids') or []
-        mod_mentions = [get_mention(rid, 'role') for rid in mod_role_ids]
-        mod_val = ", ".join(mod_mentions) if mod_mentions else "`Not Set`"
-        roles_val = (f"**Verified:** {get_mention(self.config.get('verified_role_id'), 'role')}\n"
-                     f"**Unverified:** {get_mention(self.config.get('unverified_role_id'), 'role')}\n"
-                     f"**Withered:** {get_mention(self.config.get('withered_role_id'), 'role')}\n"
-                     f"**Ex-Member:** {get_mention(self.config.get('ex_member_role_id'), 'role')}\n"
-                     f"**Moderators:** {mod_val}\n"
-                     f"**Super Ping Role:** {get_mention(self.config.get('super_ping_role_id'), 'role')}")
-        embed.add_field(name="Core Roles", value=roles_val, inline=False)
+        mod_mentions = ", ".join([await get_mention(rid, 'role', self.guild) for rid in mod_role_ids]) or "`Not Set`"
         
-        chans_val = (f"**Screenshots:** {get_mention(self.config.get('screenshots_dropbox_channel_id'), 'channel')}\n"
-                     f"**Super Attempts:** {get_mention(self.config.get('super_attempts_channel_id'), 'channel')}\n"
-                     f"**Unified Guild List:** {get_mention(self.config.get('guild_list_channel_id'), 'channel')}")
+        roles_val = (
+            f"**Verified:** {verified_mentions}\n"
+            f"**Unverified:** {await get_mention(self.config.get('unverified_role_id'), 'role', self.guild)}\n"
+            f"**Withered:** {await get_mention(self.config.get('withered_role_id'), 'role', self.guild)}\n"
+            f"**Moderators:** {mod_mentions}"
+        )
+        embed.add_field(name="Core & Staff Roles", value=roles_val, inline=False)
+
+        # --- Channels Section ---
+        ai_channels_list = self.config.get('always_on_ai_channels') or []
+        ai_mentions = ", ".join([await get_mention(cid, 'channel', self.guild) for cid in ai_channels_list]) or "`Not Set`"
+        chans_val = (
+            f"**Screenshots (Activity):** {await get_mention(self.config.get('screenshots_dropbox_channel_id'), 'channel', self.guild)}\n"
+            f"**Super Attempts Log:** {await get_mention(self.config.get('super_attempts_channel_id'), 'channel', self.guild)}\n"
+            f"**Unified Guild List:** {await get_mention(self.config.get('guild_list_channel_id'), 'channel', self.guild)}\n"
+            f"**Changelog:** {await get_mention(self.config.get('changelog_channel_id'), 'channel', self.guild)}\n"
+            f"**Always-On AI:** {ai_mentions}"
+        )
         embed.add_field(name="Feature Channels", value=chans_val, inline=False)
+        
+        # --- Toggles Section ---
+        toggles_val = (
+            f"**Keywords:** {get_bool_status('keywords_enabled')} | "
+            f"**Wither Cmd:** {get_bool_status('wither_command_enabled')}\n"
+            f"**ServerCodes Cmd:** {get_bool_status('servercodes_command_enabled')} | "
+            f"**Profile Cmd:** {get_bool_status('profile_command_enabled')}"
+        )
+        embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
 
-        # --- Developer-Only View Sections ---
-        if self.mode == 'dev':
-            ping_chans_val = (f"**Craft Pings:** {get_mention(self.config.get('craft_ping_channel_id'), 'channel')}\n"
-                              f"**Spawn Pings:** {get_mention(self.config.get('spawn_ping_channel_id'), 'channel')}\n"
-                              f"**Defeat Pings:** {get_mention(self.config.get('defeat_ping_channel_id'), 'channel')}")
-            embed.add_field(name="Super Ping Channels (Dev Only)", value=ping_chans_val, inline=False)
-            
-            if self.global_guilds_data:
-                guilds_val_parts = [f"**`{g['guild_tag']}`**: {g['description']}" for g in sorted(self.global_guilds_data, key=lambda x: x['guild_tag'].lower())]
-                guilds_val = "\n".join(guilds_val_parts)
-            else:
-                guilds_val = "`No global guilds are configured.`"
-            embed.add_field(name="🌐 Globally Available Guilds (Dev Only)", value=guilds_val, inline=False)
-
+        # --- Tracked Guilds ---
         tracked_guilds = self.config.get('tracked_guilds', {})
-        guilds_val = "\n".join([f"**{tag}**: Role -> {get_mention(data.get('discord_role_id'), 'role')}" for tag, data in sorted(tracked_guilds.items())]) or "`No guilds are being tracked yet.`"
+        guilds_val = "\n".join([f"**{tag}**: Role -> {await get_mention(data.get('discord_role_id'), 'role', self.guild)}" for tag, data in sorted(tracked_guilds.items())]) or "`No guilds tracked.`"
         embed.add_field(name=f"Tracked Florr Guilds", value=guilds_val, inline=False)
         
-        embed.set_footer(text="Enter a name or ID in the modals. Leave blank to clear a setting.")
+        embed.set_footer(text="Leave an option blank in a modal to clear it.")
         return embed
 
-    async def _update_message(self, interaction: discord.Interaction):
-        """Refreshes the view's components and edits the message."""
-        if self.mode == 'dev':
-            self.global_guilds_data = await fetch_globally_available_guilds()
+    def _update_ui_elements(self):
+        self.clear_items()
+        self.add_item(discord.ui.Button(label="Set Roles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_roles"))
+        self.add_item(discord.ui.Button(label="Set Channels", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_channels"))
+        self.add_item(discord.ui.Button(label="Set Toggles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_toggles"))
+        self.add_item(discord.ui.Button(label="Add Tracked Guild", style=discord.ButtonStyle.success, row=1, custom_id="setup_btn_add_guild"))
+        self.add_item(discord.ui.Button(label="Remove Tracked Guild", style=discord.ButtonStyle.danger, row=1, custom_id="setup_btn_remove_guild"))
         
-        self._update_ui_elements()
-        await interaction.response.edit_message(embed=await self.create_embed(), view=self)
+        if self.original_interaction_user_id == DEVELOPER_USER_ID:
+            self.add_item(discord.ui.Button(label="Open Developer Panel", emoji="👑", style=discord.ButtonStyle.secondary, row=2, custom_id="setup_switch_to_dev"))
+        
+        self.add_item(discord.ui.Button(label="Done", style=discord.ButtonStyle.secondary, row=3, custom_id="setup_btn_done"))
+        
+        for child in self.children:
+            if isinstance(child, discord.ui.Button): child.callback = self.dispatch_callback
 
-    async def refresh_view(self, interaction: discord.Interaction):
-        """Reloads config from DB and updates the message embed."""
-        if self.guild.id in server_settings_cache:
-            del server_settings_cache[self.guild.id]
-        self.config = await load_server_config(self.guild.id)
-        
-        if self.mode == 'dev':
-            self.global_guilds_data = await fetch_globally_available_guilds()
-        
-        if self.message:
-            await self.message.edit(embed=await self.create_embed(), view=self)
-
-    async def dispatch_button_callback(self, interaction: discord.Interaction):
-        """A single callback dispatcher for all buttons."""
+    async def dispatch_callback(self, interaction: discord.Interaction):
         custom_id = interaction.data['custom_id']
         
-        action_map = {
-            "setup_toggle_dev_view": lambda i: self._update_message(i),
-            "setup_btn_roles": self.set_roles_button,
-            "setup_btn_feature_chans": self.set_channels_button,
-            "setup_btn_cmd_perms": self.set_perms_button,
-            "setup_btn_ai_chans": self.set_ai_channels_button,
-            "setup_btn_modules": self.set_modules_button,
-            "setup_btn_toggles": self.toggle_features_button,
-            "setup_btn_add_guild": self.add_tracked_guild_button,
-            "setup_btn_remove_guild": self.remove_tracked_guild_button,
-            "setup_btn_done": self.done_button,
-            "setup_btn_ping_chans": self.set_ping_channels_button,
-            "setup_btn_add_global_guild": self.add_global_guild_button,
-            "setup_btn_delete_global_guild": self.delete_global_guild_button,
-        }
+        if custom_id == 'setup_btn_roles':
+            current_verified_roles = ', '.join(map(str, self.config.get('verified_role_ids', [])))
+            current_mod_roles = ', '.join(map(str, self.config.get('moderator_role_ids', [])))
+            fields = [
+                {'label': "Verified Roles (comma-separated)", 'id': "verified_role_ids", 'default': current_verified_roles},
+                {'label': "Unverified Role", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
+                {'label': "Withered Role", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
+                {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'default': current_mod_roles}
+            ]
+            await interaction.response.send_modal(SetupModal(title="Set Core & Staff Roles", fields=fields, callback_func=self.handle_modal_submit))
+
+        elif custom_id == 'setup_btn_channels':
+            current_ai_channels = ', '.join(map(str, self.config.get('always_on_ai_channels', [])))
+            fields = [
+                {'label': "Screenshots Channel (Activity)", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
+                {'label': "Super Attempts Log Channel", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
+                {'label': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str(self.config.get('guild_list_channel_id') or '')},
+                {'label': "Changelog Channel", 'id': "changelog_channel_id", 'default': str(self.config.get('changelog_channel_id') or '')},
+                {'label': "Always-On AI Channels (comma-sep)", 'id': "always_on_ai_channels", 'default': current_ai_channels}
+            ]
+            await interaction.response.send_modal(SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit))
+
+        elif custom_id == 'setup_btn_toggles':
+            fields = [
+                {'label': "AI Keywords (enable/disable)", 'id': "keywords_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('keywords_enabled', True) else 'disable'},
+                {'label': "Wither Command (enable/disable)", 'id': "wither_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('wither_command_enabled', True) else 'disable'},
+                {'label': "/servercodes Command (enable/disable)", 'id': "servercodes_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('servercodes_command_enabled', True) else 'disable'},
+                {'label': "/profile Command (enable/disable)", 'id': "profile_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('profile_command_enabled', True) else 'disable'}
+            ]
+            await interaction.response.send_modal(SetupModal(title="Set Feature Toggles", fields=fields, callback_func=self.handle_modal_submit))
         
-        if custom_id == 'setup_toggle_dev_view':
-            self.mode = 'admin' if self.mode == 'dev' else 'dev'
+        elif custom_id == 'setup_btn_add_guild':
+            await interaction.response.send_modal(AddTrackedGuildModal(self))
+        elif custom_id == 'setup_btn_remove_guild':
+            await interaction.response.send_modal(RemoveTrackedGuildModal(self))
+        elif custom_id == 'setup_switch_to_dev':
+            if self.message: await self.message.delete()
+            await _show_dev_setup_view(interaction)
+        elif custom_id == 'setup_btn_done':
+            if self.message: await self.message.edit(content="✅ Admin setup complete.", embed=None, view=None)
+            self.stop()
+        else: await interaction.response.defer()
 
-        handler = action_map.get(custom_id)
-        if handler: await handler(interaction)
-        else: await interaction.response.send_message("Unknown button action.", ephemeral=True)
-
-    async def set_roles_button(self, interaction: discord.Interaction):
-        current_mod_roles = self.config.get('moderator_role_ids', [])
-        default_mod_roles_str = ', '.join(map(str, current_mod_roles)) if current_mod_roles else ''
-        fields = [{'label': "Verified Role", 'id': "verified_role_id", 'default': str(self.config.get('verified_role_id') or '')},
-                  {'label': "Unverified Role", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
-                  {'label': "Withered Role", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
-                  {'label': "Ex-Member Role", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
-                  {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'default': default_mod_roles_str, 'style': discord.TextStyle.paragraph},
-                  {'label': "Super Spawn Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')}]
-        await interaction.response.send_modal(SetupModal(title="Set Core & Moderator Roles", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def set_channels_button(self, interaction: discord.Interaction):
-        fields = [{'label': "Screenshots Channel", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
-                  {'label': "Super Attempts Channel", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
-                  {'label': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str(self.config.get('guild_list_channel_id') or '')}]
-        await interaction.response.send_modal(SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def set_ping_channels_button(self, interaction: discord.Interaction):
-        fields = [{'label': "Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
-                  {'label': "Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
-                  {'label': "Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')}]
-        await interaction.response.send_modal(SetupModal(title="Set Self-Bot Ping Channels (Dev Only)", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def add_global_guild_button(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(AddGlobalGuildModal(self))
-
-    async def delete_global_guild_button(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(DeleteGlobalGuildModal(self))
-
-    async def set_perms_button(self, interaction: discord.Interaction, *args):
-        fields = [{'label': "/florr Command Role", 'id': "florr_command_role_id", 'default': str(self.config.get('florr_command_role_id') or '')},
-                  {'label': "/imitate Command Role", 'id': "imitate_command_role_id", 'default': str(self.config.get('imitate_command_role_id') or '')},
-                  {'label': "/wither Command Role", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')}]
-        await interaction.response.send_modal(SetupModal(title="Set Command Roles", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def set_ai_channels_button(self, interaction: discord.Interaction, *args):
-        current_ai_channels = self.config.get('always_on_ai_channels', [])
-        default_str = ', '.join(map(str, current_ai_channels)) if current_ai_channels else ''
-        fields = [{'label': "AI Channel Names/IDs (comma-separated)", 'id': "always_on_ai_channels", 'default': default_str, 'style': discord.TextStyle.paragraph}]
-        await interaction.response.send_modal(SetupModal(title="Set Always-On AI Channels", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def set_modules_button(self, interaction: discord.Interaction, *args):
-        current_modules = self.config.get('enabled_modules', [])
-        default_str = ', '.join(current_modules) if current_modules else ''
-        fields = [{'label': "Enabled Modules (comma-separated)", 'id': "enabled_modules", 'default': default_str, 'style': discord.TextStyle.paragraph}]
-        await interaction.response.send_modal(SetupModal(title="Set Enabled Bot Modules", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def add_tracked_guild_button(self, interaction: discord.Interaction, *args):
-        await interaction.response.send_modal(AddTrackedGuildModal(self))
-
-    async def remove_tracked_guild_button(self, interaction: discord.Interaction, *args):
-        await interaction.response.send_modal(RemoveTrackedGuildModal(self))
-
-    async def toggle_features_button(self, interaction: discord.Interaction, *args):
-        fields = [{'label': "Keyword Triggers Enabled (yes/no)", 'id': "keywords_enabled", 'default': "yes" if self.config.get('keywords_enabled', True) else "no"},
-                  {'label': "/wither Command Enabled (yes/no)", 'id': "wither_command_enabled", 'default': "yes" if self.config.get('wither_command_enabled', True) else "no"}]
-        await interaction.response.send_modal(SetupModal(title="Toggle Features", fields=fields, callback_func=self.handle_modal_submit))
-
-    async def done_button(self, interaction: discord.Interaction, *args):
-        await interaction.response.edit_message(content="✅ Setup complete.", embed=None, view=None)
-        self.stop()
-    
     async def handle_modal_submit(self, interaction: discord.Interaction, results: Dict[str, str]):
         await interaction.response.defer(thinking=True, ephemeral=True)
         updates = {"guild_id": self.guild.id}
-        errors = []
-        resolved_items = []
-
+        errors, resolved_items = [], []
+        
+        boolean_fields = ["keywords_enabled", "wither_command_enabled", "servercodes_command_enabled", "profile_command_enabled"]
+        
         for key, value in results.items():
             value_stripped = value.strip()
             
+            # Handle booleans
+            if key in boolean_fields:
+                if not value_stripped: # If blank, keep current setting
+                    continue
+                if value_stripped.lower() in ["enable", "yes", "true", "1"]:
+                    updates[key] = True
+                    resolved_items.append(f"Set `{key}` to `Enabled`.")
+                elif value_stripped.lower() in ["disable", "no", "false", "0"]:
+                    updates[key] = False
+                    resolved_items.append(f"Set `{key}` to `Disabled`.")
+                else:
+                    errors.append(f"For `{key}`: Invalid input. Use 'enable' or 'disable'.")
+                continue
+
+            # Handle blank values for other fields (clear setting)
             if not value_stripped:
                 updates[key] = [] if key.endswith('_ids') or key.endswith('_channels') else None
                 resolved_items.append(f"Cleared setting for `{key}`.")
                 continue
 
-            if key in ['always_on_ai_channels', 'moderator_role_ids']:
-                item_type = 'channel' if key == 'always_on_ai_channels' else 'role'
+            # Handle lists (roles or channels)
+            if key.endswith('_ids') or key.endswith('_channels'):
+                item_type = 'channel' if key.endswith('_channels') else 'role'
                 inputs = [name.strip() for name in value_stripped.split(',') if name.strip()]
                 resolved_ids = []
                 temp_errors = []
@@ -2649,34 +2558,17 @@ class SetupView(discord.ui.View):
                     resolved_id, status_msg = await resolve_name_to_id(self.guild, item_input, item_type)
                     if resolved_id: resolved_ids.append(resolved_id)
                     else: temp_errors.append(f"Could not resolve '{item_input}': {status_msg}")
-                
                 if not temp_errors:
                     updates[key] = resolved_ids
-                    mention_prefix = '#' if item_type == 'channel' else '@&'
-                    mentions = [f"<{mention_prefix}{cid}>" for cid in resolved_ids]
+                    mention_char = '#' if item_type == 'channel' else '@&'
+                    mentions = [f"<{mention_char}{rid}>" for rid in resolved_ids]
                     resolved_items.append(f"Set `{key}` to: {', '.join(mentions) or 'None'}.")
                 else: errors.extend(temp_errors)
                 continue
-
-            if key.endswith('_enabled'):
-                if value_stripped.lower() in ['yes', 'true', '1', 'on', 'enabled']:
-                    updates[key] = True
-                    resolved_items.append(f"Set `{key}` to ✅ Enabled.")
-                elif value_stripped.lower() in ['no', 'false', '0', 'off', 'disabled']:
-                    updates[key] = False
-                    resolved_items.append(f"Set `{key}` to ❌ Disabled.")
-                else: errors.append(f"For `{key}`: Invalid input. Please use 'yes' or 'no'.")
-                continue
-
-            if key == 'enabled_modules':
-                module_inputs = {m.strip().lower() for m in value_stripped.split(',') if m.strip()}
-                updates[key] = sorted(list(module_inputs))
-                resolved_items.append(f"Set `enabled_modules` to: `{', '.join(updates[key]) or 'None'}`.")
-                continue
-
+            
+            # Handle single items (roles or channels)
             item_type = 'channel' if 'channel' in key else 'role'
             resolved_id, status_msg = await resolve_name_to_id(self.guild, value_stripped, item_type)
-            
             if resolved_id:
                 updates[key] = resolved_id
                 item_obj = self.guild.get_role(resolved_id) if item_type == 'role' else self.guild.get_channel(resolved_id)
@@ -2688,16 +2580,25 @@ class SetupView(discord.ui.View):
         if errors:
             feedback_embed.add_field(name="❌ Errors / Unchanged", value="\n".join(errors), inline=False)
             feedback_embed.color = discord.Color.orange()
-            feedback_embed.set_footer(text="Settings with errors were not saved. Try again with valid names/IDs.")
         else: feedback_embed.color = discord.Color.green()
         
-        await self.update_config_and_refresh(interaction, updates)
+        if updates:
+            await run_supabase_sync(lambda: supabase.table(SERVER_CONFIGS_TABLE_NAME).upsert(updates).execute())
+            await self.refresh_view(interaction)
+
         await interaction.followup.send(embed=feedback_embed, ephemeral=True)
+
+    async def refresh_view(self, interaction: discord.Interaction):
+        if self.guild.id in server_settings_cache: del server_settings_cache[self.guild.id]
+        self.config = await load_server_config(self.guild.id)
+        self._update_ui_elements()
+        if self.message: await self.message.edit(embed=await self.create_embed(), view=self)
 
     async def on_timeout(self):
         if self.message:
             try: await self.message.edit(content="Setup timed out.", view=None)
             except (discord.NotFound, discord.HTTPException): pass
+        self.stop()
 
 async def check_is_staff(interaction: discord.Interaction) -> Tuple[bool, Optional[str]]:
     """
@@ -3001,25 +2902,6 @@ async def aperiodic_spawn_defeat_poster():
         for item in items_to_post:
             await spawn_defeat_queue.put(item)
 
-async def _initialize_data_caches(bot: commands.Bot):
-    """Loads all initial data from database and filesystem."""
-    print("--- Loading all server configurations into cache ---")
-    if supabase:
-        for guild in bot.guilds:
-            await load_server_config(guild.id)
-    print(f"--- Finished loading configs for {len(server_settings_cache)} guild(s) ---")
-
-    print("--- Loading initial data ---")
-    log_guild_for_data_load = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
-
-    await load_ign_cache(log_guild_for_data_load)
-    print("Loading profile picture choices...")
-    await load_profile_picture_choices(log_guild_for_data_load)
-    print("Loading AI keyword data...")
-    await load_keyword_data()
-
-    print("Staff channel identification is now dynamic based on user permissions.")
-
 async def _sync_app_commands(bot: commands.Bot) -> list:
     """Syncs application commands and populates the command_ids dictionary."""
     print("Syncing application commands...")
@@ -3122,7 +3004,7 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
         return
 
     config = await load_server_config(guild.id)
-    verified_role_id = config.get('verified_role_id')
+    verified_role_ids = config.get('verified_role_ids') or []
     unverified_role_id = config.get('unverified_role_id')
     tracked_guilds_config = config.get('tracked_guilds', {})
     
@@ -3137,19 +3019,26 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
         db_guild_tag = db_data.get('florr_guild_tag') if is_connected else None
         
         # 1. Handle Verified/Unverified Roles
-        verified_role = guild.get_role(verified_role_id) if verified_role_id else None
         unverified_role = guild.get_role(unverified_role_id) if unverified_role_id else None
 
         if is_connected:
-            if verified_role and verified_role not in member.roles and guild.me.top_role > verified_role:
-                roles_to_add.append(verified_role)
+            # Add all configured verified roles if user is connected
+            for role_id in verified_role_ids:
+                verified_role = guild.get_role(role_id)
+                if verified_role and verified_role not in member.roles and guild.me.top_role > verified_role:
+                    roles_to_add.append(verified_role)
+
             if unverified_role and unverified_role in member.roles and guild.me.top_role > unverified_role:
                 roles_to_remove.append(unverified_role)
         else: # Not connected
             if unverified_role and unverified_role not in member.roles and guild.me.top_role > unverified_role:
                 roles_to_add.append(unverified_role)
-            if verified_role and verified_role in member.roles and guild.me.top_role > verified_role:
-                roles_to_remove.append(verified_role)
+            
+            # Remove all configured verified roles if user is not connected
+            for role_id in verified_role_ids:
+                verified_role = guild.get_role(role_id)
+                if verified_role and verified_role in member.roles and guild.me.top_role > verified_role:
+                    roles_to_remove.append(verified_role)
         
         # 2. Handle Tracked Guild Roles
         is_in_tracked_guild = db_guild_tag and db_guild_tag in tracked_guilds_config
@@ -3185,10 +3074,64 @@ async def refresh_roles_for_single_user(guild: discord.Guild, member: discord.Me
     except Exception as e:
         await log_error(guild, f"Failed to sync roles for {member.mention}", error=e)
 
-async def refresh_all_guild_lists(guild: discord.Guild):
-    """Iterates through all configured tracked guilds and updates their static lists."""
-    # This function is now simpler, it just calls the one update function.
-    await update_guilds_list(guild)
+async def update_dedicated_guild_list(guild: discord.Guild, tag: str, channel_id: int):
+    """Creates or updates a dedicated, guild-specific interactive list."""
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel) or not channel.permissions_for(guild.me).send_messages:
+        await log_error(guild, f"Dedicated list update failed for tag {tag}: Channel {channel_id} invalid or permissions missing.")
+        return
+
+    message_to_edit: Optional[discord.Message] = None
+    try:
+        async for msg in channel.history(limit=20):
+            if msg.author.id == bot.user.id and msg.embeds and f"Members of {tag}" in msg.embeds[0].title:
+                message_to_edit = msg
+                break
+    except discord.Forbidden:
+        await log_error(guild, f"Cannot read history in {channel.mention} to find old dedicated list for {tag}.")
+        return
+        
+    try:
+        mock_interaction = discord.Object(id=0)
+        mock_interaction.guild = guild
+        mock_interaction.channel = channel
+        mock_interaction.user = bot.user
+        mock_interaction._session = bot._connection
+        mock_interaction._original_message = None
+
+        view = GuildsView(interaction=mock_interaction, is_static_list=True, start_mode=GuildsView.MODE_MEMBERS, start_tag=tag)
+        view.initial_start_mode = GuildsView.MODE_MEMBERS # Set initial mode for resets
+        view.member_view_mode = VIEW_MODE_ACTIVITY_MONTHLY # Default view
+        await view.initialize_data()
+        embed = await view.create_embed()
+        
+        if message_to_edit:
+            await message_to_edit.edit(embed=embed, view=view)
+            view.message = message_to_edit
+        else:
+            new_message = await channel.send(embed=embed, view=view)
+            view.message = new_message
+            
+        active_static_list_views[channel.id] = view
+    except Exception as e:
+        await log_error(guild, f"Failed to update dedicated list for {tag}", error=e)
+
+async def update_all_static_lists(guild: discord.Guild):
+    """Iterates through all configured lists for a server and updates them."""
+    config = await load_server_config(guild.id)
+    
+    # 1. Update main summary list
+    summary_channel_id = config.get('guild_list_channel_id')
+    if summary_channel_id:
+        await update_guilds_list(guild)
+
+    # 2. Update all dedicated guild lists
+    tracked_guilds = config.get('tracked_guilds', {})
+    for tag, data in tracked_guilds.items():
+        dedicated_channel_id = data.get('list_channel_id')
+        if dedicated_channel_id:
+            await update_dedicated_guild_list(guild, tag, dedicated_channel_id)
+            await asyncio.sleep(2) # Be gentle with the API
 
 async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag: str) -> Tuple[List[Dict[str, Any]], int]:
     """
@@ -3824,205 +3767,365 @@ async def handle_screenshot_dropbox(message: discord.Message):
         # This is where the standard activity logging happens now.
         await handle_guild_sync_from_screenshots(message, valid_images)
 
+async def add_changelog_entry(interaction: discord.Interaction, version: str, content: str) -> Tuple[bool, Optional[int]]:
+    """Adds a new changelog entry to the database."""
+    if not supabase: return False, None
+    try:
+        # Build ID will be the same as version for simplicity
+        resp = await run_supabase_sync(
+            lambda: supabase.table("changelogs").insert({
+                "version": version,
+                "build_id": version,
+                "content": content,
+                "author_id": interaction.user.id
+            }, returning='minimal').execute()
+        )
+        # Assuming success if no error is raised, as returning='minimal' gives no data
+        return True, None
+    except Exception as e:
+        await log_error(interaction.guild, "Failed to add changelog entry to DB", error=e, interaction=interaction)
+        return False, None
+
+async def broadcast_changelog(version: str, content: str, author: discord.User):
+    """Sends the changelog to all configured servers."""
+    today = datetime.datetime.now(pytz.utc)
+    date_str = f"{today.month}/{today.day}/{today.year}"
+
+    # Pre-process content to add bullet points if they aren't there
+    processed_content_lines = []
+    for line in content.split('\n'):
+        stripped_line = line.strip()
+        if stripped_line and not stripped_line.startswith(('* ', '- ', '• ')):
+            processed_content_lines.append(f"• {stripped_line}")
+        elif stripped_line:
+            processed_content_lines.append(stripped_line)
+
+    final_content = "\n".join(processed_content_lines)
+
+    embed = discord.Embed(
+        title=f"Changelog for version {version} ({date_str})",
+        description=final_content,
+        color=NERDY_YELLOW
+    )
+    embed.add_field(name="Build id", value=f"`{version}`", inline=False)
+
+    broadcast_count = 0
+    for guild in bot.guilds:
+        config = await load_server_config(guild.id)
+        channel_id = config.get('changelog_channel_id')
+        role_id = config.get('changelog_ping_role_id')
+
+        if not channel_id:
+            continue
+
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel) or not channel.permissions_for(guild.me).send_messages:
+            continue
+
+        ping_text = f"<@&{role_id}>" if role_id and guild.get_role(role_id) else None
+
+        try:
+            await channel.send(content=ping_text, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+            broadcast_count += 1
+            await asyncio.sleep(1) # Be gentle with API
+        except Exception as e:
+            await log_error(guild, f"Failed to broadcast changelog to channel {channel_id}", error=e)
+
+    return broadcast_count
+
+class PostChangelogModal(discord.ui.Modal, title="Post New Changelog"):
+    content_input = discord.ui.TextInput(
+        label="Changelog Content",
+        placeholder="Enter details. Use '*' or '-' for bullets. Newlines are preserved.",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500
+    )
+
+    def __init__(self, view_ref: DevSetupView):
+        super().__init__(timeout=600.0)
+        self.view_ref = view_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        content = self.content_input.value.strip()
+
+        git_commit_sha = os.getenv("RENDER_GIT_COMMIT")
+        if git_commit_sha:
+            version = git_commit_sha[:7]
+        else:
+            version = datetime.datetime.now(pytz.utc).strftime("%Y%m%d-%H%M")
+            print(f"INFO: RENDER_GIT_COMMIT not found. Using fallback version ID: {version}")
+
+        success, _ = await add_changelog_entry(interaction, version, content)
+        if not success:
+            await interaction.followup.send("❌ Failed to save the changelog to the database.", ephemeral=True)
+            return
+
+        broadcasted_to = await broadcast_changelog(version, content, interaction.user)
+        await interaction.followup.send(f"✅ Changelog for version `{version}` posted to {broadcasted_to} server(s).", ephemeral=True)
+
+class ChangelogView(discord.ui.View):
+    def __init__(self, interaction: discord.Interaction, changelogs: List[Dict[str, Any]], timeout=300.0):
+        super().__init__(timeout=timeout)
+        self.interaction = interaction
+        self.changelogs = changelogs
+        self.current_page = 0
+        self.total_pages = len(changelogs)
+        self.message: Optional[discord.Message] = None
+        self._update_ui_elements()
+
+    def _update_ui_elements(self):
+        self.clear_items()
+        prev_button = discord.ui.Button(label="⬅️ Previous", style=discord.ButtonStyle.primary, custom_id="changelog_prev", disabled=(self.current_page == 0))
+        prev_button.callback = self.pagination_callback
+        self.add_item(prev_button)
+        next_button = discord.ui.Button(label="Next ➡️", style=discord.ButtonStyle.primary, custom_id="changelog_next", disabled=(self.current_page >= self.total_pages - 1))
+        next_button.callback = self.pagination_callback
+        self.add_item(next_button)
+
+    async def create_embed_for_page(self) -> discord.Embed:
+        if not (0 <= self.current_page < self.total_pages):
+            return discord.Embed(title="Error", description="Invalid changelog page.", color=discord.Color.red())
+
+        log_data = self.changelogs[self.current_page]
+        version = log_data.get('version', 'N/A')
+        build_id = log_data.get('build_id', 'N/A')
+        content = log_data.get('content', 'No content available.')
+        created_at_str = log_data.get('created_at')
+
+        created_date = date_parse(created_at_str) if created_at_str else datetime.datetime.now(pytz.utc)
+        date_str = f"{created_date.month}/{created_date.day}/{created_date.year}"
+
+        processed_content_lines = []
+        for line in content.split('\n'):
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith(('* ', '- ', '• ')):
+                processed_content_lines.append(f"• {stripped_line}")
+            elif stripped_line:
+                processed_content_lines.append(stripped_line)
+        final_content = "\n".join(processed_content_lines)
+
+        embed = discord.Embed(
+            title=f"Changelog for version {version} ({date_str})",
+            description=final_content,
+            color=NERDY_YELLOW
+        )
+        embed.add_field(name="Build id", value=f"`{build_id}`", inline=False)
+        embed.set_footer(text=f"Update {self.current_page + 1} of {self.total_pages}")
+        return embed
+
+    async def pagination_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        action = interaction.data['custom_id']
+        if action == 'changelog_next':
+            self.current_page += 1
+        elif action == 'changelog_prev':
+            self.current_page -= 1
+        self._update_ui_elements()
+        embed = await self.create_embed_for_page()
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        self.stop()
+
 async def handle_super_attempt_message(message: discord.Message):
     """Processes a message to check for and log a super attempt."""
     guild = message.guild
     msg_content = message.content.strip()
 
-    # First, check for the new successful craft format
-    if msg_content in ["+1", "-0", "-5"]:
+    # --- REGEX PATTERNS ---
+    # CORRECTED: Check for 2+ digits BEFORE a single digit to ensure correct capture.
+    bulk_attempt_pattern = re.compile(r"-(?P<petals>(\d{2,}|[5-9]))\s*(?P<petal_query>.+)", re.IGNORECASE)
+    # Pattern for successful crafts (+1, -0, -5)
+    success_craft_pattern = re.compile(r"^(?:\+1|-0|-5)(?:\s.*)?$")
+    # Pattern for single loss (1-4 petals)
+    single_attempt_pattern = re.compile(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", re.IGNORECASE)
+
+    # --- MATCHING ---
+    bulk_match = bulk_attempt_pattern.fullmatch(msg_content)
+    success_match = success_craft_pattern.match(msg_content)
+    single_match = single_attempt_pattern.fullmatch(msg_content)
+
+    # --- 1. HANDLE BULK LOSS ---
+    if bulk_match:
+        total_petals_lost = int(bulk_match.group("petals"))
+        petal_query_str = bulk_match.group("petal_query").strip()
+        
+        author_ign = await get_ign_from_user(guild, message.author.id)
+        if not author_ign:
+            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
+            except discord.HTTPException: pass
+            return
+
+        # Resolve petal name BEFORE looping
+        ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
+        if len(ultra_candidates) > 1:
+            await message.reply(f"{message.author.mention}, your query `'{petal_query_str}'` is ambiguous. Please be more specific before logging a bulk attempt.")
+            return
+        
+        chosen_petal_name_for_db = "Unknown Ultra Petal"
+        display_friendly_name_for_reply = "Unknown Ultra"
+        if len(ultra_candidates) == 1:
+            chosen_petal_name_for_db = ultra_candidates[0]['original_full_name']
+            display_friendly_name_for_reply = ultra_candidates[0]['display_friendly_name']
+
+        num_attempts = round(total_petals_lost / 2.5)
+        if num_attempts < 1:
+            await message.reply(f"A loss of {total_petals_lost} petals is not enough to be logged as a super attempt.")
+            return
+            
+        petals_distribution = distribute_petals(total_petals_lost, num_attempts)
+        attempt_date_obj, _ = get_utc_date()
+
+        records_to_insert = []
+        for petals in petals_distribution:
+            records_to_insert.append({
+                "ingame_name": author_ign,
+                "discord_user_id": str(message.author.id),
+                "attempt_date": attempt_date_obj.isoformat(),
+                "petals_lost": petals,
+                "message_id": str(message.id),
+                "channel_id": str(message.channel.id),
+                "chosen_petal_name": chosen_petal_name_for_db
+            })
+
+        try:
+            await run_supabase_sync(lambda: supabase.table("super_attempts").insert(records_to_insert).execute())
+            
+            all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+            view = SuperAttemptBulkConfirmView(message.author.id, num_attempts, total_petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
+            embed = view.create_embed()
+            bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=view)
+            view.message = bot_reply_msg
+            
+            await _update_reactions(message, "success")
+            await log_info(guild, f"User `{author_ign}` batch-logged {num_attempts} attempts for {total_petals_lost} lost petals ({display_friendly_name_for_reply}).")
+            if isinstance(message.author, discord.Member):
+                await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+        except Exception as e:
+            await log_error(guild, "Error during bulk super attempt logging", error=e, message_context=message, ping_developer=True)
+            try: await message.reply("An error occurred while logging the batch attempts.")
+            except discord.HTTPException: pass
+        return
+
+    # --- 2. HANDLE SUCCESSFUL CRAFT ---
+    elif success_match:
+        # This logic remains the same as before
         petals_lost = 1
         chosen_petal_name_for_db = "Successful Super Craft"
         display_friendly_name_for_reply = "Successful Super Craft"
 
         author_ign = await get_ign_from_user(guild, message.author.id)
         if not author_ign:
-            try:
-                await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
-            except discord.HTTPException:
-                pass
+            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
+            except discord.HTTPException: pass
             return
 
-        attempt_date_obj, date_error_msg = get_utc_date()
-        if date_error_msg or not attempt_date_obj:
-            try:
-                await message.reply("Sorry, error determining date.")
-            except discord.HTTPException:
-                pass
-            await log_error(guild, f"Super Attempt Log: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
-            return
-
-        if not await check_supabase_available(message.channel): # type: ignore
-            await log_info(guild, f"Super Attempt Log for '{msg_content}': Supabase unavailable.")
-            return
-
-        try:
-            insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({
-                "ingame_name": author_ign, 
-                "discord_user_id": str(message.author.id),
-                "attempt_date": attempt_date_obj.isoformat(), 
-                "petals_lost": petals_lost,
-                "message_id": str(message.id), 
-                "channel_id": str(message.channel.id),
-                "chosen_petal_name": chosen_petal_name_for_db
-            }).execute())
-            
-            attempt_db_id = None
-            if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
-                attempt_db_id = insert_resp.data[0]['id']
-            
-            if not attempt_db_id:
-                fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
-
-            if not attempt_db_id:
-                await log_error(guild, f"Super Attempt (success craft): Failed to get DB ID for {author_ign}", message_context=message)
-                try:
-                    await message.reply("Error saving (no DB ID). Admin notified.")
-                except discord.HTTPException:
-                    pass
-                await _update_reactions(message, "error")
-                return
-
-            all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-            sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
-            embed = sa_view.create_embed()
-            bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
-            sa_view.message = bot_reply_msg
-            await _update_reactions(message, "success")
-            await log_info(guild, f"Super attempt by `{author_ign}`: Logged '{msg_content}' as a successful craft. All-time: {all_time_attempts_count}.")
-            
-            if isinstance(message.author, discord.Member):
-                await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
-        except Exception as e:
-            await log_error(guild, f"Error logging successful super craft for {author_ign}", error=e, message_context=message, ping_developer=True)
-            try:
-                await message.reply("Error logging attempt. Admin notified.")
-            except discord.HTTPException:
-                pass
-            await _update_reactions(message, "error")
-        
-        return # Explicitly return after handling the new format
-
-    # If not the new format, check for the old petal loss format
-    attempt_match = re.fullmatch(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", msg_content, re.IGNORECASE)
-    if not attempt_match:
-        return # Not a recognized super attempt message at all
-
-    # --- Start of Super Attempt Logic for old format ---
-    petals_lost_str = attempt_match.group("petals")
-    petal_query_str = attempt_match.group("petal_query").strip()
-    try:
-        petals_lost = int(petals_lost_str)
-    except ValueError:
-        return
-    if not petal_query_str:
-        return
-
-    author_ign = await get_ign_from_user(guild, message.author.id)
-    if not author_ign:
-        try:
-            await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
-        except discord.HTTPException:
-            pass
-        return
-
-    attempt_date_obj, date_error_msg = get_utc_date()
-    if date_error_msg or not attempt_date_obj:
-        try:
-            await message.reply("Sorry, error determining date.")
-        except discord.HTTPException:
-            pass
-        await log_error(guild, f"Super Attempt Log: Failed to get UTC date. Error: {date_error_msg}", message_context=message)
-        return
-
-    if not await check_supabase_available(message.channel): # type: ignore
-        await log_info(guild, f"Super Attempt Log for '{petal_query_str}': Supabase unavailable.")
-        return
-
-    ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
-    bot_reply_msg: Optional[discord.Message] = None
-
-    if len(ultra_candidates) == 1:
-        chosen_petal_data = ultra_candidates[0]
-        chosen_petal_name_for_db = chosen_petal_data['original_full_name']
-        display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
+        attempt_date_obj, _ = get_utc_date()
         try:
             insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
-            attempt_db_id = None
-            if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
-                attempt_db_id = insert_resp.data[0]['id']
-            if not attempt_db_id:
-                fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).eq("ingame_name", author_ign).eq("chosen_petal_name", chosen_petal_name_for_db).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
-            if not attempt_db_id:
-                await log_error(guild, f"Super Attempt (single): Failed to get DB ID for {author_ign}", message_context=message)
-                try:
-                    await message.reply("Error saving (no DB ID). Admin notified.")
-                except discord.HTTPException:
-                    pass
-                await _update_reactions(message, "error")
-                return
-            all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-            sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
-            embed = sa_view.create_embed()
-            bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
-            sa_view.message = bot_reply_msg
-            await _update_reactions(message, "success")
-            await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
-            if isinstance(message.author, discord.Member):
-                await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
-        except Exception as e:
-            await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_developer=True)
-            try:
-                await message.reply("Error logging attempt. Admin notified.")
-            except discord.HTTPException:
-                pass
-            await _update_reactions(message, "error")
-
-    elif len(ultra_candidates) > 1:
-        disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
-        sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj)
-        bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
-        sa_disamb_view.message = bot_reply_msg
-        await _update_reactions(message, "disambiguation")
-
-    else:
-        chosen_petal_name_for_db = "Unknown Ultra Petal"
-        display_friendly_name_for_reply = "Unknown Ultra"
-        await log_info(guild, f"Super Attempt: No Ultra match for '{petal_query_str}' by {author_ign}. Logging as Unknown.")
-        try:
-            insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
-            attempt_db_id = None
-            if insert_resp.data and len(insert_resp.data) > 0 and 'id' in insert_resp.data[0]:
-                attempt_db_id = insert_resp.data[0]['id']
+            attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
             if not attempt_db_id:
                 fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data and fetch_id_resp.data.get('id') is not None else None
-            if not attempt_db_id:
-                await log_error(guild, f"Super Attempt (Unknown): Failed to get DB ID for {author_ign}", message_context=message)
-                try:
-                    await message.reply("Error saving (no DB ID for unknown). Admin notified.")
-                except discord.HTTPException:
-                    pass
-                await _update_reactions(message, "error")
-                return
+                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
+            
+            if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
+            
             all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
             sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
             embed = sa_view.create_embed()
             bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
             sa_view.message = bot_reply_msg
             await _update_reactions(message, "success")
-            await log_info(guild, f"Super attempt by `{author_ign}`: Lost {petals_lost}x {display_friendly_name_for_reply}. All-time: {all_time_attempts_count}.")
-            if isinstance(message.author, discord.Member):
-                await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
         except Exception as e:
-            await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_developer=True)
+            await log_error(guild, f"Error logging successful super craft for {author_ign}", error=e, message_context=message, ping_developer=True)
+            try: await message.reply("Error logging attempt. Admin notified.")
+            except discord.HTTPException: pass
+        return
+
+    # --- 3. HANDLE SINGLE LOSS (1-4 PETALS) ---
+    elif single_match:
+        # This is the original logic for -1 to -4 petals
+        petals_lost_str = single_match.group("petals")
+        petal_query_str = single_match.group("petal_query").strip()
+        petals_lost = int(petals_lost_str)
+        
+        author_ign = await get_ign_from_user(guild, message.author.id)
+        if not author_ign:
+            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
+            except discord.HTTPException: pass
+            return
+
+        attempt_date_obj, _ = get_utc_date()
+        ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
+
+        if len(ultra_candidates) == 1:
+            chosen_petal_data = ultra_candidates[0]
+            chosen_petal_name_for_db = chosen_petal_data['original_full_name']
+            display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
             try:
-                await message.reply("Error logging unknown petal. Admin notified.")
-            except discord.HTTPException:
-                pass
-            await _update_reactions(message, "error")
+                insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
+                attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
+                if not attempt_db_id:
+                    fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                    attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
+                
+                if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
+                
+                all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
+                embed = sa_view.create_embed()
+                bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                sa_view.message = bot_reply_msg
+                await _update_reactions(message, "success")
+            except Exception as e:
+                await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_developer=True)
+                try: await message.reply("Error logging attempt. Admin notified.")
+                except discord.HTTPException: pass
+
+        elif len(ultra_candidates) > 1:
+            disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
+            sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj)
+            bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
+            sa_disamb_view.message = bot_reply_msg
+            await _update_reactions(message, "disambiguation")
+        else: # 0 candidates
+            # This logic also remains the same
+            chosen_petal_name_for_db = "Unknown Ultra Petal"
+            display_friendly_name_for_reply = "Unknown Ultra"
+            try:
+                insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
+                attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
+                if not attempt_db_id:
+                    fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
+                    attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
+                
+                if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
+
+                all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
+                embed = sa_view.create_embed()
+                bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                sa_view.message = bot_reply_msg
+                await _update_reactions(message, "success")
+            except Exception as e:
+                await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_developer=True)
+                try: await message.reply("Error logging unknown petal. Admin notified.")
+                except discord.HTTPException: pass
+        
+        # After any single-loss action, update nickname
+        if isinstance(message.author, discord.Member):
+            final_attempt_count = await get_all_time_super_attempt_count(guild, author_ign)
+            await update_custom_nickname_on_attempt(guild, message.author, author_ign, final_attempt_count)
+        return
 
 class GuildSyncInProgressView(discord.ui.View):
     def __init__(self, original_author_id: int, session_id: int): # session_id is user_id
@@ -5228,7 +5331,7 @@ class SuperAttemptConfirmView(discord.ui.View):
             )
         else:
             if self.petal_display_name == "Successful Super Craft":
-                description = f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign}. This successful craft has been recorded."
+                description = f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign}. A successful super attempt has been logged."
             else:
                 description = (
                     f"Logged! That's super attempt **#{self.all_time_attempt_count}** for you overall, {self.author_ign} "
@@ -5863,6 +5966,73 @@ class ProfileMonthSelect(discord.ui.Select):
             await view.handle_month_selection(interaction, self.values[0])
         # // --- END UNCHANGED SECTION (ProfileMonthSelect.callback) --- //
 
+
+class DevSetupView(discord.ui.View):
+    def __init__(self, interaction: discord.Interaction):
+        super().__init__(timeout=600)
+        self.guild = interaction.guild 
+        self.message: Optional[discord.Message] = None
+        self.global_guilds_data: List[Dict[str, Any]] = []
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == DEVELOPER_USER_ID:
+            return True
+        else:
+            await interaction.response.send_message("❌ You are not authorized to use these buttons.", ephemeral=True)
+            return False
+
+    async def create_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="👑 Developer Setup Panel", color=NERDY_YELLOW)
+        embed.description = "Global settings for the bot. Use buttons to manage features."
+        
+        self.global_guilds_data = await fetch_globally_available_guilds()
+        if self.global_guilds_data:
+            guilds_val_parts = [f"**`{g['guild_tag']}`**: {g['description']}" for g in sorted(self.global_guilds_data, key=lambda x: x['guild_tag'].lower())]
+            guilds_val = "\n".join(guilds_val_parts)
+        else:
+            guilds_val = "`No global guilds are configured.`"
+        embed.add_field(name="🌐 Globally Available Guilds", value=guilds_val, inline=False)
+        
+        embed.set_footer(text="These settings affect the bot across all servers.")
+        return embed
+    
+    def _add_buttons(self):
+        self.clear_items()
+        self.add_item(discord.ui.Button(label="Add Global Guild", style=discord.ButtonStyle.success, emoji="➕", row=0, custom_id="devsetup_add_global"))
+        self.add_item(discord.ui.Button(label="Delete Global Guild", style=discord.ButtonStyle.danger, emoji="🗑️", row=0, custom_id="devsetup_delete_global"))
+        self.add_item(discord.ui.Button(label="Post Changelog", style=discord.ButtonStyle.success, emoji="📝", row=1, custom_id="devsetup_post_changelog"))
+        
+        if self.guild: 
+            self.add_item(discord.ui.Button(label="Switch to Admin View", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2, custom_id="devsetup_switch_to_admin"))
+        
+        self.add_item(discord.ui.Button(label="Done", style=discord.ButtonStyle.secondary, row=3, custom_id="devsetup_done"))
+
+    async def dispatch_callback(self, interaction: discord.Interaction):
+        custom_id = interaction.data['custom_id']
+        
+        if custom_id == 'devsetup_add_global': await interaction.response.send_modal(AddGlobalGuildModal(self))
+        elif custom_id == 'devsetup_delete_global': await interaction.response.send_modal(DeleteGlobalGuildModal(self))
+        elif custom_id == 'devsetup_post_changelog': await interaction.response.send_modal(PostChangelogModal(self))
+        elif custom_id == 'devsetup_switch_to_admin':
+            if self.message: await self.message.delete()
+            await setup(interaction)
+        elif custom_id == 'devsetup_done':
+            if self.message: await self.message.edit(content="✅ Developer setup complete.", embed=None, view=None)
+            self.stop()
+
+    async def refresh_view(self, interaction: discord.Interaction):
+        self._add_buttons()
+        for item in self.children:
+            if isinstance(item, discord.ui.Button): item.callback = self.dispatch_callback
+        if self.message:
+            await self.message.edit(embed=await self.create_embed(), view=self)
+            
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children: item.disabled = True
+            try: await self.message.edit(content="Developer setup timed out.", embed=None, view=None)
+            except discord.HTTPException: pass
+        self.stop()
 
 class ProfilePagesView(discord.ui.View):
     MAIN_PAGE = "main"
@@ -7469,6 +7639,7 @@ class GuildsView(discord.ui.View):
         self.message: Optional[discord.Message] = None
         
         # State
+        self.initial_start_mode = start_mode
         self.mode = start_mode
         self.current_guild_tag = start_tag
         
@@ -7532,9 +7703,11 @@ class GuildsView(discord.ui.View):
                 self.add_item(select)
 
         elif self.mode == self.MODE_MEMBERS:
-            back_btn = discord.ui.Button(label="⬅️ All Guilds", style=discord.ButtonStyle.secondary, custom_id="guild_back_summary", row=0)
-            back_btn.callback = self.handle_back_to_summary
-            self.add_item(back_btn)
+            # Only show back button if the list can go back to a summary
+            if self.initial_start_mode == self.MODE_SUMMARY:
+                back_btn = discord.ui.Button(label="⬅️ All Guilds", style=discord.ButtonStyle.secondary, custom_id="guild_back_summary", row=0)
+                back_btn.callback = self.handle_back_to_summary
+                self.add_item(back_btn)
 
             prev_btn = discord.ui.Button(label="Previous", style=discord.ButtonStyle.blurple, custom_id="guild_prev", row=1, disabled=(self.current_page == 0 or self.is_fetching))
             prev_btn.callback = self.handle_pagination
@@ -7751,7 +7924,6 @@ async def on_ready():
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     
     await _initialize_ai_models()
-    await _initialize_data_caches(bot)
     synced_commands = await _sync_app_commands(bot)
 
     await _revive_static_list_views()
@@ -7928,44 +8100,43 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=False, thinking=True)
 
     config = await load_server_config(guild.id)
-    verified_role_id = config.get('verified_role_id')
+    verified_role_ids = config.get('verified_role_ids') or []
     unverified_role_id = config.get('unverified_role_id')
 
-    if not verified_role_id and not unverified_role_id:
+    if not verified_role_ids and not unverified_role_id:
         await interaction.followup.send("❌ This server has not configured any `Verified` or `Unverified` roles. Use `/setup`.", ephemeral=True)
         return
 
-    roles_added_msg = ""
-    roles_removed_msg = ""
+    roles_added_names = []
+    roles_removed_names = []
 
     try:
-        # Handle adding Verified role
-        if verified_role_id:
-            verified_role = guild.get_role(verified_role_id)
-            if verified_role:
-                if verified_role not in user.roles:
+        # Handle adding Verified roles
+        if verified_role_ids:
+            for role_id in verified_role_ids:
+                verified_role = guild.get_role(role_id)
+                if verified_role and verified_role not in user.roles:
                     await user.add_roles(verified_role, reason=f"Manually verified by {interaction.user}")
-                    roles_added_msg = f"added `{verified_role.name}`"
-            else:
-                await log_info(guild, f"/verify warning: Configured 'Verified' role (ID: {verified_role_id}) not found.")
+                    roles_added_names.append(f"`{verified_role.name}`")
 
         # Handle removing Unverified role
         if unverified_role_id:
             unverified_role = guild.get_role(unverified_role_id)
-            if unverified_role:
-                if unverified_role in user.roles:
-                    await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
-                    roles_removed_msg = f"removed `{unverified_role.name}`"
-            else:
-                await log_info(guild, f"/verify warning: Configured 'Unverified' role (ID: {unverified_role_id}) not found.")
+            if unverified_role and unverified_role in user.roles:
+                await user.remove_roles(unverified_role, reason=f"Manually verified by {interaction.user}")
+                roles_removed_names.append(f"`{unverified_role.name}`")
 
-        actions_performed = [msg for msg in [roles_added_msg, roles_removed_msg] if msg]
+        actions_performed = []
+        if roles_added_names:
+            actions_performed.append(f"added {', '.join(roles_added_names)}")
+        if roles_removed_names:
+             actions_performed.append(f"removed {', '.join(roles_removed_names)}")
 
         if not actions_performed:
             await interaction.followup.send(f"ℹ️ No role changes were needed for {user.mention}. They already appear to be in a verified state.", ephemeral=False)
             return
 
-        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state ({', '.join(actions_performed)}).", ephemeral=False)
+        await interaction.followup.send(f"✅ Manually set {user.mention} to a verified state ({' and '.join(actions_performed)}).", ephemeral=False)
         await log_info(guild, f"{interaction.user.name} manually verified {user.name} using /verify.")
 
     except Exception as e:
@@ -8226,7 +8397,7 @@ async def setguild(
             
         for bot_guild in bot.guilds:
             if target_member_for_roles and bot_guild.get_member(target_member_for_roles.id):
-                asyncio.create_task(refresh_all_guild_lists(bot_guild))
+                asyncio.create_task(update_all_static_lists(bot_guild))
 
     except Exception as e:
         await log_error(guild, f"Error during /setguild for {user.name if user else ingame_name}", error=e, interaction=interaction)
@@ -8462,8 +8633,132 @@ async def add_note(
     else:
         await interaction.followup.send(f"❌ Failed to add note: {msg}")
 
+@tree.command(name="dev_setup", description="[Developer] Interactively configure global bot settings.")
+@app_commands.check(lambda i: i.user.id == DEVELOPER_USER_ID)
+async def dev_setup(interaction: discord.Interaction):
+    await _show_dev_setup_view(interaction)
+
+def distribute_petals(total_lost: int, num_attempts: int) -> List[int]:
+    """Distributes a total number of petals among a number of attempts, aiming for values of 2 and 3."""
+    if num_attempts <= 0:
+        return []
+
+    # We want to solve for 'a' (number of 2-petal attempts) and 'b' (number of 3-petal attempts)
+    # a + b = num_attempts
+    # 2a + 3b = total_lost
+    # Solving this system of equations gives:
+    num_threes = total_lost - (2 * num_attempts)
+    num_twos = num_attempts - num_threes
+
+    if num_twos < 0 or num_threes < 0:
+        # Fallback if the 2/3 combination is impossible (e.g., total_lost is too low/high for num_attempts)
+        # This can happen if user enters a very low number like -5, num_attempts becomes 2, but 2+2, 2+3, 3+3 != 5.
+        # So we use a simple average distribution.
+        base_value = total_lost // num_attempts
+        remainder = total_lost % num_attempts
+        return [base_value + 1] * remainder + [base_value] * (num_attempts - remainder)
+
+    return [2] * num_twos + [3] * num_threes
+
+async def remove_super_attempts_by_message_id(guild: Optional[discord.Guild], message_id: str, author_id: int) -> Tuple[bool, int, str]:
+    """Removes all super attempt log entries matching a message ID and author. Returns (success, count, message)."""
+    if not supabase: return False, 0, "Database unavailable."
+    try:
+        delete_resp = await run_supabase_sync(
+            lambda: supabase.table("super_attempts").delete()
+                           .eq("message_id", message_id)
+                           .eq("discord_user_id", str(author_id))
+                           .execute()
+        )
+        if delete_resp.data:
+            deleted_count = len(delete_resp.data)
+            return True, deleted_count, f"Successfully removed {deleted_count} batch-logged attempt(s)."
+        else:
+            return False, 0, "No attempts found for that message to remove."
+    except Exception as e:
+        if guild: await log_error(guild, f"Error removing batch attempts for msg {message_id}", error=e)
+        return False, 0, "A database error occurred."
+
+class SuperAttemptBulkConfirmView(discord.ui.View):
+    def __init__(self, target_user_id: int, num_attempts_logged: int, total_petals_lost: int, petal_display_name: str, author_ign: str, all_time_attempt_count: int, original_user_message: discord.Message, timeout=180.0):
+        super().__init__(timeout=timeout)
+        self.target_user_id = target_user_id
+        self.num_attempts_logged = num_attempts_logged
+        self.total_petals_lost = total_petals_lost
+        self.petal_display_name = petal_display_name
+        self.author_ign = author_ign
+        self.all_time_attempt_count = all_time_attempt_count
+        self.original_user_message = original_user_message
+        self.message: Optional[discord.Message] = None
+        self.is_undone = False
+
+        # Custom button for bulk undo
+        undo_button = discord.ui.Button(label="Undo Batch Log", emoji="↩️", style=discord.ButtonStyle.danger, custom_id=f"sa_undo_bulk_{original_user_message.id}")
+        undo_button.callback = self.undo_callback
+        self.add_item(undo_button)
+
+    def create_embed(self) -> discord.Embed:
+        if self.is_undone:
+            return discord.Embed(
+                description=f"↩️ The batch log of **{self.num_attempts_logged}** attempts for `{self.petal_display_name}` has been **undone**.",
+                color=discord.Color.orange()
+            )
+        else:
+            return discord.Embed(
+                description=(
+                    f"Logged **{self.num_attempts_logged}** attempts for `{self.petal_display_name}` from your report of **{self.total_petals_lost}** lost petals.\n"
+                    f"Your total super attempt count is now **{self.all_time_attempt_count}**."
+                ),
+                color=discord.Color.green()
+            )
+
+    async def undo_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("You cannot interact with this.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        guild = interaction.guild
+        if self.is_undone:
+            await interaction.followup.send("This batch has already been undone.", ephemeral=True)
+            return
+
+        success, count, msg = await remove_super_attempts_by_message_id(guild, str(self.original_user_message.id), self.target_user_id)
+        
+        if success:
+            self.is_undone = True
+            for item in self.children:
+                if isinstance(item, discord.ui.Button): item.disabled = True
+            
+            embed = self.create_embed()
+            if self.message:
+                await self.message.edit(embed=embed, view=self)
+            
+            await _update_reactions(self.original_user_message, "undone")
+            await log_info(guild, f"{count} batch attempts for msg {self.original_user_message.id} undone by {interaction.user.name}.")
+            if guild and isinstance(interaction.user, discord.Member):
+                new_all_time_count = await get_all_time_super_attempt_count(guild, self.author_ign)
+                await update_custom_nickname_on_attempt(guild, interaction.user, self.author_ign, new_all_time_count)
+        else:
+            await interaction.followup.send(f"Could not undo batch: {msg}", ephemeral=True)
+            await _update_reactions(self.original_user_message, "error")
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for item in self.children:
+                    if isinstance(item, discord.ui.Button): item.disabled = True
+                await self.message.edit(view=self)
+                await _update_reactions(self.original_user_message, "timeout_or_neutral")
+                await asyncio.sleep(AUTODELETE_DELAY_SECONDS)
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
+        self.stop()
+
 @tree.command(name="refresh", description="Syncs all roles with the database and refreshes all server-specific data.")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.check(is_admin_or_developer)
 async def refresh(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild: return
@@ -8478,14 +8773,17 @@ async def refresh(interaction: discord.Interaction):
 
     await interaction.response.defer(thinking=True, ephemeral=False)
 
-    config = await load_server_config(guild.id)
-    tracked_guilds = config.get('tracked_guilds', {})
     feedback_parts = [f"⏳ **Starting full sync and refresh for {guild.name}...**"]
     await interaction.followup.send("\n".join(feedback_parts), ephemeral=False)
 
     action_log = ["✅ Reloaded server configuration from database."]
     errors_occurred = False
     
+    # Force a reload of the config
+    if guild.id in server_settings_cache: del server_settings_cache[guild.id]
+    config = await load_server_config(guild.id)
+    tracked_guilds = config.get('tracked_guilds', {})
+
     if not guild.me.guild_permissions.manage_roles:
         action_log.append("⚠️ **Role Sync Skipped:** Bot lacks `Manage Roles` permission.")
     else:
@@ -8518,17 +8816,13 @@ async def refresh(interaction: discord.Interaction):
                     break 
         action_log[-1] = f"✅ Role sync complete. Processed {synced_count} member adjustments."
 
-    await refresh_all_guild_lists(guild)
+    await update_all_static_lists(guild)
     action_log.append(f"✅ Triggered updates for all configured static member lists.")
-    
-    await load_keyword_data()
-    action_log.append("✅ Refreshed AI keyword data from database.")
 
     final_title = "✅ Refresh & Sync Complete" if not errors_occurred else "⚠️ Refresh & Sync Completed with Errors"
     final_embed = discord.Embed(title=final_title, description="\n".join(action_log), color=NERDY_YELLOW if not errors_occurred else discord.Color.orange())
     await interaction.edit_original_response(content="", embed=final_embed)
     await log_info(guild, f"/refresh command completed by {interaction.user.name}. Status: {'OK' if not errors_occurred else 'WITH_ERRORS'}")
-
 
 # --- Wither Command ---
 # --- Wither Command (MODIFIED - Invoker Hierarchy Check Removed) ---
@@ -8671,6 +8965,27 @@ async def on_message(message: discord.Message):
         return
     
     await process_message_for_ai(message)
+
+@tree.command(name="changelog", description="View the latest bot updates and changelogs.")
+async def changelog(interaction: discord.Interaction):
+    if not await check_supabase_available(interaction):
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    all_logs_resp = await run_supabase_sync(
+        lambda: supabase.table("changelogs").select("*").order("created_at", desc=True).execute()
+    )
+
+    if not all_logs_resp or not all_logs_resp.data:
+        await interaction.followup.send("No changelogs have been posted yet.", ephemeral=False)
+        return
+
+    view = ChangelogView(interaction, all_logs_resp.data)
+    initial_embed = await view.create_embed_for_page()
+
+    message = await interaction.followup.send(embed=initial_embed, view=view)
+    view.message = message
 
 @tree.command(name="message", description="[Developer] Send, edit, or reply to a message with full customization.")
 @app_commands.describe(
@@ -9375,9 +9690,12 @@ async def setup(interaction: discord.Interaction):
             await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the setup panel.", ephemeral=True)
             return
 
-    await interaction.response.defer(ephemeral=False)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=False)
+        
     config = await load_server_config(guild.id)
     view = SetupView(interaction, config)
+    view._update_ui_elements()
     message = await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=False)
     view.message = message
 
@@ -9783,6 +10101,12 @@ class AddTrackedGuildModal(discord.ui.Modal, title="Add Tracked Guild"):
         style=discord.TextStyle.short,
         required=True,
     )
+    list_channel_input = discord.ui.TextInput(
+        label="[Optional] Dedicated List Channel",
+        placeholder="e.g., #hc1-list (Leave blank for none)",
+        style=discord.TextStyle.short,
+        required=False,
+    )
 
     def __init__(self, view_ref: 'SetupView'):
         super().__init__(timeout=300.0)
@@ -9807,16 +10131,30 @@ class AddTrackedGuildModal(discord.ui.Modal, title="Add Tracked Guild"):
             await interaction.followup.send(f"❌ Could not resolve the role: {role_error}", ephemeral=True)
             return
 
+        list_channel_id = None
+        if self.list_channel_input.value.strip():
+            channel_id, channel_error = await resolve_name_to_id(guild, self.list_channel_input.value.strip(), 'channel')
+            if not channel_id:
+                await interaction.followup.send(f"❌ Could not resolve the list channel: {channel_error}", ephemeral=True)
+                return
+            list_channel_id = channel_id
+
         try:
             await run_supabase_sync(lambda: supabase.table("tracked_florr_guilds").insert({
                 "discord_guild_id": guild.id,
                 "florr_guild_tag": canonical_tag,
-                "discord_role_id": role_id
+                "discord_role_id": role_id,
+                "list_channel_id": list_channel_id
             }).execute())
             
             await self.view_ref.refresh_view(interaction)
             await interaction.followup.send(f"✅ Successfully added `{canonical_tag}` to the tracked guilds list.", ephemeral=True)
             await log_info(guild, f"{interaction.user.name} added tracked guild '{canonical_tag}'.")
+            
+            # Trigger an immediate update for the new list if a channel was set
+            if list_channel_id:
+                asyncio.create_task(update_dedicated_guild_list(guild, canonical_tag, list_channel_id))
+
 
         except Exception as e:
             await log_error(guild, f"Failed to add tracked guild {canonical_tag}", error=e, interaction=interaction)
