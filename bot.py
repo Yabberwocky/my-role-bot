@@ -929,6 +929,141 @@ async def get_mention(item_id: Optional[int], item_type: str, guild: discord.Gui
     else: item_obj = guild.get_channel(item_id)
     return item_obj.mention if item_obj else f"⚠️ `Not Found (ID: {item_id})`"
 
+async def handle_select_command(message: discord.Message):
+    """Handles the .select and .s commands to show a user's profile on the super crafts page."""
+    guild = message.guild
+    if not guild or not supabase:
+        return
+
+    parts = message.content.split()
+    if len(parts) < 2:
+        return
+
+    ingame_name = parts[1]
+
+    # Gatekeeper 1: Find the profile first.
+    hc_profile_db_data = await fetch_profile_details_by_ign(guild, ingame_name)
+    if not hc_profile_db_data:
+        # Not found in DB, do not respond.
+        return
+
+    target_ign = hc_profile_db_data.get("ingame_name")
+    if not target_ign:
+        # Should not happen if hc_profile_db_data is found.
+        return
+
+    # Gatekeeper 2: Check for super crafts.
+    initial_craft_logs, craft_total = await get_user_super_craft_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
+    if craft_total == 0:
+        # No crafts, do not respond.
+        return
+
+    # --- Checks passed, proceed with full data fetching like /profile ---
+    mock_interaction = discord.Object(id=message.id)
+    mock_interaction.guild = guild
+    mock_interaction.channel = message.channel
+    mock_interaction.user = message.author
+
+    target_discord_id_str = hc_profile_db_data.get("discord_id")
+
+    target_user_for_display: Union[discord.Member, discord.User, None] = None
+    if target_discord_id_str:
+        target_user_for_display = guild.get_member(int(target_discord_id_str))
+        if not target_user_for_display:
+            try:
+                target_user_for_display = await bot.fetch_user(int(target_discord_id_str))
+            except discord.NotFound:
+                pass
+
+    display_name_for_view = target_user_for_display.display_name if target_user_for_display else target_ign
+    avatar_url_for_view = target_user_for_display.display_avatar.url if target_user_for_display and target_user_for_display.display_avatar else (bot.user.display_avatar.url if bot.user else None)
+    mention_or_status_for_view = target_user_for_display.mention if target_user_for_display else "`Not Linked to Discord`"
+
+    target_user_display_data = {
+        "name": display_name_for_view, "avatar_url": avatar_url_for_view, "mention_or_status": mention_or_status_for_view,
+        "_member_object_ref": target_user_for_display if isinstance(target_user_for_display, discord.Member) else None,
+        "_discord_id_for_sa_management": target_discord_id_str
+    }
+
+    today_utc_obj, _ = get_utc_date()
+    activity_summary, initial_monthly_dates = None, set()
+    if hc_profile_db_data.get('discord_id') and today_utc_obj:
+        ign_lower = target_ign.lower()
+        all_time_summary = await fetch_activity_data(guild, [ign_lower])
+        ign_all_time_data = all_time_summary.get(ign_lower, {'count': 0, 'last_seen': None})
+        activity_summary = {"total_days_logged": ign_all_time_data['count'], "last_seen_display": f"`{format_date_dmy(ign_all_time_data['last_seen'])}`" if ign_all_time_data['last_seen'] else "`Never Logged`"}
+        first_day_current_month = today_utc_obj.replace(day=1)
+        last_day_current_month = (first_day_current_month.replace(month=first_day_current_month.month % 12 + 1, year=first_day_current_month.year + (first_day_current_month.month // 12))) - datetime.timedelta(days=1)
+        initial_monthly_dates = await fetch_activity_dates_in_range(guild, ign_lower, first_day_current_month, last_day_current_month)
+
+    super_attempt_stats_data = await get_user_super_attempt_stats(guild, target_ign)
+    initial_defeat_logs, defeat_total = await get_user_super_defeat_log_entries(guild, target_ign, 0, ProfilePagesView.SA_LOG_ENTRIES_PER_PAGE)
+    initial_notes, notes_total = await get_user_notes(guild, target_ign, 0, ProfilePagesView.NOTES_PER_PAGE)
+
+    profile_view = ProfilePagesView(
+        interaction=mock_interaction, target_user_display_data=target_user_display_data, hc_profile_data=hc_profile_db_data,
+        activity_summary_data=activity_summary, initial_monthly_active_dates=initial_monthly_dates,
+        super_attempt_stats_data=super_attempt_stats_data,
+        initial_craft_logs=initial_craft_logs, total_crafts=craft_total,
+        initial_defeat_logs=initial_defeat_logs, total_defeats=defeat_total,
+        initial_notes=initial_notes, total_notes=notes_total,
+        today_date_obj=today_utc_obj or datetime.date.today(),
+        start_page="sc_log"
+    )
+
+    initial_embed = profile_view._create_super_craft_log_embed()
+    sent_message = await message.channel.send(embed=initial_embed, view=profile_view)
+    profile_view.message = sent_message
+
+async def handle_sv_command(message: discord.Message):
+    """Handles the .sv command to show the server codes view."""
+    guild = message.guild
+    if not guild: return
+
+    parts = message.content.lower().split()
+    
+    initial_region = None
+    initial_map = None
+
+    if len(parts) == 1: # Case: only ".sv" was typed
+        initial_region = "eu"
+    elif len(parts) > 1: # Case: ".sv <alias>" was typed
+        alias = parts[1]
+        sv_alias_map = {
+            # Biomes
+            "a": ("map", "ant hell"), "ah": ("map", "ant hell"), "g": ("map", "garden"),
+            "d": ("map", "desert"), "o": ("map", "ocean"), "p": ("map", "pyramid"),
+            "h": ("map", "hel"), "s": ("map", "sewers"), "f": ("map", "factory"),
+            "jungle": ("map", "jungle"),
+            # Regions
+            "us": ("region", "na"), "n": ("region", "na"), "na": ("region", "na"),
+            "as": ("region", "as"), "e": ("region", "eu"), "eu": ("region", "eu"),
+        }
+
+        lookup_result = sv_alias_map.get(alias)
+        if not lookup_result:
+            return # Invalid alias, do nothing
+
+        filter_type, filter_value = lookup_result
+        initial_region = filter_value if filter_type == "region" else None
+        initial_map = filter_value if filter_type == "map" else None
+    else: # Should not happen, but as a guard
+        return
+
+    mock_interaction = discord.Object(id=message.id)
+    mock_interaction.guild = guild
+    mock_interaction.channel = message.channel
+    mock_interaction.user = message.author
+
+    view = ServerCodeView(initial_region=initial_region, initial_map=initial_map)
+
+    try:
+        initial_embed = await view._create_server_embed()
+        sent_message = await message.channel.send(embed=initial_embed, view=view)
+        view.message = sent_message
+    except Exception as e:
+        await log_error(guild, "Failed to send servercodes view from .sv command", error=e)
+
 class DeleteNoteModal(discord.ui.Modal, title="Delete Player Note"):
     entry_number_input = discord.ui.TextInput(
         label="Entry number on this page to remove",
@@ -8930,14 +9065,23 @@ async def wither(interaction: discord.Interaction, user: discord.Member, time: a
     except Exception as e:
         await log_error(guild, f"Wither initial remove failed for {user.name}.", error=e, interaction=interaction)
 
-
-
 @bot.event
 async def on_message(message: discord.Message):
     if not message.guild or not bot.is_ready() or not bot.user or \
        message.author.id == bot.user.id or (message.author.bot and not message.webhook_id):
         return
 
+    # --- NEW: Text Command Handling ---
+    content_lower_strip = message.content.strip().lower()
+    if content_lower_strip.startswith(('.select ', '.s ')):
+        if len(message.content.strip().split()) > 1:
+            await handle_select_command(message)
+            return
+    elif content_lower_strip == '.sv' or content_lower_strip.startswith('.sv '):
+        await handle_sv_command(message)
+        return
+    # --- END: Text Command Handling ---
+            
     config = await load_server_config(message.guild.id)
     if not config.get('bot_enabled', True) and message.author.id != DEVELOPER_USER_ID:
         return
