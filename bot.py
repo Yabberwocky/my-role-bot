@@ -8460,28 +8460,36 @@ async def setguild(
     user: Optional[discord.Member] = None,
     ingame_name: Optional[str] = None
 ):
-    if not await check_supabase_available(interaction): return
+    # Defer the interaction immediately to prevent timeouts.
+    # The final success/failure message will be public, so ephemeral=False.
+    await interaction.response.defer(ephemeral=False)
+
+    if not await check_supabase_available(interaction): 
+        # Use followup since we have deferred.
+        await interaction.followup.send("❌ Database connection is unavailable.", ephemeral=True)
+        return
+
     guild = interaction.guild
 
     if not user and not ingame_name:
-        await interaction.response.send_message("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True); return
+        await interaction.followup.send("❌ You must provide either a `user` or an `ingame_name`.", ephemeral=True)
+        return
     if user and ingame_name:
-        await interaction.response.send_message("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True); return
+        await interaction.followup.send("❌ Please provide either a `user` or an `ingame_name`, not both.", ephemeral=True)
+        return
 
     # Permission Check
     is_staff, staff_error_msg = await check_is_staff(interaction)
     if not is_staff:
         # If not staff, check if they are acting on themselves
         if user and user.id != interaction.user.id:
-            await interaction.response.send_message(f"❌ {staff_error_msg}", ephemeral=True)
+            await interaction.followup.send(f"❌ {staff_error_msg}", ephemeral=True)
             return
         if ingame_name:
             user_s_ign = await get_ign_from_user(guild, interaction.user.id)
             if not user_s_ign or clean_ign(ingame_name).lower() != user_s_ign.lower():
-                await interaction.response.send_message("❌ You can only set the guild for your own linked IGN. To act on others, you need staff permissions.", ephemeral=True)
+                await interaction.followup.send("❌ You can only set the guild for your own linked IGN. To act on others, you need staff permissions.", ephemeral=True)
                 return
-
-    await interaction.response.defer(ephemeral=False)
     
     # Get current guild status BEFORE update
     current_db_guild_tag: Optional[str] = None
@@ -8501,7 +8509,8 @@ async def setguild(
     
     config = await load_server_config(guild.id)
     if normalized_tag and normalized_tag not in config.get('tracked_guilds', {}):
-        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not a tracked guild in this server.", ephemeral=True); return
+        await interaction.followup.send(f"❌ The guild tag **{normalized_tag}** is not a tracked guild in this server.", ephemeral=True)
+        return
         
     try:
         update_resp = None
@@ -8568,7 +8577,6 @@ async def setguild(
     except Exception as e:
         await log_error(guild, f"Error during /setguild for {user.name if user else ingame_name}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
-
 
 # Add a new helper function right before the /profile command definition
 async def get_guild_tag_from_ign(guild: Optional[discord.Guild], ign: str) -> Optional[str]:
