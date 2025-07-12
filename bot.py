@@ -1015,6 +1015,33 @@ async def handle_select_command(message: discord.Message):
     sent_message = await message.channel.send(embed=initial_embed, view=profile_view)
     profile_view.message = sent_message
 
+async def _show_admin_setup_view(interaction: discord.Interaction):
+    """Core logic to display the admin setup view."""
+    guild = interaction.guild
+    if not guild: return
+    
+    # This check is important as this function can be called from multiple places
+    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+        bot_perms = interaction.channel.permissions_for(guild.me)
+        if not bot_perms.send_messages or not bot_perms.embed_links:
+            # Use followup if the interaction might already be deferred
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the setup panel.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the setup panel.", ephemeral=True)
+            except discord.HTTPException: pass
+            return
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=False)
+        
+    config = await load_server_config(guild.id)
+    view = SetupView(interaction, config)
+    view._update_ui_elements()
+    message = await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=False)
+    view.message = message
+
 async def handle_sv_command(message: discord.Message):
     """Handles the .sv command to show the server codes view."""
     guild = message.guild
@@ -2545,24 +2572,29 @@ class SetupView(discord.ui.View):
         embed = discord.Embed(title=f"🛡️ Admin Setup for {self.guild.name}", color=NERDY_YELLOW)
         embed.description = "Use the buttons below to configure the bot for this server."
 
-        def get_bool_status(key: str) -> str:
-            return "✅ Enabled" if self.config.get(key, True) else "❌ Disabled"
-
-        # --- Roles Section ---
+        # --- Member & Status Roles ---
         verified_roles_list = self.config.get('verified_role_ids') or []
         verified_mentions = ", ".join([await get_mention(rid, 'role', self.guild) for rid in verified_roles_list]) or "`Not Set`"
-        mod_role_ids = self.config.get('moderator_role_ids') or []
-        mod_mentions = ", ".join([await get_mention(rid, 'role', self.guild) for rid in mod_role_ids]) or "`Not Set`"
-        
         roles_val = (
             f"**Verified:** {verified_mentions}\n"
             f"**Unverified:** {await get_mention(self.config.get('unverified_role_id'), 'role', self.guild)}\n"
             f"**Withered:** {await get_mention(self.config.get('withered_role_id'), 'role', self.guild)}\n"
-            f"**Moderators:** {mod_mentions}"
+            f"**Ex-Member:** {await get_mention(self.config.get('ex_member_role_id'), 'role', self.guild)}"
         )
-        embed.add_field(name="Core & Staff Roles", value=roles_val, inline=False)
+        embed.add_field(name="Member & Status Roles", value=roles_val, inline=False)
 
-        # --- Channels Section ---
+        # --- Permission Roles ---
+        mod_role_ids = self.config.get('moderator_role_ids') or []
+        mod_mentions = ", ".join([await get_mention(rid, 'role', self.guild) for rid in mod_role_ids]) or "`Not Set`"
+        perm_roles_val = (
+            f"**Bot Moderators:** {mod_mentions}\n"
+            f"**/wither Command:** {await get_mention(self.config.get('wither_command_role_id'), 'role', self.guild)}\n"
+            f"**/florr Command:** {await get_mention(self.config.get('florr_command_role_id'), 'role', self.guild)}\n"
+            f"**/imitate Command:** {await get_mention(self.config.get('imitate_command_role_id'), 'role', self.guild)}"
+        )
+        embed.add_field(name="Permission Roles", value=perm_roles_val, inline=False)
+
+        # --- Feature Channels ---
         ai_channels_list = self.config.get('always_on_ai_channels') or []
         ai_mentions = ", ".join([await get_mention(cid, 'channel', self.guild) for cid in ai_channels_list]) or "`Not Set`"
         chans_val = (
@@ -2574,14 +2606,15 @@ class SetupView(discord.ui.View):
         )
         embed.add_field(name="Feature Channels", value=chans_val, inline=False)
         
-        # --- Toggles Section ---
-        toggles_val = (
-            f"**Keywords:** {get_bool_status('keywords_enabled')} | "
-            f"**Wither Cmd:** {get_bool_status('wither_command_enabled')}\n"
-            f"**ServerCodes Cmd:** {get_bool_status('servercodes_command_enabled')} | "
-            f"**Profile Cmd:** {get_bool_status('profile_command_enabled')}"
+        # --- Ping Settings ---
+        ping_settings_val = (
+            f"**Craft Pings:** {await get_mention(self.config.get('craft_ping_channel_id'), 'channel', self.guild)}\n"
+            f"**Spawn Pings:** {await get_mention(self.config.get('spawn_ping_channel_id'), 'channel', self.guild)}\n"
+            f"**Defeat Pings:** {await get_mention(self.config.get('defeat_ping_channel_id'), 'channel', self.guild)}\n"
+            f"**Super Event Ping Role:** {await get_mention(self.config.get('super_ping_role_id'), 'role', self.guild)}\n"
+            f"**Changelog Ping Role:** {await get_mention(self.config.get('changelog_ping_role_id'), 'role', self.guild)}"
         )
-        embed.add_field(name="Feature Toggles", value=toggles_val, inline=False)
+        embed.add_field(name="Ping Settings", value=ping_settings_val, inline=False)
 
         # --- Tracked Guilds ---
         tracked_guilds = self.config.get('tracked_guilds', {})
@@ -2593,16 +2626,17 @@ class SetupView(discord.ui.View):
 
     def _update_ui_elements(self):
         self.clear_items()
-        self.add_item(discord.ui.Button(label="Set Roles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_roles"))
-        self.add_item(discord.ui.Button(label="Set Channels", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_channels"))
-        self.add_item(discord.ui.Button(label="Set Toggles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_toggles"))
-        self.add_item(discord.ui.Button(label="Add Tracked Guild", style=discord.ButtonStyle.success, row=1, custom_id="setup_btn_add_guild"))
-        self.add_item(discord.ui.Button(label="Remove Tracked Guild", style=discord.ButtonStyle.danger, row=1, custom_id="setup_btn_remove_guild"))
+        self.add_item(discord.ui.Button(label="Set Member Roles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_member_roles"))
+        self.add_item(discord.ui.Button(label="Set Command Roles", style=discord.ButtonStyle.primary, row=0, custom_id="setup_btn_command_roles"))
+        self.add_item(discord.ui.Button(label="Set Feature Channels", style=discord.ButtonStyle.primary, row=1, custom_id="setup_btn_feature_channels"))
+        self.add_item(discord.ui.Button(label="Set Ping Settings", style=discord.ButtonStyle.primary, row=1, custom_id="setup_btn_ping_settings"))
+        self.add_item(discord.ui.Button(label="Add Tracked Guild", style=discord.ButtonStyle.success, row=2, custom_id="setup_btn_add_guild"))
+        self.add_item(discord.ui.Button(label="Remove Tracked Guild", style=discord.ButtonStyle.danger, row=2, custom_id="setup_btn_remove_guild"))
         
         if self.original_interaction_user_id == DEVELOPER_USER_ID:
-            self.add_item(discord.ui.Button(label="Open Developer Panel", emoji="👑", style=discord.ButtonStyle.secondary, row=2, custom_id="setup_switch_to_dev"))
+            self.add_item(discord.ui.Button(label="Open Developer Panel", emoji="👑", style=discord.ButtonStyle.secondary, row=3, custom_id="setup_switch_to_dev"))
         
-        self.add_item(discord.ui.Button(label="Done", style=discord.ButtonStyle.secondary, row=3, custom_id="setup_btn_done"))
+        self.add_item(discord.ui.Button(label="Done", style=discord.ButtonStyle.secondary, row=4, custom_id="setup_btn_done"))
         
         for child in self.children:
             if isinstance(child, discord.ui.Button): child.callback = self.dispatch_callback
@@ -2610,37 +2644,47 @@ class SetupView(discord.ui.View):
     async def dispatch_callback(self, interaction: discord.Interaction):
         custom_id = interaction.data['custom_id']
         
-        if custom_id == 'setup_btn_roles':
+        if custom_id == 'setup_btn_member_roles':
             current_verified_roles = ', '.join(map(str, self.config.get('verified_role_ids', [])))
-            current_mod_roles = ', '.join(map(str, self.config.get('moderator_role_ids', [])))
             fields = [
-                {'label': "Verified Roles (comma-separated)", 'id': "verified_role_ids", 'default': current_verified_roles},
+                {'label': "Verified Roles (comma-sep)", 'id': "verified_role_ids", 'default': current_verified_roles, 'max_length': 200},
                 {'label': "Unverified Role", 'id': "unverified_role_id", 'default': str(self.config.get('unverified_role_id') or '')},
                 {'label': "Withered Role", 'id': "withered_role_id", 'default': str(self.config.get('withered_role_id') or '')},
-                {'label': "Moderator Roles (comma-separated)", 'id': "moderator_role_ids", 'default': current_mod_roles}
+                {'label': "Ex-Member Role", 'id': "ex_member_role_id", 'default': str(self.config.get('ex_member_role_id') or '')},
             ]
-            await interaction.response.send_modal(SetupModal(title="Set Core & Staff Roles", fields=fields, callback_func=self.handle_modal_submit))
+            await interaction.response.send_modal(SetupModal(title="Set Member & Status Roles", fields=fields, callback_func=self.handle_modal_submit))
 
-        elif custom_id == 'setup_btn_channels':
+        elif custom_id == 'setup_btn_command_roles':
+            current_mod_roles = ', '.join(map(str, self.config.get('moderator_role_ids', [])))
+            fields = [
+                {'label': "Bot Moderator Roles (comma-sep)", 'id': "moderator_role_ids", 'default': current_mod_roles, 'max_length': 200},
+                {'label': "/wither Command Role", 'id': "wither_command_role_id", 'default': str(self.config.get('wither_command_role_id') or '')},
+                {'label': "/florr Command Role", 'id': "florr_command_role_id", 'default': str(self.config.get('florr_command_role_id') or '')},
+                {'label': "/imitate Command Role", 'id': "imitate_command_role_id", 'default': str(self.config.get('imitate_command_role_id') or '')},
+            ]
+            await interaction.response.send_modal(SetupModal(title="Set Command Permission Roles", fields=fields, callback_func=self.handle_modal_submit))
+
+        elif custom_id == 'setup_btn_feature_channels':
             current_ai_channels = ', '.join(map(str, self.config.get('always_on_ai_channels', [])))
             fields = [
-                {'label': "Screenshots Channel (Activity)", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
+                {'label': "Screenshots (Activity) Channel", 'id': "screenshots_dropbox_channel_id", 'default': str(self.config.get('screenshots_dropbox_channel_id') or '')},
                 {'label': "Super Attempts Log Channel", 'id': "super_attempts_channel_id", 'default': str(self.config.get('super_attempts_channel_id') or '')},
                 {'label': "Unified Guild List Channel", 'id': "guild_list_channel_id", 'default': str(self.config.get('guild_list_channel_id') or '')},
                 {'label': "Changelog Channel", 'id': "changelog_channel_id", 'default': str(self.config.get('changelog_channel_id') or '')},
-                {'label': "Always-On AI Channels (comma-sep)", 'id': "always_on_ai_channels", 'default': current_ai_channels}
+                {'label': "Always-On AI Channels (comma-sep)", 'id': "always_on_ai_channels", 'default': current_ai_channels, 'max_length': 200},
             ]
             await interaction.response.send_modal(SetupModal(title="Set Feature Channels", fields=fields, callback_func=self.handle_modal_submit))
 
-        elif custom_id == 'setup_btn_toggles':
+        elif custom_id == 'setup_btn_ping_settings':
             fields = [
-                {'label': "AI Keywords (enable/disable)", 'id': "keywords_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('keywords_enabled', True) else 'disable'},
-                {'label': "Wither Command (enable/disable)", 'id': "wither_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('wither_command_enabled', True) else 'disable'},
-                {'label': "/servercodes Command (enable/disable)", 'id': "servercodes_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('servercodes_command_enabled', True) else 'disable'},
-                {'label': "/profile Command (enable/disable)", 'id': "profile_command_enabled", 'placeholder': 'Default: enable', 'default': 'enable' if self.config.get('profile_command_enabled', True) else 'disable'}
+                {'label': "Super Craft Ping Channel", 'id': "craft_ping_channel_id", 'default': str(self.config.get('craft_ping_channel_id') or '')},
+                {'label': "Super Spawn Ping Channel", 'id': "spawn_ping_channel_id", 'default': str(self.config.get('spawn_ping_channel_id') or '')},
+                {'label': "Super Defeat Ping Channel", 'id': "defeat_ping_channel_id", 'default': str(self.config.get('defeat_ping_channel_id') or '')},
+                {'label': "Super Event Ping Role", 'id': "super_ping_role_id", 'default': str(self.config.get('super_ping_role_id') or '')},
+                {'label': "Changelog Ping Role", 'id': "changelog_ping_role_id", 'default': str(self.config.get('changelog_ping_role_id') or '')},
             ]
-            await interaction.response.send_modal(SetupModal(title="Set Feature Toggles", fields=fields, callback_func=self.handle_modal_submit))
-        
+            await interaction.response.send_modal(SetupModal(title="Set Ping Channels & Roles", fields=fields, callback_func=self.handle_modal_submit))
+
         elif custom_id == 'setup_btn_add_guild':
             await interaction.response.send_modal(AddTrackedGuildModal(self))
         elif custom_id == 'setup_btn_remove_guild':
@@ -2658,24 +2702,12 @@ class SetupView(discord.ui.View):
         updates = {"guild_id": self.guild.id}
         errors, resolved_items = [], []
         
-        boolean_fields = ["keywords_enabled", "wither_command_enabled", "servercodes_command_enabled", "profile_command_enabled"]
-        
         for key, value in results.items():
             value_stripped = value.strip()
             
-            # Handle booleans
-            if key in boolean_fields:
-                if not value_stripped: # If blank, keep current setting
-                    continue
-                if value_stripped.lower() in ["enable", "yes", "true", "1"]:
-                    updates[key] = True
-                    resolved_items.append(f"Set `{key}` to `Enabled`.")
-                elif value_stripped.lower() in ["disable", "no", "false", "0"]:
-                    updates[key] = False
-                    resolved_items.append(f"Set `{key}` to `Disabled`.")
-                else:
-                    errors.append(f"For `{key}`: Invalid input. Use 'enable' or 'disable'.")
-                continue
+            # This block is REMOVED as requested
+            # if key in boolean_fields:
+            #     ...
 
             # Handle blank values for other fields (clear setting)
             if not value_stripped:
@@ -6108,6 +6140,8 @@ class DevSetupView(discord.ui.View):
         self.guild = interaction.guild 
         self.message: Optional[discord.Message] = None
         self.global_guilds_data: List[Dict[str, Any]] = []
+        # Store original user ID to show dev-only buttons
+        self.original_interaction_user_id = interaction.user.id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == DEVELOPER_USER_ID:
@@ -6137,6 +6171,7 @@ class DevSetupView(discord.ui.View):
         self.add_item(discord.ui.Button(label="Delete Global Guild", style=discord.ButtonStyle.danger, emoji="🗑️", row=0, custom_id="devsetup_delete_global"))
         self.add_item(discord.ui.Button(label="Post Changelog", style=discord.ButtonStyle.success, emoji="📝", row=1, custom_id="devsetup_post_changelog"))
         
+        # Only show the "Switch to Admin View" button if the command was used in a server
         if self.guild: 
             self.add_item(discord.ui.Button(label="Switch to Admin View", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2, custom_id="devsetup_switch_to_admin"))
         
@@ -6150,7 +6185,8 @@ class DevSetupView(discord.ui.View):
         elif custom_id == 'devsetup_post_changelog': await interaction.response.send_modal(PostChangelogModal(self))
         elif custom_id == 'devsetup_switch_to_admin':
             if self.message: await self.message.delete()
-            await setup(interaction)
+            # This is the fix for the TypeError
+            await _show_admin_setup_view(interaction)
         elif custom_id == 'devsetup_done':
             if self.message: await self.message.edit(content="✅ Developer setup complete.", embed=None, view=None)
             self.stop()
@@ -6165,7 +6201,7 @@ class DevSetupView(discord.ui.View):
     async def on_timeout(self):
         if self.message:
             for item in self.children: item.disabled = True
-            try: await self.message.edit(content="Developer setup timed out.", embed=None, view=None)
+            try: await self.message.edit(content="Developer setup timed out.", embed=None, view=self)
             except discord.HTTPException: pass
         self.stop()
 
@@ -9825,23 +9861,7 @@ async def setnickname(interaction: discord.Interaction, template: Optional[str] 
 @tree.command(name="setup", description="[Admin] Interactively configure the bot for this server.")
 @app_commands.check(is_admin_or_developer)
 async def setup(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild: return
-    
-    if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-        bot_perms = interaction.channel.permissions_for(guild.me)
-        if not bot_perms.send_messages or not bot_perms.embed_links:
-            await interaction.response.send_message("❌ I need `Send Messages` and `Embed Links` permissions in this channel to show the setup panel.", ephemeral=True)
-            return
-
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=False)
-        
-    config = await load_server_config(guild.id)
-    view = SetupView(interaction, config)
-    view._update_ui_elements()
-    message = await interaction.followup.send(embed=await view.create_embed(), view=view, ephemeral=False)
-    view.message = message
+    await _show_admin_setup_view(interaction)
 
 class NerdAdminGroup(app_commands.Group):
     """[Developer Only] Commands for global bot administration."""
