@@ -171,6 +171,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ADMIN_KEY = os.getenv("SUPABASE_ADMIN_KEY")
 SELF_DISCORD_TOKEN = os.getenv("SELF_DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # <-- ADD THIS LINE
+RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL")
 
 # --- Global Constants & Variables ---
 DEVELOPER_USER_ID = 1230848174218940416
@@ -214,10 +215,9 @@ PETALS_FOLDER_NAME = "Petals"
 MOBS_FOLDER_NAME = "Mobs"
 RARITY_PREFIXES = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "ultra", "super", "unique"]
 PETAL_ABBREVIATIONS = {"ygg": "yggdrasil", "begg": "beetle egg", "beggs": "beetle egg", "pinger": "stinger", "binger": "blood stinger", "minger": "magic stinger"}
-ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage"]
+ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage", "Domino", "Totem"]
 GUILD_SYNC_SESSION_TIMEOUT_SECONDS = 1800
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
-# (Add any other constants from your original file here if they were missed)
 MAX_WITHER_SECONDS = 3600
 MEMBERS_PER_PAGE = 50
 VIEW_MODE_DISCORD = "discord_view"
@@ -6161,7 +6161,10 @@ class DevSetupView(discord.ui.View):
         self.add_item(discord.ui.Button(label="Delete Global Guild", style=discord.ButtonStyle.danger, emoji="🗑️", row=0, custom_id="devsetup_delete_global"))
         self.add_item(discord.ui.Button(label="Post Changelog", style=discord.ButtonStyle.success, emoji="📝", row=1, custom_id="devsetup_post_changelog"))
         
-        # Only show the "Switch to Admin View" button if the command was used in a server
+        # Row 2 for restart and admin view switch
+        if os.getenv("RENDER_DEPLOY_HOOK_URL"):
+            self.add_item(discord.ui.Button(label="Restart Bot", style=discord.ButtonStyle.danger, emoji="🔄", row=2, custom_id="devsetup_restart_bot"))
+
         if self.guild: 
             self.add_item(discord.ui.Button(label="Switch to Admin View", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2, custom_id="devsetup_switch_to_admin"))
         
@@ -6173,13 +6176,72 @@ class DevSetupView(discord.ui.View):
         if custom_id == 'devsetup_add_global': await interaction.response.send_modal(AddGlobalGuildModal(self))
         elif custom_id == 'devsetup_delete_global': await interaction.response.send_modal(DeleteGlobalGuildModal(self))
         elif custom_id == 'devsetup_post_changelog': await interaction.response.send_modal(PostChangelogModal(self))
+        elif custom_id == 'devsetup_restart_bot': await self.handle_restart_bot(interaction)
         elif custom_id == 'devsetup_switch_to_admin':
             if self.message: await self.message.delete()
-            # This is the fix for the TypeError
             await _show_admin_setup_view(interaction)
         elif custom_id == 'devsetup_done':
             if self.message: await self.message.edit(content="✅ Developer setup complete.", embed=None, view=None)
             self.stop()
+
+    async def handle_restart_bot(self, interaction: discord.Interaction):
+        deploy_hook_url = os.getenv("RENDER_DEPLOY_HOOK_URL")
+        if not deploy_hook_url:
+            await interaction.response.send_message(
+                "❌ **Feature Not Configured:** The `RENDER_DEPLOY_HOOK_URL` environment variable is not set.",
+                ephemeral=True
+            )
+            return
+
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        
+        await interaction.response.edit_message(
+            content="*Sending restart signal to Render...*",
+            embed=None,
+            view=self
+        )
+
+        try:
+            async with bot.http_session.post(deploy_hook_url) as response:
+                if 200 <= response.status < 300:
+                    await interaction.followup.send(
+                        "✅ **Restart Signal Sent!** The bot will begin restarting. This may take a few minutes.",
+                        ephemeral=True
+                    )
+                    await log_error(
+                        interaction.guild,
+                        f"Bot restart triggered by {interaction.user.name}",
+                        embed=discord.Embed(
+                            title="🔄 Bot Restart Triggered",
+                            description=f"The bot restart process was successfully initiated by {interaction.user.mention} via the developer panel.",
+                            color=discord.Color.blue()
+                        ),
+                        ping_developer=False
+                    )
+                else:
+                    error_text = await response.text()
+                    await interaction.followup.send(
+                        f"❌ **Failed to Trigger Restart!**\n"
+                        f"Render deploy hook returned status `{response.status}`.\n"
+                        f"**Response:**\n```\n{error_text[:1000]}\n```",
+                        ephemeral=True
+                    )
+                    await log_error(interaction.guild, f"Failed to trigger bot restart. Status: {response.status}", interaction=interaction, ping_developer=True)
+                    for item in self.children:
+                        if isinstance(item, discord.ui.Button): item.disabled = False
+                    await interaction.edit_original_response(content="", embed=await self.create_embed(), view=self)
+
+        except aiohttp.ClientError as e:
+            await interaction.followup.send(
+                "❌ **Network Error!** Could not connect to the Render deploy hook URL. Check the URL and the bot's network status.",
+                ephemeral=True
+            )
+            await log_error(interaction.guild, "Network error trying to trigger restart.", error=e, interaction=interaction, ping_developer=True)
+            for item in self.children:
+                if isinstance(item, discord.ui.Button): item.disabled = False
+            await interaction.edit_original_response(content="", embed=await self.create_embed(), view=self)
 
     async def refresh_view(self, interaction: discord.Interaction):
         self._add_buttons()
@@ -8460,9 +8522,30 @@ async def setguild(
     user: Optional[discord.Member] = None,
     ingame_name: Optional[str] = None
 ):
-    # Defer the interaction immediately to prevent timeouts.
-    # The final success/failure message will be public, so ephemeral=False.
-    await interaction.response.defer(ephemeral=False)
+    try:
+        # Defer the interaction immediately to prevent timeouts.
+        await interaction.response.defer(ephemeral=False)
+    except discord.NotFound:
+        # This happens if the autocomplete function takes too long (> 3 seconds)
+        # and the interaction token expires before we can defer.
+        await log_error(
+            interaction.guild,
+            "Interaction token expired before deferral in /setguild, likely due to slow autocomplete.",
+            interaction=interaction,
+            ping_developer=True # This is a significant issue worth pinging.
+        )
+        try:
+            # We can't use `interaction.followup` because the interaction is dead.
+            # We send a new message to the channel instead.
+            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.send(
+                    f"⏱️ {interaction.user.mention}, the command took too long to start, likely due to slow database lookups for autocomplete. "
+                    "Please try again in a moment. If this persists, the bot may be under heavy load and an admin has been notified.",
+                    allowed_mentions=discord.AllowedMentions(users=[interaction.user])
+                )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await log_error(interaction.guild, "Failed to send secondary error message for /setguild timeout.", error=e)
+        return
 
     if not await check_supabase_available(interaction): 
         # Use followup since we have deferred.
