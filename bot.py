@@ -4434,14 +4434,6 @@ async def process_guild_sync_batch(
     user = message.author
     user_id = user.id
     
-    ai_cog = bot.get_cog('AICog')
-    if not ai_cog:
-        await log_error(guild, "GuildSync: AICog not found during batch processing.", message_context=message)
-        if is_new_session:
-            try: return await message.reply(f"{user.mention} ❌ AI Module error. Sync aborted.")
-            except discord.HTTPException: pass
-        return None
-
     # Determine the target guild for this sync session
     target_guild_tag = None
     known_igns_for_ai = []
@@ -4476,7 +4468,7 @@ async def process_guild_sync_batch(
     known_igns_list_for_ai_str = "\n".join(known_igns_for_ai)
 
     # --- BATCHED AI CALL ---
-    ai_extracted_text = await ai_cog.get_ai_response_with_image(
+    ai_extracted_text = await get_ai_response_with_image(
         prompt_key="FLORR_GUILD_LIST_FULL_EXTRACTION",
         image_bytes_list=image_bytes_list,
         prompt_kwargs={'known_igns_list_str': known_igns_list_for_ai_str}
@@ -4538,7 +4530,7 @@ async def process_guild_sync_batch(
         session_data['bot_reply_message_id'] = new_bot_reply_msg.id
 
         await log_info(guild, f"GuildSync: Added {newly_added_count} IGNs to session for {user.name}. Total: {len(session_data['screenshot_igns_collected'])}. Failures: {failed_ai_this_batch}")
-        return new_bot_reply_msg # Or None if not fetched/edited # Or None if not fetched/edited
+        return new_bot_reply_msg
 
 
 async def generate_final_sync_report_embed_only(guild: Optional[discord.Guild], user: discord.User, user_id_session_key: int) -> Optional[discord.Embed]:
@@ -5864,7 +5856,7 @@ def _get_display_friendly_petal_name(original_name: str) -> str:
 
 async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict[str, Any]:
     """
-    Fuzzy matches a query string against base petal names from the cache.
+    Fuzzy matches a query string against base petal names from the cache and additional names list.
     Handles preprocessing and abbreviations.
 
     Returns a dictionary with status and match data.
@@ -5873,25 +5865,30 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
         'display_friendly_name': A display-friendly version (e.g., 'Lotus Petal').
         'original_query', 'processed_query'.
     """
-    if not available_profile_pics_cache:
+    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
         return {'status': 'cache_not_ready'}
 
-    # Map: base_search_name -> {'display_friendly_name': str, 'count': int}
-    # We store the first encountered display_friendly_name for a base_search_name.
     unique_base_petal_data_map: Dict[str, Dict[str, Any]] = {}
 
-    for display_name_orig, folder_id, _ in available_profile_pics_cache:
-        if folder_id == PETALS_FOLDER_NAME: # Only consider petals
-            # This gets the name like "lotus", "dandelion", "egg"
-            base_search_name = _preprocess_petal_name_for_search(display_name_orig)
-            if base_search_name:
-                if base_search_name not in unique_base_petal_data_map:
-                    # This gets the name like "Lotus Petal", "Dandelion", "Egg"
+    if available_profile_pics_cache:
+        for display_name_orig, folder_id, _ in available_profile_pics_cache:
+            if folder_id == PETALS_FOLDER_NAME:
+                base_search_name = _preprocess_petal_name_for_search(display_name_orig)
+                if base_search_name and base_search_name not in unique_base_petal_data_map:
                     display_friendly = _get_display_friendly_petal_name(display_name_orig)
                     unique_base_petal_data_map[base_search_name] = {
                         'display_friendly_name': display_friendly,
-                        # 'original_full_name_representative': display_name_orig # We don't need this for this func's output
                     }
+    
+    # Add additional petal names to the searchable map
+    for additional_name in ADDITIONAL_SUPER_PETAL_NAMES:
+        base_search_name = _preprocess_petal_name_for_search(additional_name)
+        if base_search_name and base_search_name not in unique_base_petal_data_map:
+            # For display, treat them as "Ultra Name"
+            display_friendly = _get_display_friendly_petal_name(f"Ultra {additional_name.title()}")
+            unique_base_petal_data_map[base_search_name] = {
+                'display_friendly_name': display_friendly,
+            }
     
     if not unique_base_petal_data_map:
         return {'status': 'no_searchable_petals'}
@@ -5914,29 +5911,23 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
             'processed_query': processed_query_for_match
         }
 
-    # Score the matches against the *base names*
     scored_matches: List[Dict[str, Any]] = []
     for matched_base_name_str in matches_from_difflib:
         score = difflib.SequenceMatcher(None, processed_query_for_match, matched_base_name_str).ratio()
         base_petal_entry_data = unique_base_petal_data_map.get(matched_base_name_str)
         if base_petal_entry_data:
             scored_matches.append({
-                'base_name_matched': matched_base_name_str, # e.g., 'lotus'
-                'display_friendly_name': base_petal_entry_data['display_friendly_name'], # e.g., 'Lotus Petal'
+                'base_name_matched': matched_base_name_str,
+                'display_friendly_name': base_petal_entry_data['display_friendly_name'],
                 'score': score
             })
     
-    if not scored_matches: # Should not happen if matches_from_difflib was populated
-         return {
-            'status': 'not_found', 
-            'original_query': query_string, 
-            'processed_query': processed_query_for_match
-        }
+    if not scored_matches:
+         return { 'status': 'not_found', 'original_query': query_string, 'processed_query': processed_query_for_match }
 
     scored_matches.sort(key=lambda x: x['score'], reverse=True)
-    best_match = scored_matches[0] # This contains 'base_name_matched' and 'display_friendly_name'
+    best_match = scored_matches[0]
     
-    # Ambiguity Check (remains similar, but now based on base name matches)
     if len(scored_matches) > 1:
         second_match = scored_matches[1]
         is_ambiguous = (
@@ -5952,7 +5943,7 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
             ambiguous_display_names_set = set()
             for m in scored_matches[:min(3, len(scored_matches))]:
                 if m['score'] > 0.60:
-                    ambiguous_display_names_set.add(m['display_friendly_name']) # Show display friendly for ambiguity
+                    ambiguous_display_names_set.add(m['display_friendly_name'])
             
             unique_ambiguous_options = list(ambiguous_display_names_set)
             if len(unique_ambiguous_options) > 1:
@@ -5969,7 +5960,6 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
         'processed_query': processed_query_for_match,
         'base_name_matched': best_match['base_name_matched'],
         'display_friendly_name': best_match['display_friendly_name']
-        # Removed 'match_details' as the direct items are now returned
     }
 
 def _generate_activity_week_display(
@@ -8069,7 +8059,6 @@ async def on_close():
          await bot.http_session.close()
          print("Closed persistent aiohttp ClientSession.")
 
-# --- Discord Events ---
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
@@ -8094,14 +8083,20 @@ async def on_ready():
 
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     
-    await _initialize_ai_models()
-    synced_commands = await _sync_app_commands(bot)
+    # Get log_guild context early
+    log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
 
+    # Initialize data caches before starting dependent tasks
+    await load_profile_picture_choices(log_guild)
+    await load_ign_cache(log_guild)
+    await _initialize_ai_models()
+    
+    synced_commands = await _sync_app_commands(bot)
+    
     await _revive_static_list_views()
     
     await _start_background_tasks(bot)
 
-    log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
     if log_guild:
         instance_info = f" ({BOT_INSTANCE_TYPE} instance)" if BOT_INSTANCE_TYPE != "PRODUCTION" else ""
         await log_info(log_guild, f"Bot ready and online{instance_info}. Synced {len(synced_commands)} commands.")
