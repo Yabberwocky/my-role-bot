@@ -216,8 +216,6 @@ NERDY_YELLOW = discord.Color.gold()
 PETALS_FOLDER_NAME = "Petals"
 MOBS_FOLDER_NAME = "Mobs"
 RARITY_PREFIXES = ["common", "uncommon", "rare", "epic", "legendary", "mythic", "ultra", "super", "unique"]
-PETAL_ABBREVIATIONS = {"ygg": "yggdrasil", "begg": "beetle egg", "beggs": "beetle egg", "pinger": "stinger", "binger": "blood stinger", "minger": "magic stinger"}
-ADDITIONAL_SUPER_PETAL_NAMES = ["Laser", "Triangle", "Bandage", "Domino", "Totem"]
 GUILD_SYNC_SESSION_TIMEOUT_SECONDS = 1800
 STATIC_LIST_RESET_TIMEOUT_MINUTES = 5
 MAX_WITHER_SECONDS = 3600
@@ -821,93 +819,142 @@ async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Opti
     category = item.get('category')
     rarity = item.get('rarity')
     image_path = None
-    embed_title = "New Event"
+    embed_title = None # No titles for these embeds
     embed_description = ""
     embed_color = NERDY_YELLOW
     filename_for_attachment = None
     base_path = os.path.dirname(os.path.abspath(__file__))
 
-    # --- Crafting Logic ---
+    log_details = {
+        'event_item': item,
+        'steps': [],
+        'final_path_checked': None,
+        'final_filename_generated': None
+    }
+
+    # --- Crafting Logic (REVISED) ---
     if category == 'super_craft':
         petal_display_name = item.get('petal')
         player = item.get('player', 'Someone')
-        embed_title = "✨ Super Crafted! ✨"
-        embed_description = f"**{player}** crafted a **{rarity} {petal_display_name}**!"
         
+        petal_full_name = f"{rarity} {petal_display_name}"
+        embed_description = f"# {petal_full_name}\n# {player}"
+
+        log_details['steps'].append(f"Starting image search for CRAFT event: '{petal_full_name}'.")
+
+        petal_id_for_image = None
         if petal_display_name:
-            # Find the petal in florr_data by its display_name to get the internal 'name' for the filename.
+            log_details['steps'].append(f"Searching for petal with display_name '{petal_display_name}' in florr_data.json.")
             petal_data = next((p for p in florr_data.get('petals', []) if p.get('display_name', '').lower() == petal_display_name.lower()), None)
-            
-            # Use the internal 'name' for the file if found; otherwise, fall back to converting the display name.
-            if petal_data and 'name' in petal_data:
-                 petal_filename_base = petal_data['name']
+
+            if petal_data:
+                petal_id_for_image = petal_data.get('id')
+                log_details['steps'].append(f"Found matching petal data. Using id for image: '{petal_id_for_image}'.")
             else:
-                 petal_filename_base = petal_display_name.lower().replace(' ', '_').replace('-', '_')
+                log_details['steps'].append(f"FAILURE: Petal with display_name '{petal_display_name}' not found in florr_data.json.")
 
-            filename_for_attachment = f"{petal_filename_base}.png"
+        if petal_id_for_image is not None:
+            filename_for_attachment = f"{petal_id_for_image}.png"
+            log_details['final_filename_generated'] = filename_for_attachment
             potential_path = os.path.join(base_path, PETALS_FOLDER_NAME, filename_for_attachment)
-            
-            if os.path.exists(potential_path):
-                image_path = potential_path
+            log_details['final_path_checked'] = potential_path
 
-    # --- Mob Spawn/Defeat Logic ---
+            if os.path.exists(potential_path):
+                log_details['steps'].append(f"SUCCESS: Image file exists at '{potential_path}'.")
+                image_path = potential_path
+            else:
+                log_details['steps'].append(f"FAILURE: Image file does NOT exist at the checked path.")
+
+    # --- Mob Spawn/Defeat Logic (REVISED) ---
     elif category in ['super_spawn', 'super_defeat']:
         mob_display_name_from_event = item.get('mob')
-        mob_id_for_image = None
+        image_filename_base = None
         display_name_for_embed = mob_display_name_from_event.replace('_', ' ').title() if mob_display_name_from_event else "Unknown Mob"
+        log_details['steps'].append(f"Starting image search for MOB event: '{rarity} {mob_display_name_from_event}'.")
 
-        # --- Group Logic (for spawns primarily) ---
-        found_in_group = False
-        if mob_display_name_from_event and category == 'super_spawn':
-            for group in florr_data.get('shared_spawns', []):
-                for member in group.get('group_members', []):
-                    # Match the event mob's display name against the group member's display name
-                    if member.get('name', '').lower() == mob_display_name_from_event.lower():
-                        mob_id_for_image = group.get('leader_id')
-                        display_name_for_embed = group.get('group_name', display_name_for_embed)
-                        found_in_group = True
-                        break
-                if found_in_group:
-                    break
-        
-        # --- Standard Mob Logic (if not found in a group, or for all defeats) ---
-        if not found_in_group and mob_display_name_from_event:
-            # Match by display_name from the event against the main mobs list
+        mob_primary_id = None
+        if mob_display_name_from_event:
+            log_details['steps'].append(f"Searching main 'mobs' list for display_name '{mob_display_name_from_event}'.")
             mob_data = next((m for m in florr_data.get('mobs', []) if m.get('display_name', '').lower() == mob_display_name_from_event.lower()), None)
             if mob_data:
-                mob_id_for_image = mob_data.get('id')
-                # Use the canonical display name from the JSON file
-                display_name_for_embed = mob_data.get('display_name')
+                mob_primary_id = mob_data.get('id')
+                display_name_for_embed = mob_data.get('display_name', display_name_for_embed)
+                log_details['steps'].append(f"Found mob in main list. Primary ID is '{mob_primary_id}'.")
+            else:
+                log_details['steps'].append(f"FAILURE: Mob display name '{mob_display_name_from_event}' not found in main mobs list.")
 
-        # --- Build Embed Description ---
+        if category == 'super_spawn' and mob_primary_id is not None:
+            log_details['steps'].append(f"SPAWN event: Searching 'shared_spawns' for a group containing mob ID '{mob_primary_id}'.")
+            found_group = False
+            for group in florr_data.get('shared_spawns', []):
+                for member in group.get('group_members', []):
+                    if member.get('id') == mob_primary_id:
+                        image_filename_base = group.get('group_id')
+                        display_name_for_embed = group.get('group_name', display_name_for_embed)
+                        log_details['steps'].append(f"Found mob in group '{group.get('group_name')}'. Using group_id '{image_filename_base}' for image and group_name for display.")
+                        found_group = True
+                        break
+                if found_group:
+                    break
+            if not found_group:
+                log_details['steps'].append("Mob ID was not found in any spawn group. Will use primary ID for image.")
+                image_filename_base = mob_primary_id
+        
+        elif image_filename_base is None:
+            image_filename_base = mob_primary_id
+            log_details['steps'].append(f"{category.upper()} event: Using primary mob ID '{mob_primary_id}' for image.")
+
         if category == 'super_spawn':
-            embed_title = "🚨 Super Spawn! 🚨"
-            embed_description = f"A **{rarity} {display_name_for_embed}** has appeared!"
+            embed_description = f"# {rarity} {display_name_for_embed}"
+        
         else: # super_defeat
-            players_str = ", ".join(item.get('players', [])) if item.get('players') else "Someone"
-            embed_title = "⚔️ Super Defeated! ⚔️"
-            embed_description = f"The **{rarity} {display_name_for_embed}** was defeated by **{players_str}**!"
+            players = item.get('players', [])
+            defeat_display_name = display_name_for_embed # Use the official name found in mob_data
+            defeat_mob_full_name = f"{rarity} {defeat_display_name}"
             
-        # --- Find Image File using the determined ID ---
-        if mob_id_for_image:
+            description_lines = [f"# {defeat_mob_full_name}"]
+            if players:
+                description_lines.extend([f"- {p}" for p in players])
+            
+            embed_description = "\n".join(description_lines)
+
+        if image_filename_base is not None:
             rarity_suffix = "_7" if rarity == "Super" else "_8" if rarity == "Unique" else None
             if rarity_suffix:
-                mob_filename = f"{mob_id_for_image}{rarity_suffix}.png"
+                log_details['steps'].append(f"Rarity is '{rarity}', using suffix '{rarity_suffix}'.")
+                mob_filename = f"{image_filename_base}{rarity_suffix}.png"
+                log_details['final_filename_generated'] = mob_filename
                 potential_path = os.path.join(base_path, MOBS_FOLDER_NAME, mob_filename)
+                log_details['final_path_checked'] = potential_path
+
                 if os.path.exists(potential_path):
+                    log_details['steps'].append(f"SUCCESS: Image file exists at '{potential_path}'.")
                     image_path = potential_path
                     filename_for_attachment = mob_filename
                 else:
-                    print(f"Event Image File Missing: Expected '{mob_filename}' in '{MOBS_FOLDER_NAME}' folder, but it was not found.")
+                    log_details['steps'].append(f"FAILURE: Image file does NOT exist at the checked path.")
+            else:
+                log_details['steps'].append(f"NOTE: Rarity '{rarity}' does not have a special image suffix (not Super or Unique). No image will be attached.")
+        else:
+            log_details['steps'].append("No image filename base was determined, so no image can be found.")
 
-    # --- Finalize Embed ---
     embed = discord.Embed(title=embed_title, description=embed_description, color=embed_color)
     if image_path and filename_for_attachment:
         embed.set_thumbnail(url=f"attachment://{filename_for_attachment}")
     else:
-        # Log if an image was expected but not found
         if category in ['super_spawn', 'super_defeat', 'super_craft']:
-            print(f"Event Image Not Found: Path='{image_path}' for item: {item}")
+            log_message = [
+                f"\n--- Event Image Trace [FAILURE] ---",
+                f"Event Type: {category}",
+                f"Generated Filename: {log_details['final_filename_generated'] or 'N/A'}",
+                f"Full Path Checked: {log_details['final_path_checked'] or 'N/A'}",
+                f"Trace Log:"
+            ]
+            for step in log_details['steps']:
+                log_message.append(f"  - {step}")
+            log_message.append(f"Original Event Data: {log_details['event_item']}")
+            log_message.append("-------------------------------------\n")
+            print('\n'.join(log_message))
 
     return embed, image_path
 
@@ -1345,10 +1392,51 @@ class SelfBotListener:
 
         if item_data:
             item_data['message_id'] = message_id
-            item_data['timestamp'] = embed.get('timestamp') # This is the crucial field from Discord payload
+            item_data['timestamp'] = embed.get('timestamp')
             
             event_category = item_data.get('category', 'unknown')
-            if event_category == 'unclassified': return
+            if event_category == 'unclassified':
+                # --- Log Unclassified Events Instead of Discarding ---
+                log_embed = discord.Embed(
+                    title="🕵️ Unclassified Self-Bot Event",
+                    description="An event was received from the listener that did not match any known patterns (craft, spawn, defeat).",
+                    color=discord.Color.blue()
+                )
+                
+                raw_text = item_data.get('text', '`No description found.`')
+                footer_text = item_data.get('footer', '`No footer found.`')
+                event_message_id = item_data.get('message_id')
+                timestamp = item_data.get('timestamp')
+
+                log_embed.add_field(name="Raw Description", value=f"```\n{raw_text[:1000]}\n```", inline=False)
+                log_embed.add_field(name="Footer", value=f"`{footer_text}`", inline=False)
+                
+                if event_message_id:
+                    jump_url = f"https://discord.com/channels/{PRIVATE_SERVER_ID}/{SUPER_CRAFT_SELF_BOT_CHANNEL_ID}/{event_message_id}"
+                    log_embed.add_field(name="Source Message", value=f"[Jump to Message]({jump_url})\n(ID: `{event_message_id}`)", inline=True)
+                else:
+                    log_embed.add_field(name="Source Message ID", value="`Not found`", inline=True)
+
+                if timestamp:
+                    try:
+                        log_embed.timestamp = date_parse(timestamp)
+                    except (ValueError, TypeError):
+                        log_embed.timestamp = discord.utils.utcnow()
+                else:
+                    log_embed.timestamp = discord.utils.utcnow()
+                
+                log_guild = self.bot.get_guild(EXTRAORDINARY_LOGS_GUILD_ID)
+
+                async def do_log():
+                    await log_error(
+                        guild=log_guild,
+                        message="Unclassified self-bot event detected.",
+                        embed=log_embed,
+                        ping_developer=False
+                    )
+                
+                asyncio.run_coroutine_threadsafe(do_log(), self.main_loop)
+                return
 
             event_key = (item_data.get('message_id'), event_category)
             if event_key in self.processed_events_cache:
@@ -1386,7 +1474,6 @@ class SelfBotListener:
                 if str(event_data.get('channel_id')) == self.target_channel_id and event_data.get('embeds'):
                     for embed in event_data['embeds']:
                         embed['_message_id'] = event_data.get('id')
-                        # The raw Discord timestamp is passed directly now
                         embed['timestamp'] = event_data.get('timestamp') 
                         self._classify_and_dispatch(embed, event_type)
         elif op_code == 7:
@@ -3435,7 +3522,7 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
     try:
         resp = await run_supabase_sync(
             lambda: supabase.table("florr_players")
-                           .select("discord_id, ingame_name, discord_name, florr_guild_tag")
+                           .select("discord_id, ingame_name, discord_name, florr_guild_tag, updated_at")
                            .eq("florr_guild_tag", florr_guild_tag)
                            .execute()
         )
@@ -3471,7 +3558,8 @@ async def fetch_tracked_guild_member_data(guild: discord.Guild, florr_guild_tag:
             "ign": ign,
             "activity_count": activity.get('count', 0),
             "last_seen": activity.get('last_seen'),
-            "florr_guild_tag": member_entry.get("florr_guild_tag")
+            "florr_guild_tag": member_entry.get("florr_guild_tag"),
+            "updated_at": member_entry.get("updated_at")
         })
 
     # Default sort
@@ -4228,41 +4316,89 @@ async def handle_super_attempt_message(message: discord.Message):
     guild = message.guild
     msg_content = message.content.strip()
 
-    # --- REGEX PATTERNS ---
-    # CORRECTED: Check for 2+ digits BEFORE a single digit to ensure correct capture.
     bulk_attempt_pattern = re.compile(r"-(?P<petals>(\d{2,}|[5-9]))\s*(?P<petal_query>.+)", re.IGNORECASE)
-    # Pattern for successful crafts (+1, -0, -5)
     success_craft_pattern = re.compile(r"^(?:\+1|-0|-5)(?:\s.*)?$")
-    # Pattern for single loss (1-4 petals)
     single_attempt_pattern = re.compile(r"-(?P<petals>[1-4])\s*(?P<petal_query>.+)", re.IGNORECASE)
 
-    # --- MATCHING ---
     bulk_match = bulk_attempt_pattern.fullmatch(msg_content)
     success_match = success_craft_pattern.match(msg_content)
     single_match = single_attempt_pattern.fullmatch(msg_content)
 
-    # --- 1. HANDLE BULK LOSS ---
-    if bulk_match:
+    author_ign = await get_ign_from_user(guild, message.author.id)
+    if not author_ign and (bulk_match or success_match or single_match):
+        try:
+            await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/connect` or a similar command to link your account before logging attempts.")
+        except discord.HTTPException:
+            pass
+        return
+
+    # --- LOGIC FOR A SINGLE FAILED ATTEMPT (-1 to -4) ---
+    if single_match:
+        petals_lost = int(single_match.group("petals"))
+        petal_query_str = single_match.group("petal_query").strip()
+        attempt_date_obj, _ = get_utc_date()
+
+        petal_candidates = await fuzzy_match_petal_name(petal_query_str)
+        
+        # Helper function to perform the database logging and reply
+        async def log_and_reply(petal_data_for_db: Dict[str, Any]):
+            chosen_petal_name_for_db = f"Ultra {petal_data_for_db.get('display_name', 'Unknown')}"
+            display_friendly_name_for_reply = petal_data_for_db.get('display_name', 'Unknown')
+            
+            try:
+                insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
+                attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
+                if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
+                
+                all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
+                sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
+                embed = sa_view.create_embed()
+                bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
+                sa_view.message = bot_reply_msg
+                await _update_reactions(message, "success")
+                if isinstance(message.author, discord.Member):
+                    await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
+            except Exception as e:
+                await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_developer=True)
+
+        if len(petal_candidates) == 1:
+            await log_and_reply(petal_candidates[0]['data'])
+        elif len(petal_candidates) > 1:
+            disamb_candidates = []
+            for match in petal_candidates:
+                petal_data = match['data']
+                disamb_candidates.append({
+                    'original_full_name': f"Ultra {petal_data['display_name']}",
+                    'display_friendly_name': petal_data['display_name'],
+                    'base_name_for_db': petal_data['name']
+                })
+
+            disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, your query \"{discord.utils.escape_markdown(petal_query_str)}\" could refer to multiple petals. Please choose one:", color=discord.Color.blue())
+            sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, disamb_candidates, petals_lost, message, author_ign, attempt_date_obj)
+            bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
+            sa_disamb_view.message = bot_reply_msg
+            await _update_reactions(message, "disambiguation")
+        else: # 0 candidates
+            await log_and_reply({"display_name": "Unknown Ultra Petal", "name": "unknown"})
+        return
+
+    # --- LOGIC FOR BULK LOSS (e.g. -5, -10) ---
+    elif bulk_match:
         total_petals_lost = int(bulk_match.group("petals"))
         petal_query_str = bulk_match.group("petal_query").strip()
         
-        author_ign = await get_ign_from_user(guild, message.author.id)
-        if not author_ign:
-            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
-            except discord.HTTPException: pass
-            return
-
-        # Resolve petal name BEFORE looping
-        ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
-        if len(ultra_candidates) > 1:
-            await message.reply(f"{message.author.mention}, your query `'{petal_query_str}'` is ambiguous. Please be more specific before logging a bulk attempt.")
-            return
+        petal_candidates = await fuzzy_match_petal_name(petal_query_str)
         
         chosen_petal_name_for_db = "Unknown Ultra Petal"
         display_friendly_name_for_reply = "Unknown Ultra"
-        if len(ultra_candidates) == 1:
-            chosen_petal_name_for_db = ultra_candidates[0]['original_full_name']
-            display_friendly_name_for_reply = ultra_candidates[0]['display_friendly_name']
+
+        if len(petal_candidates) == 1:
+            petal_data = petal_candidates[0]['data']
+            chosen_petal_name_for_db = f"Ultra {petal_data['display_name']}"
+            display_friendly_name_for_reply = petal_data['display_name']
+        elif len(petal_candidates) > 1:
+            await message.reply(f"{message.author.mention}, your query `'{petal_query_str}'` is ambiguous. Please be more specific before logging a bulk attempt.")
+            return
 
         num_attempts = round(total_petals_lost / 2.5)
         if num_attempts < 1:
@@ -4272,17 +4408,12 @@ async def handle_super_attempt_message(message: discord.Message):
         petals_distribution = distribute_petals(total_petals_lost, num_attempts)
         attempt_date_obj, _ = get_utc_date()
 
-        records_to_insert = []
-        for petals in petals_distribution:
-            records_to_insert.append({
-                "ingame_name": author_ign,
-                "discord_user_id": str(message.author.id),
-                "attempt_date": attempt_date_obj.isoformat(),
-                "petals_lost": petals,
-                "message_id": str(message.id),
-                "channel_id": str(message.channel.id),
-                "chosen_petal_name": chosen_petal_name_for_db
-            })
+        records_to_insert = [{
+            "ingame_name": author_ign, "discord_user_id": str(message.author.id),
+            "attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals,
+            "message_id": str(message.id), "channel_id": str(message.channel.id),
+            "chosen_petal_name": chosen_petal_name_for_db
+        } for petals in petals_distribution]
 
         try:
             await run_supabase_sync(lambda: supabase.table("super_attempts").insert(records_to_insert).execute())
@@ -4294,36 +4425,22 @@ async def handle_super_attempt_message(message: discord.Message):
             view.message = bot_reply_msg
             
             await _update_reactions(message, "success")
-            await log_info(guild, f"User `{author_ign}` batch-logged {num_attempts} attempts for {total_petals_lost} lost petals ({display_friendly_name_for_reply}).")
             if isinstance(message.author, discord.Member):
                 await update_custom_nickname_on_attempt(guild, message.author, author_ign, all_time_attempts_count)
         except Exception as e:
             await log_error(guild, "Error during bulk super attempt logging", error=e, message_context=message, ping_developer=True)
-            try: await message.reply("An error occurred while logging the batch attempts.")
-            except discord.HTTPException: pass
         return
 
-    # --- 2. HANDLE SUCCESSFUL CRAFT ---
+    # --- LOGIC FOR SUCCESSFUL CRAFT (+1, -0, -5) ---
     elif success_match:
-        # This logic remains the same as before
         petals_lost = 1
         chosen_petal_name_for_db = "Successful Super Craft"
         display_friendly_name_for_reply = "Successful Super Craft"
-
-        author_ign = await get_ign_from_user(guild, message.author.id)
-        if not author_ign:
-            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
-            except discord.HTTPException: pass
-            return
-
         attempt_date_obj, _ = get_utc_date()
+
         try:
             insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
             attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
-            if not attempt_db_id:
-                fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
-            
             if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
             
             all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
@@ -4334,84 +4451,6 @@ async def handle_super_attempt_message(message: discord.Message):
             await _update_reactions(message, "success")
         except Exception as e:
             await log_error(guild, f"Error logging successful super craft for {author_ign}", error=e, message_context=message, ping_developer=True)
-            try: await message.reply("Error logging attempt. Admin notified.")
-            except discord.HTTPException: pass
-        return
-
-    # --- 3. HANDLE SINGLE LOSS (1-4 PETALS) ---
-    elif single_match:
-        # This is the original logic for -1 to -4 petals
-        petals_lost_str = single_match.group("petals")
-        petal_query_str = single_match.group("petal_query").strip()
-        petals_lost = int(petals_lost_str)
-        
-        author_ign = await get_ign_from_user(guild, message.author.id)
-        if not author_ign:
-            try: await message.reply(f"{message.author.mention}, your IGN isn't linked. Use `/guild` or `/verify`.")
-            except discord.HTTPException: pass
-            return
-
-        attempt_date_obj, _ = get_utc_date()
-        ultra_candidates = await find_ultra_petal_candidates_for_query(petal_query_str, guild)
-
-        if len(ultra_candidates) == 1:
-            chosen_petal_data = ultra_candidates[0]
-            chosen_petal_name_for_db = chosen_petal_data['original_full_name']
-            display_friendly_name_for_reply = chosen_petal_data['display_friendly_name']
-            try:
-                insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
-                attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
-                if not attempt_db_id:
-                    fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                    attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
-                
-                if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
-                
-                all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-                sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
-                embed = sa_view.create_embed()
-                bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
-                sa_view.message = bot_reply_msg
-                await _update_reactions(message, "success")
-            except Exception as e:
-                await log_error(guild, f"Error logging single super attempt for {author_ign}", error=e, message_context=message, ping_developer=True)
-                try: await message.reply("Error logging attempt. Admin notified.")
-                except discord.HTTPException: pass
-
-        elif len(ultra_candidates) > 1:
-            disamb_embed = discord.Embed(title="❓ Which Ultra Petal Was It?", description=f"{message.author.mention}, \"{discord.utils.escape_markdown(petal_query_str)}\" could be multiple. Choose one:", color=discord.Color.blue())
-            sa_disamb_view = SuperAttemptDisambiguationView(message.author.id, ultra_candidates, petals_lost, message, author_ign, attempt_date_obj)
-            bot_reply_msg = await message.reply(embed=disamb_embed, view=sa_disamb_view)
-            sa_disamb_view.message = bot_reply_msg
-            await _update_reactions(message, "disambiguation")
-        else: # 0 candidates
-            # This logic also remains the same
-            chosen_petal_name_for_db = "Unknown Ultra Petal"
-            display_friendly_name_for_reply = "Unknown Ultra"
-            try:
-                insert_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").insert({"ingame_name": author_ign, "discord_user_id": str(message.author.id),"attempt_date": attempt_date_obj.isoformat(), "petals_lost": petals_lost,"message_id": str(message.id), "channel_id": str(message.channel.id),"chosen_petal_name": chosen_petal_name_for_db}).execute())
-                attempt_db_id = insert_resp.data[0]['id'] if insert_resp.data else None
-                if not attempt_db_id:
-                    fetch_id_resp = await run_supabase_sync(lambda: supabase.table("super_attempts").select("id").eq("message_id", str(message.id)).order("recorded_at", desc=True).limit(1).maybe_single().execute())
-                    attempt_db_id = fetch_id_resp.data['id'] if fetch_id_resp.data else None
-                
-                if not attempt_db_id: raise ValueError("Could not get DB ID after insert")
-
-                all_time_attempts_count = await get_all_time_super_attempt_count(guild, author_ign)
-                sa_view = SuperAttemptConfirmView(message.author.id, attempt_db_id, petals_lost, display_friendly_name_for_reply, author_ign, all_time_attempts_count, message)
-                embed = sa_view.create_embed()
-                bot_reply_msg = await message.reply(content=f"{message.author.mention}", embed=embed, view=sa_view)
-                sa_view.message = bot_reply_msg
-                await _update_reactions(message, "success")
-            except Exception as e:
-                await log_error(guild, f"Error logging 'Unknown Ultra Petal' for {author_ign}", error=e, message_context=message, ping_developer=True)
-                try: await message.reply("Error logging unknown petal. Admin notified.")
-                except discord.HTTPException: pass
-        
-        # After any single-loss action, update nickname
-        if isinstance(message.author, discord.Member):
-            final_attempt_count = await get_all_time_super_attempt_count(guild, author_ign)
-            await update_custom_nickname_on_attempt(guild, message.author, author_ign, final_attempt_count)
         return
 
 class GuildSyncInProgressView(discord.ui.View):
@@ -5748,50 +5787,8 @@ async def _update_reactions(user_message: discord.Message, state: str):
     except Exception as e:
         print(f"Reaction Error: Unexpected error: {e}")
 
-async def find_ultra_petal_candidates_for_query(petal_query_str: str, guild_for_log: Optional[discord.Guild]) -> List[Dict[str, str]]:
-    candidates = []
-    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES: # Check both
-        if guild_for_log: await log_error(guild_for_log, "find_ultra_petal_candidates: Cache and additional names list are empty.")
-        return candidates
-
-    primary_match_result = await fuzzy_match_petal_name(petal_query_str)
-    
-    if primary_match_result.get("status") != "success":
-        return candidates 
-
-    target_base_name = primary_match_result.get("base_name_matched")
-    if not target_base_name:
-        return candidates
-
-    # Check from image cache
-    if available_profile_pics_cache:
-        for original_full_name_cache, folder_id, _ in available_profile_pics_cache:
-            if folder_id == PETALS_FOLDER_NAME and original_full_name_cache.lower().startswith("ultra "):
-                base_name_of_this_ultra = _preprocess_petal_name_for_search(original_full_name_cache)
-                if base_name_of_this_ultra == target_base_name:
-                    display_friendly_version = _get_display_friendly_petal_name(original_full_name_cache)
-                    candidates.append({
-                        'original_full_name': original_full_name_cache,
-                        'display_friendly_name': display_friendly_version,
-                        'base_name_for_db': base_name_of_this_ultra 
-                    })
-    
-    # Check from additional names list (treat them as "Ultra" for candidacy)
-    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
-        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
-        if base_name_of_additional == target_base_name:
-            # Ensure we don't add duplicates if it was already found via image cache (unlikely but possible if names overlap)
-            if not any(c['original_full_name'].lower() == f"ultra {additional_petal_name.lower()}" or c['original_full_name'].lower() == additional_petal_name.lower() for c in candidates):
-                candidates.append({
-                    'original_full_name': f"Ultra {additional_petal_name.title()}", # Store with "Ultra" prefix for DB consistency if that's the intent
-                    'display_friendly_name': f"Ultra {additional_petal_name.title()}", # Display as "Ultra Name"
-                    'base_name_for_db': base_name_of_additional
-                })
-    
-    return candidates
-
 async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict[str, Any]:
-    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
+    if not available_profile_pics_cache:
         return {'status': 'cache_not_ready'}
 
     unique_base_petal_data_map: Dict[str, Dict[str, Any]] = {}
@@ -5805,18 +5802,6 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
                     unique_base_petal_data_map[base_search_name] = {
                         'display_friendly_name': display_friendly,
                     }
-    
-    # Add additional petal names to the searchable map
-    for additional_name in ADDITIONAL_SUPER_PETAL_NAMES:
-        base_search_name = _preprocess_petal_name_for_search(additional_name)
-        if base_search_name and base_search_name not in unique_base_petal_data_map:
-            # For display, treat them as "Ultra Name" if that's how they should appear in disambiguation
-            # The _get_display_friendly_petal_name expects a name potentially starting with "Ultra ",
-            # so we construct one for it.
-            display_friendly = _get_display_friendly_petal_name(f"Ultra {additional_name.title()}")
-            unique_base_petal_data_map[base_search_name] = {
-                'display_friendly_name': display_friendly,
-            }
     
     if not unique_base_petal_data_map:
         return {'status': 'no_searchable_petals'}
@@ -5890,44 +5875,6 @@ async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict
         'display_friendly_name': best_match['display_friendly_name']
     }
 
-async def check_ultra_petal_exists(base_petal_name_to_find: str) -> Optional[str]:
-    """
-    Checks if an 'Ultra' rarity version of a given base petal name exists in the cache.
-
-    Args:
-        base_petal_name_to_find: The base name of the petal, e.g., "lotus", "egg".
-                                 This should be pre-processed (lowercase, no 'petal' suffix, etc.).
-
-    Returns:
-        The original_full_name (e.g., "Ultra Lotus Petal") from the cache if an Ultra version
-        of the base_petal_name_to_find is found, otherwise None.
-    """ # MODIFIED
-    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES: # MODIFIED
-        print("[CHECK ULTRA] Cache not ready for check_ultra_petal_exists.")
-        return None
-    normalized_base_to_find = base_petal_name_to_find.lower().strip()
-
-    for original_full_name, folder_id, _ in available_profile_pics_cache:
-        if folder_id == PETALS_FOLDER_NAME: # Only consider petals
-            # Check if this cached item is an Ultra rarity
-            if original_full_name.lower().startswith("ultra "):
-                # Now, get the base name of this Ultra petal from the cache
-                base_name_of_this_cached_ultra = _preprocess_petal_name_for_search(original_full_name)
-                # Compare it with the base name we are looking for
-                if base_name_of_this_cached_ultra == normalized_base_to_find:
-                    print(f"[CHECK ULTRA] Found Ultra for base '{normalized_base_to_find}': '{original_full_name}'")
-                    return original_full_name # Return the full name from cache, e.g., "Ultra Lotus Petal"
-
-    # MODIFIED: Check additional names list if not found in cache
-    for additional_petal_name in ADDITIONAL_SUPER_PETAL_NAMES:
-        base_name_of_additional = _preprocess_petal_name_for_search(additional_petal_name)
-        if base_name_of_additional == normalized_base_to_find:
-            # Return a consistent "Ultra" formatted name
-            return f"Ultra {additional_petal_name.title()}"
-            
-    print(f"[CHECK ULTRA] No Ultra version found in cache for base name: '{normalized_base_to_find}'")
-    return None
-
 def _preprocess_petal_name_for_search(name: str) -> str:
     """Lowercase, strip, remove rarity prefix, remove 'petal' suffix."""
     clean_name = name.lower().strip()
@@ -5942,7 +5889,7 @@ def _preprocess_petal_name_for_search(name: str) -> str:
     return clean_name
 
 def _preprocess_query_for_search(query: str) -> str:
-    """Lowercase, strip, remove rarity, drop 'u', remove 'petal' suffix, expand abbreviations."""
+    """Lowercase, strip, remove rarity, drop 'u', remove 'petal' suffix, expand abbreviations from florr_data."""
     processed_query = query.lower().strip()
     for prefix in RARITY_PREFIXES:
         if processed_query.startswith(prefix + " "):
@@ -5960,8 +5907,16 @@ def _preprocess_query_for_search(query: str) -> str:
     elif processed_query.endswith("petal"):
         processed_query = processed_query[:-len("petal")].strip()
     
-    # Abbreviation expansion (after other cleaning)
-    return PETAL_ABBREVIATIONS.get(processed_query, processed_query)
+    # Abbreviation expansion from florr_data.json
+    if florr_data and 'petals' in florr_data:
+        abbreviations = {
+            petal['abbreviation'].lower(): petal['name']
+            for petal in florr_data['petals']
+            if petal.get('abbreviation') and petal.get('name')
+        }
+        return abbreviations.get(processed_query, processed_query)
+
+    return processed_query
 
 def _get_display_friendly_petal_name(original_name: str) -> str:
     """Remove rarity prefix from original cased name, preserving case of the rest."""
@@ -5974,113 +5929,70 @@ def _get_display_friendly_petal_name(original_name: str) -> str:
             break
     return display_friendly_name
 
-async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> Dict[str, Any]:
+async def fuzzy_match_petal_name(query_string: str, cutoff: float = 0.6) -> List[Dict[str, Any]]:
     """
-    Fuzzy matches a query string against base petal names from the cache and additional names list.
-    Handles preprocessing and abbreviations.
-
-    Returns a dictionary with status and match data.
-    'success' status includes:
-        'base_name_matched': The common base name found (e.g., 'lotus').
-        'display_friendly_name': A display-friendly version (e.g., 'Lotus Petal').
-        'original_query', 'processed_query'.
+    Fuzzy matches a query string against petal names from florr_data.json.
+    Returns a list of matched petal data dicts, sorted by match score.
+    Each dict contains: {'score': float, 'data': dict_from_json}
     """
-    if not available_profile_pics_cache and not ADDITIONAL_SUPER_PETAL_NAMES:
-        return {'status': 'cache_not_ready'}
+    if not florr_data or 'petals' not in florr_data:
+        return []
 
-    unique_base_petal_data_map: Dict[str, Dict[str, Any]] = {}
+    # 1. Build a map of base_name -> original_petal_data
+    searchable_petals_map: Dict[str, Dict[str, Any]] = {}
+    for petal_entry in florr_data.get('petals', []):
+        display_name = petal_entry.get('display_name')
+        if not display_name:
+            continue
+        base_name = _preprocess_petal_name_for_search(display_name)
+        if base_name and base_name not in searchable_petals_map:
+            searchable_petals_map[base_name] = petal_entry
 
-    if available_profile_pics_cache:
-        for display_name_orig, folder_id, _ in available_profile_pics_cache:
-            if folder_id == PETALS_FOLDER_NAME:
-                base_search_name = _preprocess_petal_name_for_search(display_name_orig)
-                if base_search_name and base_search_name not in unique_base_petal_data_map:
-                    display_friendly = _get_display_friendly_petal_name(display_name_orig)
-                    unique_base_petal_data_map[base_search_name] = {
-                        'display_friendly_name': display_friendly,
-                    }
-    
-    # Add additional petal names to the searchable map
-    for additional_name in ADDITIONAL_SUPER_PETAL_NAMES:
-        base_search_name = _preprocess_petal_name_for_search(additional_name)
-        if base_search_name and base_search_name not in unique_base_petal_data_map:
-            # For display, treat them as "Ultra Name"
-            display_friendly = _get_display_friendly_petal_name(f"Ultra {additional_name.title()}")
-            unique_base_petal_data_map[base_search_name] = {
-                'display_friendly_name': display_friendly,
-            }
-    
-    if not unique_base_petal_data_map:
-        return {'status': 'no_searchable_petals'}
+    if not searchable_petals_map:
+        return []
 
-    processed_query_for_match = _preprocess_query_for_search(query_string)
-
-    if not processed_query_for_match:
-        return {'status': 'empty_query_after_processing', 'original_query': query_string}
-
-    searchable_base_names_pool = list(unique_base_petal_data_map.keys())
-    
+    # 2. Preprocess query and find initial matches
+    processed_query = _preprocess_query_for_search(query_string)
+    if not processed_query:
+        return []
+        
+    searchable_base_names_pool = list(searchable_petals_map.keys())
     matches_from_difflib = difflib.get_close_matches(
-        processed_query_for_match, searchable_base_names_pool, n=3, cutoff=cutoff
+        processed_query, searchable_base_names_pool, n=5, cutoff=cutoff
     )
 
     if not matches_from_difflib:
-        return {
-            'status': 'not_found', 
-            'original_query': query_string, 
-            'processed_query': processed_query_for_match
-        }
+        return []
 
+    # 3. Score all matches and filter out weak/ambiguous ones
     scored_matches: List[Dict[str, Any]] = []
-    for matched_base_name_str in matches_from_difflib:
-        score = difflib.SequenceMatcher(None, processed_query_for_match, matched_base_name_str).ratio()
-        base_petal_entry_data = unique_base_petal_data_map.get(matched_base_name_str)
-        if base_petal_entry_data:
-            scored_matches.append({
-                'base_name_matched': matched_base_name_str,
-                'display_friendly_name': base_petal_entry_data['display_friendly_name'],
-                'score': score
-            })
-    
-    if not scored_matches:
-         return { 'status': 'not_found', 'original_query': query_string, 'processed_query': processed_query_for_match }
+    for matched_base_name in matches_from_difflib:
+        score = difflib.SequenceMatcher(None, processed_query, matched_base_name).ratio()
+        scored_matches.append({
+            'score': score,
+            'data': searchable_petals_map[matched_base_name]
+        })
 
+    # Sort by score descending
     scored_matches.sort(key=lambda x: x['score'], reverse=True)
-    best_match = scored_matches[0]
-    
-    if len(scored_matches) > 1:
-        second_match = scored_matches[1]
-        is_ambiguous = (
-            best_match['score'] > 0.70 and 
-            second_match['score'] > 0.65 and
-            (best_match['score'] - second_match['score']) < 0.1 
-        )
-        if len(processed_query_for_match) <= 3 and best_match['score'] < 0.85 :
-            if (best_match['score'] - second_match['score']) < 0.15 and second_match['score'] > 0.60:
-                 is_ambiguous = True
 
-        if is_ambiguous:
-            ambiguous_display_names_set = set()
-            for m in scored_matches[:min(3, len(scored_matches))]:
-                if m['score'] > 0.60:
-                    ambiguous_display_names_set.add(m['display_friendly_name'])
-            
-            unique_ambiguous_options = list(ambiguous_display_names_set)
-            if len(unique_ambiguous_options) > 1:
-                return {
-                    'status': 'ambiguous',
-                    'original_query': query_string,
-                    'processed_query': processed_query_for_match,
-                    'ambiguous_display_names': unique_ambiguous_options 
-                }
+    # 4. Handle ambiguity and return final list
+    if not scored_matches:
+        return []
 
-    return {
-        'status': 'success',
-        'original_query': query_string,
-        'processed_query': processed_query_for_match,
-        'base_name_matched': best_match['base_name_matched'],
-        'display_friendly_name': best_match['display_friendly_name']
-    }
+    # If the top score is very low, consider it no match
+    if scored_matches[0]['score'] < 0.65:
+        return []
+        
+    # If the top score is not a near-perfect match, check for ambiguity
+    if len(scored_matches) > 1 and scored_matches[0]['score'] < 0.9:
+        # If the second-best score is very close to the best, it's ambiguous
+        if (scored_matches[0]['score'] - scored_matches[1]['score']) < 0.1:
+            # Return all closely scored candidates
+            return [m for m in scored_matches if (scored_matches[0]['score'] - m['score']) < 0.1]
+
+    # Otherwise, return just the best match
+    return [scored_matches[0]]
 
 def _generate_activity_week_display(
     relevant_active_dates: Set[datetime.date],
@@ -8109,11 +8021,46 @@ class GuildsView(discord.ui.View):
                 header = f"{'#':<4}{'IGN':<20}{'Activity':<18}"
                 lines.append(header)
                 lines.append("-" * len(header))
+                today = datetime.datetime.now(pytz.utc).date()
+
                 for i, item in enumerate(page_data, start=start_index + 1):
                     ign_disp = item.get('ign', 'N/A')[:18]
                     act_count = item.get('activity_count', 0)
-                    last_seen_disp = format_date_dmy(item['last_seen']) if item['last_seen'] else "N/A"
-                    act_disp = f"{act_count} ({last_seen_disp})"
+                    last_seen_date = item.get('last_seen')
+                    updated_at_str = item.get('updated_at')
+                    
+                    # Calculate relative last seen string
+                    relative_last_seen_str = "N/A"
+                    if last_seen_date:
+                        delta = today - last_seen_date
+                        if delta.days == 0:
+                            relative_last_seen_str = "Today"
+                        elif delta.days > 0:
+                            relative_last_seen_str = f"{delta.days}d ago"
+                        else:
+                            relative_last_seen_str = "Future"
+                    
+                    # Calculate total_days for the period
+                    total_days = "N/A"
+                    if updated_at_str:
+                        try:
+                            updated_at_date = date_parse(updated_at_str).date()
+                            days_since_update = max(0, (today - updated_at_date).days)
+                            
+                            view_mode_days_limit = {
+                                VIEW_MODE_ACTIVITY_DAILY: 1,
+                                VIEW_MODE_ACTIVITY_WEEKLY: 7,
+                                VIEW_MODE_ACTIVITY_MONTHLY: 30,
+                            }
+                            # Get the limit for the current view, or use days_since_update itself for All-Time view
+                            limit = view_mode_days_limit.get(self.member_view_mode, days_since_update)
+                            total_days = min(days_since_update, limit)
+
+                        except (ValueError, TypeError):
+                            total_days = "err"
+
+                    act_disp = f"{act_count}/{total_days} ({relative_last_seen_str})"
+                    
                     lines.append(f"{f'{i}.':<4}{ign_disp:<20}{act_disp:<18}")
                 lines.append("```")
                 embed.description = "\n".join(lines)

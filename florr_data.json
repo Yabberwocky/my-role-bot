@@ -243,19 +243,19 @@
     {
       "id": 45,
       "name": "termite_baby",
-      "display_name": "Termite Baby",
+      "display_name": "Baby Termite",
       "abbreviation": ""
     },
     {
       "id": 46,
       "name": "termite_worker",
-      "display_name": "Termite Worker",
+      "display_name": "Worker Termite",
       "abbreviation": ""
     },
     {
       "id": 47,
       "name": "termite_soldier",
-      "display_name": "Termite Soldier",
+      "display_name": "Soldier Termite",
       "abbreviation": ""
     },
     {
@@ -773,7 +773,7 @@
     {
       "id": 61,
       "name": "mark",
-      "display_name": "Mark",
+      "display_name": "Dark Mark",
       "abbreviation": ""
     },
     {
@@ -815,7 +815,7 @@
     {
       "id": 68,
       "name": "talisman",
-      "display_name": "Talisman",
+      "display_name": "Talisman Of Evasion",
       "abbreviation": ""
     },
     {
@@ -857,7 +857,7 @@
     {
       "id": 75,
       "name": "chip",
-      "display_name": "Chip",
+      "display_name": "Poker Chip",
       "abbreviation": ""
     },
     {
@@ -959,7 +959,7 @@
     {
       "id": 92,
       "name": "nazar",
-      "display_name": "Nazar",
+      "display_name": "Nazar Amulet",
       "abbreviation": ""
     },
     {
