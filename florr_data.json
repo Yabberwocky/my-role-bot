@@ -1,0 +1,1151 @@
+{
+  "mobs": [
+    {
+      "id": 1,
+      "name": "rock",
+      "display_name": "Rock",
+      "abbreviation": ""
+    },
+    {
+      "id": 2,
+      "name": "cactus",
+      "display_name": "Cactus",
+      "abbreviation": ""
+    },
+    {
+      "id": 3,
+      "name": "ladybug",
+      "display_name": "Ladybug",
+      "abbreviation": ""
+    },
+    {
+      "id": 4,
+      "name": "bee",
+      "display_name": "Bee",
+      "abbreviation": ""
+    },
+    {
+      "id": 5,
+      "name": "ant_baby",
+      "display_name": "Baby Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 6,
+      "name": "ant_worker",
+      "display_name": "Worker Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 7,
+      "name": "ant_soldier",
+      "display_name": "Soldier Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 8,
+      "name": "ant_queen",
+      "display_name": "Queen Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 9,
+      "name": "ant_hole",
+      "display_name": "Ant Hole",
+      "abbreviation": ""
+    },
+    {
+      "id": 10,
+      "name": "beetle",
+      "display_name": "Beetle",
+      "abbreviation": ""
+    },
+    {
+      "id": 11,
+      "name": "hornet",
+      "display_name": "Hornet",
+      "abbreviation": ""
+    },
+    {
+      "id": 12,
+      "name": "centipede",
+      "display_name": "Centipede",
+      "abbreviation": ""
+    },
+    {
+      "id": 14,
+      "name": "centipede_evil",
+      "display_name": "Evil Centipede",
+      "abbreviation": ""
+    },
+    {
+      "id": 16,
+      "name": "centipede_desert",
+      "display_name": "Desert Centipede",
+      "abbreviation": ""
+    },
+    {
+      "id": 18,
+      "name": "square",
+      "display_name": "Square",
+      "abbreviation": ""
+    },
+    {
+      "id": 19,
+      "name": "ladybug_dark",
+      "display_name": "Dark Ladybug Dark",
+      "abbreviation": ""
+    },
+    {
+      "id": 20,
+      "name": "ladybug_shiny",
+      "display_name": "Shiny Ladybug",
+      "abbreviation": ""
+    },
+    {
+      "id": 21,
+      "name": "spider",
+      "display_name": "Spider",
+      "abbreviation": ""
+    },
+    {
+      "id": 22,
+      "name": "scorpion",
+      "display_name": "Scorpion",
+      "abbreviation": ""
+    },
+    {
+      "id": 23,
+      "name": "fire_ant_soldier",
+      "display_name": "Soldier Fire Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 24,
+      "name": "fire_ant_burrow",
+      "display_name": "Fire Ant Burrow",
+      "abbreviation": ""
+    },
+    {
+      "id": 25,
+      "name": "sandstorm",
+      "display_name": "Sandstorm",
+      "abbreviation": ""
+    },
+    {
+      "id": 26,
+      "name": "bubble",
+      "display_name": "Bubble",
+      "abbreviation": ""
+    },
+    {
+      "id": 27,
+      "name": "bumble_bee",
+      "display_name": "Bumble Bee",
+      "abbreviation": ""
+    },
+    {
+      "id": 28,
+      "name": "shell",
+      "display_name": "Shell",
+      "abbreviation": ""
+    },
+    {
+      "id": 29,
+      "name": "starfish",
+      "display_name": "Starfish",
+      "abbreviation": ""
+    },
+    {
+      "id": 30,
+      "name": "crab",
+      "display_name": "Crab",
+      "abbreviation": ""
+    },
+    {
+      "id": 31,
+      "name": "jellyfish",
+      "display_name": "Jellyfish",
+      "abbreviation": ""
+    },
+    {
+      "id": 32,
+      "name": "digger",
+      "display_name": "Digger",
+      "abbreviation": ""
+    },
+    {
+      "id": 33,
+      "name": "sponge",
+      "display_name": "Sponge",
+      "abbreviation": ""
+    },
+    {
+      "id": 34,
+      "name": "leech",
+      "display_name": "Leech",
+      "abbreviation": ""
+    },
+    {
+      "id": 36,
+      "name": "dandelion",
+      "display_name": "Dandelion",
+      "abbreviation": ""
+    },
+    {
+      "id": 37,
+      "name": "fire_ant_baby",
+      "display_name": "Baby Fire Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 38,
+      "name": "fire_ant_worker",
+      "display_name": "Worker Fire Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 39,
+      "name": "fire_ant_queen",
+      "display_name": "Queen Fire Ant",
+      "abbreviation": ""
+    },
+    {
+      "id": 40,
+      "name": "ant_egg",
+      "display_name": "Ant Egg",
+      "abbreviation": ""
+    },
+    {
+      "id": 41,
+      "name": "fire_ant_egg",
+      "display_name": "Fire Ant Egg",
+      "abbreviation": ""
+    },
+    {
+      "id": 42,
+      "name": "fly",
+      "display_name": "Fly",
+      "abbreviation": ""
+    },
+    {
+      "id": 43,
+      "name": "leafbug",
+      "display_name": "Leafbug",
+      "abbreviation": ""
+    },
+    {
+      "id": 44,
+      "name": "mantis",
+      "display_name": "Mantis",
+      "abbreviation": ""
+    },
+    {
+      "id": 45,
+      "name": "termite_baby",
+      "display_name": "Termite Baby",
+      "abbreviation": ""
+    },
+    {
+      "id": 46,
+      "name": "termite_worker",
+      "display_name": "Termite Worker",
+      "abbreviation": ""
+    },
+    {
+      "id": 47,
+      "name": "termite_soldier",
+      "display_name": "Termite Soldier",
+      "abbreviation": ""
+    },
+    {
+      "id": 48,
+      "name": "termite_overmind",
+      "display_name": "Termite Overmind",
+      "abbreviation": ""
+    },
+    {
+      "id": 49,
+      "name": "termite_mound",
+      "display_name": "Termite Mound",
+      "abbreviation": ""
+    },
+    {
+      "id": 50,
+      "name": "termite_egg",
+      "display_name": "Termite Egg",
+      "abbreviation": ""
+    },
+    {
+      "id": 51,
+      "name": "bush",
+      "display_name": "Bush",
+      "abbreviation": ""
+    },
+    {
+      "id": 52,
+      "name": "roach",
+      "display_name": "Roach",
+      "abbreviation": ""
+    },
+    {
+      "id": 53,
+      "name": "moth",
+      "display_name": "Moth",
+      "abbreviation": ""
+    },
+    {
+      "id": 54,
+      "name": "firefly",
+      "display_name": "Firefly",
+      "abbreviation": ""
+    },
+    {
+      "id": 55,
+      "name": "beetle_hel",
+      "display_name": "Hel Beetle",
+      "abbreviation": ""
+    },
+    {
+      "id": 56,
+      "name": "wasp",
+      "display_name": "Wasp",
+      "abbreviation": ""
+    },
+    {
+      "id": 58,
+      "name": "spider_hel",
+      "display_name": "Hel Spider",
+      "abbreviation": ""
+    },
+    {
+      "id": 59,
+      "name": "centipede_hel",
+      "display_name": "Hel Centipede",
+      "abbreviation": ""
+    },
+    {
+      "id": 61,
+      "name": "wasp_hel",
+      "display_name": "Hel Wasp",
+      "abbreviation": ""
+    },
+    {
+      "id": 63,
+      "name": "gambler",
+      "display_name": "Gambler",
+      "abbreviation": ""
+    },
+    {
+      "id": 65,
+      "name": "firefly_magic",
+      "display_name": "Magic Firefly",
+      "abbreviation": ""
+    },
+    {
+      "id": 67,
+      "name": "beetle_nazar",
+      "display_name": "Nazar Beetle",
+      "abbreviation": ""
+    },
+    {
+      "id": 68,
+      "name": "worm",
+      "display_name": "Worm",
+      "abbreviation": ""
+    },
+    {
+      "id": 70,
+      "name": "mecha_flower",
+      "display_name": "Mecha Flower",
+      "abbreviation": ""
+    },
+    {
+      "id": 71,
+      "name": "wasp_mecha",
+      "display_name": "Mecha Wasp",
+      "abbreviation": ""
+    },
+    {
+      "id": 72,
+      "name": "spider_mecha",
+      "display_name": "Mecha Spider",
+      "abbreviation": ""
+    },
+    {
+      "id": 73,
+      "name": "leafbug_shiny",
+      "display_name": "Shiny Leafbug",
+      "abbreviation": ""
+    },
+    {
+      "id": 74,
+      "name": "crab_mecha",
+      "display_name": "Mecha Crab",
+      "abbreviation": ""
+    },
+    {
+      "id": 76,
+      "name": "barrel",
+      "display_name": "Barrel",
+      "abbreviation": ""
+    },
+    {
+      "id": 77,
+      "name": "beetle_mummy",
+      "display_name": "Mummy Beetle",
+      "abbreviation": ""
+    },
+    {
+      "id": 78,
+      "name": "beetle_pharaoh",
+      "display_name": "Pharaoh Beetle",
+      "abbreviation": ""
+    },
+    {
+      "id": 79,
+      "name": "tomb",
+      "display_name": "Tomb",
+      "abbreviation": ""
+    }
+  ],
+  "petals": [
+    {
+      "id": 1,
+      "name": "basic",
+      "display_name": "Basic",
+      "abbreviation": ""
+    },
+    {
+      "id": 2,
+      "name": "light",
+      "display_name": "Light",
+      "abbreviation": ""
+    },
+    {
+      "id": 3,
+      "name": "rock",
+      "display_name": "Rock",
+      "abbreviation": ""
+    },
+    {
+      "id": 4,
+      "name": "square",
+      "display_name": "Square",
+      "abbreviation": ""
+    },
+    {
+      "id": 5,
+      "name": "rose",
+      "display_name": "Rose",
+      "abbreviation": ""
+    },
+    {
+      "id": 6,
+      "name": "stinger",
+      "display_name": "Stinger",
+      "abbreviation": ""
+    },
+    {
+      "id": 7,
+      "name": "iris",
+      "display_name": "Iris",
+      "abbreviation": ""
+    },
+    {
+      "id": 8,
+      "name": "wing",
+      "display_name": "Wing",
+      "abbreviation": ""
+    },
+    {
+      "id": 9,
+      "name": "missile",
+      "display_name": "Missile",
+      "abbreviation": ""
+    },
+    {
+      "id": 10,
+      "name": "grapes",
+      "display_name": "Grapes",
+      "abbreviation": ""
+    },
+    {
+      "id": 11,
+      "name": "cactus",
+      "display_name": "Cactus",
+      "abbreviation": ""
+    },
+    {
+      "id": 12,
+      "name": "faster",
+      "display_name": "Faster",
+      "abbreviation": ""
+    },
+    {
+      "id": 13,
+      "name": "bubble",
+      "display_name": "Bubble",
+      "abbreviation": ""
+    },
+    {
+      "id": 14,
+      "name": "pollen",
+      "display_name": "Pollen",
+      "abbreviation": ""
+    },
+    {
+      "id": 15,
+      "name": "dandelion",
+      "display_name": "Dandelion",
+      "abbreviation": ""
+    },
+    {
+      "id": 16,
+      "name": "beetle_egg",
+      "display_name": "Beetle Egg",
+      "abbreviation": ""
+    },
+    {
+      "id": 17,
+      "name": "antennae",
+      "display_name": "Antennae",
+      "abbreviation": ""
+    },
+    {
+      "id": 18,
+      "name": "heavy",
+      "display_name": "Heavy",
+      "abbreviation": ""
+    },
+    {
+      "id": 19,
+      "name": "yin_yang",
+      "display_name": "Yin Yang",
+      "abbreviation": ""
+    },
+    {
+      "id": 20,
+      "name": "web",
+      "display_name": "Web",
+      "abbreviation": ""
+    },
+    {
+      "id": 21,
+      "name": "honey",
+      "display_name": "Honey",
+      "abbreviation": ""
+    },
+    {
+      "id": 22,
+      "name": "leaf",
+      "display_name": "Leaf",
+      "abbreviation": ""
+    },
+    {
+      "id": 23,
+      "name": "salt",
+      "display_name": "Salt",
+      "abbreviation": ""
+    },
+    {
+      "id": 24,
+      "name": "rice",
+      "display_name": "Rice",
+      "abbreviation": ""
+    },
+    {
+      "id": 25,
+      "name": "corn",
+      "display_name": "Corn",
+      "abbreviation": ""
+    },
+    {
+      "id": 26,
+      "name": "sand",
+      "display_name": "Sand",
+      "abbreviation": ""
+    },
+    {
+      "id": 27,
+      "name": "pincer",
+      "display_name": "Pincer",
+      "abbreviation": ""
+    },
+    {
+      "id": 28,
+      "name": "yucca",
+      "display_name": "Yucca",
+      "abbreviation": ""
+    },
+    {
+      "id": 29,
+      "name": "magnet",
+      "display_name": "Magnet",
+      "abbreviation": ""
+    },
+    {
+      "id": 30,
+      "name": "yggdrasil",
+      "display_name": "Yggdrasil",
+      "abbreviation": "ygg"
+    },
+    {
+      "id": 31,
+      "name": "starfish",
+      "display_name": "Starfish",
+      "abbreviation": ""
+    },
+    {
+      "id": 32,
+      "name": "pearl",
+      "display_name": "Pearl",
+      "abbreviation": ""
+    },
+    {
+      "id": 33,
+      "name": "lightning",
+      "display_name": "Lightning",
+      "abbreviation": ""
+    },
+    {
+      "id": 34,
+      "name": "jelly",
+      "display_name": "Jelly",
+      "abbreviation": ""
+    },
+    {
+      "id": 35,
+      "name": "claw",
+      "display_name": "Claw",
+      "abbreviation": ""
+    },
+    {
+      "id": 36,
+      "name": "shell",
+      "display_name": "Shell",
+      "abbreviation": ""
+    },
+    {
+      "id": 37,
+      "name": "cutter",
+      "display_name": "Cutter",
+      "abbreviation": ""
+    },
+    {
+      "id": 38,
+      "name": "dahlia",
+      "display_name": "Dahlia",
+      "abbreviation": ""
+    },
+    {
+      "id": 39,
+      "name": "uranium",
+      "display_name": "Uranium",
+      "abbreviation": ""
+    },
+    {
+      "id": 40,
+      "name": "sponge",
+      "display_name": "Sponge",
+      "abbreviation": ""
+    },
+    {
+      "id": 41,
+      "name": "soil",
+      "display_name": "Soil",
+      "abbreviation": ""
+    },
+    {
+      "id": 42,
+      "name": "fangs",
+      "display_name": "Fangs",
+      "abbreviation": ""
+    },
+    {
+      "id": 43,
+      "name": "third_eye",
+      "display_name": "Third Eye",
+      "abbreviation": ""
+    },
+    {
+      "id": 44,
+      "name": "peas",
+      "display_name": "Peas",
+      "abbreviation": ""
+    },
+    {
+      "id": 45,
+      "name": "stick",
+      "display_name": "Stick",
+      "abbreviation": ""
+    },
+    {
+      "id": 46,
+      "name": "clover",
+      "display_name": "Clover",
+      "abbreviation": ""
+    },
+    {
+      "id": 47,
+      "name": "powder",
+      "display_name": "Powder",
+      "abbreviation": ""
+    },
+    {
+      "id": 48,
+      "name": "air",
+      "display_name": "Air",
+      "abbreviation": ""
+    },
+    {
+      "id": 49,
+      "name": "basil",
+      "display_name": "Basil",
+      "abbreviation": ""
+    },
+    {
+      "id": 50,
+      "name": "orange",
+      "display_name": "Orange",
+      "abbreviation": ""
+    },
+    {
+      "id": 51,
+      "name": "ant_egg",
+      "display_name": "Ant Egg",
+      "abbreviation": ""
+    },
+    {
+      "id": 52,
+      "name": "poo",
+      "display_name": "Poo",
+      "abbreviation": ""
+    },
+    {
+      "id": 53,
+      "name": "relic",
+      "display_name": "Relic",
+      "abbreviation": ""
+    },
+    {
+      "id": 54,
+      "name": "lotus",
+      "display_name": "Lotus",
+      "abbreviation": ""
+    },
+    {
+      "id": 55,
+      "name": "bulb",
+      "display_name": "Bulb",
+      "abbreviation": ""
+    },
+    {
+      "id": 56,
+      "name": "cotton",
+      "display_name": "Cotton",
+      "abbreviation": ""
+    },
+    {
+      "id": 57,
+      "name": "carrot",
+      "display_name": "Carrot",
+      "abbreviation": ""
+    },
+    {
+      "id": 58,
+      "name": "bone",
+      "display_name": "Bone",
+      "abbreviation": ""
+    },
+    {
+      "id": 59,
+      "name": "plank",
+      "display_name": "Plank",
+      "abbreviation": ""
+    },
+    {
+      "id": 60,
+      "name": "tomato",
+      "display_name": "Tomato",
+      "abbreviation": ""
+    },
+    {
+      "id": 61,
+      "name": "mark",
+      "display_name": "Mark",
+      "abbreviation": ""
+    },
+    {
+      "id": 62,
+      "name": "rubber",
+      "display_name": "Rubber",
+      "abbreviation": ""
+    },
+    {
+      "id": 63,
+      "name": "blood_stinger",
+      "display_name": "Blood Stinger",
+      "abbreviation": ""
+    },
+    {
+      "id": 64,
+      "name": "bur",
+      "display_name": "Bur",
+      "abbreviation": ""
+    },
+    {
+      "id": 65,
+      "name": "root",
+      "display_name": "Root",
+      "abbreviation": ""
+    },
+    {
+      "id": 66,
+      "name": "ankh",
+      "display_name": "Ankh",
+      "abbreviation": ""
+    },
+    {
+      "id": 67,
+      "name": "dice",
+      "display_name": "Dice",
+      "abbreviation": ""
+    },
+    {
+      "id": 68,
+      "name": "talisman",
+      "display_name": "Talisman",
+      "abbreviation": ""
+    },
+    {
+      "id": 69,
+      "name": "battery",
+      "display_name": "Battery",
+      "abbreviation": ""
+    },
+    {
+      "id": 70,
+      "name": "amulet",
+      "display_name": "Amulet",
+      "abbreviation": ""
+    },
+    {
+      "id": 71,
+      "name": "compass",
+      "display_name": "Compass",
+      "abbreviation": ""
+    },
+    {
+      "id": 72,
+      "name": "disc",
+      "display_name": "Disc",
+      "abbreviation": ""
+    },
+    {
+      "id": 73,
+      "name": "shovel",
+      "display_name": "Shovel",
+      "abbreviation": ""
+    },
+    {
+      "id": 74,
+      "name": "coin",
+      "display_name": "Coin",
+      "abbreviation": ""
+    },
+    {
+      "id": 75,
+      "name": "chip",
+      "display_name": "Chip",
+      "abbreviation": ""
+    },
+    {
+      "id": 76,
+      "name": "card",
+      "display_name": "Card",
+      "abbreviation": ""
+    },
+    {
+      "id": 77,
+      "name": "moon",
+      "display_name": "Moon",
+      "abbreviation": ""
+    },
+    {
+      "id": 78,
+      "name": "privet",
+      "display_name": "Privet",
+      "abbreviation": ""
+    },
+    {
+      "id": 79,
+      "name": "glass",
+      "display_name": "Glass",
+      "abbreviation": ""
+    },
+    {
+      "id": 80,
+      "name": "corruption",
+      "display_name": "Corruption",
+      "abbreviation": ""
+    },
+    {
+      "id": 81,
+      "name": "orb",
+      "display_name": "Orb",
+      "abbreviation": ""
+    },
+    {
+      "id": 82,
+      "name": "blueberries",
+      "display_name": "Blueberries",
+      "abbreviation": ""
+    },
+    {
+      "id": 83,
+      "name": "magic_cotton",
+      "display_name": "Magic Cotton",
+      "abbreviation": ""
+    },
+    {
+      "id": 84,
+      "name": "magic_stinger",
+      "display_name": "Magic Stinger",
+      "abbreviation": ""
+    },
+    {
+      "id": 85,
+      "name": "magic_leaf",
+      "display_name": "Magic Leaf",
+      "abbreviation": ""
+    },
+    {
+      "id": 86,
+      "name": "magic_cactus",
+      "display_name": "Magic Cactus",
+      "abbreviation": ""
+    },
+    {
+      "id": 87,
+      "name": "magic_eye",
+      "display_name": "Magic Eye",
+      "abbreviation": ""
+    },
+    {
+      "id": 88,
+      "name": "magic_missile",
+      "display_name": "Magic Missile",
+      "abbreviation": ""
+    },
+    {
+      "id": 89,
+      "name": "magic_stick",
+      "display_name": "Magic Stick",
+      "abbreviation": ""
+    },
+    {
+      "id": 90,
+      "name": "coral",
+      "display_name": "Coral",
+      "abbreviation": ""
+    },
+    {
+      "id": 91,
+      "name": "magic_bubble",
+      "display_name": "Magic Bubble",
+      "abbreviation": ""
+    },
+    {
+      "id": 92,
+      "name": "nazar",
+      "display_name": "Nazar",
+      "abbreviation": ""
+    },
+    {
+      "id": 93,
+      "name": "mimic",
+      "display_name": "Mimic",
+      "abbreviation": ""
+    },
+    {
+      "id": 94,
+      "name": "mjolnir",
+      "display_name": "Mjolnir",
+      "abbreviation": ""
+    },
+    {
+      "id": 95,
+      "name": "mecha_missile",
+      "display_name": "Mecha Missile",
+      "abbreviation": ""
+    },
+    {
+      "id": 96,
+      "name": "wax",
+      "display_name": "Wax",
+      "abbreviation": ""
+    },
+    {
+      "id": 97,
+      "name": "golden_leaf",
+      "display_name": "Golden Leaf",
+      "abbreviation": ""
+    },
+    {
+      "id": 98,
+      "name": "cog",
+      "display_name": "Cog",
+      "abbreviation": ""
+    },
+    {
+      "id": 99,
+      "name": "monstera",
+      "display_name": "Monstera",
+      "abbreviation": ""
+    },
+    {
+      "id": 100,
+      "name": "mecha_antennae",
+      "display_name": "Mecha Antennae",
+      "abbreviation": ""
+    },
+    {
+      "id": 101,
+      "name": "laser",
+      "display_name": "Laser",
+      "abbreviation": ""
+    },
+    {
+      "id": 102,
+      "name": "domino",
+      "display_name": "Domino",
+      "abbreviation": ""
+    },
+    {
+      "id": 103,
+      "name": "bandage",
+      "display_name": "Bandage",
+      "abbreviation": ""
+    },
+    {
+      "id": 104,
+      "name": "crown",
+      "display_name": "Crown",
+      "abbreviation": ""
+    },
+    {
+      "id": 105,
+      "name": "totem",
+      "display_name": "Totem",
+      "abbreviation": ""
+    },
+    {
+      "id": 106,
+      "name": "triangle",
+      "display_name": "Triangle",
+      "abbreviation": ""
+    }
+  ],
+  "shared_spawns": [
+    {
+      "leader_id": 10,
+      "group_id": "beetle",
+      "group_name": "Unknown Beetle",
+      "group_members": [
+        {
+          "id": 10,
+          "name": "Beetle"
+        }
+      ]
+    },
+    {
+      "leader_id": 3,
+      "group_id": "ladybug",
+      "group_name": "Unknown Ladybug",
+      "group_members": [
+        {
+          "id": 3,
+          "name": "Ladybug"
+        }
+      ]
+    },
+    {
+      "leader_id": 56,
+      "group_id": "wasp",
+      "group_name": "Unknown Wasp",
+      "group_members": [
+        {
+          "id": 56,
+          "name": "Wasp"
+        }
+      ]
+    },
+    {
+      "leader_id": 30,
+      "group_id": "crab",
+      "group_name": "Unknown Crab",
+      "group_members": [
+        {
+          "id": 30,
+          "name": "Crab"
+        }
+      ]
+    },
+    {
+      "leader_id": 12,
+      "group_id": "centipede",
+      "group_name": "Unknown Centipede",
+      "group_members": [
+        {
+          "id": 12,
+          "name": "Centipede"
+        }
+      ]
+    },
+    {
+      "leader_id": 55,
+      "group_id": "hel",
+      "group_name": "Unknown Hel Mob",
+      "group_members": [
+        {
+          "id": 55,
+          "name": "Hel Beetle"
+        }
+      ]
+    },
+    {
+      "leader_id": 21,
+      "group_id": "spider",
+      "group_name": "Unknown Spider",
+      "group_members": [
+        {
+          "id": 21,
+          "name": "Spider"
+        }
+      ]
+    },
+    {
+      "leader_id": 54,
+      "group_id": "firefly",
+      "group_name": "Unknown Firefly",
+      "group_members": [
+        {
+          "id": 54,
+          "name": "Firefly"
+        }
+      ]
+    },
+    {
+      "leader_id": 43,
+      "group_id": "leafbug",
+      "group_name": "Unknown Leafbug",
+      "group_members": [
+        {
+          "id": 43,
+          "name": "Leafbug"
+        }
+      ]
+    }
+  ]
+}

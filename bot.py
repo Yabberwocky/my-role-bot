@@ -163,6 +163,7 @@ from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockT
 import google.api_core.exceptions as google_exceptions
 from PIL import Image, UnidentifiedImageError
 import sys
+import json
 
 # --- Configuration ---
 load_dotenv()
@@ -208,6 +209,7 @@ available_profile_pics_cache: List[Tuple[str, str, str]] = []
 PROFILE_PIC_BASE_PATH = ""
 m28_server_list: Dict[str, Dict[str, Any]] = {}
 m28_server_list_lock = asyncio.Lock()
+florr_data: Dict[str, Any] = {}
 
 # Uncategorized/Misc
 NERDY_YELLOW = discord.Color.gold()
@@ -811,8 +813,106 @@ async def _handle_self_bot_event(item: Dict[str, Any]):
     # --- Dispatch Ping Immediately (Replaces Consolidation Logic) ---
     await _dispatch_single_event_ping(item)
 
+async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Optional[discord.Embed], Optional[str]]:
+    """
+    Creates an embed and determines the local image file path for a game event, handling mob groups.
+    Returns (embed, image_path) tuple. image_path is None if not found.
+    """
+    category = item.get('category')
+    rarity = item.get('rarity')
+    image_path = None
+    embed_title = "New Event"
+    embed_description = ""
+    embed_color = NERDY_YELLOW
+    filename_for_attachment = None
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+    # --- Crafting Logic ---
+    if category == 'super_craft':
+        petal_display_name = item.get('petal')
+        player = item.get('player', 'Someone')
+        embed_title = "✨ Super Crafted! ✨"
+        embed_description = f"**{player}** crafted a **{rarity} {petal_display_name}**!"
+        
+        if petal_display_name:
+            # Find the petal in florr_data by its display_name to get the internal 'name' for the filename.
+            petal_data = next((p for p in florr_data.get('petals', []) if p.get('display_name', '').lower() == petal_display_name.lower()), None)
+            
+            # Use the internal 'name' for the file if found; otherwise, fall back to converting the display name.
+            if petal_data and 'name' in petal_data:
+                 petal_filename_base = petal_data['name']
+            else:
+                 petal_filename_base = petal_display_name.lower().replace(' ', '_').replace('-', '_')
+
+            filename_for_attachment = f"{petal_filename_base}.png"
+            potential_path = os.path.join(base_path, PETALS_FOLDER_NAME, filename_for_attachment)
+            
+            if os.path.exists(potential_path):
+                image_path = potential_path
+
+    # --- Mob Spawn/Defeat Logic ---
+    elif category in ['super_spawn', 'super_defeat']:
+        mob_display_name_from_event = item.get('mob')
+        mob_id_for_image = None
+        display_name_for_embed = mob_display_name_from_event.replace('_', ' ').title() if mob_display_name_from_event else "Unknown Mob"
+
+        # --- Group Logic (for spawns primarily) ---
+        found_in_group = False
+        if mob_display_name_from_event and category == 'super_spawn':
+            for group in florr_data.get('shared_spawns', []):
+                for member in group.get('group_members', []):
+                    # Match the event mob's display name against the group member's display name
+                    if member.get('name', '').lower() == mob_display_name_from_event.lower():
+                        mob_id_for_image = group.get('leader_id')
+                        display_name_for_embed = group.get('group_name', display_name_for_embed)
+                        found_in_group = True
+                        break
+                if found_in_group:
+                    break
+        
+        # --- Standard Mob Logic (if not found in a group, or for all defeats) ---
+        if not found_in_group and mob_display_name_from_event:
+            # Match by display_name from the event against the main mobs list
+            mob_data = next((m for m in florr_data.get('mobs', []) if m.get('display_name', '').lower() == mob_display_name_from_event.lower()), None)
+            if mob_data:
+                mob_id_for_image = mob_data.get('id')
+                # Use the canonical display name from the JSON file
+                display_name_for_embed = mob_data.get('display_name')
+
+        # --- Build Embed Description ---
+        if category == 'super_spawn':
+            embed_title = "🚨 Super Spawn! 🚨"
+            embed_description = f"A **{rarity} {display_name_for_embed}** has appeared!"
+        else: # super_defeat
+            players_str = ", ".join(item.get('players', [])) if item.get('players') else "Someone"
+            embed_title = "⚔️ Super Defeated! ⚔️"
+            embed_description = f"The **{rarity} {display_name_for_embed}** was defeated by **{players_str}**!"
+            
+        # --- Find Image File using the determined ID ---
+        if mob_id_for_image:
+            rarity_suffix = "_7" if rarity == "Super" else "_8" if rarity == "Unique" else None
+            if rarity_suffix:
+                mob_filename = f"{mob_id_for_image}{rarity_suffix}.png"
+                potential_path = os.path.join(base_path, MOBS_FOLDER_NAME, mob_filename)
+                if os.path.exists(potential_path):
+                    image_path = potential_path
+                    filename_for_attachment = mob_filename
+                else:
+                    print(f"Event Image File Missing: Expected '{mob_filename}' in '{MOBS_FOLDER_NAME}' folder, but it was not found.")
+
+    # --- Finalize Embed ---
+    embed = discord.Embed(title=embed_title, description=embed_description, color=embed_color)
+    if image_path and filename_for_attachment:
+        embed.set_thumbnail(url=f"attachment://{filename_for_attachment}")
+    else:
+        # Log if an image was expected but not found
+        if category in ['super_spawn', 'super_defeat', 'super_craft']:
+            print(f"Event Image Not Found: Path='{image_path}' for item: {item}")
+
+    return embed, image_path
+
 async def _dispatch_single_event_ping(item: Dict[str, Any]):
-    """Dispatches a single event ping to all configured servers."""
+    """Dispatches a single event ping with an embed and image to all configured servers."""
     category = item.get('category')
     if not category:
         return
@@ -828,6 +928,8 @@ async def _dispatch_single_event_ping(item: Dict[str, Any]):
     ping_template, should_ping_role, _ = await _create_ping_text(item)
     if not ping_template:
         return
+
+    event_embed, image_path = await _create_event_embed_and_image_path(item)
 
     for guild in bot.guilds:
         config = await load_server_config(guild.id)
@@ -846,12 +948,30 @@ async def _dispatch_single_event_ping(item: Dict[str, Any]):
         content_to_send = ping_template
         ping_role_id = config.get('super_ping_role_id')
         if should_ping_role and ping_role_id:
-            content_to_send += f"\n<@&{config['super_ping_role_id']}>"
+            role = guild.get_role(ping_role_id)
+            if role:
+                 content_to_send += f"\n{role.mention}"
         
+        # CORRECTED: Prepare keyword arguments to avoid passing `file=None`
+        send_kwargs = {
+            'content': content_to_send,
+            'embed': event_embed,
+            'allowed_mentions': discord.AllowedMentions(roles=True)
+        }
+        
+        event_file = None
         try:
-            await webhook.send(content=content_to_send, allowed_mentions=discord.AllowedMentions(roles=True))
+            if image_path:
+                event_file = discord.File(image_path, filename=os.path.basename(image_path))
+                send_kwargs['file'] = event_file
+
+            await webhook.send(**send_kwargs)
         except Exception as e:
             await log_error(guild, f"Failed to send single event ping for {category}", error=e)
+        finally:
+            # Ensure the file handle is closed if it was opened
+            if event_file:
+                event_file.close()
 
 async def get_note_author_count(guild: Optional[discord.Guild], author_id: str, target_ign: str) -> int:
     """Counts how many notes a specific author has on a specific target IGN."""
@@ -8124,7 +8244,7 @@ async def on_close():
 @bot.event
 async def on_ready():
     print("--- on_ready event started ---")
-    global BOT_USER_ID, command_ids
+    global BOT_USER_ID, command_ids, florr_data
 
     if bot.user:
         BOT_USER_ID = bot.user.id
@@ -8145,14 +8265,22 @@ async def on_ready():
 
     print(f"Bot is ready and connected to {len(bot.guilds)} guild(s).")
     
-    # Get log_guild context early
     log_guild = bot.get_guild(CATERCORD_GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
 
-    # Initialize data caches before starting dependent tasks
     await load_profile_picture_choices(log_guild)
     await load_ign_cache(log_guild)
     await _initialize_ai_models()
     
+    try:
+        data_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'florr_data.json')
+        with open(data_file_path, 'r', encoding='utf-8') as f:
+            florr_data = json.load(f)
+        print("Successfully loaded florr_data.json.")
+        await log_info(log_guild, "Successfully loaded florr_data.json.")
+    except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
+        print(f"CRITICAL: Failed to load or parse florr_data.json: {e}")
+        await log_error(log_guild, "Failed to load florr_data.json, mob/petal images will not work.", error=e, ping_developer=True)
+
     synced_commands = await _sync_app_commands(bot)
     
     await _revive_static_list_views()
