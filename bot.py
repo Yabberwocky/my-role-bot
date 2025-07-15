@@ -844,7 +844,7 @@ async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Opti
         description_lines = [f"# {petal_full_name}"]
         if player:
             description_lines.append("crafted by:")
-            description_lines.append(player)
+            description_lines.append(f"# {player}")
         embed_description = "\n".join(description_lines)
         # END MODIFICATION
 
@@ -3046,7 +3046,7 @@ async def _create_ping_text(item: Dict[str, Any]) -> Tuple[Optional[str], bool, 
     if category == 'super_craft':
         petal = item.get('petal')
         player = item.get('player')
-        text = f"{region_prefix}**{rarity} {petal}** was just crafted by **{player or 'Someone'}**!"
+        text = f"{region_prefix}**{rarity} {petal}** has been crafted by **{player or 'Someone'}**!"
 
     elif category == 'super_spawn':
         mob = item.get('mob', 'Unknown Mob').replace('_', ' ').title()
