@@ -839,7 +839,14 @@ async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Opti
         player = item.get('player', 'Someone')
         
         petal_full_name = f"{rarity} {petal_display_name}"
-        embed_description = f"# {petal_full_name}\n# {player}"
+        
+        # MODIFIED EMBED DESCRIPTION LOGIC
+        description_lines = [f"# {petal_full_name}"]
+        if player:
+            description_lines.append("crafted by:")
+            description_lines.append(player)
+        embed_description = "\n".join(description_lines)
+        # END MODIFICATION
 
         log_details['steps'].append(f"Starting image search for CRAFT event: '{petal_full_name}'.")
 
@@ -913,18 +920,22 @@ async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Opti
             log_details['steps'].append(f"{category.upper()} event: Using primary mob ID '{mob_primary_id}' for image.")
 
         if category == 'super_spawn':
-            embed_description = f"# {rarity} {display_name_for_embed}"
+            # MODIFIED EMBED DESCRIPTION LOGIC
+            embed_description = f"# {rarity} {display_name_for_embed}\nhas spawned!"
+            # END MODIFICATION
         
         else: # super_defeat
             players = item.get('players', [])
             defeat_display_name = display_name_for_embed # Use the official name found in mob_data
             defeat_mob_full_name = f"{rarity} {defeat_display_name}"
             
+            # MODIFIED EMBED DESCRIPTION LOGIC
             description_lines = [f"# {defeat_mob_full_name}"]
             if players:
+                description_lines.append("defeated by:")
                 description_lines.extend([f"- {p}" for p in players])
-            
             embed_description = "\n".join(description_lines)
+            # END MODIFICATION
 
         if image_filename_base is not None:
             rarity_suffix = "_7" if rarity == "Super" else "_8" if rarity == "Unique" else None
