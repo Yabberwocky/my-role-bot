@@ -252,7 +252,8 @@ STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes]
 STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
 STALE_EVENT_THRESHOLD_SECONDS = 300  # 5 minutes
 STALE_DEFEAT_EVENT_THRESHOLD_SECONDS = 259200 # 72 hours (72 * 60 * 60)
-EVENT_CONSOLIDATION_WINDOW_SECONDS = 3.0 # Collect events for 3s before posting
+EVENT_CONSOLIDATION_WINDOW_SECONDS = 3.0 # Collect events for 3s before 
+self_bot_listener_started = False
 
 
 # --- Supabase Client ---
