@@ -504,7 +504,7 @@
       "id": 16,
       "name": "beetle_egg",
       "display_name": "Beetle Egg",
-      "abbreviation": ""
+      "abbreviation": "begg"
     },
     {
       "id": 17,
@@ -522,7 +522,7 @@
       "id": 19,
       "name": "yin_yang",
       "display_name": "Yin Yang",
-      "abbreviation": ""
+      "abbreviation": "yy"
     },
     {
       "id": 20,
@@ -594,7 +594,7 @@
       "id": 31,
       "name": "starfish",
       "display_name": "Starfish",
-      "abbreviation": ""
+      "abbreviation": "star"
     },
     {
       "id": 32,
@@ -606,7 +606,7 @@
       "id": 33,
       "name": "lightning",
       "display_name": "Lightning",
-      "abbreviation": ""
+      "abbreviation": "ltn"
     },
     {
       "id": 34,
@@ -666,7 +666,7 @@
       "id": 43,
       "name": "third_eye",
       "display_name": "Third Eye",
-      "abbreviation": ""
+      "abbreviation": "te"
     },
     {
       "id": 44,
@@ -714,7 +714,7 @@
       "id": 51,
       "name": "ant_egg",
       "display_name": "Ant Egg",
-      "abbreviation": ""
+      "abbreviation": "aegg"
     },
     {
       "id": 52,
@@ -774,7 +774,7 @@
       "id": 61,
       "name": "mark",
       "display_name": "Dark Mark",
-      "abbreviation": ""
+      "abbreviation": "mark"
     },
     {
       "id": 62,
@@ -786,7 +786,7 @@
       "id": 63,
       "name": "blood_stinger",
       "display_name": "Blood Stinger",
-      "abbreviation": ""
+      "abbreviation": "binger"
     },
     {
       "id": 64,
@@ -816,7 +816,7 @@
       "id": 68,
       "name": "talisman",
       "display_name": "Talisman Of Evasion",
-      "abbreviation": ""
+      "abbreviation": "talis"
     },
     {
       "id": 69,
@@ -858,7 +858,7 @@
       "id": 75,
       "name": "chip",
       "display_name": "Poker Chip",
-      "abbreviation": ""
+      "abbreviation": "chip"
     },
     {
       "id": 76,
@@ -888,7 +888,7 @@
       "id": 80,
       "name": "corruption",
       "display_name": "Corruption",
-      "abbreviation": ""
+      "abbreviation": "corr"
     },
     {
       "id": 81,
@@ -912,25 +912,25 @@
       "id": 84,
       "name": "magic_stinger",
       "display_name": "Magic Stinger",
-      "abbreviation": ""
+      "abbreviation": "minger"
     },
     {
       "id": 85,
       "name": "magic_leaf",
       "display_name": "Magic Leaf",
-      "abbreviation": ""
+      "abbreviation": "mleaf"
     },
     {
       "id": 86,
       "name": "magic_cactus",
       "display_name": "Magic Cactus",
-      "abbreviation": ""
+      "abbreviation": "mcac"
     },
     {
       "id": 87,
       "name": "magic_eye",
       "display_name": "Magic Eye",
-      "abbreviation": ""
+      "abbreviation": "meye"
     },
     {
       "id": 88,
@@ -942,7 +942,7 @@
       "id": 89,
       "name": "magic_stick",
       "display_name": "Magic Stick",
-      "abbreviation": ""
+      "abbreviation": "mstick"
     },
     {
       "id": 90,
@@ -954,13 +954,13 @@
       "id": 91,
       "name": "magic_bubble",
       "display_name": "Magic Bubble",
-      "abbreviation": ""
+      "abbreviation": "mbub"
     },
     {
       "id": 92,
       "name": "nazar",
       "display_name": "Nazar Amulet",
-      "abbreviation": ""
+      "abbreviation": "nazar"
     },
     {
       "id": 93,
@@ -972,7 +972,7 @@
       "id": 94,
       "name": "mjolnir",
       "display_name": "Mjolnir",
-      "abbreviation": ""
+      "abbreviation": "hammer"
     },
     {
       "id": 95,
@@ -990,7 +990,7 @@
       "id": 97,
       "name": "golden_leaf",
       "display_name": "Golden Leaf",
-      "abbreviation": ""
+      "abbreviation": "gleaf"
     },
     {
       "id": 98,
@@ -1044,7 +1044,7 @@
       "id": 106,
       "name": "triangle",
       "display_name": "Triangle",
-      "abbreviation": ""
+      "abbreviation": "tri"
     }
   ],
   "shared_spawns": [

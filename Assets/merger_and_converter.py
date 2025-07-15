@@ -115,18 +115,17 @@ def run_combined_process():
     os.makedirs(OUTPUT_PETAL_DIR_PNG, exist_ok=True)
     os.makedirs(OUTPUT_MOB_DIR_PNG, exist_ok=True)
 
-    # --- Prepare mob tasks, replacing leader mobs with their group representation ---
+    # --- Prepare mob tasks, ensuring both individual leaders and groups are included ---
     mob_tasks = []
-    shared_spawns = game_data.get('shared_spawns', [])
-    leader_ids = {group['leader_id'] for group in shared_spawns}
-
-    # Add mobs that are NOT leaders of a spawn group
+    
+    # 1. Add ALL individual mobs from the main list, including leaders.
+    #    The `if` condition that excluded leaders has been removed.
     for mob in game_data['mobs']:
-        if mob['id'] not in leader_ids:
-            mob_tasks.append(mob)
+        mob_tasks.append(mob)
 
-    # Add the spawn groups themselves as new tasks
-    for group in shared_spawns:
+    # 2. Add the special spawn groups themselves as new tasks.
+    #    This uses the string-based ID (e.g., "beetle") to find the question mark SVG.
+    for group in game_data.get('shared_spawns', []):
         mob_tasks.append({
             "id": group['group_id'], # Use the string ID like "beetle"
             "name": group['group_name'],

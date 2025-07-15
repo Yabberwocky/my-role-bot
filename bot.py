@@ -854,7 +854,14 @@ async def _create_event_embed_and_image_path(item: Dict[str, Any]) -> Tuple[Opti
                 log_details['steps'].append(f"FAILURE: Petal with display_name '{petal_display_name}' not found in florr_data.json.")
 
         if petal_id_for_image is not None:
-            filename_for_attachment = f"{petal_id_for_image}.png"
+            rarity_suffix = "_7" if rarity == "Super" else "_8" if rarity == "Unique" else None
+            if rarity_suffix:
+                log_details['steps'].append(f"Rarity is '{rarity}', using suffix '{rarity_suffix}'.")
+                filename_for_attachment = f"{petal_id_for_image}{rarity_suffix}.png"
+            else:
+                log_details['steps'].append(f"NOTE: Rarity '{rarity}' does not have a special image suffix (not Super or Unique). Defaulting to base name.")
+                filename_for_attachment = f"{petal_id_for_image}.png"
+
             log_details['final_filename_generated'] = filename_for_attachment
             potential_path = os.path.join(base_path, PETALS_FOLDER_NAME, filename_for_attachment)
             log_details['final_path_checked'] = potential_path
@@ -3307,6 +3314,7 @@ async def fetch_globally_available_guilds() -> List[Dict[str, Any]]:
 
 async def _start_background_tasks(bot: commands.Bot):
     """Initializes and starts all background tasks and listeners."""
+    global self_bot_listener_started
     print("Starting background tasks...")
 
     if not check_guilds_view_timeout.is_running(): check_guilds_view_timeout.start()
@@ -3317,15 +3325,19 @@ async def _start_background_tasks(bot: commands.Bot):
     
     print("--- Starting Self-Bot Integration ---")
     if SELF_DISCORD_TOKEN:
-        print("SELF_DISCORD_TOKEN found. Initializing listener...")
-        listener = SelfBotListener(token=SELF_DISCORD_TOKEN, channel_id=SUPER_CRAFT_SELF_BOT_CHANNEL_ID, bot_instance=bot)
-        
-        def run_listener_in_thread():
-            asyncio.run(listener.run())
+        if not self_bot_listener_started:
+            self_bot_listener_started = True
+            print("SELF_DISCORD_TOKEN found. Initializing listener for the first time...")
+            listener = SelfBotListener(token=SELF_DISCORD_TOKEN, channel_id=SUPER_CRAFT_SELF_BOT_CHANNEL_ID, bot_instance=bot)
+            
+            def run_listener_in_thread():
+                asyncio.run(listener.run())
 
-        listener_thread = threading.Thread(target=run_listener_in_thread, daemon=True)
-        listener_thread.start()
-        print("Self-Bot listener thread started.")
+            listener_thread = threading.Thread(target=run_listener_in_thread, daemon=True)
+            listener_thread.start()
+            print("Self-Bot listener thread started.")
+        else:
+            print("Self-Bot listener is already running. Skipping initialization on this reconnect.")
     else:
         print("SELF_DISCORD_TOKEN not found. Self-bot integration will be skipped.")
 
@@ -8446,28 +8458,22 @@ async def verify(interaction: discord.Interaction, user: discord.Member):
         await log_error(guild, "Error during manual /verify", error=e, interaction=interaction)
         await interaction.followup.send("❌ An error occurred while managing roles.", ephemeral=True)
 
-@tree.command(name="connect", description="Connect your Discord account to your Florr IGN.")
+@tree.command(name="connect", description="Connect a user's Discord account to their Florr IGN.")
 @app_commands.describe(
-    ingame_name="Your exact in-game name.",
-    user="[Optional] The user to connect. Staff can target others."
+    user="The user to connect.",
+    ingame_name="Their exact in-game name."
 )
 @app_commands.autocomplete(ingame_name=ign_autocomplete)
-async def connect(interaction: discord.Interaction, ingame_name: str, user: Optional[discord.Member] = None):
+async def connect(interaction: discord.Interaction, user: discord.Member, ingame_name: str):
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
-    target_user = user or interaction.user
-
-    is_self_action = (target_user.id == interaction.user.id)
-    if not is_self_action:
+    # Permission check: If acting on another user, the invoker must be staff.
+    if user.id != interaction.user.id:
         is_staff, error_msg = await check_is_staff(interaction)
         if not is_staff:
-            await interaction.response.send_message(f"❌ {error_msg}", ephemeral=True)
+            await interaction.response.send_message(f"❌ You need staff permissions to connect another user. {error_msg}", ephemeral=True)
             return
-
-    if not isinstance(target_user, discord.Member):
-        await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
-        return
 
     await interaction.response.defer(ephemeral=False)
 
@@ -8478,17 +8484,17 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
 
     try:
         params = {
-            'p_discord_id': str(target_user.id),
-            'p_discord_name': str(target_user),
+            'p_discord_id': str(user.id),
+            'p_discord_name': str(user),
             'p_ign': cleaned_ign
         }
         await run_supabase_sync(lambda: supabase.rpc('connect_florr_player', params).execute())
 
-        await trigger_global_role_sync_for_user(target_user)
+        await trigger_global_role_sync_for_user(user)
         await load_ign_cache(guild)
         
-        await interaction.followup.send(f"✅ Successfully connected {target_user.mention} to IGN `{cleaned_ign}`.", ephemeral=False)
-        await log_info(guild, f"`{interaction.user.name}` connected `{target_user.name}` to IGN `{cleaned_ign}`.")
+        await interaction.followup.send(f"✅ Successfully connected {user.mention} to IGN `{cleaned_ign}`.", ephemeral=False)
+        await log_info(guild, f"`{interaction.user.name}` connected `{user.name}` to IGN `{cleaned_ign}`.")
 
     except APIError as e:
         if "IGN_TAKEN_BY" in e.message:
@@ -8504,40 +8510,35 @@ async def connect(interaction: discord.Interaction, ingame_name: str, user: Opti
         await log_error(guild, f"Error during /connect (General)", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
-@tree.command(name="disconnect", description="Disconnect your Discord account from your Florr IGN.")
-@app_commands.describe(user="[Optional] The user to disconnect. Staff can target others.")
-async def disconnect(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+@tree.command(name="disconnect", description="Disconnect a user's Discord account from their Florr IGN.")
+@app_commands.describe(user="The user to disconnect.")
+async def disconnect(interaction: discord.Interaction, user: discord.Member):
     if not await check_supabase_available(interaction): return
     guild = interaction.guild
 
-    target_user = user or interaction.user
-
-    is_self_action = (target_user.id == interaction.user.id)
-    if not is_self_action:
+    # Permission check: If acting on another user, the invoker must be staff.
+    if user.id != interaction.user.id:
         is_staff, error_msg = await check_is_staff(interaction)
         if not is_staff:
-            await interaction.response.send_message(f"❌ {error_msg}", ephemeral=True)
+            await interaction.response.send_message(f"❌ You need staff permissions to disconnect another user. {error_msg}", ephemeral=True)
             return
-
-    if not isinstance(target_user, discord.Member):
-        await interaction.response.send_message("Target must be a member of this server.", ephemeral=True)
-        return
 
     await interaction.response.defer(ephemeral=False)
 
     try:
-        update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(target_user.id)).execute())
+        # The target is now just `user`.
+        update_resp = await run_supabase_sync(lambda: supabase.table("florr_players").update({"discord_id": None, "discord_name": None}).eq("discord_id", str(user.id)).execute())
 
         if not update_resp.data:
-            await interaction.followup.send(f"ℹ️ {target_user.mention} was not connected to any IGN in the database.", ephemeral=True); return
+            await interaction.followup.send(f"ℹ️ {user.mention} was not connected to any IGN in the database.", ephemeral=True); return
         
-        await trigger_global_role_sync_for_user(target_user)
+        await trigger_global_role_sync_for_user(user)
         ign_disconnected = update_resp.data[0].get('ingame_name', 'an IGN')
-        await interaction.followup.send(f"✅ Successfully disconnected {target_user.mention} from `{ign_disconnected}`. Roles are being updated across all servers.", ephemeral=False)
-        await log_info(guild, f"`{interaction.user.name}` disconnected `{target_user.name}`.")
+        await interaction.followup.send(f"✅ Successfully disconnected {user.mention} from `{ign_disconnected}`. Roles are being updated across all servers.", ephemeral=False)
+        await log_info(guild, f"`{interaction.user.name}` disconnected `{user.name}`.")
 
     except Exception as e:
-        await log_error(guild, f"Error during /disconnect for {target_user.name}", error=e, interaction=interaction)
+        await log_error(guild, f"Error during /disconnect for {user.name}", error=e, interaction=interaction)
         await interaction.followup.send("❌ An unexpected error occurred.", ephemeral=True)
 
 @tree.command(name="guilds", description="View an interactive list of members in tracked Florr guilds.")
