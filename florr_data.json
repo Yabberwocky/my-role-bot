@@ -659,8 +659,8 @@
     {
       "id": 42,
       "name": "fangs",
-      "display_name": "Fangs",
-      "abbreviation": ""
+      "display_name": "Fang",
+      "abbreviation": "fang"
     },
     {
       "id": 43,
@@ -689,8 +689,8 @@
     {
       "id": 47,
       "name": "powder",
-      "display_name": "Powder",
-      "abbreviation": ""
+      "display_name": "Mysterious Powder",
+      "abbreviation": "powder"
     },
     {
       "id": 48,
@@ -725,8 +725,8 @@
     {
       "id": 53,
       "name": "relic",
-      "display_name": "Relic",
-      "abbreviation": ""
+      "display_name": "Mysterious Relic",
+      "abbreviation": "relic"
     },
     {
       "id": 54,
@@ -737,8 +737,8 @@
     {
       "id": 55,
       "name": "bulb",
-      "display_name": "Bulb",
-      "abbreviation": ""
+      "display_name": "Light Bulb",
+      "abbreviation": "bulb"
     },
     {
       "id": 56,
@@ -875,8 +875,8 @@
     {
       "id": 78,
       "name": "privet",
-      "display_name": "Privet",
-      "abbreviation": ""
+      "display_name": "Privet Berry",
+      "abbreviation": "privet"
     },
     {
       "id": 79,
