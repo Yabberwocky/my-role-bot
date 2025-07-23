@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # Credits:
+# yabberwocky
 # The Fly Bot:
 # /servercodes command is based on the code of The Fly Bot by @Proxima_fish (disocrd username)
 #
